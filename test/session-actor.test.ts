@@ -225,4 +225,16 @@ describe("SessionActor abort + teardown", () => {
     await s.actor.disconnect();
     expect(s.session.disconnected).toBe(1);
   });
+
+  it("a FAILED disconnect faults the actor and never reports success on retry", async () => {
+    const s = await setup();
+    s.session.disconnect = async () => {
+      throw new Error("rpc down");
+    };
+    await expect(s.actor.disconnect()).rejects.toThrow(/rpc down/);
+    expect(s.actor.isFaulted()).toBe(true);
+    // The retry must REJECT (fence), not resolve — else /new would delete a
+    // session whose runtime may still be live.
+    await expect(s.actor.disconnect()).rejects.toThrow(/faulted/);
+  });
 });

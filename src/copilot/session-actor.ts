@@ -49,9 +49,14 @@ export class SessionActor {
   private renderer = new TurnRenderer();
   private readonly generation: number;
   private idleWaiters: Array<() => void> = [];
-  /** Actor lifecycle. `faulted`/`closed` are terminal: the actor refuses new
-   *  turns so a dead/half-torn-down session can never accept work. */
-  private lifecycle: "active" | "closed" | "faulted" = "active";
+  /** Actor lifecycle. `faulted`/`closed` are terminal; `closing` means a
+   *  disconnect RPC is in flight (not yet confirmed). The actor refuses new
+   *  turns once it leaves `active`, so a dead/tearing-down session can never
+   *  accept work. */
+  private lifecycle: "active" | "closing" | "closed" | "faulted" = "active";
+  /** In-flight disconnect (single-flight), so concurrent/retried disconnects
+   *  share one RPC instead of re-hitting a possibly-hung endpoint. */
+  private disconnectPromise?: Promise<void>;
   /** True while a /stop abort is in flight — new permissions fail closed. */
   private aborting = false;
   private unsubscribeDecision?: () => void;
@@ -306,18 +311,30 @@ export class SessionActor {
   }
 
   async disconnect(): Promise<void> {
-    // Idempotent: a closed/faulted actor's runtime session is already being torn
-    // down; re-calling would re-hit a possibly-hung RPC. This makes a /new after
-    // a fault a safe no-op rather than a new hang.
-    if (this.lifecycle !== "active") return;
-    this.lifecycle = "closed";
+    if (this.lifecycle === "closed") return; // confirmed torn down — no-op
+    if (this.lifecycle === "faulted") {
+      // A prior teardown failed: never report success (which would let /new
+      // delete the fence over a maybe-live runtime). Stay a fence.
+      throw new Error("session has faulted; disconnect cannot be confirmed");
+    }
+    if (this.disconnectPromise) return this.disconnectPromise; // single-flight
+    this.lifecycle = "closing";
     this.aborting = true;
     this.opts.broker.abortSession(this.opts.sessionKey);
     this.unsubscribeDecision?.();
-    // Throws on failure so callers replacing this session (/new) can refuse to
-    // start a new one over a runtime session that may still be live. Callers
-    // that want best-effort teardown (shutdown) use `.catch()`.
-    await this.session.disconnect();
+    // Transition to `closed` ONLY after the RPC confirms; on failure become a
+    // permanent fault fence and rethrow, so a retry can't masquerade as success.
+    this.disconnectPromise = this.session.disconnect().then(
+      () => {
+        this.lifecycle = "closed";
+      },
+      (err) => {
+        this.lifecycle = "faulted";
+        this.disconnectPromise = undefined;
+        throw err;
+      }
+    );
+    return this.disconnectPromise;
   }
 
   /** Terminal fault path: mark the actor faulted (rejects further turns) and
