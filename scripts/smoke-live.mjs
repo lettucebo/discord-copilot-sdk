@@ -5,6 +5,9 @@
 import { createCopilotClient } from "../dist/copilot/sdk.js";
 import { SessionActor } from "../dist/copilot/session-actor.js";
 import { PendingInteractionBroker } from "../dist/core/broker.js";
+import { ApprovalPolicy } from "../dist/core/approval-policy.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const REPO = "C:\\Source\\Repos\\discopilot";
 
@@ -44,6 +47,7 @@ const actor = await SessionActor.create(client, {
   contextTier: "long_context",
   broker,
   transport,
+  policy: new ApprovalPolicy(join(tmpdir(), `discopilot-smoke-approvals-${Date.now()}.json`)),
 });
 console.log("SessionActor created; sending prompt …");
 

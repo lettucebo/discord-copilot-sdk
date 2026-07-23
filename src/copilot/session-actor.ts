@@ -4,6 +4,7 @@ import { TurnRenderer } from "../core/turn-render.js";
 import type { Decision, Transport } from "../core/transport.js";
 import { normalizeSdkEvent } from "./normalize.js";
 import { sanitizeForCodeBlock, hasBidiOrControls } from "../core/text-safety.js";
+import { ApprovalPolicy, commandExecutable } from "../core/approval-policy.js";
 
 const PERMISSION_TIMEOUT_MS = 5 * 60_000;
 const TURN_WATCHDOG_MS = 15 * 60_000;
@@ -22,15 +23,13 @@ const MAX_CARD_LEN = 3900;
  *  permission kinds discopilot has no UI for (fail-closed). */
 const DENY_UNAVAILABLE = { kind: "user-not-available" } as const;
 const DENIED_BY_USER = { kind: "denied-interactively-by-user" } as const;
+const APPROVE_ONCE = { kind: "approve-once" } as const;
 
-/** Metadata captured at request time so a later decision can be built into the
- *  correct SDK approval scope (session/location need the command identifiers).
- *  `canOfferSession` is stored so `buildDecision` self-defends: it never emits a
- *  wider scope for a request the SDK didn't mark session-approvable, regardless
- *  of where the decision came from. */
+/** Metadata captured at request time so a later decision can record the right
+ *  approval rule. `executable` is the single command's executable (empty when a
+ *  wider scope isn't offerable); `canOfferSession` gates the wider buttons. */
 interface PendingPermMeta {
-  commandIdentifiers: string[];
-  locationKey: string;
+  executable: string;
   canOfferSession: boolean;
 }
 
@@ -41,6 +40,8 @@ export interface SessionActorOpts {
   contextTier?: "default" | "long_context";
   broker: PendingInteractionBroker;
   transport: Transport;
+  /** discopilot-side approval memory (session + persisted repo rules). */
+  policy: ApprovalPolicy;
   /** Session incarnation (P1: always 1; P2 resume will vary this). */
   generation?: number;
 }
@@ -170,12 +171,29 @@ export class SessionActor {
     if (hasBidiOrControls(summary)) {
       // Bidirectional/control characters have no legitimate use in a shell
       // command and are a spoofing signal (the card would have to strip them,
-      // making it differ from what actually runs). Deny outright.
+      // making it differ from what actually runs). Deny outright — never
+      // auto-approve a spoofing-laden command even if its executable is trusted.
       await this.opts.transport.notice(
         this.opts.sessionKey,
         "Auto-denied: the command contains bidirectional/control characters (possible spoofing)."
       );
       return DENY_UNAVAILABLE;
+    }
+    // Executables of every parsed command (e.g. ["git"] or ["git","rm"]).
+    const executables = dedupe(
+      extractCommandIdentifiers(r).map(commandExecutable).filter((e) => e.length > 0)
+    );
+    // Auto-approve only when EVERY executable is already trusted (so an approved
+    // `git` can't smuggle `rm` via `git status && rm -rf`).
+    if (
+      executables.length > 0 &&
+      this.opts.policy.isApproved(this.opts.sessionKey, this.opts.workingDirectory, executables)
+    ) {
+      await this.opts.transport.notice(
+        this.opts.sessionKey,
+        `✓ Auto-approved (existing rule): ${executables.map((e) => `\`${e}\``).join(", ")}`
+      );
+      return APPROVE_ONCE;
     }
     if (sanitizeForCodeBlock(summary).length > MAX_CARD_LEN) {
       // Gate on the SANITIZED (display) length: escaping can expand the text,
@@ -187,15 +205,11 @@ export class SessionActor {
       );
       return DENY_UNAVAILABLE;
     }
-    const commandIdentifiers = extractCommandIdentifiers(r);
-    // Suppress the wider (session/always) scopes when the parsed command is a
-    // generic interpreter (powershell/bash/…): "always allow powershell" would
-    // auto-approve essentially every future shell command. Those must stay
-    // per-request. Wider scopes are offered only for specific executables.
-    const canOfferSession =
-      r["canOfferSessionApproval"] === true &&
-      commandIdentifiers.length > 0 &&
-      !commandIdentifiers.some(isGenericInterpreter);
+    // Offer session/always only for a SINGLE, specific (non-interpreter) command
+    // — chained/multi-command requests and generic shells stay per-request so a
+    // single tap can never broadly trust the shell.
+    const singleExec = executables.length === 1 ? executables[0]! : "";
+    const canOfferSession = singleExec !== "" && !isGenericInterpreter(singleExec);
     const { nonce, promise } = this.opts.broker.register<unknown>({
       sessionKey: this.opts.sessionKey,
       generation: this.generation,
@@ -203,11 +217,7 @@ export class SessionActor {
       timeoutMs: PERMISSION_TIMEOUT_MS,
       onDefault: () => DENY_UNAVAILABLE,
     });
-    this.pendingPerms.set(nonce, {
-      commandIdentifiers,
-      locationKey: this.opts.workingDirectory,
-      canOfferSession,
-    });
+    this.pendingPerms.set(nonce, { executable: singleExec, canOfferSession });
     try {
       try {
         await this.opts.transport.showPermission({
@@ -217,7 +227,7 @@ export class SessionActor {
           summary,
           supported: true,
           canOfferSession,
-          scopeCommands: commandIdentifiers,
+          scopeCommands: canOfferSession ? [singleExec] : executables,
         });
       } catch {
         // Couldn't post the card (e.g. embed rejected) — settle deny now rather
@@ -238,29 +248,24 @@ export class SessionActor {
     this.opts.broker.settle(nonce, this.buildDecision(nonce, decision), this.generation);
   }
 
-  /** Map a UI decision to the SDK PermissionDecision, using the request's
-   *  captured command identifiers for the wider (session/location) scopes.
-   *  Self-defending & fail-closed: a `session`/`always` decision produces a
-   *  wider scope ONLY when the request was marked session-approvable AND has
-   *  identifiers; otherwise it DENIES (never silently widens, never silently
-   *  approves a scope the request didn't authorize). `once` always approves
-   *  just this request. */
+  /** Map a UI decision to the SDK response, recording discopilot-side approval
+   *  rules for the wider scopes. The SDK's native session/location approval is
+   *  not honored in this CLI setup (verified), so session/always store a
+   *  discopilot rule and return approve-once; future matching commands are
+   *  auto-approved before a card is shown. Fail-closed: a wider decision the
+   *  request didn't authorize denies. */
   private buildDecision(nonce: string, decision: Decision): unknown {
     if (decision === "deny") return DENIED_BY_USER;
-    if (decision === "once") return { kind: "approve-once" };
+    if (decision === "once") return APPROVE_ONCE;
     const meta = this.pendingPerms.get(nonce);
-    const cmds = meta?.commandIdentifiers ?? [];
-    const wider = meta?.canOfferSession === true && cmds.length > 0;
-    if (!wider) return DENIED_BY_USER; // session/always not authorized → fail closed
+    if (!meta || !meta.canOfferSession || !meta.executable) return DENIED_BY_USER;
     if (decision === "session") {
-      return { kind: "approve-for-session", approval: { kind: "commands", commandIdentifiers: cmds } };
+      this.opts.policy.approveForSession(this.opts.sessionKey, meta.executable);
+      return APPROVE_ONCE;
     }
     // decision === "always"
-    return {
-      kind: "approve-for-location",
-      approval: { kind: "commands", commandIdentifiers: cmds },
-      locationKey: meta!.locationKey,
-    };
+    this.opts.policy.approveForRepo(this.opts.workingDirectory, meta.executable);
+    return APPROVE_ONCE;
   }
 
   /** Send a user prompt, starting a fresh turn's render state. Rejects once the
@@ -374,6 +379,7 @@ export class SessionActor {
     this.lifecycle = "closing";
     this.aborting = true;
     this.opts.broker.abortSession(this.opts.sessionKey);
+    this.opts.policy.clearSession(this.opts.sessionKey);
     this.unsubscribeDecision?.();
     // Transition to `closed` ONLY after the RPC confirms; on failure become a
     // permanent fault fence and rethrow, so a retry can't masquerade as success.
@@ -432,6 +438,10 @@ const GENERIC_INTERPRETERS = new Set([
 
 function isGenericInterpreter(identifier: string): boolean {
   return GENERIC_INTERPRETERS.has(identifier.trim().toLowerCase());
+}
+
+function dedupe(items: string[]): string[] {
+  return [...new Set(items)];
 }
 
 /** Pull parsed command identifiers (e.g. ["git"]) from a shell permission

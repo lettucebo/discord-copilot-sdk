@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { SessionActor } from "../src/copilot/session-actor.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
+import { ApprovalPolicy } from "../src/core/approval-policy.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Decision, PermissionView, Transport } from "../src/core/transport.js";
 import type { RenderState } from "../src/core/turn-render.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
@@ -60,6 +63,7 @@ interface Setup {
   session: FakeSession;
   transport: FakeTransport;
   broker: PendingInteractionBroker;
+  policy: ApprovalPolicy;
   config: Record<string, unknown>;
 }
 
@@ -67,6 +71,7 @@ async function setup(): Promise<Setup> {
   const session = new FakeSession();
   const transport = new FakeTransport();
   const broker = new PendingInteractionBroker();
+  const policy = new ApprovalPolicy(join(tmpdir(), `discopilot-test-approvals-${Math.random()}.json`));
   let config: Record<string, unknown> = {};
   const client = {
     createSession: async (cfg: Record<string, unknown>) => {
@@ -79,8 +84,9 @@ async function setup(): Promise<Setup> {
     workingDirectory: "C:\\repo",
     broker,
     transport,
+    policy,
   });
-  return { actor, session, transport, broker, config };
+  return { actor, session, transport, broker, policy, config };
 }
 
 // The captured permission callback (typed loosely for the test).
@@ -138,53 +144,80 @@ describe("SessionActor permission handling", () => {
     expect(s.broker.size).toBe(0);
   });
 
-  it("offers session/always and maps them to command-scoped SDK approvals", async () => {
+  it("session approval records a rule and auto-approves later matching commands (no card)", async () => {
     const s = await setup();
-    const req = {
-      kind: "shell",
-      fullCommandText: "git status",
-      canOfferSessionApproval: true,
-      commands: [{ identifier: "git", readOnly: true }],
-    };
-    // session scope
-    let result = perm(s)(req);
+    const r1 = perm(s)({ kind: "shell", fullCommandText: "git --no-pager status", commands: [{ identifier: "git --no-pager status" }] });
     await tick();
-    expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(true);
-    s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "session", "u1");
-    expect(await result).toEqual({
-      kind: "approve-for-session",
-      approval: { kind: "commands", commandIdentifiers: ["git"] },
-    });
-    // always (this repo) scope → approve-for-location with the working dir
-    result = perm(s)(req);
-    await tick();
-    s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "always", "u1");
-    expect(await result).toEqual({
-      kind: "approve-for-location",
-      approval: { kind: "commands", commandIdentifiers: ["git"] },
-      locationKey: "C:\\repo",
-    });
+    const view = s.transport.permissions.at(-1)!;
+    expect(view.canOfferSession).toBe(true);
+    expect(view.scopeCommands).toEqual(["git"]); // discloses the executable, not the full command
+    s.transport.decision!(view.nonce, "session", "u1");
+    expect(await r1).toEqual({ kind: "approve-once" }); // SDK gets approve-once; discopilot stored the rule
+    expect(s.policy.isApproved("t", "C:\\repo", ["git"])).toBe(true);
+    // A DIFFERENT git command is now auto-approved WITHOUT a new card.
+    const before = s.transport.permissions.length;
+    const r2 = await perm(s)({ kind: "shell", fullCommandText: "git log --oneline -5", commands: [{ identifier: "git log --oneline -5" }] });
+    expect(r2).toEqual({ kind: "approve-once" });
+    expect(s.transport.permissions.length).toBe(before); // no card shown
+    expect(s.transport.notices.some((n) => /auto-approved/i.test(n))).toBe(true);
   });
 
-  it("does not offer session/always when the SDK can't (no identifiers)", async () => {
+  it("always approval persists an executable rule for the repo", async () => {
     const s = await setup();
-    void perm(s)({ kind: "shell", fullCommandText: "git status", canOfferSessionApproval: false });
+    const r = perm(s)({ kind: "shell", fullCommandText: "npm test", commands: [{ identifier: "npm test" }] });
+    await tick();
+    s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "always", "u1");
+    expect(await r).toEqual({ kind: "approve-once" });
+    expect(s.policy.repoApprovals("C:\\repo")).toContain("npm");
+  });
+
+  it("auto-approves a chained command only when ALL executables are trusted", async () => {
+    const s = await setup();
+    s.policy.approveForSession("t", "git");
+    // Only `git` trusted → `git && rm` must still prompt (rm not trusted).
+    const r = perm(s)({
+      kind: "shell",
+      fullCommandText: "git status && rm -rf x",
+      commands: [{ identifier: "git status" }, { identifier: "rm -rf x" }],
+    });
+    await tick();
+    expect(s.transport.permissions).toHaveLength(1); // a card WAS shown (not auto-approved)
+    expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false); // multi-command → no wider scope
+    s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u1");
+    expect(await r).toEqual({ kind: "denied-interactively-by-user" });
+    // Now trust rm too → the chained command auto-approves with no card.
+    s.policy.approveForSession("t", "rm");
+    const before = s.transport.permissions.length;
+    const r2 = await perm(s)({
+      kind: "shell",
+      fullCommandText: "git status && rm -rf x",
+      commands: [{ identifier: "git status" }, { identifier: "rm -rf x" }],
+    });
+    expect(r2).toEqual({ kind: "approve-once" });
+    expect(s.transport.permissions.length).toBe(before);
+  });
+
+  it("does not offer session/always for a multi-command or empty request", async () => {
+    const s = await setup();
+    void perm(s)({ kind: "shell", fullCommandText: "git status", commands: [] });
     await tick();
     expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
   });
 
-  it("self-defends: a wider decision on a non-approvable request FAILS CLOSED (deny)", async () => {
+  it("self-defends: a wider decision on a non-offerable request FAILS CLOSED (deny)", async () => {
     const s = await setup();
+    // powershell → wider scope suppressed → canOfferSession false
     const result = perm(s)({
       kind: "shell",
-      fullCommandText: "git status",
-      canOfferSessionApproval: false, // SDK did NOT authorize a wider scope
-      commands: [{ identifier: "git", readOnly: true }],
+      fullCommandText: "powershell -c whoami",
+      commands: [{ identifier: "powershell -c whoami" }],
     });
     await tick();
-    // A "session"/"always" decision the request never authorized must deny.
+    expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
+    // A "session" decision the request never authorized must deny (not approve).
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "session", "u1");
     expect(await result).toEqual({ kind: "denied-interactively-by-user" });
+    expect(s.policy.isApproved("t", "C:\\repo", ["powershell"])).toBe(false);
   });
 
   it("suppresses wider scopes for a generic interpreter (always-allow-powershell footgun)", async () => {
@@ -192,8 +225,7 @@ describe("SessionActor permission handling", () => {
     void perm(s)({
       kind: "shell",
       fullCommandText: "powershell -c whoami",
-      canOfferSessionApproval: true,
-      commands: [{ identifier: "powershell", readOnly: false }],
+      commands: [{ identifier: "powershell -c whoami" }],
     });
     await tick();
     expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);

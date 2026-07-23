@@ -23,6 +23,7 @@ import { resolveControlledRepo } from "./core/repo.js";
 import { createCopilotClient, checkSdkCompat } from "./copilot/sdk.js";
 import { PendingInteractionBroker } from "./core/broker.js";
 import { SessionActor } from "./copilot/session-actor.js";
+import { ApprovalPolicy } from "./core/approval-policy.js";
 import { DiscordTransport } from "./platforms/discord/discord-transport.js";
 import { decodePermissionId } from "./platforms/discord/custom-id.js";
 import { isAuthorized, type AuthContext, type AuthPolicy } from "./platforms/discord/auth.js";
@@ -86,6 +87,8 @@ export class DiscopilotApp {
   private readonly transport: DiscordTransport;
   private readonly sessions = new Map<string, Session>();
   private readonly policy: AuthPolicy;
+  /** Shared approval memory (session + persisted repo rules) across sessions. */
+  private readonly approvals = new ApprovalPolicy();
   private shuttingDown = false;
   /** Serializes /new so two near-simultaneous creations can't both pass the
    *  "one live session" teardown and leave two live sessions. */
@@ -280,6 +283,7 @@ export class DiscopilotApp {
         contextTier: this.config.DEFAULT_CONTEXT_TIER,
         broker,
         transport: this.transport,
+        policy: this.approvals,
       });
       this.sessions.set(thread.id, { actor, broker, running: false });
       await interaction.editReply(`Started a session in <#${thread.id}>. Send prompts there.`);
