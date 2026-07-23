@@ -24,10 +24,14 @@ const DENY_UNAVAILABLE = { kind: "user-not-available" } as const;
 const DENIED_BY_USER = { kind: "denied-interactively-by-user" } as const;
 
 /** Metadata captured at request time so a later decision can be built into the
- *  correct SDK approval scope (session/location need the command identifiers). */
+ *  correct SDK approval scope (session/location need the command identifiers).
+ *  `canOfferSession` is stored so `buildDecision` self-defends: it never emits a
+ *  wider scope for a request the SDK didn't mark session-approvable, regardless
+ *  of where the decision came from. */
 interface PendingPermMeta {
   commandIdentifiers: string[];
   locationKey: string;
+  canOfferSession: boolean;
 }
 
 export interface SessionActorOpts {
@@ -192,7 +196,11 @@ export class SessionActor {
       timeoutMs: PERMISSION_TIMEOUT_MS,
       onDefault: () => DENY_UNAVAILABLE,
     });
-    this.pendingPerms.set(nonce, { commandIdentifiers, locationKey: this.opts.workingDirectory });
+    this.pendingPerms.set(nonce, {
+      commandIdentifiers,
+      locationKey: this.opts.workingDirectory,
+      canOfferSession,
+    });
     try {
       await this.opts.transport.showPermission({
         nonce,
@@ -224,22 +232,25 @@ export class SessionActor {
 
   /** Map a UI decision to the SDK PermissionDecision, using the request's
    *  captured command identifiers for the wider (session/location) scopes.
-   *  Falls back to approve-once if the metadata is missing. */
+   *  Self-defending: a wider scope is only emitted when the request was marked
+   *  session-approvable AND has identifiers; otherwise it narrows to
+   *  approve-once. Falls back to approve-once if the metadata is missing. */
   private buildDecision(nonce: string, decision: Decision): unknown {
     if (decision === "deny") return DENIED_BY_USER;
     const meta = this.pendingPerms.get(nonce);
     const cmds = meta?.commandIdentifiers ?? [];
-    if (decision === "session" && cmds.length) {
+    const wider = meta?.canOfferSession === true && cmds.length > 0;
+    if (decision === "session" && wider) {
       return { kind: "approve-for-session", approval: { kind: "commands", commandIdentifiers: cmds } };
     }
-    if (decision === "always" && cmds.length && meta) {
+    if (decision === "always" && wider && meta) {
       return {
         kind: "approve-for-location",
         approval: { kind: "commands", commandIdentifiers: cmds },
         locationKey: meta.locationKey,
       };
     }
-    return { kind: "approve-once" }; // "once", or session/always without identifiers
+    return { kind: "approve-once" }; // "once", or a wider scope the request didn't allow
   }
 
   /** Send a user prompt, starting a fresh turn's render state. Rejects once the

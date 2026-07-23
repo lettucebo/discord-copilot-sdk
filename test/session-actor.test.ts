@@ -173,6 +173,20 @@ describe("SessionActor permission handling", () => {
     expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
   });
 
+  it("self-defends: a wider decision on a non-approvable request narrows to approve-once", async () => {
+    const s = await setup();
+    const result = perm(s)({
+      kind: "shell",
+      fullCommandText: "git status",
+      canOfferSessionApproval: false, // SDK did NOT authorize a wider scope
+      commands: [{ identifier: "git", readOnly: true }],
+    });
+    await tick();
+    // Even if a "session"/"always" decision is somehow delivered, never widen.
+    s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "session", "u1");
+    expect(await result).toEqual({ kind: "approve-once" });
+  });
+
   it("denies when the user denies", async () => {
     const s = await setup();
     const result = perm(s)({ kind: "shell", fullCommandText: "rm x" });
