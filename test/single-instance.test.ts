@@ -29,4 +29,10 @@ describe("acquireSingleInstanceLock", () => {
     expect(existsSync(lockPath)).toBe(true);
     await lock.release();
   });
+
+  it("fails closed when the lock file is empty/indeterminate (never reclaims a possibly-live lock)", async () => {
+    writeFileSync(lockPath, "", "utf8"); // empty ⇒ owner indeterminate
+    await expect(acquireSingleInstanceLock(lockPath, () => true)).rejects.toThrow(/indeterminate|fail-closed/i);
+    expect(existsSync(lockPath)).toBe(true); // must NOT have reclaimed/removed it
+  });
 });
