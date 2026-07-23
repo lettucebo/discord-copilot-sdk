@@ -180,15 +180,18 @@ export class SessionActor {
       return DENY_UNAVAILABLE;
     }
     // Executables of every parsed command (e.g. ["git"] or ["git","rm"]).
+    const fullCommandText = typeof r["fullCommandText"] === "string" ? (r["fullCommandText"] as string) : "";
     const executables = dedupe(
       extractCommandIdentifiers(r).map(commandExecutable).filter((e) => e.length > 0)
     );
-    // Auto-approve only when EVERY executable is already trusted (so an approved
-    // `git` can't smuggle `rm` via `git status && rm -rf`).
-    if (
-      executables.length > 0 &&
-      this.opts.policy.isApproved(this.opts.sessionKey, this.opts.workingDirectory, executables)
-    ) {
+    // A command is eligible for auto-approve / a wider scope only when it is a
+    // SIMPLE command (no shell metacharacters that could chain/pipe/redirect/
+    // substitute a different command) AND every executable is a safe, specific
+    // name (not a shell/runtime/wrapper that can launch arbitrary programs).
+    // This keeps discopilot from trusting the runtime's command parse blindly.
+    const simple = isSimpleCommand(fullCommandText);
+    const allSafe = executables.length > 0 && executables.every(isSafeExecutable);
+    if (simple && allSafe && this.opts.policy.isApproved(this.opts.sessionKey, this.opts.workingDirectory, executables)) {
       await this.opts.transport.notice(
         this.opts.sessionKey,
         `✓ Auto-approved (existing rule): ${executables.map((e) => `\`${e}\``).join(", ")}`
@@ -205,11 +208,11 @@ export class SessionActor {
       );
       return DENY_UNAVAILABLE;
     }
-    // Offer session/always only for a SINGLE, specific (non-interpreter) command
-    // — chained/multi-command requests and generic shells stay per-request so a
-    // single tap can never broadly trust the shell.
+    // Offer session/always only for a SINGLE, simple, safe command — chained/
+    // multi-command requests, shells, runtimes and wrappers stay per-request so
+    // one tap can never broadly trust the shell.
     const singleExec = executables.length === 1 ? executables[0]! : "";
-    const canOfferSession = singleExec !== "" && !isGenericInterpreter(singleExec);
+    const canOfferSession = simple && singleExec !== "" && isSafeExecutable(singleExec);
     const { nonce, promise } = this.opts.broker.register<unknown>({
       sessionKey: this.opts.sessionKey,
       generation: this.generation,
@@ -416,28 +419,39 @@ export class SessionActor {
   }
 }
 
-/** Command identifiers that are generic shells/interpreters — approving these
- *  for the session/repo would auto-approve essentially any future command, so
- *  the wider scopes are never offered for them (they stay per-request). */
-const GENERIC_INTERPRETERS = new Set([
-  "powershell",
-  "powershell.exe",
-  "pwsh",
-  "pwsh.exe",
-  "cmd",
-  "cmd.exe",
-  "bash",
-  "sh",
-  "zsh",
-  "dash",
-  "ksh",
-  "fish",
-  "wsl",
-  "wsl.exe",
+/** Executables that must NEVER get a session/repo "always" scope, because
+ *  approving them would auto-run essentially arbitrary code: generic shells,
+ *  language runtimes that execute arbitrary programs, and wrappers/dispatchers
+ *  that launch OTHER commands. These stay per-request. */
+const UNSAFE_EXECUTABLES = new Set([
+  // shells / interpreters
+  "powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe",
+  "bash", "sh", "zsh", "dash", "ksh", "fish", "wsl", "wsl.exe",
+  // language runtimes (run arbitrary code)
+  "python", "python3", "py", "node", "nodejs", "ruby", "perl", "php", "deno", "bun",
+  // wrappers / dispatchers (launch other commands)
+  "env", "sudo", "doas", "su", "npx", "xargs", "nice", "timeout", "watch",
+  "time", "nohup", "command", "exec", "eval", "start", "call",
 ]);
 
-function isGenericInterpreter(identifier: string): boolean {
-  return GENERIC_INTERPRETERS.has(identifier.trim().toLowerCase());
+function isUnsafeExecutable(exe: string): boolean {
+  return UNSAFE_EXECUTABLES.has(exe.trim().toLowerCase());
+}
+
+/** A safe, specific executable name we may offer a wider scope for: a bare
+ *  identifier (no path separators, quotes or spaces) that isn't a shell/runtime/
+ *  wrapper. Rejects mis-derived tokens like `"C:\Program` (path with space). */
+function isSafeExecutable(exe: string): boolean {
+  return /^[A-Za-z0-9._+-]+$/.test(exe) && !isUnsafeExecutable(exe);
+}
+
+/** A command is "simple" (safe to auto-approve / offer a wider scope for) only
+ *  if it has NO shell metacharacters that could chain, pipe, redirect, or
+ *  substitute a DIFFERENT command in — since discopilot trusts the runtime's
+ *  `commands[]` parse and a false negative there would run untrusted code. When
+ *  any of these appear, the request always shows a per-request card instead. */
+function isSimpleCommand(fullCommandText: string): boolean {
+  return fullCommandText.length > 0 && !/[;&|<>`$()\r\n]/.test(fullCommandText);
 }
 
 function dedupe(items: string[]): string[] {

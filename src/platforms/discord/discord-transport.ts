@@ -166,12 +166,16 @@ export class DiscordTransport implements Transport {
       .setDescription("```\n" + sanitizeForCodeBlock(view.summary) + "\n```");
     if (view.canOfferSession && view.scopeCommands.length) {
       // Informed consent: session/always don't just approve THIS command — they
-      // auto-approve every future invocation of these identifiers with no
-      // further prompt. Disclose exactly what the wider scope grants.
+      // auto-approve every future invocation of these executables with no
+      // further prompt, INCLUDING anything those executables can launch via
+      // their own options (e.g. git pagers/diff/ssh commands).
       const list = view.scopeCommands.map((c) => `\`${c}\``).join(", ");
       embed.addFields({
         name: "⚠️ Session / Always scope",
-        value: `Auto-approves ALL future ${list} commands (no further Discord prompt) for the session / this repo.`,
+        value:
+          `Auto-approves ALL future ${list} commands with no further Discord prompt ` +
+          `(for the session / this repo). This also trusts anything ${list} can run ` +
+          `via its own options — approve only executables you fully trust.`,
       });
     }
     embed.setFooter({

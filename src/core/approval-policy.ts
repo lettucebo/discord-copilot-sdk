@@ -15,8 +15,12 @@ import { stateDir } from "./paths.js";
  *    controlled repo path, surviving restarts.
  *
  * Safety: a request is auto-approved only when EVERY parsed command executable
- * in it is approved (so an approved `git` can't smuggle `rm` via
- * `git status && rm -rf`). Executables are matched case-insensitively.
+ * in it is approved AND (checked by the caller) the command is "simple" (no
+ * shell chaining/piping/substitution) and each executable is a safe, specific
+ * name (not a shell/runtime/wrapper). NOTE: approving an executable still trusts
+ * whatever that executable can launch via its own options (e.g. `git` config
+ * pagers) — the approval UI discloses this. Executables are matched
+ * case-insensitively.
  */
 export class ApprovalPolicy {
   private readonly session = new Map<string, Set<string>>();

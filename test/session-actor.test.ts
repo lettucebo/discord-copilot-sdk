@@ -171,30 +171,46 @@ describe("SessionActor permission handling", () => {
     expect(s.policy.repoApprovals("C:\\repo")).toContain("npm");
   });
 
-  it("auto-approves a chained command only when ALL executables are trusted", async () => {
+  it("never auto-approves a non-simple command (shell metachars), even if all executables are trusted", async () => {
     const s = await setup();
     s.policy.approveForSession("t", "git");
-    // Only `git` trusted → `git && rm` must still prompt (rm not trusted).
+    s.policy.approveForSession("t", "rm");
     const r = perm(s)({
       kind: "shell",
       fullCommandText: "git status && rm -rf x",
       commands: [{ identifier: "git status" }, { identifier: "rm -rf x" }],
     });
     await tick();
-    expect(s.transport.permissions).toHaveLength(1); // a card WAS shown (not auto-approved)
-    expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false); // multi-command → no wider scope
+    expect(s.transport.permissions).toHaveLength(1); // carded despite both trusted (has &&)
+    expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u1");
     expect(await r).toEqual({ kind: "denied-interactively-by-user" });
-    // Now trust rm too → the chained command auto-approves with no card.
-    s.policy.approveForSession("t", "rm");
-    const before = s.transport.permissions.length;
-    const r2 = await perm(s)({
-      kind: "shell",
-      fullCommandText: "git status && rm -rf x",
-      commands: [{ identifier: "git status" }, { identifier: "rm -rf x" }],
-    });
-    expect(r2).toEqual({ kind: "approve-once" });
-    expect(s.transport.permissions.length).toBe(before);
+  });
+
+  it("never auto-approves via substitution `$( )` / backticks / pipes", async () => {
+    const s = await setup();
+    s.policy.approveForSession("t", "git");
+    for (const cmd of ["git status $(id)", "git log `id`", "git status | sh"]) {
+      const before = s.transport.permissions.length;
+      const r = perm(s)({ kind: "shell", fullCommandText: cmd, commands: [{ identifier: cmd }] });
+      await tick();
+      expect(s.transport.permissions.length).toBe(before + 1); // carded, not auto-approved
+      s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u");
+      await r;
+    }
+  });
+
+  it("does not offer or auto-approve wrapper/runtime executables (sudo/env/npx/node)", async () => {
+    for (const cmd of ["sudo ls", "env X=y ls", "npx cowsay hi", "node app.js"]) {
+      const s = await setup();
+      s.policy.approveForSession("t", cmd.split(/\s+/)[0]!); // even if (mis)trusted…
+      const r = perm(s)({ kind: "shell", fullCommandText: cmd, commands: [{ identifier: cmd }] });
+      await tick();
+      expect(s.transport.permissions).toHaveLength(1); // …still carded, not auto-approved
+      expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false); // not offerable
+      s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u");
+      await r;
+    }
   });
 
   it("does not offer session/always for a multi-command or empty request", async () => {
