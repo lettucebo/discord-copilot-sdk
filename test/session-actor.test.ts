@@ -104,14 +104,11 @@ describe("SessionActor config hardening", () => {
     }
   });
 
-  it("onUserInputRequest returns a valid UserInputResponse (fail-closed decline)", async () => {
+  it("onUserInputRequest throws (fail-closed decline — no fabricated answer)", async () => {
     const s = await setup();
-    const r = (await (s.config["onUserInputRequest"] as () => Promise<unknown>)()) as {
-      answer: string;
-      wasFreeform: boolean;
-    };
-    expect(r.wasFreeform).toBe(true);
-    expect(r.answer).toMatch(/no operator/i); // clear decline, not an empty answer
+    await expect((s.config["onUserInputRequest"] as () => Promise<unknown>)()).rejects.toThrow(
+      /not available/i
+    );
   });
 });
 

@@ -10,6 +10,9 @@ const TURN_WATCHDOG_MS = 15 * 60_000;
 /** After the watchdog aborts, how long to wait for the real session.idle before
  *  declaring the session faulted and destroying it. */
 const FAULT_GRACE_MS = 15_000;
+/** Cap on how long the fault-path disconnect may take before we give up on it
+ *  (so a hung disconnect RPC can't make a turn hang forever). */
+const FAULT_DISCONNECT_MS = 5_000;
 /** Max SANITIZED (display) length of a permission summary we will show. The
  *  card lives in a Discord embed description (≤4096). Beyond this we auto-deny
  *  rather than show a partial/undisplayable command. */
@@ -78,14 +81,15 @@ export class SessionActor {
       enableConfigDiscovery: false,
       enableSkills: false,
       onPermissionRequest: (req: unknown) => this.handlePermission(req),
-      // Fail closed until P3 builds real UIs for these. onUserInputRequest must
-      // return a valid UserInputResponse ({answer,wasFreeform}); an empty answer
-      // is the safe decline. (onAutoModeSwitchRequest/onMcpAuthRequest are left
-      // unset — their SDK defaults are already conservative, and MCP is off.)
-      onUserInputRequest: async () => ({
-        answer: "No operator is available to answer; proceed without this input or stop.",
-        wasFreeform: true,
-      }),
+      // Fail closed until P3 builds real UIs for these. ask_user THROWS
+      // (equivalent to registering no handler — SDK session.js throws too),
+      // which surfaces to the agent as the ask_user tool failing rather than a
+      // fabricated answer it might act on. Elicitation/exit-plan return their
+      // valid cancel/decline shapes. (onAutoModeSwitchRequest/onMcpAuthRequest
+      // are left unset — their SDK defaults are already conservative, MCP off.)
+      onUserInputRequest: async () => {
+        throw new Error("Interactive user input (ask_user) is not available in discopilot P1.");
+      },
       onElicitationRequest: async () => ({ action: "cancel" }),
       onExitPlanModeRequest: async () => ({ approved: false, feedback: "Not available in P1." }),
     };
@@ -255,9 +259,15 @@ export class SessionActor {
         void this.stop(); // abort; expect session.idle to follow
       }, watchdogMs);
       hard = setTimeout(() => {
-        void this.disconnect()
-          .catch(() => {})
-          .finally(() => done("faulted"));
+        // Destroy the session, but never let a hung disconnect RPC keep the
+        // turn pending — cap it and resolve "faulted" regardless.
+        const timeout = new Promise<void>((res) => {
+          const t = setTimeout(res, FAULT_DISCONNECT_MS);
+          (t as { unref?: () => void }).unref?.();
+        });
+        void Promise.race([this.disconnect().catch(() => {}), timeout]).finally(() =>
+          done("faulted")
+        );
       }, watchdogMs + FAULT_GRACE_MS);
       (wd as { unref?: () => void }).unref?.();
       (hard as { unref?: () => void }).unref?.();

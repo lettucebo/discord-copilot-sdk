@@ -327,20 +327,23 @@ export class DiscopilotApp {
     }
   }
 
-  /** Tear down every live session (disconnect + release render state). Returns
-   *  false if any session failed to disconnect cleanly. */
+  /** Tear down every live session. A session that disconnects cleanly is
+   *  removed; one that FAILS to disconnect is kept in the map (its runtime
+   *  session may still be live) so a later /new re-attempts the disconnect
+   *  (which is idempotent) instead of orphaning a possibly-live session.
+   *  Returns false if any session failed to disconnect. */
   private async endAllSessions(reason: string): Promise<boolean> {
     let ok = true;
-    for (const [threadId, session] of this.sessions) {
+    for (const [threadId, session] of [...this.sessions]) {
       await this.transport.notice(threadId, reason).catch(() => {});
       try {
         await session.actor.disconnect();
+        this.sessions.delete(threadId);
+        this.transport.dispose(threadId);
       } catch {
-        ok = false;
+        ok = false; // keep it — a later /new retries the (idempotent) disconnect
       }
-      this.transport.dispose(threadId);
     }
-    this.sessions.clear();
     return ok;
   }
 

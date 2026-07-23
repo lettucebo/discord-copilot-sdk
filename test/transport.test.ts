@@ -69,6 +69,12 @@ describe("hasBidiOrControls", () => {
     expect(hasBidiOrControls("a\u2066b\u2069")).toBe(true);
     expect(hasBidiOrControls("plain git status")).toBe(false);
   });
+
+  it("also detects C0 control chars (ESC/bell) but allows tab/newline", () => {
+    expect(hasBidiOrControls("rm\u001b[2K")).toBe(true); // ESC
+    expect(hasBidiOrControls("echo\u0007")).toBe(true); // bell
+    expect(hasBidiOrControls("echo hi\tthere\nagain")).toBe(false); // tab/newline OK
+  });
 });
 
 describe("DiscordTransport render/flush", () => {
