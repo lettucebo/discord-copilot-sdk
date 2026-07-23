@@ -73,6 +73,14 @@ export class SessionActor {
   /** True while a /stop abort is in flight — new permissions fail closed. */
   private aborting = false;
   private unsubscribeDecision?: () => void;
+  private unsubscribeChoice?: () => void;
+  private unsubscribePlan?: () => void;
+  /** Per-nonce ask_user metadata (choices for index→answer mapping). */
+  private readonly pendingAsk = new Map<string, { choices: string[] }>();
+  /** Nonce of an ask_user awaiting a FREEFORM answer via a thread message. */
+  private freeformAskNonce?: string;
+  /** Per-nonce exit-plan metadata (actions for index→action mapping). */
+  private readonly pendingPlan = new Map<string, { actions: string[] }>();
 
   private constructor(private readonly opts: SessionActorOpts) {
     this.generation = opts.generation ?? 1;
@@ -88,6 +96,10 @@ export class SessionActor {
     this.unsubscribeDecision = this.opts.transport.onDecision((nonce, decision) =>
       this.onDecision(nonce, decision)
     );
+    this.unsubscribeChoice = this.opts.transport.onChoice((nonce, index) =>
+      this.onChoice(nonce, index)
+    );
+    this.unsubscribePlan = this.opts.transport.onPlan((nonce, action) => this.onPlan(nonce, action));
 
     const config: Record<string, unknown> = {
       streaming: true, // required for delta events
@@ -102,17 +114,18 @@ export class SessionActor {
       enableConfigDiscovery: false,
       enableSkills: false,
       onPermissionRequest: (req: unknown) => this.handlePermission(req),
-      // Fail closed until P3 builds real UIs for these. ask_user THROWS
-      // (equivalent to registering no handler — SDK session.js throws too),
-      // which surfaces to the agent as the ask_user tool failing rather than a
-      // fabricated answer it might act on. Elicitation/exit-plan return their
-      // valid cancel/decline shapes. (onAutoModeSwitchRequest/onMcpAuthRequest
+      // Interactive UIs (P3): ask_user → choice buttons + freeform; exit-plan →
+      // action buttons + reject. Elicitation stays fail-closed (cancel) with a
+      // notice until it has its own UI. (onAutoModeSwitchRequest/onMcpAuthRequest
       // are left unset — their SDK defaults are already conservative, MCP off.)
-      onUserInputRequest: async () => {
-        throw new Error("Interactive user input (ask_user) is not available in discopilot P1.");
+      onUserInputRequest: (req: unknown) => this.handleUserInput(req),
+      onExitPlanModeRequest: (req: unknown) => this.handleExitPlan(req),
+      onElicitationRequest: async () => {
+        await this.opts.transport
+          .notice(this.opts.sessionKey, "ℹ️ Cancelled a structured input request (not supported yet).")
+          .catch(() => {});
+        return { action: "cancel" };
       },
-      onElicitationRequest: async () => ({ action: "cancel" }),
-      onExitPlanModeRequest: async () => ({ approved: false, feedback: "Not available in P1." }),
     };
     if (this.opts.model) config["model"] = this.opts.model;
     if (this.opts.contextTier) config["contextTier"] = this.opts.contextTier;
@@ -154,6 +167,16 @@ export class SessionActor {
       const d = data(e);
       void this.opts.transport.notice(this.opts.sessionKey, `⚠️ ${str(d["message"]) || "session error"}`);
     });
+  }
+
+  /** Seal the current assistant message before posting an interaction card so
+   *  the card appears in chronological order and any output produced AFTER it
+   *  (e.g. a tool result once approved) starts in a NEW message below the card
+   *  — not edited into the message created before the card. */
+  private async beginInteractionCard(): Promise<void> {
+    await this.opts.transport.flush(this.opts.sessionKey).catch(() => {});
+    this.opts.transport.resetTurn(this.opts.sessionKey);
+    this.renderer = new TurnRenderer();
   }
 
   private async handlePermission(req: unknown): Promise<unknown> {
@@ -228,6 +251,7 @@ export class SessionActor {
     this.pendingPerms.set(nonce, { executable: singleExec, canOfferSession });
     try {
       try {
+        await this.beginInteractionCard();
         await this.opts.transport.showPermission({
           nonce,
           sessionKey: this.opts.sessionKey,
@@ -274,6 +298,127 @@ export class SessionActor {
     // decision === "always"
     this.opts.policy.approveForRepo(this.opts.workingDirectory, meta.executable);
     return APPROVE_ONCE;
+  }
+
+  // ---- ask_user (P3) ----------------------------------------------------
+
+  private async handleUserInput(req: unknown): Promise<unknown> {
+    const r = (req ?? {}) as Record<string, unknown>;
+    const question = typeof r["question"] === "string" ? (r["question"] as string) : "Copilot needs your input.";
+    const choices = Array.isArray(r["choices"])
+      ? (r["choices"] as unknown[]).filter((c): c is string => typeof c === "string")
+      : [];
+    const allowFreeform = r["allowFreeform"] !== false; // default true
+    if (this.aborting) return { answer: "", wasFreeform: true };
+    const { nonce, promise } = this.opts.broker.register<unknown>({
+      sessionKey: this.opts.sessionKey,
+      generation: this.generation,
+      kind: "ask_user",
+      timeoutMs: PERMISSION_TIMEOUT_MS,
+      onDefault: () => ({ answer: "(no response from operator)", wasFreeform: true }),
+    });
+    this.pendingAsk.set(nonce, { choices });
+    if (allowFreeform) this.freeformAskNonce = nonce;
+    try {
+      try {
+        await this.beginInteractionCard();
+        await this.opts.transport.showUserInput({
+          nonce,
+          sessionKey: this.opts.sessionKey,
+          question,
+          choices,
+          allowFreeform,
+        });
+      } catch {
+        this.opts.broker.settle(
+          nonce,
+          { answer: "(could not present the question)", wasFreeform: true },
+          this.generation
+        );
+      }
+      return await promise;
+    } finally {
+      this.pendingAsk.delete(nonce);
+      if (this.freeformAskNonce === nonce) this.freeformAskNonce = undefined;
+    }
+  }
+
+  private onChoice(nonce: string, index: number): void {
+    const meta = this.pendingAsk.get(nonce);
+    if (!meta || index < 0 || index >= meta.choices.length) return;
+    this.opts.broker.settle(nonce, { answer: meta.choices[index]!, wasFreeform: false }, this.generation);
+  }
+
+  /** Consume a thread message as the freeform answer to a pending ask_user, if
+   *  one is awaiting freeform. Returns true if the message was consumed. */
+  tryConsumeFreeform(text: string): boolean {
+    const nonce = this.freeformAskNonce;
+    if (!nonce) return false;
+    const settled = this.opts.broker.settle(
+      nonce,
+      { answer: text, wasFreeform: true },
+      this.generation
+    );
+    if (settled) this.freeformAskNonce = undefined;
+    return settled;
+  }
+
+  // ---- exit-plan (P3) ---------------------------------------------------
+
+  private async handleExitPlan(req: unknown): Promise<unknown> {
+    const r = (req ?? {}) as Record<string, unknown>;
+    const summary = typeof r["summary"] === "string" ? (r["summary"] as string) : "Copilot proposes to proceed.";
+    const planContent = typeof r["planContent"] === "string" ? (r["planContent"] as string) : undefined;
+    const actions = Array.isArray(r["actions"])
+      ? (r["actions"] as unknown[]).filter((a): a is string => typeof a === "string")
+      : [];
+    const recommendedAction =
+      typeof r["recommendedAction"] === "string" ? (r["recommendedAction"] as string) : actions[0] ?? "";
+    if (this.aborting) return { approved: false, feedback: "Session aborting." };
+    const { nonce, promise } = this.opts.broker.register<unknown>({
+      sessionKey: this.opts.sessionKey,
+      generation: this.generation,
+      kind: "exit_plan",
+      timeoutMs: PERMISSION_TIMEOUT_MS,
+      onDefault: () => ({ approved: false, feedback: "No response from the operator." }),
+    });
+    this.pendingPlan.set(nonce, { actions });
+    try {
+      try {
+        await this.beginInteractionCard();
+        await this.opts.transport.showPlan({
+          nonce,
+          sessionKey: this.opts.sessionKey,
+          summary,
+          actions,
+          recommendedAction,
+          ...(planContent ? { planContent } : {}),
+        });
+      } catch {
+        this.opts.broker.settle(
+          nonce,
+          { approved: false, feedback: "Could not present the plan." },
+          this.generation
+        );
+      }
+      return await promise;
+    } finally {
+      this.pendingPlan.delete(nonce);
+    }
+  }
+
+  private onPlan(nonce: string, action: number | "reject"): void {
+    if (action === "reject") {
+      this.opts.broker.settle(nonce, { approved: false, feedback: "Rejected via Discord." }, this.generation);
+      return;
+    }
+    const meta = this.pendingPlan.get(nonce);
+    const selectedAction = meta && action >= 0 && action < meta.actions.length ? meta.actions[action] : undefined;
+    this.opts.broker.settle(
+      nonce,
+      { approved: true, ...(selectedAction ? { selectedAction } : {}) },
+      this.generation
+    );
   }
 
   /** Send a user prompt, starting a fresh turn's render state. Rejects once the
@@ -389,6 +534,8 @@ export class SessionActor {
     this.opts.broker.abortSession(this.opts.sessionKey);
     this.opts.policy.clearSession(this.opts.sessionKey);
     this.unsubscribeDecision?.();
+    this.unsubscribeChoice?.();
+    this.unsubscribePlan?.();
     // Transition to `closed` ONLY after the RPC confirms; on failure become a
     // permanent fault fence and rethrow, so a retry can't masquerade as success.
     this.disconnectPromise = this.session.disconnect().then(
@@ -412,7 +559,10 @@ export class SessionActor {
     this.lifecycle = "faulted";
     this.aborting = true;
     this.opts.broker.abortSession(this.opts.sessionKey);
+    this.opts.policy.clearSession(this.opts.sessionKey);
     this.unsubscribeDecision?.();
+    this.unsubscribeChoice?.();
+    this.unsubscribePlan?.();
     const timeout = new Promise<void>((res) => {
       const t = setTimeout(res, FAULT_DISCONNECT_MS);
       (t as { unref?: () => void }).unref?.();

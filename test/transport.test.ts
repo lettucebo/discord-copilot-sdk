@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { DiscordTransport, sanitizeForCodeBlock } from "../src/platforms/discord/discord-transport.js";
 import { hasBidiOrControls } from "../src/core/text-safety.js";
-import { decodePermissionId } from "../src/platforms/discord/custom-id.js";
+import { decodePermissionId, decodeChoiceId, decodePlanId } from "../src/platforms/discord/custom-id.js";
 import type { Client } from "discord.js";
 
 class FakeMessage {
@@ -173,5 +173,54 @@ describe("DiscordTransport onDecision", () => {
     off();
     t.deliverDecision("n", "deny", "u1");
     expect(h).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("DiscordTransport ask_user / plan cards", () => {
+  it("renders one button per choice, decoding to the choice index", async () => {
+    const ch = new FakeChannel();
+    const t = new DiscordTransport(fakeClient(ch));
+    await t.showUserInput({
+      nonce: "q1",
+      sessionKey: "thread",
+      question: "Pick a color",
+      choices: ["Red", "Green", "Blue"],
+      allowFreeform: true,
+    });
+    const decoded = buttonIds(ch.sent[0]!).map((id) => decodeChoiceId(id)!);
+    expect(decoded).toEqual([
+      { nonce: "q1", index: 0 },
+      { nonce: "q1", index: 1 },
+      { nonce: "q1", index: 2 },
+    ]);
+  });
+
+  it("renders plan action buttons + a Reject, decoding to index/reject", async () => {
+    const ch = new FakeChannel();
+    const t = new DiscordTransport(fakeClient(ch));
+    await t.showPlan({
+      nonce: "p1",
+      sessionKey: "thread",
+      summary: "Proceed with the plan?",
+      actions: ["Proceed", "Autopilot"],
+      recommendedAction: "Proceed",
+    });
+    const decoded = buttonIds(ch.sent[0]!).map((id) => decodePlanId(id)!.action);
+    expect(decoded).toEqual([0, 1, "reject"]);
+  });
+
+  it("onChoice/onPlan broadcast and unsubscribe", () => {
+    const t = new DiscordTransport(fakeClient(new FakeChannel()));
+    const c = vi.fn();
+    const p = vi.fn();
+    const offC = t.onChoice(c);
+    t.onPlan(p);
+    t.deliverChoice("n", 2, "u");
+    t.deliverPlan("n", "reject", "u");
+    expect(c).toHaveBeenCalledWith("n", 2, "u");
+    expect(p).toHaveBeenCalledWith("n", "reject", "u");
+    offC();
+    t.deliverChoice("n", 0, "u");
+    expect(c).toHaveBeenCalledTimes(1);
   });
 });

@@ -26,3 +26,49 @@ export function decodePermissionId(customId: string): DecodedPermission | undefi
   if (!nonce) return undefined;
   return { nonce, action: action as PermAction };
 }
+
+// ---- ask_user (choice) buttons -----------------------------------------
+
+export function encodeChoiceId(nonce: string, index: number): string {
+  return `${NS}:ask:${index}:${nonce}`;
+}
+
+export interface DecodedChoice {
+  nonce: string;
+  index: number;
+}
+
+export function decodeChoiceId(customId: string): DecodedChoice | undefined {
+  const parts = customId.split(":");
+  if (parts.length !== 4) return undefined;
+  const [ns, kind, idx, nonce] = parts;
+  if (ns !== NS || kind !== "ask" || !nonce) return undefined;
+  const index = Number.parseInt(idx ?? "", 10);
+  if (!Number.isInteger(index) || index < 0) return undefined;
+  return { nonce, index };
+}
+
+// ---- exit-plan buttons --------------------------------------------------
+
+/** Plan action: an index into the request's `actions`, or "reject". */
+export type PlanAction = number | "reject";
+
+export function encodePlanId(nonce: string, action: PlanAction): string {
+  return `${NS}:plan:${action}:${nonce}`;
+}
+
+export interface DecodedPlan {
+  nonce: string;
+  action: PlanAction;
+}
+
+export function decodePlanId(customId: string): DecodedPlan | undefined {
+  const parts = customId.split(":");
+  if (parts.length !== 4) return undefined;
+  const [ns, kind, action, nonce] = parts;
+  if (ns !== NS || kind !== "plan" || !action || !nonce) return undefined;
+  if (action === "reject") return { nonce, action: "reject" };
+  const index = Number.parseInt(action, 10);
+  if (!Number.isInteger(index) || index < 0) return undefined;
+  return { nonce, action: index };
+}

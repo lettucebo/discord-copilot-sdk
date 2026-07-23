@@ -23,6 +23,8 @@ class FakeTransport {
   async flush(_key) {}
   resetTurn(_key) {}
   dispose(_key) {}
+  async showUserInput(_v) {}
+  async showPlan(_v) {}
   async showPermission(view) {
     this.permissions.push(view);
     console.log(`  <permission> kind=${view.kind} supported=${view.supported}\n    ${view.summary.replace(/\n/g, "\n    ")}`);
@@ -30,6 +32,8 @@ class FakeTransport {
   }
   async notice(_key, text) { this.notices.push(text); console.log(`  <notice> ${text}`); }
   onDecision(h) { this._decision = h; return () => { this._decision = undefined; }; }
+  onChoice(_h) { return () => {}; }
+  onPlan(_h) { return () => {}; }
 }
 
 let pass = 0, fail = 0;

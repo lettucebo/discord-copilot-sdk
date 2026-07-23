@@ -3,7 +3,7 @@ import { SessionActor } from "../src/copilot/session-actor.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { ApprovalPolicy } from "../src/core/approval-policy.js";
 import type { CopilotClient } from "@github/copilot-sdk";
-import type { Decision, PermissionView, Transport } from "../src/core/transport.js";
+import type { Decision, PermissionView, PlanView, Transport, UserInputView } from "../src/core/transport.js";
 import type { RenderState } from "../src/core/turn-render.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,8 +36,12 @@ class FakeSession {
 class FakeTransport implements Transport {
   renders: RenderState[] = [];
   permissions: PermissionView[] = [];
+  userInputs: UserInputView[] = [];
+  plans: PlanView[] = [];
   notices: string[] = [];
   decision?: (nonce: string, decision: Decision, userId: string) => void;
+  choice?: (nonce: string, index: number, userId: string) => void;
+  plan?: (nonce: string, action: number | "reject", userId: string) => void;
   async render(_k: string, s: RenderState): Promise<void> {
     this.renders.push(s);
   }
@@ -47,6 +51,12 @@ class FakeTransport implements Transport {
   async showPermission(v: PermissionView): Promise<void> {
     this.permissions.push(v);
   }
+  async showUserInput(v: UserInputView): Promise<void> {
+    this.userInputs.push(v);
+  }
+  async showPlan(v: PlanView): Promise<void> {
+    this.plans.push(v);
+  }
   async notice(_k: string, t: string): Promise<void> {
     this.notices.push(t);
   }
@@ -54,6 +64,18 @@ class FakeTransport implements Transport {
     this.decision = h;
     return () => {
       this.decision = undefined;
+    };
+  }
+  onChoice(h: (nonce: string, index: number, userId: string) => void): () => void {
+    this.choice = h;
+    return () => {
+      this.choice = undefined;
+    };
+  }
+  onPlan(h: (nonce: string, action: number | "reject", userId: string) => void): () => void {
+    this.plan = h;
+    return () => {
+      this.plan = undefined;
     };
   }
 }
@@ -110,11 +132,50 @@ describe("SessionActor config hardening", () => {
     }
   });
 
-  it("onUserInputRequest throws (fail-closed decline — no fabricated answer)", async () => {
+  it("ask_user: choice button answers (wasFreeform=false), freeform message answers (wasFreeform=true)", async () => {
     const s = await setup();
-    await expect((s.config["onUserInputRequest"] as () => Promise<unknown>)()).rejects.toThrow(
-      /not available/i
-    );
+    const ask = s.config["onUserInputRequest"] as (r: unknown) => Promise<unknown>;
+    // choice path
+    let result = ask({ question: "Pick one", choices: ["Red", "Blue"], allowFreeform: true });
+    await tick();
+    expect(s.transport.userInputs.at(-1)!.question).toBe("Pick one");
+    expect(s.transport.userInputs.at(-1)!.choices).toEqual(["Red", "Blue"]);
+    s.transport.choice!(s.transport.userInputs.at(-1)!.nonce, 1, "u1");
+    expect(await result).toEqual({ answer: "Blue", wasFreeform: false });
+    // freeform path (via a thread message the app routes through tryConsumeFreeform)
+    result = ask({ question: "Name it", choices: [], allowFreeform: true });
+    await tick();
+    expect(s.actor.tryConsumeFreeform("Fluffy")).toBe(true);
+    expect(await result).toEqual({ answer: "Fluffy", wasFreeform: true });
+  });
+
+  it("ask_user: an out-of-range choice index is ignored (stays pending)", async () => {
+    const s = await setup();
+    const ask = s.config["onUserInputRequest"] as (r: unknown) => Promise<unknown>;
+    void ask({ question: "Q", choices: ["A"], allowFreeform: false });
+    await tick();
+    const nonce = s.transport.userInputs.at(-1)!.nonce;
+    s.transport.choice!(nonce, 5, "u1"); // invalid
+    expect(s.broker.size).toBe(1); // still pending
+    s.transport.choice!(nonce, 0, "u1");
+    // now settled
+    await tick();
+    expect(s.broker.size).toBe(0);
+  });
+
+  it("exit-plan: an action button approves with selectedAction; Reject declines", async () => {
+    const s = await setup();
+    const plan = s.config["onExitPlanModeRequest"] as (r: unknown) => Promise<unknown>;
+    let result = plan({ summary: "Do it", actions: ["Proceed", "Autopilot"], recommendedAction: "Proceed" });
+    await tick();
+    expect(s.transport.plans.at(-1)!.actions).toEqual(["Proceed", "Autopilot"]);
+    s.transport.plan!(s.transport.plans.at(-1)!.nonce, 1, "u1");
+    expect(await result).toEqual({ approved: true, selectedAction: "Autopilot" });
+    // reject
+    result = plan({ summary: "Do it", actions: ["Proceed"], recommendedAction: "Proceed" });
+    await tick();
+    s.transport.plan!(s.transport.plans.at(-1)!.nonce, "reject", "u1");
+    expect(await result).toEqual({ approved: false, feedback: "Rejected via Discord." });
   });
 });
 

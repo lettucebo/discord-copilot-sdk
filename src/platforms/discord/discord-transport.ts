@@ -7,8 +7,8 @@ import {
 } from "discord.js";
 import { chunkText } from "../../core/chunk.js";
 import type { RenderState } from "../../core/turn-render.js";
-import type { Decision, PermissionView, Transport } from "../../core/transport.js";
-import { encodePermissionId } from "./custom-id.js";
+import type { Decision, PermissionView, PlanView, Transport, UserInputView } from "../../core/transport.js";
+import { encodePermissionId, encodeChoiceId, encodePlanId } from "./custom-id.js";
 import { sanitizeForCodeBlock } from "../../core/text-safety.js";
 
 export { sanitizeForCodeBlock };
@@ -48,6 +48,10 @@ export class DiscordTransport implements Transport {
   private readonly decisionHandlers = new Set<
     (nonce: string, decision: Decision, userId: string) => void
   >();
+  private readonly choiceHandlers = new Set<(nonce: string, index: number, userId: string) => void>();
+  private readonly planHandlers = new Set<
+    (nonce: string, action: number | "reject", userId: string) => void
+  >();
 
   constructor(private readonly client: Client) {}
 
@@ -56,9 +60,27 @@ export class DiscordTransport implements Transport {
     return () => this.decisionHandlers.delete(handler);
   }
 
+  onChoice(handler: (nonce: string, index: number, userId: string) => void): () => void {
+    this.choiceHandlers.add(handler);
+    return () => this.choiceHandlers.delete(handler);
+  }
+
+  onPlan(handler: (nonce: string, action: number | "reject", userId: string) => void): () => void {
+    this.planHandlers.add(handler);
+    return () => this.planHandlers.delete(handler);
+  }
+
   /** Called by the app's interaction router after auth passes. */
   deliverDecision(nonce: string, decision: Decision, userId: string): void {
     for (const h of this.decisionHandlers) h(nonce, decision, userId);
+  }
+
+  deliverChoice(nonce: string, index: number, userId: string): void {
+    for (const h of this.choiceHandlers) h(nonce, index, userId);
+  }
+
+  deliverPlan(nonce: string, action: number | "reject", userId: string): void {
+    for (const h of this.planHandlers) h(nonce, action, userId);
   }
 
   private ensure(sessionKey: string): SessionRender {
@@ -216,6 +238,57 @@ export class DiscordTransport implements Transport {
     if (channel) await channel.send({ content: text.slice(0, 1900), ...NO_MENTIONS });
   }
 
+  async showUserInput(view: UserInputView): Promise<void> {
+    const channel = await this.fetchThread(view.sessionKey);
+    if (!channel) return;
+    const embed = new EmbedBuilder()
+      .setColor(0x3498db)
+      .setTitle("❓ Copilot is asking")
+      .setDescription(view.question.slice(0, 4000))
+      .setFooter({
+        text: view.allowFreeform
+          ? "Pick an option below, or type your answer in this thread."
+          : "Pick an option below.",
+      });
+    const rows = buttonRows(
+      view.choices.slice(0, 25).map((choice, i) =>
+        new ButtonBuilder()
+          .setCustomId(encodeChoiceId(view.nonce, i))
+          .setLabel(truncateLabel(choice))
+          .setStyle(ButtonStyle.Secondary)
+      )
+    );
+    await channel.send({ embeds: [embed], components: rows, ...NO_MENTIONS });
+  }
+
+  async showPlan(view: PlanView): Promise<void> {
+    const channel = await this.fetchThread(view.sessionKey);
+    if (!channel) return;
+    let desc = view.summary.slice(0, 3500);
+    if (view.planContent) {
+      const body = sanitizeForCodeBlock(view.planContent).slice(0, 3500 - desc.length);
+      if (body) desc += "\n\n```\n" + body + "\n```";
+    }
+    const embed = new EmbedBuilder()
+      .setColor(0x9b59b6)
+      .setTitle("📋 Plan ready — approve to proceed")
+      .setDescription(desc || "(no summary)")
+      .setFooter({ text: "Choose an action, or Reject to send it back with feedback." });
+    const buttons = view.actions.slice(0, 24).map((action, i) =>
+      new ButtonBuilder()
+        .setCustomId(encodePlanId(view.nonce, i))
+        .setLabel(truncateLabel(action))
+        .setStyle(action === view.recommendedAction ? ButtonStyle.Success : ButtonStyle.Primary)
+    );
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(encodePlanId(view.nonce, "reject"))
+        .setLabel("Reject")
+        .setStyle(ButtonStyle.Danger)
+    );
+    await channel.send({ embeds: [embed], components: buttonRows(buttons), ...NO_MENTIONS });
+  }
+
   /** Release a session's render state + any pending timer. */
   dispose(sessionKey: string): void {
     const s = this.sessions.get(sessionKey);
@@ -233,6 +306,21 @@ export class DiscordTransport implements Transport {
       return undefined;
     }
   }
+}
+
+/** Split buttons into Discord action rows (max 5 per row, max 5 rows). */
+function buttonRows(buttons: ButtonBuilder[]): ActionRowBuilder<ButtonBuilder>[] {
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+  for (let i = 0; i < buttons.length && rows.length < 5; i += 5) {
+    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(buttons.slice(i, i + 5)));
+  }
+  return rows;
+}
+
+/** Discord button labels are capped at 80 chars. */
+function truncateLabel(s: string): string {
+  const t = s.replace(/\s+/g, " ").trim();
+  return t.length <= 80 ? t || "(option)" : t.slice(0, 77) + "…";
 }
 
 function formatState(state: RenderState): string {

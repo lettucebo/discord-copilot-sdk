@@ -35,16 +35,45 @@ export interface Transport {
   /** Present a permission prompt; the transport later delivers the decision via
    *  the handler registered with `onDecision`. */
   showPermission(view: PermissionView): Promise<void>;
+  /** Present an ask_user question (choices as buttons + optional freeform). */
+  showUserInput(view: UserInputView): Promise<void>;
+  /** Present an exit-plan-mode prompt (actions as buttons + reject). */
+  showPlan(view: PlanView): Promise<void>;
   /** Post a plain notice (errors, auto-denials, aborts). */
   notice(sessionKey: string, text: string): Promise<void>;
   /** Register the sink that receives user decisions (wired to broker.settle).
    *  Returns an unsubscribe function so a torn-down session's handler doesn't
    *  leak or keep receiving broadcasts. */
   onDecision(handler: (nonce: string, decision: Decision, userId: string) => void): () => void;
+  /** Register the sink for ask_user choice-button selections. */
+  onChoice(handler: (nonce: string, index: number, userId: string) => void): () => void;
+  /** Register the sink for exit-plan action/reject selections. */
+  onPlan(handler: (nonce: string, action: number | "reject", userId: string) => void): () => void;
   /** Flush the latest render for a session immediately (e.g. at turn end). */
   flush(sessionKey: string): Promise<void>;
   /** Begin a fresh turn's message set for a session. */
   resetTurn(sessionKey: string): void;
   /** Release all per-session render state/timers (on session teardown). */
   dispose(sessionKey: string): void;
+}
+
+/** ask_user prompt: a question with optional multiple-choice buttons; freeform
+ *  answers arrive as a normal thread message when `allowFreeform`. */
+export interface UserInputView {
+  nonce: string;
+  sessionKey: string;
+  question: string;
+  choices: string[];
+  allowFreeform: boolean;
+}
+
+/** exit-plan prompt: a plan summary + optional full content, with the runtime's
+ *  available actions (buttons) and its recommended one. */
+export interface PlanView {
+  nonce: string;
+  sessionKey: string;
+  summary: string;
+  planContent?: string;
+  actions: string[];
+  recommendedAction: string;
 }

@@ -25,7 +25,7 @@ import { PendingInteractionBroker } from "./core/broker.js";
 import { SessionActor } from "./copilot/session-actor.js";
 import { ApprovalPolicy } from "./core/approval-policy.js";
 import { DiscordTransport } from "./platforms/discord/discord-transport.js";
-import { decodePermissionId } from "./platforms/discord/custom-id.js";
+import { decodePermissionId, decodeChoiceId, decodePlanId } from "./platforms/discord/custom-id.js";
 import { isAuthorized, type AuthContext, type AuthPolicy } from "./platforms/discord/auth.js";
 import type { Decision } from "./core/transport.js";
 
@@ -218,21 +218,39 @@ export class DiscopilotApp {
   }
 
   private async onButton(interaction: ButtonInteraction): Promise<void> {
-    const decoded = decodePermissionId(interaction.customId);
-    if (!decoded) return;
+    const perm = decodePermissionId(interaction.customId);
+    const choice = perm ? undefined : decodeChoiceId(interaction.customId);
+    const plan = perm || choice ? undefined : decodePlanId(interaction.customId);
+    if (!perm && !choice && !plan) return; // not one of ours
     if (!isAuthorized(ctxOf(interaction), this.policy)) {
       await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
       return;
     }
-    // Acknowledge Discord (and remove the buttons) BEFORE settling the decision,
-    // so an Allow can never run while the user sees "interaction failed". If the
-    // ack fails, the SAFE default (deny) is delivered instead. (See
-    // resolveButtonAck — unit-tested for both orderings.)
-    await resolveButtonAck(
-      () => interaction.update({ components: [] }),
-      (d) => this.transport.deliverDecision(decoded.nonce, d, interaction.user.id),
-      decoded.action
-    );
+    const uid = interaction.user.id;
+    if (perm) {
+      // Ack Discord BEFORE settling, so an Allow can never run while the user
+      // sees "interaction failed"; ack failure delivers the safe default (deny).
+      await resolveButtonAck(
+        () => interaction.update({ components: [] }),
+        (d) => this.transport.deliverDecision(perm.nonce, d, uid),
+        perm.action
+      );
+      return;
+    }
+    // choice/plan: ack first, then settle on success.
+    let acked = true;
+    try {
+      await interaction.update({ components: [] });
+    } catch {
+      acked = false;
+    }
+    if (choice) {
+      // ack failure ⇒ leave the ask pending; it times out to the safe default.
+      if (acked) this.transport.deliverChoice(choice.nonce, choice.index, uid);
+    } else if (plan) {
+      // ack failure ⇒ safe default is reject.
+      this.transport.deliverPlan(plan.nonce, acked ? plan.action : "reject", uid);
+    }
   }
 
   private async cmdNew(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -330,6 +348,9 @@ export class DiscopilotApp {
       );
       return;
     }
+    // If the agent is awaiting a freeform ask_user answer, this message answers
+    // it (rather than starting a new turn or hitting the "still working" guard).
+    if (session.actor.tryConsumeFreeform(prompt)) return;
     await this.runTurn(message.channelId, prompt);
   }
 

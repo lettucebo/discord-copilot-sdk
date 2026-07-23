@@ -1,5 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
-import { encodePermissionId, decodePermissionId } from "../src/platforms/discord/custom-id.js";
+import {
+  encodePermissionId,
+  decodePermissionId,
+  encodeChoiceId,
+  decodeChoiceId,
+  encodePlanId,
+  decodePlanId,
+} from "../src/platforms/discord/custom-id.js";
 import { isAuthorized } from "../src/platforms/discord/auth.js";
 import { resolveButtonAck } from "../src/app.js";
 
@@ -23,6 +30,23 @@ describe("custom-id", () => {
 
   it("stays within Discord's 100-char custom id limit for a uuid nonce", () => {
     expect(encodePermissionId("123e4567-e89b-12d3-a456-426614174000", "always").length).toBeLessThanOrEqual(100);
+  });
+});
+
+describe("choice + plan custom ids", () => {
+  it("round-trips a choice index", () => {
+    expect(encodeChoiceId("n", 3)).toBe("dp:ask:3:n");
+    expect(decodeChoiceId(encodeChoiceId("nonce-1", 0))).toEqual({ nonce: "nonce-1", index: 0 });
+    expect(decodeChoiceId("dp:ask:-1:n")).toBeUndefined();
+    expect(decodeChoiceId("dp:ask:x:n")).toBeUndefined();
+    expect(decodeChoiceId("dp:perm:once:n")).toBeUndefined();
+  });
+
+  it("round-trips a plan action (index or reject)", () => {
+    expect(decodePlanId(encodePlanId("n", 2))).toEqual({ nonce: "n", action: 2 });
+    expect(decodePlanId(encodePlanId("n", "reject"))).toEqual({ nonce: "n", action: "reject" });
+    expect(decodePlanId("dp:plan:x:n")).toBeUndefined();
+    expect(decodePlanId("dp:ask:0:n")).toBeUndefined();
   });
 });
 
