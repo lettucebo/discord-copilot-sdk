@@ -46,4 +46,20 @@ describe("ApprovalPolicy", () => {
     expect(p.isApproved("s1", "/repo", ["git"])).toBe(false);
     expect(p.isApproved("s2", "/repo", ["git"])).toBe(true);
   });
+
+  it("exposes session + repo approvals and clears repo rules", () => {
+    const f = tmpFile();
+    try {
+      const p = new ApprovalPolicy(f);
+      p.approveForSession("s1", "GIT");
+      p.approveForRepo("/repo", "npm");
+      expect(p.sessionApprovals("s1")).toEqual(["git"]);
+      expect(p.repoApprovals("/repo")).toEqual(["npm"]);
+      p.clearRepo("/repo");
+      expect(p.repoApprovals("/repo")).toEqual([]);
+      expect(new ApprovalPolicy(f).repoApprovals("/repo")).toEqual([]); // persisted
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
 });

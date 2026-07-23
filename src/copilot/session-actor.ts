@@ -86,11 +86,19 @@ export class SessionActor {
   /** One interactive request (ask_user / exit_plan) at a time per actor —
    *  overlapping ones fail closed (the single freeform slot can't hold two). */
   private interactiveActive = false;
+  /** Live session config (for /model /effort /context + display). */
+  private currentModel?: string;
+  private currentEffort?: string;
+  private currentContext?: "default" | "long_context";
+  /** Latest usage snapshot from session.usage_info (for /usage). */
+  private lastUsage?: { currentTokens: number; tokenLimit: number };
   /** Per-nonce exit-plan metadata (actions for index→action mapping). */
   private readonly pendingPlan = new Map<string, { actions: string[] }>();
 
   private constructor(private readonly opts: SessionActorOpts) {
     this.generation = opts.generation ?? 1;
+    this.currentModel = opts.model;
+    this.currentContext = opts.contextTier;
   }
 
   static async create(client: CopilotClient, opts: SessionActorOpts): Promise<SessionActor> {
@@ -174,6 +182,45 @@ export class SessionActor {
       const d = data(e);
       void this.opts.transport.notice(this.opts.sessionKey, `⚠️ ${str(d["message"]) || "session error"}`);
     });
+    s.on("session.usage_info", (e) => {
+      const d = data(e);
+      const cur = d["currentTokens"];
+      const lim = d["tokenLimit"];
+      if (typeof cur === "number" && typeof lim === "number") {
+        this.lastUsage = { currentTokens: cur, tokenLimit: lim };
+      }
+    });
+  }
+
+  /** Change model / reasoning effort / context tier on the LIVE session (takes
+   *  effect next message; history preserved). Any subset may be provided; the
+   *  rest keep their current values. */
+  async reconfigure(opts: { model?: string; effort?: string; context?: "default" | "long_context" }): Promise<void> {
+    if (this.lifecycle !== "active") throw new Error(`session is ${this.lifecycle}`);
+    const model = opts.model ?? this.currentModel;
+    if (!model) throw new Error("no model set for this session");
+    const effort = opts.effort ?? this.currentEffort;
+    const context = opts.context ?? this.currentContext;
+    const s = this.session as unknown as {
+      setModel(m: string, o?: { reasoningEffort?: string; contextTier?: string }): Promise<unknown>;
+    };
+    await s.setModel(model, {
+      ...(effort ? { reasoningEffort: effort } : {}),
+      ...(context ? { contextTier: context } : {}),
+    });
+    this.currentModel = model;
+    this.currentEffort = effort;
+    this.currentContext = context;
+  }
+
+  /** Current session config for display (/model /effort /context). */
+  config(): { model?: string; effort?: string; context?: string } {
+    return { model: this.currentModel, effort: this.currentEffort, context: this.currentContext };
+  }
+
+  /** Latest token usage snapshot, if any (/usage). */
+  usage(): { currentTokens: number; tokenLimit: number } | undefined {
+    return this.lastUsage;
   }
 
   /** Seal the current assistant message before posting an interaction card so

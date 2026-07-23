@@ -39,6 +39,11 @@ interface Session {
  *  up on it (and keep it for a later retry) rather than stalling. */
 const TEARDOWN_TIMEOUT_MS = 5_000;
 
+/** Format an executable list for a compact reply. */
+function fmtList(items: string[]): string {
+  return items.length ? items.map((e) => `\`${e}\``).join(", ") : "(none)";
+}
+
 /** Reject if `p` doesn't settle within `ms` (the pending work keeps running). */
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -89,6 +94,8 @@ export class DiscopilotApp {
   private readonly policy: AuthPolicy;
   /** Shared approval memory (session + persisted repo rules) across sessions. */
   private readonly approvals = new ApprovalPolicy();
+  private modelIds: string[] = [];
+  private readonly modelEfforts = new Map<string, string[]>();
   private shuttingDown = false;
   /** Serializes /new so two near-simultaneous creations can't both pass the
    *  "one live session" teardown and leave two live sessions. */
@@ -167,17 +174,34 @@ export class DiscopilotApp {
   }
 
   private async onReady(clientId: string): Promise<void> {
+    await this.loadModels();
     await this.registerCommands(clientId);
     console.log(
       `✅ discopilot ready — controlling ${this.repoPath}\n` +
         `   guild=${this.config.DISCORD_GUILD_ID} channel=${this.config.DISCORD_PARENT_CHANNEL_ID}\n` +
-        `   model=${this.config.DEFAULT_MODEL} contextTier=${this.config.DEFAULT_CONTEXT_TIER}\n` +
+        `   model=${this.config.DEFAULT_MODEL} contextTier=${this.config.DEFAULT_CONTEXT_TIER} (${this.modelIds.length} models)\n` +
         `   ⚠️  lab mode: tools run as this OS user with no sandbox. The bot uses your\n` +
         `      logged-in Copilot, so any saved "always allow" rules bypass the Discord prompt.`
     );
   }
 
+  /** Snapshot the available models + their supported reasoning efforts for the
+   *  /model and /effort commands (choices are static once registered). */
+  private async loadModels(): Promise<void> {
+    try {
+      const models = await this.copilot.listModels();
+      this.modelIds = models.map((m) => m.id).slice(0, 25);
+      for (const m of models) {
+        const efforts = (m.supportedReasoningEfforts as string[] | undefined) ?? [];
+        if (efforts.length) this.modelEfforts.set(m.id, efforts);
+      }
+    } catch (err) {
+      console.warn(`⚠️  could not list models for /model choices: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
   private async registerCommands(clientId: string): Promise<void> {
+    const modelChoices = this.modelIds.slice(0, 25).map((id) => ({ name: id, value: id }));
     const commands = [
       new SlashCommandBuilder()
         .setName("new")
@@ -189,6 +213,56 @@ export class DiscopilotApp {
       new SlashCommandBuilder()
         .setName("stop")
         .setDescription("Abort the current turn in this session thread")
+        .toJSON(),
+      new SlashCommandBuilder()
+        .setName("model")
+        .setDescription("Switch this session's model (history preserved)")
+        .addStringOption((o) => {
+          o.setName("id").setDescription("Model id").setRequired(true);
+          if (modelChoices.length) o.addChoices(...modelChoices);
+          return o;
+        })
+        .toJSON(),
+      new SlashCommandBuilder()
+        .setName("effort")
+        .setDescription("Set this session's reasoning effort")
+        .addStringOption((o) =>
+          o
+            .setName("level")
+            .setDescription("Reasoning effort")
+            .setRequired(true)
+            .addChoices(
+              { name: "low", value: "low" },
+              { name: "medium", value: "medium" },
+              { name: "high", value: "high" },
+              { name: "xhigh", value: "xhigh" }
+            )
+        )
+        .toJSON(),
+      new SlashCommandBuilder()
+        .setName("context")
+        .setDescription("Set this session's context window tier")
+        .addStringOption((o) =>
+          o
+            .setName("tier")
+            .setDescription("Context tier")
+            .setRequired(true)
+            .addChoices(
+              { name: "default", value: "default" },
+              { name: "long_context", value: "long_context" }
+            )
+        )
+        .toJSON(),
+      new SlashCommandBuilder()
+        .setName("usage")
+        .setDescription("Show this session's token usage")
+        .toJSON(),
+      new SlashCommandBuilder()
+        .setName("approvals")
+        .setDescription("List (or clear) remembered command approvals")
+        .addBooleanOption((o) =>
+          o.setName("clear").setDescription("Clear this session + repo approvals").setRequired(false)
+        )
         .toJSON(),
     ];
     // Register in the AUTHORIZED guild so command availability matches the auth
@@ -209,8 +283,12 @@ export class DiscopilotApp {
         return;
       }
       if (interaction.isChatInputCommand()) {
-        if (interaction.commandName === "new") await this.cmdNew(interaction);
-        else if (interaction.commandName === "stop") await this.cmdStop(interaction);
+        const c = interaction.commandName;
+        if (c === "new") await this.cmdNew(interaction);
+        else if (c === "stop") await this.cmdStop(interaction);
+        else if (c === "model" || c === "effort" || c === "context") await this.cmdReconfigure(interaction);
+        else if (c === "usage") await this.cmdUsage(interaction);
+        else if (c === "approvals") await this.cmdApprovals(interaction);
       }
     } catch (err) {
       console.error("interaction error:", err);
@@ -329,6 +407,104 @@ export class DiscopilotApp {
     const ok = await session.actor.stop();
     await interaction.reply({
       content: ok ? "Abort requested for the current turn." : "Abort attempted but the runtime reported an error.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  /** /model, /effort, /context — reconfigure the current thread's session. */
+  private async cmdReconfigure(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isAuthorized(ctxOf(interaction), this.policy)) {
+      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const session = this.sessions.get(interaction.channelId);
+    if (!session) {
+      await interaction.reply({
+        content: "Run this inside a session thread (start one with /new).",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const change: { model?: string; effort?: string; context?: "default" | "long_context" } = {};
+    const cur = session.actor.config();
+    if (interaction.commandName === "model") {
+      const id = interaction.options.getString("id", true);
+      if (this.modelIds.length && !this.modelIds.includes(id)) {
+        await interaction.reply({ content: `Unknown model \`${id}\`.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      change.model = id;
+    } else if (interaction.commandName === "effort") {
+      const level = interaction.options.getString("level", true);
+      const supported = this.modelEfforts.get(change.model ?? cur.model ?? "");
+      if (supported && supported.length && !supported.includes(level)) {
+        await interaction.reply({
+          content: `Model \`${cur.model}\` supports effort: ${supported.join(", ")}.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      change.effort = level;
+    } else {
+      change.context = interaction.options.getString("tier", true) as "default" | "long_context";
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      await session.actor.reconfigure(change);
+      const c = session.actor.config();
+      await interaction.editReply(
+        `Updated. model=\`${c.model ?? "?"}\` effort=\`${c.effort ?? "default"}\` context=\`${c.context ?? "default"}\` (takes effect next message).`
+      );
+    } catch (err) {
+      await interaction.editReply(`Could not update: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async cmdUsage(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isAuthorized(ctxOf(interaction), this.policy)) {
+      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const session = this.sessions.get(interaction.channelId);
+    if (!session) {
+      await interaction.reply({
+        content: "Run this inside a session thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const u = session.actor.usage();
+    const c = session.actor.config();
+    const header = `model=\`${c.model ?? "?"}\` effort=\`${c.effort ?? "default"}\` context=\`${c.context ?? "default"}\``;
+    const body = u
+      ? `\ntokens: ${u.currentTokens.toLocaleString()} / ${u.tokenLimit.toLocaleString()} (${Math.round((u.currentTokens / u.tokenLimit) * 100)}%)`
+      : "\n(no usage reported yet — send a message first)";
+    await interaction.reply({ content: header + body, flags: MessageFlags.Ephemeral });
+  }
+
+  private async cmdApprovals(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isAuthorized(ctxOf(interaction), this.policy)) {
+      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const clear = interaction.options.getBoolean("clear") ?? false;
+    const sessionRules = this.sessions.has(interaction.channelId)
+      ? this.approvals.sessionApprovals(interaction.channelId)
+      : [];
+    const repoRules = this.approvals.repoApprovals(this.repoPath);
+    if (clear) {
+      if (this.sessions.has(interaction.channelId)) this.approvals.clearSession(interaction.channelId);
+      this.approvals.clearRepo(this.repoPath);
+      await interaction.reply({
+        content:
+          `Cleared approvals — session: ${fmtList(sessionRules)} · repo: ${fmtList(repoRules)}. ` +
+          `Future commands will prompt again.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await interaction.reply({
+      content: `Approved (auto-run, no prompt):\n• session: ${fmtList(sessionRules)}\n• this repo: ${fmtList(repoRules)}`,
       flags: MessageFlags.Ephemeral,
     });
   }

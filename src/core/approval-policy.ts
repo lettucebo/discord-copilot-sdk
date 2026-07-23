@@ -72,9 +72,22 @@ export class ApprovalPolicy {
     this.session.delete(sessionKey);
   }
 
+  /** Executables approved in-memory for a session (for /approvals display). */
+  sessionApprovals(sessionKey: string): string[] {
+    return [...(this.session.get(sessionKey) ?? [])];
+  }
+
   /** Executables persisted for a repo (for display/debug). */
   repoApprovals(repoPath: string): string[] {
     return [...(this.repo[repoPath] ?? [])];
+  }
+
+  /** Forget a repo's persisted approvals (e.g. /approvals clear). */
+  clearRepo(repoPath: string): void {
+    if (this.repo[repoPath]) {
+      delete this.repo[repoPath];
+      this.persist();
+    }
   }
 
   private load(): void {

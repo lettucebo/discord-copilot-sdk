@@ -13,6 +13,7 @@ const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 class FakeSession {
   handlers = new Map<string, (e: unknown) => void>();
   sent: string[] = [];
+  setModelCalls: Array<{ model: string; options?: unknown }> = [];
   aborted = 0;
   disconnected = 0;
   on(ev: string, h: (e: unknown) => void): void {
@@ -23,6 +24,9 @@ class FakeSession {
   }
   async send(o: { prompt: string }): Promise<void> {
     this.sent.push(o.prompt);
+  }
+  async setModel(model: string, options?: unknown): Promise<void> {
+    this.setModelCalls.push({ model, options });
   }
   async abort(): Promise<void> {
     this.aborted++;
@@ -449,6 +453,27 @@ describe("SessionActor abort + teardown", () => {
     await s.actor.disconnect();
     await s.actor.disconnect();
     expect(s.session.disconnected).toBe(1);
+  });
+
+  it("reconfigure calls setModel with merged model/effort/context and tracks state", async () => {
+    const s = await setup();
+    await s.actor.reconfigure({ model: "gpt-5.4", effort: "high" });
+    expect(s.session.setModelCalls.at(-1)).toEqual({ model: "gpt-5.4", options: { reasoningEffort: "high" } });
+    expect(s.actor.config()).toEqual({ model: "gpt-5.4", effort: "high", context: undefined });
+    // change only context; model+effort preserved
+    await s.actor.reconfigure({ context: "long_context" });
+    expect(s.session.setModelCalls.at(-1)).toEqual({
+      model: "gpt-5.4",
+      options: { reasoningEffort: "high", contextTier: "long_context" },
+    });
+    expect(s.actor.config()).toEqual({ model: "gpt-5.4", effort: "high", context: "long_context" });
+  });
+
+  it("usage() reflects the last session.usage_info event", async () => {
+    const s = await setup();
+    expect(s.actor.usage()).toBeUndefined();
+    s.session.emit("session.usage_info", { data: { currentTokens: 1234, tokenLimit: 1_000_000 } });
+    expect(s.actor.usage()).toEqual({ currentTokens: 1234, tokenLimit: 1_000_000 });
   });
 
   it("a FAILED disconnect faults the actor and never reports success on retry", async () => {
