@@ -24,6 +24,10 @@ const MAX_CARD_LEN = 3900;
 const DENY_UNAVAILABLE = { kind: "user-not-available" } as const;
 const DENIED_BY_USER = { kind: "denied-interactively-by-user" } as const;
 const APPROVE_ONCE = { kind: "approve-once" } as const;
+/** Sentinel settled for an ask_user with no operator answer (timeout/abort/card
+ *  failure). The handler throws on it so the ask_user tool FAILS rather than the
+ *  agent acting on a fabricated answer. Identity-compared, never returned. */
+const NO_ANSWER = Symbol("no-answer");
 
 /** Metadata captured at request time so a later decision can record the right
  *  approval rule. `executable` is the single command's executable (empty when a
@@ -79,6 +83,9 @@ export class SessionActor {
   private readonly pendingAsk = new Map<string, { choices: string[] }>();
   /** Nonce of an ask_user awaiting a FREEFORM answer via a thread message. */
   private freeformAskNonce?: string;
+  /** One interactive request (ask_user / exit_plan) at a time per actor —
+   *  overlapping ones fail closed (the single freeform slot can't hold two). */
+  private interactiveActive = false;
   /** Per-nonce exit-plan metadata (actions for index→action mapping). */
   private readonly pendingPlan = new Map<string, { actions: string[] }>();
 
@@ -309,17 +316,22 @@ export class SessionActor {
       ? (r["choices"] as unknown[]).filter((c): c is string => typeof c === "string")
       : [];
     const allowFreeform = r["allowFreeform"] !== false; // default true
-    if (this.aborting) return { answer: "", wasFreeform: true };
+    // Fail closed while aborting or when another interactive request is already
+    // in flight (freeformAskNonce is a single slot; overlapping asks are unsafe).
+    if (this.aborting || this.interactiveActive) {
+      throw new Error("ask_user is not available right now (session busy/aborting).");
+    }
+    this.interactiveActive = true;
     const { nonce, promise } = this.opts.broker.register<unknown>({
       sessionKey: this.opts.sessionKey,
       generation: this.generation,
       kind: "ask_user",
       timeoutMs: PERMISSION_TIMEOUT_MS,
-      onDefault: () => ({ answer: "(no response from operator)", wasFreeform: true }),
+      onDefault: () => NO_ANSWER, // timeout/abort ⇒ the ask_user tool fails (below)
     });
     this.pendingAsk.set(nonce, { choices });
-    if (allowFreeform) this.freeformAskNonce = nonce;
     try {
+      let posted = false;
       try {
         await this.beginInteractionCard();
         await this.opts.transport.showUserInput({
@@ -329,17 +341,24 @@ export class SessionActor {
           choices,
           allowFreeform,
         });
+        posted = true;
       } catch {
-        this.opts.broker.settle(
-          nonce,
-          { answer: "(could not present the question)", wasFreeform: true },
-          this.generation
-        );
+        this.opts.broker.settle(nonce, NO_ANSWER, this.generation);
       }
-      return await promise;
+      // Arm freeform ONLY after the card is actually published, so a message
+      // sent before the card can't settle an unseen question.
+      if (posted && allowFreeform) this.freeformAskNonce = nonce;
+      const result = await promise;
+      if (result === NO_ANSWER) {
+        // No operator answer (timeout/abort/card-failure). Fail the ask_user
+        // tool rather than fabricating an answer the agent would act on.
+        throw new Error("ask_user: no response from the operator.");
+      }
+      return result;
     } finally {
       this.pendingAsk.delete(nonce);
       if (this.freeformAskNonce === nonce) this.freeformAskNonce = undefined;
+      this.interactiveActive = false;
     }
   }
 
@@ -374,7 +393,9 @@ export class SessionActor {
       : [];
     const recommendedAction =
       typeof r["recommendedAction"] === "string" ? (r["recommendedAction"] as string) : actions[0] ?? "";
-    if (this.aborting) return { approved: false, feedback: "Session aborting." };
+    const declined = { approved: false, feedback: "Not approved." };
+    if (this.aborting || this.interactiveActive) return declined; // fail closed
+    this.interactiveActive = true;
     const { nonce, promise } = this.opts.broker.register<unknown>({
       sessionKey: this.opts.sessionKey,
       generation: this.generation,
@@ -395,15 +416,18 @@ export class SessionActor {
           ...(planContent ? { planContent } : {}),
         });
       } catch {
+        // Couldn't fully publish the plan (e.g. a chunk failed to post) — do not
+        // let the operator approve a plan they can't see. Settle as not approved.
         this.opts.broker.settle(
           nonce,
-          { approved: false, feedback: "Could not present the plan." },
+          { approved: false, feedback: "Could not present the full plan." },
           this.generation
         );
       }
       return await promise;
     } finally {
       this.pendingPlan.delete(nonce);
+      this.interactiveActive = false;
     }
   }
 
@@ -413,10 +437,10 @@ export class SessionActor {
       return;
     }
     const meta = this.pendingPlan.get(nonce);
-    const selectedAction = meta && action >= 0 && action < meta.actions.length ? meta.actions[action] : undefined;
+    if (!meta || action < 0 || action >= meta.actions.length) return; // invalid index → stays pending
     this.opts.broker.settle(
       nonce,
-      { approved: true, ...(selectedAction ? { selectedAction } : {}) },
+      { approved: true, selectedAction: meta.actions[action]! },
       this.generation
     );
   }

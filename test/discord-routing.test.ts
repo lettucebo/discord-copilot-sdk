@@ -39,6 +39,7 @@ describe("choice + plan custom ids", () => {
     expect(decodeChoiceId(encodeChoiceId("nonce-1", 0))).toEqual({ nonce: "nonce-1", index: 0 });
     expect(decodeChoiceId("dp:ask:-1:n")).toBeUndefined();
     expect(decodeChoiceId("dp:ask:x:n")).toBeUndefined();
+    expect(decodeChoiceId("dp:ask:1junk:n")).toBeUndefined(); // non-all-digit rejected
     expect(decodeChoiceId("dp:perm:once:n")).toBeUndefined();
   });
 
@@ -46,6 +47,7 @@ describe("choice + plan custom ids", () => {
     expect(decodePlanId(encodePlanId("n", 2))).toEqual({ nonce: "n", action: 2 });
     expect(decodePlanId(encodePlanId("n", "reject"))).toEqual({ nonce: "n", action: "reject" });
     expect(decodePlanId("dp:plan:x:n")).toBeUndefined();
+    expect(decodePlanId("dp:plan:2junk:n")).toBeUndefined(); // non-all-digit rejected
     expect(decodePlanId("dp:ask:0:n")).toBeUndefined();
   });
 });

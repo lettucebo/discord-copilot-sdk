@@ -263,16 +263,18 @@ export class DiscordTransport implements Transport {
 
   async showPlan(view: PlanView): Promise<void> {
     const channel = await this.fetchThread(view.sessionKey);
-    if (!channel) return;
-    let desc = view.summary.slice(0, 3500);
+    if (!channel) throw new Error("plan thread unavailable"); // actor settles "not approved"
+    // Publish the COMPLETE plan first (chunked) so approval is informed — never
+    // show approve buttons over a silently truncated plan.
     if (view.planContent) {
-      const body = sanitizeForCodeBlock(view.planContent).slice(0, 3500 - desc.length);
-      if (body) desc += "\n\n```\n" + body + "\n```";
+      const chunks = chunkText("📋 Proposed plan:\n" + view.planContent);
+      if (chunks.length > 20) throw new Error("plan too long to publish in full");
+      for (const c of chunks) await channel.send({ content: c, ...NO_MENTIONS });
     }
     const embed = new EmbedBuilder()
       .setColor(0x9b59b6)
       .setTitle("📋 Plan ready — approve to proceed")
-      .setDescription(desc || "(no summary)")
+      .setDescription((view.summary || "(no summary)").slice(0, 4000))
       .setFooter({ text: "Choose an action, or Reject to send it back with feedback." });
     const buttons = view.actions.slice(0, 24).map((action, i) =>
       new ButtonBuilder()

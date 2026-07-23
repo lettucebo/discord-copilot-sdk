@@ -43,8 +43,9 @@ export function decodeChoiceId(customId: string): DecodedChoice | undefined {
   if (parts.length !== 4) return undefined;
   const [ns, kind, idx, nonce] = parts;
   if (ns !== NS || kind !== "ask" || !nonce) return undefined;
-  const index = Number.parseInt(idx ?? "", 10);
-  if (!Number.isInteger(index) || index < 0) return undefined;
+  if (!idx || !/^\d+$/.test(idx)) return undefined; // all-digit index only
+  const index = Number.parseInt(idx, 10);
+  if (!Number.isInteger(index)) return undefined;
   return { nonce, index };
 }
 
@@ -68,7 +69,8 @@ export function decodePlanId(customId: string): DecodedPlan | undefined {
   const [ns, kind, action, nonce] = parts;
   if (ns !== NS || kind !== "plan" || !action || !nonce) return undefined;
   if (action === "reject") return { nonce, action: "reject" };
+  if (!/^\d+$/.test(action)) return undefined; // all-digit index only
   const index = Number.parseInt(action, 10);
-  if (!Number.isInteger(index) || index < 0) return undefined;
+  if (!Number.isInteger(index)) return undefined;
   return { nonce, action: index };
 }

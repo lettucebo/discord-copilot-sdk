@@ -177,6 +177,45 @@ describe("SessionActor config hardening", () => {
     s.transport.plan!(s.transport.plans.at(-1)!.nonce, "reject", "u1");
     expect(await result).toEqual({ approved: false, feedback: "Rejected via Discord." });
   });
+
+  it("fails a second ask_user while one is pending (one interactive request at a time)", async () => {
+    const s = await setup();
+    const ask = s.config["onUserInputRequest"] as (r: unknown) => Promise<unknown>;
+    const first = ask({ question: "Q1", choices: ["A"], allowFreeform: true });
+    await tick();
+    await expect(ask({ question: "Q2", choices: ["B"], allowFreeform: true })).rejects.toThrow(
+      /busy|aborting|available/i
+    );
+    s.transport.choice!(s.transport.userInputs.at(-1)!.nonce, 0, "u1"); // settle the first
+    expect(await first).toEqual({ answer: "A", wasFreeform: false });
+  });
+
+  it("ask_user THROWS (no fabricated answer) when the card can't be shown", async () => {
+    const s = await setup();
+    s.transport.showUserInput = async () => {
+      throw new Error("no channel");
+    };
+    await expect(
+      (s.config["onUserInputRequest"] as (r: unknown) => Promise<unknown>)({
+        question: "Q",
+        choices: [],
+        allowFreeform: true,
+      })
+    ).rejects.toThrow(/no response|operator/i);
+  });
+
+  it("exit-plan: an invalid action index leaves it pending (never approves blindly)", async () => {
+    const s = await setup();
+    const plan = s.config["onExitPlanModeRequest"] as (r: unknown) => Promise<unknown>;
+    void plan({ summary: "Do it", actions: ["Proceed"], recommendedAction: "Proceed" });
+    await tick();
+    const nonce = s.transport.plans.at(-1)!.nonce;
+    s.transport.plan!(nonce, 9, "u1"); // out of range
+    expect(s.broker.size).toBe(1); // still pending (not approved)
+    s.transport.plan!(nonce, "reject", "u1");
+    await tick();
+    expect(s.broker.size).toBe(0);
+  });
 });
 
 describe("SessionActor turn lifecycle", () => {
