@@ -16,7 +16,8 @@
   },
   "dependencies": {
     "@github/copilot-sdk": "1.0.7-preview.3",
-    "discord.js": "^14.16.3"
+    "discord.js": "^14.16.3",
+    "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
