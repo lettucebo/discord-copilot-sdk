@@ -9,6 +9,9 @@ import { chunkText } from "../../core/chunk.js";
 import type { RenderState } from "../../core/turn-render.js";
 import type { Decision, PermissionView, Transport } from "../../core/transport.js";
 import { encodePermissionId } from "./custom-id.js";
+import { sanitizeForCodeBlock } from "../../core/text-safety.js";
+
+export { sanitizeForCodeBlock };
 
 /** Never let agent-produced text ping anyone. */
 const NO_MENTIONS = { allowedMentions: { parse: [] as never[] } };
@@ -24,12 +27,16 @@ interface SessionRender {
   writeChain: Promise<void>;
 }
 
+interface MinimalMessage {
+  id: string;
+  edit(opts: unknown): Promise<unknown>;
+  delete(): Promise<unknown>;
+}
+
 interface MinimalTextChannel {
   isTextBased(): boolean;
-  send(opts: unknown): Promise<{ id: string }>;
-  messages: {
-    fetch(id: string): Promise<{ edit(opts: unknown): Promise<unknown>; delete(): Promise<unknown> }>;
-  };
+  send(opts: unknown): Promise<MinimalMessage>;
+  messages: { fetch(id: string): Promise<MinimalMessage> };
 }
 
 /** Transport that posts to Discord threads. Renders are debounced (~1s) and
@@ -121,6 +128,17 @@ export class DiscordTransport implements Transport {
         }
       } else {
         const m = await channel.send({ content, ...NO_MENTIONS });
+        // A resetTurn/dispose may have landed while the send was in flight; if
+        // so this message belongs to a turn that no longer exists — delete it
+        // instead of recording its id into the new epoch's state.
+        if (s.epoch !== epoch) {
+          try {
+            await m.delete();
+          } catch {
+            /* best effort */
+          }
+          return;
+        }
         s.msgIds[i] = m.id;
       }
     }
@@ -189,24 +207,4 @@ function formatState(state: RenderState): string {
     ? "\n" + state.tools.map((t) => `🔧 ${t.name || "tool"} — ${t.status}`).join("\n")
     : "";
   return (state.assistantText || "") + toolLine;
-}
-
-/**
- * Make text safe to place inside a Discord ```` ``` ```` block for APPROVAL
- * display. Two attacks are neutralized without dropping any visible character:
- *  - **fence breakout**: a zero-width space is inserted after each backtick so
- *    no ```` ``` ```` run can terminate the block early and let
- *    attacker-controlled command text render as trusted markdown.
- *  - **BiDi / control chars**: Unicode directional overrides (and other
- *    zero-width/format controls) that could visually reorder the command are
- *    stripped.
- * The real characters stay visible; only invisible separators/controls change.
- */
-export function sanitizeForCodeBlock(s: string): string {
-  return s
-    .replace(
-      /[\u202A-\u202E\u2066-\u2069\u200E\u200F\u2028\u2029\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
-      ""
-    )
-    .replace(/`/g, "`\u200b");
 }

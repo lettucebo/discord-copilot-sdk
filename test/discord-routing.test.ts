@@ -1,6 +1,7 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { encodePermissionId, decodePermissionId } from "../src/platforms/discord/custom-id.js";
 import { isAuthorized } from "../src/platforms/discord/auth.js";
+import { resolveButtonAck } from "../src/app.js";
 
 describe("custom-id", () => {
   it("round-trips allow/deny + nonce", () => {
@@ -49,5 +50,33 @@ describe("isAuthorized", () => {
 
   it("denies a channel/thread outside the parent", () => {
     expect(isAuthorized({ userId: "u1", guildId: "g1", channelId: "cX", parentId: "cY" }, policy)).toBe(false);
+  });
+});
+
+describe("resolveButtonAck (ack-before-settle)", () => {
+  it("delivers the user's decision only after a successful Discord ack", async () => {
+    const order: string[] = [];
+    const deliver = (d: string) => order.push(`deliver:${d}`);
+    await resolveButtonAck(
+      async () => {
+        order.push("ack");
+      },
+      deliver,
+      "allow"
+    );
+    expect(order).toEqual(["ack", "deliver:allow"]); // ack strictly first
+  });
+
+  it("delivers DENY (never allow) if the ack fails", async () => {
+    const deliver = vi.fn();
+    await resolveButtonAck(
+      async () => {
+        throw new Error("interaction failed");
+      },
+      deliver,
+      "allow"
+    );
+    expect(deliver).toHaveBeenCalledWith("deny");
+    expect(deliver).toHaveBeenCalledTimes(1);
   });
 });

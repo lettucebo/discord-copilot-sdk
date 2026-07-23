@@ -3,13 +3,17 @@ import { PendingInteractionBroker } from "../core/broker.js";
 import { TurnRenderer } from "../core/turn-render.js";
 import type { Decision, Transport } from "../core/transport.js";
 import { normalizeSdkEvent } from "./normalize.js";
+import { sanitizeForCodeBlock, hasBidiOrControls } from "../core/text-safety.js";
 
 const PERMISSION_TIMEOUT_MS = 5 * 60_000;
 const TURN_WATCHDOG_MS = 15 * 60_000;
-/** Max raw permission-summary length we will display for approval. Beyond this
- *  we auto-deny rather than show a command we can't render in full (a truncated
- *  approval could hide a dangerous suffix). */
-const MAX_PERMISSION_SUMMARY = 3000;
+/** After the watchdog aborts, how long to wait for the real session.idle before
+ *  declaring the session faulted and destroying it. */
+const FAULT_GRACE_MS = 15_000;
+/** Max SANITIZED (display) length of a permission summary we will show. The
+ *  card lives in a Discord embed description (≤4096). Beyond this we auto-deny
+ *  rather than show a partial/undisplayable command. */
+const MAX_CARD_LEN = 3900;
 
 /** Safe-default permission result (deny). Used for timeout/abort and for
  *  permission kinds discopilot has no UI for (fail-closed). */
@@ -78,7 +82,10 @@ export class SessionActor {
       // return a valid UserInputResponse ({answer,wasFreeform}); an empty answer
       // is the safe decline. (onAutoModeSwitchRequest/onMcpAuthRequest are left
       // unset — their SDK defaults are already conservative, and MCP is off.)
-      onUserInputRequest: async () => ({ answer: "", wasFreeform: true }),
+      onUserInputRequest: async () => ({
+        answer: "No operator is available to answer; proceed without this input or stop.",
+        wasFreeform: true,
+      }),
       onElicitationRequest: async () => ({ action: "cancel" }),
       onExitPlanModeRequest: async () => ({ approved: false, feedback: "Not available in P1." }),
     };
@@ -113,6 +120,7 @@ export class SessionActor {
     s.on("tool.execution_start", handle("tool.execution_start"));
     s.on("tool.execution_complete", handle("tool.execution_complete"));
     s.on("session.idle", () => {
+      this.aborting = false; // a real idle means any in-flight abort has settled
       const waiters = this.idleWaiters;
       this.idleWaiters = [];
       for (const w of waiters) w();
@@ -135,9 +143,19 @@ export class SessionActor {
       return DENY_UNAVAILABLE;
     }
     const summary = summarizePermission(r);
-    if (summary.length > MAX_PERMISSION_SUMMARY) {
-      // Don't show a command we can't render in full — a truncated approval
-      // could hide a dangerous suffix. Deny and tell the operator.
+    if (hasBidiOrControls(summary)) {
+      // Bidirectional/control characters have no legitimate use in a shell
+      // command and are a spoofing signal (the card would have to strip them,
+      // making it differ from what actually runs). Deny outright.
+      await this.opts.transport.notice(
+        this.opts.sessionKey,
+        "Auto-denied: the command contains bidirectional/control characters (possible spoofing)."
+      );
+      return DENY_UNAVAILABLE;
+    }
+    if (sanitizeForCodeBlock(summary).length > MAX_CARD_LEN) {
+      // Gate on the SANITIZED (display) length: escaping can expand the text,
+      // and a card we can't render in full could hide a dangerous suffix.
       await this.opts.transport.notice(
         this.opts.sessionKey,
         "Auto-denied a shell command too long to display in full for approval. " +
@@ -152,13 +170,23 @@ export class SessionActor {
       timeoutMs: PERMISSION_TIMEOUT_MS,
       onDefault: () => DENY_UNAVAILABLE,
     });
-    await this.opts.transport.showPermission({
-      nonce,
-      sessionKey: this.opts.sessionKey,
-      kind,
-      summary,
-      supported: true,
-    });
+    try {
+      await this.opts.transport.showPermission({
+        nonce,
+        sessionKey: this.opts.sessionKey,
+        kind,
+        summary,
+        supported: true,
+      });
+    } catch {
+      // Couldn't post the card (e.g. embed rejected) — settle deny now rather
+      // than leave the SDK callback pending until the broker timeout.
+      this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
+      await this.opts.transport.notice(
+        this.opts.sessionKey,
+        "Auto-denied: could not render the approval card."
+      );
+    }
     return await promise;
   }
 
@@ -179,34 +207,61 @@ export class SessionActor {
   /**
    * Run one prompt to completion. The idle waiter is armed BEFORE `send` so a
    * fast `session.idle` cannot be missed (lost-wakeup). Completion is driven by
-   * the real `session.idle` event — not a wall clock — so a long or
-   * permission-gated turn is never falsely declared finished. A watchdog only
-   * fires as a last resort and ABORTS the turn (which makes the session go
-   * idle); it never fabricates an idle.
+   * the real `session.idle` event. If a turn runs past `watchdogMs`, the
+   * watchdog ABORTS it (which makes the session go idle → normal completion,
+   * reported as a timeout). If even the abort doesn't yield idle within a grace
+   * window, the session is destroyed (faulted) so it is never reused mid-turn.
    */
   async runTurn(prompt: string, watchdogMs = TURN_WATCHDOG_MS): Promise<void> {
     const idle = this.nextIdle();
     await this.send(prompt);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let watchdogFired = false;
-    const watchdog = new Promise<void>((resolve) => {
-      timer = setTimeout(() => {
-        watchdogFired = true;
-        void this.stop().finally(() => resolve());
-      }, watchdogMs);
-      (timer as { unref?: () => void }).unref?.();
-    });
-    try {
-      await Promise.race([idle, watchdog]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-    if (watchdogFired) {
+    const outcome = await this.awaitTurnEnd(idle, watchdogMs);
+    if (outcome === "watchdog") {
       await this.opts.transport.notice(
         this.opts.sessionKey,
         "⏱️ Turn exceeded the time limit and was aborted."
       );
+    } else if (outcome === "faulted") {
+      await this.opts.transport.notice(
+        this.opts.sessionKey,
+        "⚠️ Turn did not stop cleanly; the session was reset. Start a new one with /new."
+      );
     }
+  }
+
+  /** Resolve when the turn truly ends. Order of finalization:
+   *  - real `session.idle` → "idle" (or "watchdog" if the watchdog aborted it);
+   *  - abort didn't produce idle within the grace window → "faulted" (session
+   *    destroyed). Never fabricates idle. */
+  private awaitTurnEnd(
+    idle: Promise<void>,
+    watchdogMs: number
+  ): Promise<"idle" | "watchdog" | "faulted"> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let watchdogFired = false;
+      let wd: ReturnType<typeof setTimeout>;
+      let hard: ReturnType<typeof setTimeout>;
+      const done = (r: "idle" | "watchdog" | "faulted"): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(wd);
+        clearTimeout(hard);
+        resolve(r);
+      };
+      void idle.then(() => done(watchdogFired ? "watchdog" : "idle"));
+      wd = setTimeout(() => {
+        watchdogFired = true;
+        void this.stop(); // abort; expect session.idle to follow
+      }, watchdogMs);
+      hard = setTimeout(() => {
+        void this.disconnect()
+          .catch(() => {})
+          .finally(() => done("faulted"));
+      }, watchdogMs + FAULT_GRACE_MS);
+      (wd as { unref?: () => void }).unref?.();
+      (hard as { unref?: () => void }).unref?.();
+    });
   }
 
   /** A promise that resolves the next time the session goes idle. */
@@ -214,9 +269,9 @@ export class SessionActor {
     return new Promise<void>((resolve) => this.idleWaiters.push(resolve));
   }
 
-  /** Abort the current turn and settle any pending prompts (deny). Rejects new
-   *  permissions while in flight. Returns whether the underlying abort call
-   *  succeeded so the caller can report truthfully. */
+  /** Abort the current turn and settle any pending prompts (deny). New
+   *  permissions fail closed until the real `session.idle` arrives (which
+   *  clears `aborting`). Returns whether the abort call itself succeeded. */
   async stop(): Promise<boolean> {
     this.aborting = true;
     this.opts.broker.abortSession(this.opts.sessionKey);
@@ -226,8 +281,6 @@ export class SessionActor {
       return true;
     } catch {
       return false;
-    } finally {
-      this.aborting = false;
     }
   }
 
@@ -239,11 +292,10 @@ export class SessionActor {
     this.aborting = true;
     this.opts.broker.abortSession(this.opts.sessionKey);
     this.unsubscribeDecision?.();
-    try {
-      await this.session.disconnect();
-    } catch {
-      /* best effort */
-    }
+    // Throws on failure so callers replacing this session (/new) can refuse to
+    // start a new one over a runtime session that may still be live. Callers
+    // that want best-effort teardown (shutdown) use `.catch()`.
+    await this.session.disconnect();
   }
 }
 

@@ -26,11 +26,30 @@ import { SessionActor } from "./copilot/session-actor.js";
 import { DiscordTransport } from "./platforms/discord/discord-transport.js";
 import { decodePermissionId } from "./platforms/discord/custom-id.js";
 import { isAuthorized, type AuthContext, type AuthPolicy } from "./platforms/discord/auth.js";
+import type { Decision } from "./core/transport.js";
 
 interface Session {
   actor: SessionActor;
   broker: PendingInteractionBroker;
   running: boolean;
+}
+
+/** Ack the Discord button interaction BEFORE settling the decision. On ack
+ *  success the user's decision is delivered; on ack failure the SAFE default
+ *  (deny) is delivered instead, so an Allow never runs while Discord shows an
+ *  error. Pure + exported for unit tests. */
+export async function resolveButtonAck(
+  ack: () => Promise<unknown>,
+  deliver: (d: Decision) => void,
+  action: Decision
+): Promise<void> {
+  try {
+    await ack();
+  } catch {
+    deliver("deny");
+    return;
+  }
+  deliver(action);
 }
 
 /**
@@ -46,6 +65,9 @@ export class DiscopilotApp {
   private readonly sessions = new Map<string, Session>();
   private readonly policy: AuthPolicy;
   private shuttingDown = false;
+  /** Serializes /new so two near-simultaneous creations can't both pass the
+   *  "one live session" teardown and leave two live sessions. */
+  private creating = false;
 
   private constructor(
     private readonly config: Config,
@@ -83,16 +105,23 @@ export class DiscopilotApp {
     }
     const lock = await acquireSingleInstanceLock(lockPath());
     let copilot: CopilotClient | undefined;
+    let app: DiscopilotApp | undefined;
     try {
       copilot = createCopilotClient({ workingDirectory: repoPath });
       await copilot.start();
       await preflightModel(copilot, config.DEFAULT_MODEL);
-      const app = new DiscopilotApp(config, repoPath, copilot, lock);
+      app = new DiscopilotApp(config, repoPath, copilot, lock);
       await app.login();
       return app;
     } catch (err) {
-      if (copilot) await copilot.stop().catch(() => {});
-      await lock.release().catch(() => {});
+      // Full teardown on any startup failure. If the app was constructed, its
+      // stop() also destroys the (possibly logged-in) Discord client — so a
+      // registration failure after gateway-ready doesn't leak a connection.
+      if (app) await app.stop().catch(() => {});
+      else {
+        if (copilot) await copilot.stop().catch(() => {});
+        await lock.release().catch(() => {});
+      }
       throw err;
     }
   }
@@ -117,7 +146,9 @@ export class DiscopilotApp {
     console.log(
       `✅ discopilot ready — controlling ${this.repoPath}\n` +
         `   guild=${this.config.DISCORD_GUILD_ID} channel=${this.config.DISCORD_PARENT_CHANNEL_ID}\n` +
-        `   model=${this.config.DEFAULT_MODEL} contextTier=${this.config.DEFAULT_CONTEXT_TIER}`
+        `   model=${this.config.DEFAULT_MODEL} contextTier=${this.config.DEFAULT_CONTEXT_TIER}\n` +
+        `   ⚠️  lab mode: tools run as this OS user with no sandbox. The bot uses your\n` +
+        `      logged-in Copilot, so any saved "always allow" rules bypass the Discord prompt.`
     );
   }
 
@@ -168,16 +199,15 @@ export class DiscopilotApp {
       await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
       return;
     }
-    // Acknowledge Discord (and remove the buttons) BEFORE settling an Allow, so
-    // a command can never run while the user sees "interaction failed". If the
-    // ack fails, settle the SAFE default (deny) instead of the click's action.
-    try {
-      await interaction.update({ components: [] });
-    } catch {
-      this.transport.deliverDecision(decoded.nonce, "deny", interaction.user.id);
-      return;
-    }
-    this.transport.deliverDecision(decoded.nonce, decoded.action, interaction.user.id);
+    // Acknowledge Discord (and remove the buttons) BEFORE settling the decision,
+    // so an Allow can never run while the user sees "interaction failed". If the
+    // ack fails, the SAFE default (deny) is delivered instead. (See
+    // resolveButtonAck — unit-tested for both orderings.)
+    await resolveButtonAck(
+      () => interaction.update({ components: [] }),
+      (d) => this.transport.deliverDecision(decoded.nonce, d, interaction.user.id),
+      decoded.action
+    );
   }
 
   private async cmdNew(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -193,34 +223,49 @@ export class DiscopilotApp {
       return;
     }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const parent = await this.discord.channels.fetch(this.config.DISCORD_PARENT_CHANNEL_ID);
-    if (!parent || parent.type !== ChannelType.GuildText) {
-      await interaction.editReply("Parent channel is not a text channel.");
+    if (this.creating) {
+      await interaction.editReply("A session is already being created — please retry in a moment.");
       return;
     }
-    // v1 runs ONE live session at a time: all sessions share the single
-    // controlled working tree, so two concurrent agents could clobber each
-    // other's checkout/edits. Starting a new session ends the previous one.
-    await this.endAllSessions("A new session was started; this one has ended.");
+    this.creating = true;
+    try {
+      const parent = await this.discord.channels.fetch(this.config.DISCORD_PARENT_CHANNEL_ID);
+      if (!parent || parent.type !== ChannelType.GuildText) {
+        await interaction.editReply("Parent channel is not a text channel.");
+        return;
+      }
+      // v1 runs ONE live session at a time: all sessions share the single
+      // controlled working tree, so two concurrent agents could clobber each
+      // other's checkout/edits. Refuse to start if the previous one won't end.
+      const ended = await this.endAllSessions("A new session was started; this one has ended.");
+      if (!ended) {
+        await interaction.editReply(
+          "Could not cleanly end the previous session; not starting a new one. Try again."
+        );
+        return;
+      }
 
-    const thread = await (parent as TextChannel).threads.create({
-      name: `copilot ${new Date().toISOString().slice(5, 16).replace("T", " ")}`,
-      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
-    });
-    const broker = new PendingInteractionBroker();
-    const actor = await SessionActor.create(this.copilot, {
-      sessionKey: thread.id,
-      workingDirectory: this.repoPath,
-      model: this.config.DEFAULT_MODEL,
-      contextTier: this.config.DEFAULT_CONTEXT_TIER,
-      broker,
-      transport: this.transport,
-    });
-    this.sessions.set(thread.id, { actor, broker, running: false });
-    await interaction.editReply(`Started a session in <#${thread.id}>. Send prompts there.`);
+      const thread = await (parent as TextChannel).threads.create({
+        name: `copilot ${new Date().toISOString().slice(5, 16).replace("T", " ")}`,
+        autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+      });
+      const broker = new PendingInteractionBroker();
+      const actor = await SessionActor.create(this.copilot, {
+        sessionKey: thread.id,
+        workingDirectory: this.repoPath,
+        model: this.config.DEFAULT_MODEL,
+        contextTier: this.config.DEFAULT_CONTEXT_TIER,
+        broker,
+        transport: this.transport,
+      });
+      this.sessions.set(thread.id, { actor, broker, running: false });
+      await interaction.editReply(`Started a session in <#${thread.id}>. Send prompts there.`);
 
-    const prompt = interaction.options.getString("prompt");
-    if (prompt) void this.runTurn(thread.id, prompt);
+      const prompt = interaction.options.getString("prompt");
+      if (prompt) void this.runTurn(thread.id, prompt);
+    } finally {
+      this.creating = false;
+    }
   }
 
   private async cmdStop(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -282,14 +327,21 @@ export class DiscopilotApp {
     }
   }
 
-  /** Tear down every live session (disconnect + release render state). */
-  private async endAllSessions(reason: string): Promise<void> {
+  /** Tear down every live session (disconnect + release render state). Returns
+   *  false if any session failed to disconnect cleanly. */
+  private async endAllSessions(reason: string): Promise<boolean> {
+    let ok = true;
     for (const [threadId, session] of this.sessions) {
       await this.transport.notice(threadId, reason).catch(() => {});
-      await session.actor.disconnect().catch(() => {});
+      try {
+        await session.actor.disconnect();
+      } catch {
+        ok = false;
+      }
       this.transport.dispose(threadId);
     }
     this.sessions.clear();
+    return ok;
   }
 
   // ---- shutdown ----------------------------------------------------------

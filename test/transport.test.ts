@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { DiscordTransport, sanitizeForCodeBlock } from "../src/platforms/discord/discord-transport.js";
+import { hasBidiOrControls } from "../src/core/text-safety.js";
 import { decodePermissionId } from "../src/platforms/discord/custom-id.js";
 import type { Client } from "discord.js";
 
@@ -59,6 +60,14 @@ describe("sanitizeForCodeBlock", () => {
   it("strips BiDi/control characters used for visual spoofing", () => {
     const out = sanitizeForCodeBlock("echo safe\u202evohsg nur\u202c");
     expect(out).not.toMatch(/[\u202A-\u202E\u2066-\u2069]/);
+  });
+});
+
+describe("hasBidiOrControls", () => {
+  it("detects bidi override / isolate / marks", () => {
+    expect(hasBidiOrControls("echo \u202egnp")).toBe(true);
+    expect(hasBidiOrControls("a\u2066b\u2069")).toBe(true);
+    expect(hasBidiOrControls("plain git status")).toBe(false);
   });
 });
 

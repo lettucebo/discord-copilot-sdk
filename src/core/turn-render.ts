@@ -21,29 +21,35 @@ export interface RenderState {
 /**
  * Accumulates a single turn's events into a render state.
  *
- * Correctness rules (both flagged by review as easy to get wrong):
- *  - **Final message is authoritative**: once a persisted `message` arrives, its
- *    `content` replaces the streamed deltas — we never show both.
- *  - **Sub-agent filtering**: sub-agents stream with a different `agentId` and can
- *    interleave; we bind to the first-seen (root) agentId and ignore the rest, so
- *    the main response text stays clean.
+ * Correctness rules (all flagged by review as easy to get wrong):
+ *  - **Root vs sub-agent**: root/main-agent events have NO `agentId` (the SDK
+ *    sets it only for sub-agents). We render root events and ignore sub-agents
+ *    so the main response stays clean — binding to `agentId === undefined`, not
+ *    "the first agent seen" (which a stray sub-agent event could hijack).
+ *  - **Multi-message turns stream**: an agentic turn commonly emits an
+ *    assistant message, runs a tool, then streams ANOTHER assistant message. We
+ *    keep the finalized text of completed messages and a live buffer for the
+ *    one currently streaming, so post-tool messages stream and earlier messages
+ *    are not lost. A message's persisted `content` is authoritative for that
+ *    message and replaces its streamed deltas.
  */
 export class TurnRenderer {
-  private rootAgentId: string | undefined;
-  private rootBound = false;
-  private deltaBuf = "";
-  private finalText: string | undefined;
+  private finalizedText = "";
+  private streamingBuf = "";
   private readonly toolOrder: string[] = [];
   private readonly tools = new Map<string, ToolView>();
 
   apply(e: NormEvent): void {
-    if (!this.isRoot(e.agentId)) return; // ignore sub-agent noise
+    if (e.agentId !== undefined) return; // ignore sub-agent noise
     switch (e.type) {
       case "message_delta":
-        if (this.finalText === undefined) this.deltaBuf += e.text;
+        this.streamingBuf += e.text;
         return;
       case "message":
-        this.finalText = e.content; // authoritative — supersedes deltas
+        // Authoritative content for the just-completed message: append it and
+        // reset the live buffer for the next message in this turn.
+        this.finalizedText += (this.finalizedText ? "\n\n" : "") + e.content;
+        this.streamingBuf = "";
         return;
       case "tool_start":
         if (!this.tools.has(e.id)) this.toolOrder.push(e.id);
@@ -62,19 +68,10 @@ export class TurnRenderer {
   }
 
   state(): RenderState {
+    const sep = this.finalizedText && this.streamingBuf ? "\n\n" : "";
     return {
-      assistantText: this.finalText ?? this.deltaBuf,
+      assistantText: this.finalizedText + sep + this.streamingBuf,
       tools: this.toolOrder.map((id) => this.tools.get(id)!),
     };
-  }
-
-  /** Bind to the first agentId we see; thereafter only that agent is "root". */
-  private isRoot(agentId: string | undefined): boolean {
-    if (!this.rootBound) {
-      this.rootAgentId = agentId;
-      this.rootBound = true;
-      return true;
-    }
-    return agentId === this.rootAgentId;
   }
 }

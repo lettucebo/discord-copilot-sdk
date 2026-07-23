@@ -106,8 +106,12 @@ describe("SessionActor config hardening", () => {
 
   it("onUserInputRequest returns a valid UserInputResponse (fail-closed decline)", async () => {
     const s = await setup();
-    const r = await (s.config["onUserInputRequest"] as () => Promise<unknown>)();
-    expect(r).toEqual({ answer: "", wasFreeform: true });
+    const r = (await (s.config["onUserInputRequest"] as () => Promise<unknown>)()) as {
+      answer: string;
+      wasFreeform: boolean;
+    };
+    expect(r.wasFreeform).toBe(true);
+    expect(r.answer).toMatch(/no operator/i); // clear decline, not an empty answer
   });
 });
 
@@ -171,6 +175,24 @@ describe("SessionActor permission handling", () => {
     });
     await tick();
     expect(s.transport.permissions.at(-1)!.summary).toContain("SANDBOX BYPASS");
+  });
+
+  it("auto-denies a command containing bidirectional/control characters", async () => {
+    const s = await setup();
+    const result = await perm(s)({ kind: "shell", fullCommandText: "echo \u202eevil" });
+    expect(result).toEqual({ kind: "user-not-available" });
+    expect(s.transport.notices.some((n) => /bidirectional|control/i.test(n))).toBe(true);
+    expect(s.transport.permissions).toHaveLength(0);
+  });
+
+  it("settles deny (no leak) if the approval card cannot be posted", async () => {
+    const s = await setup();
+    s.transport.showPermission = async () => {
+      throw new Error("embed rejected");
+    };
+    const result = await perm(s)({ kind: "shell", fullCommandText: "ls" });
+    expect(result).toEqual({ kind: "user-not-available" });
+    expect(s.broker.size).toBe(0);
   });
 });
 
