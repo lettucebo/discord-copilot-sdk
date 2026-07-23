@@ -35,4 +35,11 @@ describe("acquireSingleInstanceLock", () => {
     await expect(acquireSingleInstanceLock(lockPath, () => true)).rejects.toThrow(/indeterminate|fail-closed/i);
     expect(existsSync(lockPath)).toBe(true); // must NOT have reclaimed/removed it
   });
+
+  it("release does not delete a lock now owned by a successor", async () => {
+    const lock = await acquireSingleInstanceLock(lockPath);
+    writeFileSync(lockPath, "424242", "utf8"); // a successor overwrote ownership
+    await lock.release();
+    expect(existsSync(lockPath)).toBe(true); // our release must not remove it
+  });
 });

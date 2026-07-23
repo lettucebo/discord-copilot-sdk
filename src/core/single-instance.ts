@@ -40,7 +40,7 @@ export async function acquireSingleInstanceLock(
 ): Promise<InstanceLock> {
   for (let attempt = 0; attempt < 2; attempt++) {
     if (tryCreateLock(lockPath)) {
-      return { path: lockPath, release: () => releaseQuietly(lockPath) };
+      return { path: lockPath, release: () => releaseIfOwner(lockPath) };
     }
 
     // Lock file already exists — decide whether we may reclaim it.
@@ -111,7 +111,11 @@ function removeQuietlySync(lockPath: string): void {
   }
 }
 
-async function releaseQuietly(lockPath: string): Promise<void> {
+async function releaseIfOwner(lockPath: string): Promise<void> {
+  // Only remove the lock if it still belongs to us. If it was reclaimed by a
+  // successor (e.g. we were mistakenly considered dead), we must NOT delete the
+  // successor's lock.
+  if (readHolderPid(lockPath) !== process.pid) return;
   try {
     await unlink(lockPath);
   } catch {

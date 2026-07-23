@@ -1,25 +1,40 @@
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
 import { acquireSingleInstanceLock } from "./core/single-instance.js";
+import { lockPath } from "./core/paths.js";
 import { checkSdkCompat, sdkSelfCheck } from "./copilot/sdk.js";
 
-const LOCK_PATH = join(tmpdir(), "discopilot.lock");
+/** Load ./.env into process.env if present (Node built-in; no dependency). */
+function loadDotEnv(): void {
+  if (!existsSync(".env")) return;
+  try {
+    // process.loadEnvFile is available on Node >= 20.12 / 22.
+    (process as unknown as { loadEnvFile?: (p?: string) => void }).loadEnvFile?.(".env");
+  } catch {
+    /* malformed/unreadable .env — ignore; config validation will surface it */
+  }
+}
 
 async function main(): Promise<void> {
+  loadDotEnv();
   const args = new Set(process.argv.slice(2));
 
   if (args.has("--version")) {
     const c = checkSdkCompat();
-    console.log(`discopilot • @github/copilot-sdk ${c.installed} (expected ${c.expected})`);
+    console.log(
+      `discopilot • @github/copilot-sdk installed ${c.installed} (declared ${c.declared})` +
+        (c.ok ? "" : "  ⚠️ mismatch")
+    );
     return;
   }
 
   if (args.has("--selfcheck")) {
-    const lock = await acquireSingleInstanceLock(LOCK_PATH);
+    const lock = await acquireSingleInstanceLock(lockPath());
     try {
       const compat = checkSdkCompat();
       if (!compat.ok) {
-        console.warn(`⚠️  installed SDK ${compat.installed} != expected ${compat.expected}`);
+        console.warn(
+          `⚠️  installed SDK ${compat.installed} != declared ${compat.declared}`
+        );
       }
       console.log(`Connecting to local Copilot via @github/copilot-sdk ${compat.installed} …`);
       const r = await sdkSelfCheck();
@@ -38,7 +53,7 @@ async function main(): Promise<void> {
   console.log(
     "discopilot — the Discord bot is not implemented yet (P1).\n" +
       "  npm start -- --selfcheck   verify the local Copilot SDK wiring\n" +
-      "  npm start -- --version     print the installed SDK version"
+      "  npm start -- --version     print installed/declared SDK versions"
   );
 }
 

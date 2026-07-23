@@ -1,76 +1,136 @@
 import fs from "node:fs";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
-import { CopilotClient } from "@github/copilot-sdk";
+import { fileURLToPath } from "node:url";
+import { CopilotClient, type ModelInfo } from "@github/copilot-sdk";
 
-/** The SDK version this build is written and tested against. The user requested
- *  tracking the latest published version (npm dist-tag `latest`). */
-export const EXPECTED_SDK_VERSION = "1.0.7-preview.3";
-
-/** Read the installed @github/copilot-sdk version from its package.json on disk.
- *  (The package's `exports` map hides package.json from `require`, so we resolve
- *  the entry and walk up to the package root — the entry may be nested a few
- *  levels deep, e.g. dist/cjs/index.js, so we don't assume a fixed depth.) */
-export function installedSdkVersion(): string {
-  const require = createRequire(import.meta.url);
-  const entry = require.resolve("@github/copilot-sdk");
-  let dir = path.dirname(entry);
-  for (let i = 0; i < 8; i++) {
+/** Walk up from `startDir` to find a package.json whose `name` matches, and
+ *  return a field from it. Robust to nested dist entry points. */
+function readPkgField<T>(
+  startDir: string,
+  name: string,
+  pick: (pkg: Record<string, unknown>) => T | undefined
+): T | undefined {
+  let dir = startDir;
+  for (let i = 0; i < 10; i++) {
     const candidate = path.join(dir, "package.json");
     if (fs.existsSync(candidate)) {
-      const pkg = JSON.parse(fs.readFileSync(candidate, "utf8")) as {
-        name?: string;
-        version?: string;
-      };
-      if (pkg.name === "@github/copilot-sdk" && pkg.version) return pkg.version;
+      const pkg = JSON.parse(fs.readFileSync(candidate, "utf8")) as Record<string, unknown>;
+      if (pkg["name"] === name) {
+        const v = pick(pkg);
+        if (v !== undefined) return v;
+      }
     }
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
-  return "unknown";
+  return undefined;
+}
+
+/** Version of @github/copilot-sdk actually installed in node_modules. */
+export function installedSdkVersion(): string {
+  const require = createRequire(import.meta.url);
+  const entry = require.resolve("@github/copilot-sdk");
+  return (
+    readPkgField(path.dirname(entry), "@github/copilot-sdk", (p) => p["version"] as string) ??
+    "unknown"
+  );
+}
+
+/** SDK version discopilot declares — single source of truth is our own
+ *  package.json dependency pin (no duplicated constant). */
+export function declaredSdkVersion(): string {
+  return (
+    readPkgField(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "discopilot",
+      (p) => (p["dependencies"] as Record<string, string> | undefined)?.["@github/copilot-sdk"]
+    ) ?? "unknown"
+  );
 }
 
 export interface SdkCompat {
   installed: string;
-  expected: string;
+  declared: string;
   ok: boolean;
 }
 
-/** Startup compatibility check: does the installed SDK match what we target? */
+/** Does the installed SDK match the version discopilot was built against? */
 export function checkSdkCompat(): SdkCompat {
   const installed = installedSdkVersion();
-  return { installed, expected: EXPECTED_SDK_VERSION, ok: installed === EXPECTED_SDK_VERSION };
+  const declared = declaredSdkVersion();
+  return { installed, declared, ok: installed === declared };
+}
+
+/** Build the sanitized environment handed to the Copilot runtime. Strips the
+ *  controller's Discord/discopilot secrets so a tool the agent runs cannot read
+ *  them from its process env. (Defense-in-depth, not isolation — see PLAN §1.) */
+export function sanitizeRuntimeEnv(
+  base: NodeJS.ProcessEnv
+): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (/^(DISCORD_|DISCOPILOT_)/i.test(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+export interface ClientOptions {
+  /** Session working directory. Defaults to a neutral temp dir (self-check). */
+  workingDirectory?: string;
+}
+
+/**
+ * Central factory for the CopilotClient. Explicitly chooses a sanitized env and
+ * working directory instead of inheriting the controller's. Uses the host's
+ * logged-in Copilot, so `baseDirectory` is left at the default (~/.copilot),
+ * where the login lives.
+ */
+export function createCopilotClient(opts: ClientOptions = {}): CopilotClient {
+  return new CopilotClient({
+    useLoggedInUser: true,
+    logLevel: "error",
+    env: sanitizeRuntimeEnv(process.env),
+    workingDirectory: opts.workingDirectory ?? tmpdir(),
+  });
 }
 
 export interface SelfCheckResult {
-  version: string;
+  installed: string;
+  declared: string;
   modelCount: number;
   sample?: { id: string; contextWindow?: number; efforts?: string[] };
 }
 
-interface ModelLike {
-  id: string;
-  capabilities?: { limits?: { max_context_window_tokens?: number } };
-  supportedReasoningEfforts?: string[];
-}
-
 /** Connect to the local Copilot runtime and enumerate models. Proves the SDK
- *  wiring + local auth work end to end. Uses the host's logged-in Copilot. */
+ *  wiring + local auth work end to end. Treats zero models as a failure. */
 export async function sdkSelfCheck(): Promise<SelfCheckResult> {
-  const client = new CopilotClient({ useLoggedInUser: true, logLevel: "error" });
+  const client = createCopilotClient();
   await client.start();
   try {
-    const models = (await client.listModels()) as unknown as ModelLike[];
+    const models: ModelInfo[] = await client.listModels();
+    if (models.length === 0) {
+      throw new Error(
+        "SDK self-check failed: listModels() returned 0 models (auth/policy problem?)."
+      );
+    }
     const m = models.find((x) => /sonnet|gpt/i.test(x.id)) ?? models[0];
     const sample = m
       ? {
           id: m.id,
           contextWindow: m.capabilities?.limits?.max_context_window_tokens,
-          efforts: m.supportedReasoningEfforts,
+          efforts: m.supportedReasoningEfforts as string[] | undefined,
         }
       : undefined;
-    return { version: installedSdkVersion(), modelCount: models.length, ...(sample ? { sample } : {}) };
+    return {
+      installed: installedSdkVersion(),
+      declared: declaredSdkVersion(),
+      modelCount: models.length,
+      ...(sample ? { sample } : {}),
+    };
   } finally {
     await client.stop();
   }
