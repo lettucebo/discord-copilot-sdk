@@ -163,12 +163,22 @@ export class DiscordTransport implements Transport {
     const embed = new EmbedBuilder()
       .setColor(bypass ? 0xe74c3c : 0xf1c40f)
       .setTitle(`🔐 Permission requested: ${view.kind}${bypass ? " ⚠️ SANDBOX BYPASS" : ""}`)
-      .setDescription("```\n" + sanitizeForCodeBlock(view.summary) + "\n```")
-      .setFooter({
-        text: view.canOfferSession
-          ? "Once = this request · Session = until the session ends · Always = remembered for this repo"
-          : "Approve applies to this single request only.",
+      .setDescription("```\n" + sanitizeForCodeBlock(view.summary) + "\n```");
+    if (view.canOfferSession && view.scopeCommands.length) {
+      // Informed consent: session/always don't just approve THIS command — they
+      // auto-approve every future invocation of these identifiers with no
+      // further prompt. Disclose exactly what the wider scope grants.
+      const list = view.scopeCommands.map((c) => `\`${c}\``).join(", ");
+      embed.addFields({
+        name: "⚠️ Session / Always scope",
+        value: `Auto-approves ALL future ${list} commands (no further Discord prompt) for the session / this repo.`,
       });
+    }
+    embed.setFooter({
+      text: view.canOfferSession
+        ? "Once = this request · Session = until the session ends · Always = remembered for this repo"
+        : "Approve applies to this single request only.",
+    });
     const row = new ActionRowBuilder<ButtonBuilder>();
     row.addComponents(
       new ButtonBuilder()

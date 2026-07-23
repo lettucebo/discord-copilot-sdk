@@ -173,7 +173,7 @@ describe("SessionActor permission handling", () => {
     expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
   });
 
-  it("self-defends: a wider decision on a non-approvable request narrows to approve-once", async () => {
+  it("self-defends: a wider decision on a non-approvable request FAILS CLOSED (deny)", async () => {
     const s = await setup();
     const result = perm(s)({
       kind: "shell",
@@ -182,9 +182,21 @@ describe("SessionActor permission handling", () => {
       commands: [{ identifier: "git", readOnly: true }],
     });
     await tick();
-    // Even if a "session"/"always" decision is somehow delivered, never widen.
+    // A "session"/"always" decision the request never authorized must deny.
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "session", "u1");
-    expect(await result).toEqual({ kind: "approve-once" });
+    expect(await result).toEqual({ kind: "denied-interactively-by-user" });
+  });
+
+  it("suppresses wider scopes for a generic interpreter (always-allow-powershell footgun)", async () => {
+    const s = await setup();
+    void perm(s)({
+      kind: "shell",
+      fullCommandText: "powershell -c whoami",
+      canOfferSessionApproval: true,
+      commands: [{ identifier: "powershell", readOnly: false }],
+    });
+    await tick();
+    expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
   });
 
   it("denies when the user denies", async () => {

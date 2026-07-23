@@ -18,6 +18,10 @@ export interface PermissionView {
   /** true ⇒ the request can be approved for the session / repo, so the wider
    *  approval buttons (session/always) are offered. */
   canOfferSession: boolean;
+  /** The command identifiers a session/always approval would cover (e.g.
+   *  ["git"]). Disclosed on the card so the user knows the wider scope grants
+   *  more than the single displayed command. */
+  scopeCommands: string[];
 }
 
 /**

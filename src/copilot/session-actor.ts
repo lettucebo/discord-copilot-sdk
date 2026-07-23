@@ -188,7 +188,14 @@ export class SessionActor {
       return DENY_UNAVAILABLE;
     }
     const commandIdentifiers = extractCommandIdentifiers(r);
-    const canOfferSession = r["canOfferSessionApproval"] === true && commandIdentifiers.length > 0;
+    // Suppress the wider (session/always) scopes when the parsed command is a
+    // generic interpreter (powershell/bash/…): "always allow powershell" would
+    // auto-approve essentially every future shell command. Those must stay
+    // per-request. Wider scopes are offered only for specific executables.
+    const canOfferSession =
+      r["canOfferSessionApproval"] === true &&
+      commandIdentifiers.length > 0 &&
+      !commandIdentifiers.some(isGenericInterpreter);
     const { nonce, promise } = this.opts.broker.register<unknown>({
       sessionKey: this.opts.sessionKey,
       generation: this.generation,
@@ -202,24 +209,25 @@ export class SessionActor {
       canOfferSession,
     });
     try {
-      await this.opts.transport.showPermission({
-        nonce,
-        sessionKey: this.opts.sessionKey,
-        kind,
-        summary,
-        supported: true,
-        canOfferSession,
-      });
-    } catch {
-      // Couldn't post the card (e.g. embed rejected) — settle deny now rather
-      // than leave the SDK callback pending until the broker timeout.
-      this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
-      await this.opts.transport.notice(
-        this.opts.sessionKey,
-        "Auto-denied: could not render the approval card."
-      );
-    }
-    try {
+      try {
+        await this.opts.transport.showPermission({
+          nonce,
+          sessionKey: this.opts.sessionKey,
+          kind,
+          summary,
+          supported: true,
+          canOfferSession,
+          scopeCommands: commandIdentifiers,
+        });
+      } catch {
+        // Couldn't post the card (e.g. embed rejected) — settle deny now rather
+        // than leave the SDK callback pending until the broker timeout. Guard
+        // the notice so a second failure can't skip the finally cleanup below.
+        this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
+        await this.opts.transport
+          .notice(this.opts.sessionKey, "Auto-denied: could not render the approval card.")
+          .catch(() => {});
+      }
       return await promise;
     } finally {
       this.pendingPerms.delete(nonce);
@@ -232,25 +240,27 @@ export class SessionActor {
 
   /** Map a UI decision to the SDK PermissionDecision, using the request's
    *  captured command identifiers for the wider (session/location) scopes.
-   *  Self-defending: a wider scope is only emitted when the request was marked
-   *  session-approvable AND has identifiers; otherwise it narrows to
-   *  approve-once. Falls back to approve-once if the metadata is missing. */
+   *  Self-defending & fail-closed: a `session`/`always` decision produces a
+   *  wider scope ONLY when the request was marked session-approvable AND has
+   *  identifiers; otherwise it DENIES (never silently widens, never silently
+   *  approves a scope the request didn't authorize). `once` always approves
+   *  just this request. */
   private buildDecision(nonce: string, decision: Decision): unknown {
     if (decision === "deny") return DENIED_BY_USER;
+    if (decision === "once") return { kind: "approve-once" };
     const meta = this.pendingPerms.get(nonce);
     const cmds = meta?.commandIdentifiers ?? [];
     const wider = meta?.canOfferSession === true && cmds.length > 0;
-    if (decision === "session" && wider) {
+    if (!wider) return DENIED_BY_USER; // session/always not authorized → fail closed
+    if (decision === "session") {
       return { kind: "approve-for-session", approval: { kind: "commands", commandIdentifiers: cmds } };
     }
-    if (decision === "always" && wider && meta) {
-      return {
-        kind: "approve-for-location",
-        approval: { kind: "commands", commandIdentifiers: cmds },
-        locationKey: meta.locationKey,
-      };
-    }
-    return { kind: "approve-once" }; // "once", or a wider scope the request didn't allow
+    // decision === "always"
+    return {
+      kind: "approve-for-location",
+      approval: { kind: "commands", commandIdentifiers: cmds },
+      locationKey: meta!.locationKey,
+    };
   }
 
   /** Send a user prompt, starting a fresh turn's render state. Rejects once the
@@ -398,6 +408,30 @@ export class SessionActor {
       timeout,
     ]);
   }
+}
+
+/** Command identifiers that are generic shells/interpreters — approving these
+ *  for the session/repo would auto-approve essentially any future command, so
+ *  the wider scopes are never offered for them (they stay per-request). */
+const GENERIC_INTERPRETERS = new Set([
+  "powershell",
+  "powershell.exe",
+  "pwsh",
+  "pwsh.exe",
+  "cmd",
+  "cmd.exe",
+  "bash",
+  "sh",
+  "zsh",
+  "dash",
+  "ksh",
+  "fish",
+  "wsl",
+  "wsl.exe",
+]);
+
+function isGenericInterpreter(identifier: string): boolean {
+  return GENERIC_INTERPRETERS.has(identifier.trim().toLowerCase());
 }
 
 /** Pull parsed command identifiers (e.g. ["git"]) from a shell permission

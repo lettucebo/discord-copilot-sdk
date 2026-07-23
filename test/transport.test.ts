@@ -139,6 +139,7 @@ describe("DiscordTransport permission card", () => {
       summary: "$ git status",
       supported: true,
       canOfferSession: true,
+      scopeCommands: ["git"],
     });
     const actions = buttonIds(ch.sent[0]!).map((id) => decodePermissionId(id)!.action);
     expect(actions).toEqual(["once", "session", "always", "deny"]);
