@@ -247,7 +247,7 @@ describe("DiscordTransport ask_user / plan cards", () => {
       .filter((m) => typeof m.content === "string")
       .map((m) => m.content)
       .join("");
-    expect(textPosted).toContain("S".repeat(4000)); // full summary present across chunks
+    expect(textPosted).toContain("S".repeat(5000)); // ENTIRE summary present across chunks
     expect(ch.sent.some((m) => m.opts && (m.opts as Record<string, unknown>)["embeds"])).toBe(true); // card posted
   });
 });
