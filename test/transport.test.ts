@@ -205,7 +205,8 @@ describe("DiscordTransport ask_user / plan cards", () => {
       actions: ["Proceed", "Autopilot"],
       recommendedAction: "Proceed",
     });
-    const decoded = buttonIds(ch.sent[0]!).map((id) => decodePlanId(id)!.action);
+    const cardMsg = ch.sent.find((m) => m.opts && (m.opts as Record<string, unknown>)["components"])!;
+    const decoded = buttonIds(cardMsg).map((id) => decodePlanId(id)!.action);
     expect(decoded).toEqual([0, 1, "reject"]);
   });
 
@@ -222,5 +223,31 @@ describe("DiscordTransport ask_user / plan cards", () => {
     offC();
     t.deliverChoice("n", 0, "u");
     expect(c).toHaveBeenCalledTimes(1);
+  });
+
+  it("showUserInput throws when the thread is unavailable (no false success)", async () => {
+    const t = new DiscordTransport({ channels: { fetch: async () => null } } as unknown as Client);
+    await expect(
+      t.showUserInput({ nonce: "n", sessionKey: "x", question: "Q", choices: [], allowFreeform: true })
+    ).rejects.toThrow();
+  });
+
+  it("showPlan publishes the FULL summary in chunks before the card (no truncation)", async () => {
+    const ch = new FakeChannel();
+    const t = new DiscordTransport(fakeClient(ch));
+    const bigSummary = "S".repeat(5000); // larger than one message
+    await t.showPlan({
+      nonce: "p",
+      sessionKey: "x",
+      summary: bigSummary,
+      actions: ["Go"],
+      recommendedAction: "Go",
+    });
+    const textPosted = ch.sent
+      .filter((m) => typeof m.content === "string")
+      .map((m) => m.content)
+      .join("");
+    expect(textPosted).toContain("S".repeat(4000)); // full summary present across chunks
+    expect(ch.sent.some((m) => m.opts && (m.opts as Record<string, unknown>)["embeds"])).toBe(true); // card posted
   });
 });

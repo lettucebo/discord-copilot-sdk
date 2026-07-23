@@ -240,7 +240,7 @@ export class DiscordTransport implements Transport {
 
   async showUserInput(view: UserInputView): Promise<void> {
     const channel = await this.fetchThread(view.sessionKey);
-    if (!channel) return;
+    if (!channel) throw new Error("ask_user thread unavailable"); // never report false success
     const embed = new EmbedBuilder()
       .setColor(0x3498db)
       .setTitle("❓ Copilot is asking")
@@ -264,18 +264,17 @@ export class DiscordTransport implements Transport {
   async showPlan(view: PlanView): Promise<void> {
     const channel = await this.fetchThread(view.sessionKey);
     if (!channel) throw new Error("plan thread unavailable"); // actor settles "not approved"
-    // Publish the COMPLETE plan first (chunked) so approval is informed — never
-    // show approve buttons over a silently truncated plan.
-    if (view.planContent) {
-      const chunks = chunkText("📋 Proposed plan:\n" + view.planContent);
-      if (chunks.length > 20) throw new Error("plan too long to publish in full");
-      for (const c of chunks) await channel.send({ content: c, ...NO_MENTIONS });
-    }
+    // Publish the COMPLETE plan text (summary + full content) first, chunked, so
+    // approval is informed — never truncate the info the operator decides on.
+    const full = view.summary + (view.planContent ? "\n\n" + view.planContent : "");
+    const chunks = chunkText("📋 Proposed plan:\n" + full);
+    if (chunks.length > 20) throw new Error("plan too long to publish in full");
+    for (const c of chunks) await channel.send({ content: c, ...NO_MENTIONS });
+    // Compact approval card that references the full plan posted above.
     const embed = new EmbedBuilder()
       .setColor(0x9b59b6)
       .setTitle("📋 Plan ready — approve to proceed")
-      .setDescription((view.summary || "(no summary)").slice(0, 4000))
-      .setFooter({ text: "Choose an action, or Reject to send it back with feedback." });
+      .setDescription("Review the plan above, then choose an action (or Reject with feedback).");
     const buttons = view.actions.slice(0, 24).map((action, i) =>
       new ButtonBuilder()
         .setCustomId(encodePlanId(view.nonce, i))
