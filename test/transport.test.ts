@@ -46,6 +46,13 @@ function fakeClient(channel: FakeChannel): Client {
   return { channels: { fetch: async () => channel } } as unknown as Client;
 }
 
+function buttonIds(msg: FakeMessage): string[] {
+  const row = (msg.opts!["components"] as Array<{ toJSON(): unknown }>)[0]!.toJSON() as {
+    components: Array<{ custom_id: string }>;
+  };
+  return row.components.map((c) => c.custom_id);
+}
+
 const st = (assistantText: string) => ({ assistantText, tools: [] });
 
 describe("sanitizeForCodeBlock", () => {
@@ -106,7 +113,7 @@ describe("DiscordTransport render/flush", () => {
 });
 
 describe("DiscordTransport permission card", () => {
-  it("renders Allow/Deny buttons whose custom ids decode to this nonce", async () => {
+  it("renders once/deny only when session approval is not offerable", async () => {
     const ch = new FakeChannel();
     const t = new DiscordTransport(fakeClient(ch));
     await t.showPermission({
@@ -115,14 +122,26 @@ describe("DiscordTransport permission card", () => {
       kind: "shell",
       summary: "$ rm -rf ~",
       supported: true,
+      canOfferSession: false,
     });
-    const msg = ch.sent[0]!;
-    const components = (msg.opts!["components"] as Array<{ toJSON(): unknown }>)[0]!.toJSON() as {
-      components: Array<{ custom_id: string }>;
-    };
-    const ids = components.components.map((c) => c.custom_id);
-    expect(decodePermissionId(ids[0]!)).toEqual({ nonce: "n-123", action: "allow" });
-    expect(decodePermissionId(ids[1]!)).toEqual({ nonce: "n-123", action: "deny" });
+    const ids = buttonIds(ch.sent[0]!);
+    expect(ids.map((id) => decodePermissionId(id)!.action)).toEqual(["once", "deny"]);
+    expect(decodePermissionId(ids[0]!)).toEqual({ nonce: "n-123", action: "once" });
+  });
+
+  it("adds session/always buttons when session approval IS offerable", async () => {
+    const ch = new FakeChannel();
+    const t = new DiscordTransport(fakeClient(ch));
+    await t.showPermission({
+      nonce: "n9",
+      sessionKey: "thread",
+      kind: "shell",
+      summary: "$ git status",
+      supported: true,
+      canOfferSession: true,
+    });
+    const actions = buttonIds(ch.sent[0]!).map((id) => decodePermissionId(id)!.action);
+    expect(actions).toEqual(["once", "session", "always", "deny"]);
   });
 
   it("sanitizes the displayed command so it cannot break the code fence", async () => {
@@ -134,6 +153,7 @@ describe("DiscordTransport permission card", () => {
       kind: "shell",
       summary: "$ echo ```pwned```",
       supported: true,
+      canOfferSession: false,
     });
     const embed = (ch.sent[0]!.opts!["embeds"] as Array<{ data: { description: string } }>)[0]!;
     const desc = embed.data.description;

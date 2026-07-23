@@ -1,6 +1,10 @@
 import type { RenderState } from "./turn-render.js";
 
-export type Decision = "allow" | "deny";
+/** A user's response to a permission prompt. `once`/`session`/`always` are
+ *  escalating approval scopes; `deny` refuses. For shell these map to the SDK's
+ *  approve-once / approve-for-session (commands) / approve-for-location
+ *  (commands, persisted to the repo) / denied-interactively-by-user. */
+export type Decision = "once" | "session" | "always" | "deny";
 
 /** What a permission prompt shows. `summary` is the COMPLETE structured request
  *  the SDK supplied (never truncated for approval). */
@@ -11,6 +15,9 @@ export interface PermissionView {
   summary: string;
   /** false ⇒ discopilot has no UI for this kind and it will be denied. */
   supported: boolean;
+  /** true ⇒ the request can be approved for the session / repo, so the wider
+   *  approval buttons (session/always) are offered. */
+  canOfferSession: boolean;
 }
 
 /**

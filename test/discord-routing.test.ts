@@ -4,23 +4,25 @@ import { isAuthorized } from "../src/platforms/discord/auth.js";
 import { resolveButtonAck } from "../src/app.js";
 
 describe("custom-id", () => {
-  it("round-trips allow/deny + nonce", () => {
-    const id = encodePermissionId("abc-123", "allow");
-    expect(id).toBe("dp:perm:allow:abc-123");
-    expect(decodePermissionId(id)).toEqual({ nonce: "abc-123", action: "allow" });
-    expect(decodePermissionId(encodePermissionId("n", "deny"))).toEqual({ nonce: "n", action: "deny" });
+  it("round-trips each action + nonce", () => {
+    const id = encodePermissionId("abc-123", "once");
+    expect(id).toBe("dp:perm:once:abc-123");
+    for (const action of ["once", "session", "always", "deny"] as const) {
+      expect(decodePermissionId(encodePermissionId("n", action))).toEqual({ nonce: "n", action });
+    }
   });
 
   it("rejects malformed / foreign ids", () => {
-    expect(decodePermissionId("other:perm:allow:n")).toBeUndefined();
-    expect(decodePermissionId("dp:x:allow:n")).toBeUndefined();
+    expect(decodePermissionId("other:perm:once:n")).toBeUndefined();
+    expect(decodePermissionId("dp:x:once:n")).toBeUndefined();
     expect(decodePermissionId("dp:perm:maybe:n")).toBeUndefined();
-    expect(decodePermissionId("dp:perm:allow:")).toBeUndefined();
-    expect(decodePermissionId("dp:perm:allow")).toBeUndefined();
+    expect(decodePermissionId("dp:perm:allow:n")).toBeUndefined(); // old action name gone
+    expect(decodePermissionId("dp:perm:once:")).toBeUndefined();
+    expect(decodePermissionId("dp:perm:once")).toBeUndefined();
   });
 
   it("stays within Discord's 100-char custom id limit for a uuid nonce", () => {
-    expect(encodePermissionId("123e4567-e89b-12d3-a456-426614174000", "deny").length).toBeLessThanOrEqual(100);
+    expect(encodePermissionId("123e4567-e89b-12d3-a456-426614174000", "always").length).toBeLessThanOrEqual(100);
   });
 });
 
@@ -62,19 +64,19 @@ describe("resolveButtonAck (ack-before-settle)", () => {
         order.push("ack");
       },
       deliver,
-      "allow"
+      "once"
     );
-    expect(order).toEqual(["ack", "deliver:allow"]); // ack strictly first
+    expect(order).toEqual(["ack", "deliver:once"]); // ack strictly first
   });
 
-  it("delivers DENY (never allow) if the ack fails", async () => {
+  it("delivers DENY (never an approval) if the ack fails", async () => {
     const deliver = vi.fn();
     await resolveButtonAck(
       async () => {
         throw new Error("interaction failed");
       },
       deliver,
-      "allow"
+      "always"
     );
     expect(deliver).toHaveBeenCalledWith("deny");
     expect(deliver).toHaveBeenCalledTimes(1);

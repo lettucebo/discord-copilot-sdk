@@ -3,7 +3,10 @@
 
 const NS = "dp";
 
-export type PermAction = "allow" | "deny";
+/** Permission button actions. Mirror the Transport `Decision` type. */
+export type PermAction = "once" | "session" | "always" | "deny";
+
+const ACTIONS: ReadonlySet<string> = new Set(["once", "session", "always", "deny"]);
 
 export function encodePermissionId(nonce: string, action: PermAction): string {
   return `${NS}:perm:${action}:${nonce}`;
@@ -19,7 +22,7 @@ export function decodePermissionId(customId: string): DecodedPermission | undefi
   if (parts.length !== 4) return undefined;
   const [ns, kind, action, nonce] = parts;
   if (ns !== NS || kind !== "perm") return undefined;
-  if (action !== "allow" && action !== "deny") return undefined;
+  if (!action || !ACTIONS.has(action)) return undefined;
   if (!nonce) return undefined;
-  return { nonce, action };
+  return { nonce, action: action as PermAction };
 }

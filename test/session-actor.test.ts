@@ -126,16 +126,51 @@ describe("SessionActor turn lifecycle", () => {
 });
 
 describe("SessionActor permission handling", () => {
-  it("shows a shell card and approves when the user allows", async () => {
+  it("shows a shell card and approves once when the user taps Allow once", async () => {
     const s = await setup();
     const result = perm(s)({ kind: "shell", intention: "branch", fullCommandText: "git branch" });
     await tick();
     const view = s.transport.permissions.at(-1)!;
     expect(view.kind).toBe("shell");
     expect(view.summary).toContain("git branch");
-    s.transport.decision!(view.nonce, "allow", "u1");
+    s.transport.decision!(view.nonce, "once", "u1");
     expect(await result).toEqual({ kind: "approve-once" });
     expect(s.broker.size).toBe(0);
+  });
+
+  it("offers session/always and maps them to command-scoped SDK approvals", async () => {
+    const s = await setup();
+    const req = {
+      kind: "shell",
+      fullCommandText: "git status",
+      canOfferSessionApproval: true,
+      commands: [{ identifier: "git", readOnly: true }],
+    };
+    // session scope
+    let result = perm(s)(req);
+    await tick();
+    expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(true);
+    s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "session", "u1");
+    expect(await result).toEqual({
+      kind: "approve-for-session",
+      approval: { kind: "commands", commandIdentifiers: ["git"] },
+    });
+    // always (this repo) scope → approve-for-location with the working dir
+    result = perm(s)(req);
+    await tick();
+    s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "always", "u1");
+    expect(await result).toEqual({
+      kind: "approve-for-location",
+      approval: { kind: "commands", commandIdentifiers: ["git"] },
+      locationKey: "C:\\repo",
+    });
+  });
+
+  it("does not offer session/always when the SDK can't (no identifiers)", async () => {
+    const s = await setup();
+    void perm(s)({ kind: "shell", fullCommandText: "git status", canOfferSessionApproval: false });
+    await tick();
+    expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
   });
 
   it("denies when the user denies", async () => {

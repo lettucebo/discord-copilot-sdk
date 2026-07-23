@@ -23,7 +23,7 @@ class FakeTransport {
   async showPermission(view) {
     this.permissions.push(view);
     console.log(`  <permission> kind=${view.kind} supported=${view.supported}\n    ${view.summary.replace(/\n/g, "\n    ")}`);
-    if (this.autoApprove && this._decision) this._decision(view.nonce, "allow", "smoke-user");
+    if (this.autoApprove && this._decision) this._decision(view.nonce, "once", "smoke-user");
   }
   async notice(_key, text) { this.notices.push(text); console.log(`  <notice> ${text}`); }
   onDecision(h) { this._decision = h; return () => { this._decision = undefined; }; }

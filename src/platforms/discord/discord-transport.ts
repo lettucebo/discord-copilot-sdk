@@ -164,12 +164,31 @@ export class DiscordTransport implements Transport {
       .setColor(bypass ? 0xe74c3c : 0xf1c40f)
       .setTitle(`🔐 Permission requested: ${view.kind}${bypass ? " ⚠️ SANDBOX BYPASS" : ""}`)
       .setDescription("```\n" + sanitizeForCodeBlock(view.summary) + "\n```")
-      .setFooter({ text: "Approve applies to this single request only." });
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      .setFooter({
+        text: view.canOfferSession
+          ? "Once = this request · Session = until the session ends · Always = remembered for this repo"
+          : "Approve applies to this single request only.",
+      });
+    const row = new ActionRowBuilder<ButtonBuilder>();
+    row.addComponents(
       new ButtonBuilder()
-        .setCustomId(encodePermissionId(view.nonce, "allow"))
+        .setCustomId(encodePermissionId(view.nonce, "once"))
         .setLabel("Allow once")
-        .setStyle(ButtonStyle.Success),
+        .setStyle(ButtonStyle.Success)
+    );
+    if (view.canOfferSession) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(encodePermissionId(view.nonce, "session"))
+          .setLabel("Allow for session")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(encodePermissionId(view.nonce, "always"))
+          .setLabel("Always (this repo)")
+          .setStyle(ButtonStyle.Secondary)
+      );
+    }
+    row.addComponents(
       new ButtonBuilder()
         .setCustomId(encodePermissionId(view.nonce, "deny"))
         .setLabel("Deny")

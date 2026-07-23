@@ -21,8 +21,14 @@ const MAX_CARD_LEN = 3900;
 /** Safe-default permission result (deny). Used for timeout/abort and for
  *  permission kinds discopilot has no UI for (fail-closed). */
 const DENY_UNAVAILABLE = { kind: "user-not-available" } as const;
-const APPROVE_ONCE = { kind: "approve-once" } as const;
 const DENIED_BY_USER = { kind: "denied-interactively-by-user" } as const;
+
+/** Metadata captured at request time so a later decision can be built into the
+ *  correct SDK approval scope (session/location need the command identifiers). */
+interface PendingPermMeta {
+  commandIdentifiers: string[];
+  locationKey: string;
+}
 
 export interface SessionActorOpts {
   sessionKey: string;
@@ -57,6 +63,8 @@ export class SessionActor {
   /** In-flight disconnect (single-flight), so concurrent/retried disconnects
    *  share one RPC instead of re-hitting a possibly-hung endpoint. */
   private disconnectPromise?: Promise<void>;
+  /** Per-nonce request metadata for building session/location approvals. */
+  private readonly pendingPerms = new Map<string, PendingPermMeta>();
   /** True while a /stop abort is in flight — new permissions fail closed. */
   private aborting = false;
   private unsubscribeDecision?: () => void;
@@ -175,6 +183,8 @@ export class SessionActor {
       );
       return DENY_UNAVAILABLE;
     }
+    const commandIdentifiers = extractCommandIdentifiers(r);
+    const canOfferSession = r["canOfferSessionApproval"] === true && commandIdentifiers.length > 0;
     const { nonce, promise } = this.opts.broker.register<unknown>({
       sessionKey: this.opts.sessionKey,
       generation: this.generation,
@@ -182,6 +192,7 @@ export class SessionActor {
       timeoutMs: PERMISSION_TIMEOUT_MS,
       onDefault: () => DENY_UNAVAILABLE,
     });
+    this.pendingPerms.set(nonce, { commandIdentifiers, locationKey: this.opts.workingDirectory });
     try {
       await this.opts.transport.showPermission({
         nonce,
@@ -189,6 +200,7 @@ export class SessionActor {
         kind,
         summary,
         supported: true,
+        canOfferSession,
       });
     } catch {
       // Couldn't post the card (e.g. embed rejected) — settle deny now rather
@@ -199,15 +211,35 @@ export class SessionActor {
         "Auto-denied: could not render the approval card."
       );
     }
-    return await promise;
+    try {
+      return await promise;
+    } finally {
+      this.pendingPerms.delete(nonce);
+    }
   }
 
   private onDecision(nonce: string, decision: Decision): void {
-    this.opts.broker.settle(
-      nonce,
-      decision === "allow" ? APPROVE_ONCE : DENIED_BY_USER,
-      this.generation
-    );
+    this.opts.broker.settle(nonce, this.buildDecision(nonce, decision), this.generation);
+  }
+
+  /** Map a UI decision to the SDK PermissionDecision, using the request's
+   *  captured command identifiers for the wider (session/location) scopes.
+   *  Falls back to approve-once if the metadata is missing. */
+  private buildDecision(nonce: string, decision: Decision): unknown {
+    if (decision === "deny") return DENIED_BY_USER;
+    const meta = this.pendingPerms.get(nonce);
+    const cmds = meta?.commandIdentifiers ?? [];
+    if (decision === "session" && cmds.length) {
+      return { kind: "approve-for-session", approval: { kind: "commands", commandIdentifiers: cmds } };
+    }
+    if (decision === "always" && cmds.length && meta) {
+      return {
+        kind: "approve-for-location",
+        approval: { kind: "commands", commandIdentifiers: cmds },
+        locationKey: meta.locationKey,
+      };
+    }
+    return { kind: "approve-once" }; // "once", or session/always without identifiers
   }
 
   /** Send a user prompt, starting a fresh turn's render state. Rejects once the
@@ -355,6 +387,17 @@ export class SessionActor {
       timeout,
     ]);
   }
+}
+
+/** Pull parsed command identifiers (e.g. ["git"]) from a shell permission
+ *  request, used to scope session/location approvals. */
+function extractCommandIdentifiers(r: Record<string, unknown>): string[] {
+  const cmds = r["commands"];
+  if (!Array.isArray(cmds)) return [];
+  const ids = cmds
+    .map((c) => (c && typeof c === "object" ? (c as Record<string, unknown>)["identifier"] : undefined))
+    .filter((x): x is string => typeof x === "string" && x.length > 0);
+  return [...new Set(ids)];
 }
 
 /**
