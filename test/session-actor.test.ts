@@ -200,8 +200,8 @@ describe("SessionActor permission handling", () => {
     }
   });
 
-  it("does not offer or auto-approve wrapper/runtime executables (sudo/env/npx/node)", async () => {
-    for (const cmd of ["sudo ls", "env X=y ls", "npx cowsay hi", "node app.js"]) {
+  it("does not offer or auto-approve wrapper/runtime/launcher executables", async () => {
+    for (const cmd of ["sudo ls", "env X=y ls", "npx cowsay hi", "node app.js", "find . -name x", "ssh host ls"]) {
       const s = await setup();
       s.policy.approveForSession("t", cmd.split(/\s+/)[0]!); // even if (mis)trusted…
       const r = perm(s)({ kind: "shell", fullCommandText: cmd, commands: [{ identifier: cmd }] });
@@ -213,9 +213,25 @@ describe("SessionActor permission handling", () => {
     }
   });
 
-  it("does not offer session/always for a multi-command or empty request", async () => {
+  it("does not auto-approve when fullCommandText disagrees with commands[] (SDK mislabel defense)", async () => {
     const s = await setup();
-    void perm(s)({ kind: "shell", fullCommandText: "git status", commands: [] });
+    s.policy.approveForSession("t", "git");
+    // commands[] mislabels the executable as trusted `git`, but the real command is `rm`.
+    const r = perm(s)({ kind: "shell", fullCommandText: "rm -rf x", commands: [{ identifier: "git" }] });
+    await tick();
+    expect(s.transport.permissions).toHaveLength(1); // carded — `rm` (the real exec) isn't trusted
+    s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u");
+    expect(await r).toEqual({ kind: "denied-interactively-by-user" });
+  });
+
+  it("does not offer session/always for a multi-executable request", async () => {
+    const s = await setup();
+    // commands[] introduces a second executable beyond the fullCommandText one.
+    void perm(s)({
+      kind: "shell",
+      fullCommandText: "git status",
+      commands: [{ identifier: "git status" }, { identifier: "rm x" }],
+    });
     await tick();
     expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
   });

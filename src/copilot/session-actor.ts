@@ -179,16 +179,20 @@ export class SessionActor {
       );
       return DENY_UNAVAILABLE;
     }
-    // Executables of every parsed command (e.g. ["git"] or ["git","rm"]).
+    // Executables of every parsed command PLUS the fullCommandText's own first
+    // token. For a `simple` command the latter is authoritative, so including it
+    // defends against a hypothetical SDK mislabel (commands[] says `git` while
+    // fullCommandText is `rm …`): both must be trusted to auto-approve.
     const fullCommandText = typeof r["fullCommandText"] === "string" ? (r["fullCommandText"] as string) : "";
+    const cmdExec = commandExecutable(fullCommandText);
     const executables = dedupe(
-      extractCommandIdentifiers(r).map(commandExecutable).filter((e) => e.length > 0)
+      [cmdExec, ...extractCommandIdentifiers(r).map(commandExecutable)].filter((e) => e.length > 0)
     );
     // A command is eligible for auto-approve / a wider scope only when it is a
     // SIMPLE command (no shell metacharacters that could chain/pipe/redirect/
     // substitute a different command) AND every executable is a safe, specific
-    // name (not a shell/runtime/wrapper that can launch arbitrary programs).
-    // This keeps discopilot from trusting the runtime's command parse blindly.
+    // name (not a shell/runtime/wrapper/exec-launcher). This keeps discopilot
+    // from trusting the runtime's command parse blindly.
     const simple = isSimpleCommand(fullCommandText);
     const allSafe = executables.length > 0 && executables.every(isSafeExecutable);
     if (simple && allSafe && this.opts.policy.isApproved(this.opts.sessionKey, this.opts.workingDirectory, executables)) {
@@ -208,11 +212,12 @@ export class SessionActor {
       );
       return DENY_UNAVAILABLE;
     }
-    // Offer session/always only for a SINGLE, simple, safe command — chained/
-    // multi-command requests, shells, runtimes and wrappers stay per-request so
-    // one tap can never broadly trust the shell.
-    const singleExec = executables.length === 1 ? executables[0]! : "";
-    const canOfferSession = simple && singleExec !== "" && isSafeExecutable(singleExec);
+    // Offer session/always only for a SINGLE, simple, safe command whose sole
+    // executable is the fullCommandText's own — chained/multi-command requests,
+    // shells, runtimes and launchers stay per-request.
+    const canOfferSession =
+      simple && executables.length === 1 && cmdExec !== "" && isSafeExecutable(cmdExec);
+    const singleExec = canOfferSession ? cmdExec : "";
     const { nonce, promise } = this.opts.broker.register<unknown>({
       sessionKey: this.opts.sessionKey,
       generation: this.generation,
@@ -429,9 +434,11 @@ const UNSAFE_EXECUTABLES = new Set([
   "bash", "sh", "zsh", "dash", "ksh", "fish", "wsl", "wsl.exe",
   // language runtimes (run arbitrary code)
   "python", "python3", "py", "node", "nodejs", "ruby", "perl", "php", "deno", "bun",
-  // wrappers / dispatchers (launch other commands)
+  // wrappers / dispatchers + exec-launchers (launch other commands, often with
+  // metacharacter-free payloads: find -exec, ssh ProxyCommand, tar --to-command)
   "env", "sudo", "doas", "su", "npx", "xargs", "nice", "timeout", "watch",
   "time", "nohup", "command", "exec", "eval", "start", "call",
+  "find", "ssh", "scp", "sftp", "rsync", "tar", "docker", "podman", "awk", "cmake",
 ]);
 
 function isUnsafeExecutable(exe: string): boolean {
