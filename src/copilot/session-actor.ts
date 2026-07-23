@@ -49,6 +49,9 @@ export class SessionActor {
   private renderer = new TurnRenderer();
   private readonly generation: number;
   private idleWaiters: Array<() => void> = [];
+  /** Actor lifecycle. `faulted`/`closed` are terminal: the actor refuses new
+   *  turns so a dead/half-torn-down session can never accept work. */
+  private lifecycle: "active" | "closed" | "faulted" = "active";
   /** True while a /stop abort is in flight — new permissions fail closed. */
   private aborting = false;
   private unsubscribeDecision?: () => void;
@@ -202,10 +205,19 @@ export class SessionActor {
     );
   }
 
-  /** Send a user prompt, starting a fresh turn's render state. */
+  /** Send a user prompt, starting a fresh turn's render state. Rejects once the
+   *  actor is closed/faulted so a dead session can't accept new work. */
   async send(prompt: string): Promise<void> {
+    if (this.lifecycle !== "active") {
+      throw new Error(`session is ${this.lifecycle} and cannot accept new prompts`);
+    }
     this.renderer = new TurnRenderer();
     await (this.session as unknown as { send(o: { prompt: string }): Promise<unknown> }).send({ prompt });
+  }
+
+  /** True once the actor has faulted (needs a fresh /new; can't be reused). */
+  isFaulted(): boolean {
+    return this.lifecycle === "faulted";
   }
 
   /**
@@ -259,15 +271,10 @@ export class SessionActor {
         void this.stop(); // abort; expect session.idle to follow
       }, watchdogMs);
       hard = setTimeout(() => {
-        // Destroy the session, but never let a hung disconnect RPC keep the
-        // turn pending — cap it and resolve "faulted" regardless.
-        const timeout = new Promise<void>((res) => {
-          const t = setTimeout(res, FAULT_DISCONNECT_MS);
-          (t as { unref?: () => void }).unref?.();
-        });
-        void Promise.race([this.disconnect().catch(() => {}), timeout]).finally(() =>
-          done("faulted")
-        );
+        // Permanently fault the actor (it will refuse new turns) and best-effort
+        // destroy the runtime session, but never let a hung disconnect RPC keep
+        // the turn pending — cap it and resolve "faulted" regardless.
+        void this.markFaulted().finally(() => done("faulted"));
       }, watchdogMs + FAULT_GRACE_MS);
       (wd as { unref?: () => void }).unref?.();
       (hard as { unref?: () => void }).unref?.();
@@ -299,6 +306,11 @@ export class SessionActor {
   }
 
   async disconnect(): Promise<void> {
+    // Idempotent: a closed/faulted actor's runtime session is already being torn
+    // down; re-calling would re-hit a possibly-hung RPC. This makes a /new after
+    // a fault a safe no-op rather than a new hang.
+    if (this.lifecycle !== "active") return;
+    this.lifecycle = "closed";
     this.aborting = true;
     this.opts.broker.abortSession(this.opts.sessionKey);
     this.unsubscribeDecision?.();
@@ -306,6 +318,25 @@ export class SessionActor {
     // start a new one over a runtime session that may still be live. Callers
     // that want best-effort teardown (shutdown) use `.catch()`.
     await this.session.disconnect();
+  }
+
+  /** Terminal fault path: mark the actor faulted (rejects further turns) and
+   *  best-effort destroy the runtime session, bounded so a hung disconnect RPC
+   *  can't stall the caller. */
+  private async markFaulted(): Promise<void> {
+    if (this.lifecycle !== "active") return;
+    this.lifecycle = "faulted";
+    this.aborting = true;
+    this.opts.broker.abortSession(this.opts.sessionKey);
+    this.unsubscribeDecision?.();
+    const timeout = new Promise<void>((res) => {
+      const t = setTimeout(res, FAULT_DISCONNECT_MS);
+      (t as { unref?: () => void }).unref?.();
+    });
+    await Promise.race([
+      (this.session.disconnect() as Promise<unknown>).catch(() => {}),
+      timeout,
+    ]);
   }
 }
 

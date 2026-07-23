@@ -34,6 +34,28 @@ interface Session {
   running: boolean;
 }
 
+/** Milliseconds a single session teardown may take during /new before we give
+ *  up on it (and keep it for a later retry) rather than stalling. */
+const TEARDOWN_TIMEOUT_MS = 5_000;
+
+/** Reject if `p` doesn't settle within `ms` (the pending work keeps running). */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timeout")), ms);
+    (t as { unref?: () => void }).unref?.();
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
+}
+
 /** Ack the Discord button interaction BEFORE settling the decision. On ack
  *  success the user's decision is delivered; on ack failure the SAFE default
  *  (deny) is delivered instead, so an Allow never runs while Discord shows an
@@ -240,7 +262,8 @@ export class DiscopilotApp {
       const ended = await this.endAllSessions("A new session was started; this one has ended.");
       if (!ended) {
         await interaction.editReply(
-          "Could not cleanly end the previous session; not starting a new one. Try again."
+          "Could not cleanly end the previous session (it may have faulted). Not starting a " +
+            "new one — retry, or restart the bot if this persists."
         );
         return;
       }
@@ -311,6 +334,13 @@ export class DiscopilotApp {
   private async runTurn(threadId: string, prompt: string): Promise<void> {
     const session = this.sessions.get(threadId);
     if (!session) return;
+    if (session.actor.isFaulted()) {
+      await this.transport.notice(
+        threadId,
+        "This session has faulted and can't accept more prompts. Start a new one with /new."
+      );
+      return;
+    }
     if (session.running) {
       await this.transport.notice(threadId, "⏳ Still working on the previous message — please wait.");
       return;
@@ -327,17 +357,23 @@ export class DiscopilotApp {
     }
   }
 
-  /** Tear down every live session. A session that disconnects cleanly is
-   *  removed; one that FAILS to disconnect is kept in the map (its runtime
-   *  session may still be live) so a later /new re-attempts the disconnect
-   *  (which is idempotent) instead of orphaning a possibly-live session.
-   *  Returns false if any session failed to disconnect. */
+  /** Tear down every live session. A cleanly-disconnected session is removed; a
+   *  session that FAILS or TIMES OUT on disconnect is kept (its runtime session
+   *  may still be live) so a later /new retries the idempotent disconnect; a
+   *  FAULTED session is a permanent fence (kept, not re-disconnected) that keeps
+   *  /new refusing until the bot is restarted. Returns false if anything was
+   *  left behind. */
   private async endAllSessions(reason: string): Promise<boolean> {
     let ok = true;
     for (const [threadId, session] of [...this.sessions]) {
+      if (session.actor.isFaulted()) {
+        ok = false; // fence — needs a restart, don't re-hit the dead runtime
+        continue;
+      }
       await this.transport.notice(threadId, reason).catch(() => {});
       try {
-        await session.actor.disconnect();
+        // Bound the disconnect so a hung teardown RPC can't stall /new.
+        await withTimeout(session.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
         this.sessions.delete(threadId);
         this.transport.dispose(threadId);
       } catch {

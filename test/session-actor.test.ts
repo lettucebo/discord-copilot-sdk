@@ -212,4 +212,17 @@ describe("SessionActor abort + teardown", () => {
     expect(s.session.disconnected).toBe(1);
     expect(s.transport.decision).toBeUndefined();
   });
+
+  it("refuses new prompts once closed (lifecycle guard used by the fault path)", async () => {
+    const s = await setup();
+    await s.actor.disconnect();
+    await expect(s.actor.send("hi")).rejects.toThrow(/closed|faulted/);
+  });
+
+  it("disconnect() is idempotent (no second runtime disconnect)", async () => {
+    const s = await setup();
+    await s.actor.disconnect();
+    await s.actor.disconnect();
+    expect(s.session.disconnected).toBe(1);
+  });
 });
