@@ -26,6 +26,14 @@ export interface Transport {
   showPermission(view: PermissionView): Promise<void>;
   /** Post a plain notice (errors, auto-denials, aborts). */
   notice(sessionKey: string, text: string): Promise<void>;
-  /** Register the sink that receives user decisions (wired to broker.settle). */
-  onDecision(handler: (nonce: string, decision: Decision, userId: string) => void): void;
+  /** Register the sink that receives user decisions (wired to broker.settle).
+   *  Returns an unsubscribe function so a torn-down session's handler doesn't
+   *  leak or keep receiving broadcasts. */
+  onDecision(handler: (nonce: string, decision: Decision, userId: string) => void): () => void;
+  /** Flush the latest render for a session immediately (e.g. at turn end). */
+  flush(sessionKey: string): Promise<void>;
+  /** Begin a fresh turn's message set for a session. */
+  resetTurn(sessionKey: string): void;
+  /** Release all per-session render state/timers (on session teardown). */
+  dispose(sessionKey: string): void;
 }

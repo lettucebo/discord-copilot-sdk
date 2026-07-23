@@ -68,12 +68,18 @@ export class DiscopilotApp {
     };
   }
 
-  /** Build and fully start the app (lock → SDK → Discord login). */
+  /** Build and fully start the app (lock → SDK → Discord login + commands). */
   static async start(config: Config): Promise<DiscopilotApp> {
     const repoPath = resolveControlledRepo(config.CONTROLLED_REPO_PATH);
     const compat = checkSdkCompat();
     if (!compat.ok) {
-      console.warn(`⚠️  installed SDK ${compat.installed} != declared ${compat.declared}`);
+      // Fatal in bot mode: our event-field and permission-shape assumptions are
+      // pinned to the declared SDK version; a mismatch could silently break
+      // streaming or, worse, permission handling.
+      throw new Error(
+        `Installed @github/copilot-sdk ${compat.installed} != declared ${compat.declared}. ` +
+          `Refusing to start the bot; run \`npm install\` to align.`
+      );
     }
     const lock = await acquireSingleInstanceLock(lockPath());
     let copilot: CopilotClient | undefined;
@@ -91,12 +97,19 @@ export class DiscopilotApp {
     }
   }
 
+  /** Log in and resolve only once the gateway is ready AND slash commands are
+   *  registered — so a registration failure fails startup (with cleanup) rather
+   *  than leaving a logged-in bot with no usable commands. */
   private async login(): Promise<void> {
-    this.discord.once(Events.ClientReady, (c) => void this.onReady(c.user.id));
     this.discord.on(Events.InteractionCreate, (i) => void this.onInteraction(i));
     this.discord.on(Events.MessageCreate, (m) => void this.onMessage(m));
     this.installSignalHandlers();
-    await this.discord.login(this.config.DISCORD_BOT_TOKEN);
+    await new Promise<void>((resolve, reject) => {
+      this.discord.once(Events.ClientReady, (c) => {
+        this.onReady(c.user.id).then(resolve, reject);
+      });
+      this.discord.login(this.config.DISCORD_BOT_TOKEN).catch(reject);
+    });
   }
 
   private async onReady(clientId: string): Promise<void> {
@@ -122,9 +135,13 @@ export class DiscopilotApp {
         .setDescription("Abort the current turn in this session thread")
         .toJSON(),
     ];
-    const guildId = this.config.DEV_GUILD_ID ?? this.config.DISCORD_GUILD_ID;
+    // Register in the AUTHORIZED guild so command availability matches the auth
+    // policy (DEV_GUILD_ID is intentionally not used here to avoid registering
+    // where auth would reject).
     const rest = new REST({ version: "10" }).setToken(this.config.DISCORD_BOT_TOKEN);
-    await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
+    await rest.put(Routes.applicationGuildCommands(clientId, this.config.DISCORD_GUILD_ID), {
+      body: commands,
+    });
   }
 
   // ---- input surface: interactions (slash + buttons) --------------------
@@ -151,9 +168,16 @@ export class DiscopilotApp {
       await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
       return;
     }
+    // Acknowledge Discord (and remove the buttons) BEFORE settling an Allow, so
+    // a command can never run while the user sees "interaction failed". If the
+    // ack fails, settle the SAFE default (deny) instead of the click's action.
+    try {
+      await interaction.update({ components: [] });
+    } catch {
+      this.transport.deliverDecision(decoded.nonce, "deny", interaction.user.id);
+      return;
+    }
     this.transport.deliverDecision(decoded.nonce, decoded.action, interaction.user.id);
-    // Ack + remove the buttons so they can't be double-clicked.
-    await interaction.update({ components: [] }).catch(() => {});
   }
 
   private async cmdNew(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -174,6 +198,11 @@ export class DiscopilotApp {
       await interaction.editReply("Parent channel is not a text channel.");
       return;
     }
+    // v1 runs ONE live session at a time: all sessions share the single
+    // controlled working tree, so two concurrent agents could clobber each
+    // other's checkout/edits. Starting a new session ends the previous one.
+    await this.endAllSessions("A new session was started; this one has ended.");
+
     const thread = await (parent as TextChannel).threads.create({
       name: `copilot ${new Date().toISOString().slice(5, 16).replace("T", " ")}`,
       autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
@@ -207,8 +236,11 @@ export class DiscopilotApp {
       });
       return;
     }
-    await session.actor.stop();
-    await interaction.reply({ content: "Aborted the current turn.", flags: MessageFlags.Ephemeral });
+    const ok = await session.actor.stop();
+    await interaction.reply({
+      content: ok ? "Abort requested for the current turn." : "Abort attempted but the runtime reported an error.",
+      flags: MessageFlags.Ephemeral,
+    });
   }
 
   // ---- input surface: thread messages -----------------------------------
@@ -229,7 +261,8 @@ export class DiscopilotApp {
     await this.runTurn(message.channelId, prompt);
   }
 
-  /** Run one prompt→idle turn, guarding against overlapping sends per thread. */
+  /** Run one prompt to real completion (session.idle), guarding against
+   *  overlapping sends per thread. `running` stays set for the WHOLE turn. */
   private async runTurn(threadId: string, prompt: string): Promise<void> {
     const session = this.sessions.get(threadId);
     if (!session) return;
@@ -240,14 +273,23 @@ export class DiscopilotApp {
     session.running = true;
     this.transport.resetTurn(threadId);
     try {
-      await session.actor.send(prompt);
-      await session.actor.waitIdle();
+      await session.actor.runTurn(prompt);
     } catch (err) {
       await this.transport.notice(threadId, `⚠️ ${err instanceof Error ? err.message : String(err)}`);
     } finally {
-      await this.transport.flush(threadId);
+      await this.transport.flush(threadId).catch(() => {});
       session.running = false;
     }
+  }
+
+  /** Tear down every live session (disconnect + release render state). */
+  private async endAllSessions(reason: string): Promise<void> {
+    for (const [threadId, session] of this.sessions) {
+      await this.transport.notice(threadId, reason).catch(() => {});
+      await session.actor.disconnect().catch(() => {});
+      this.transport.dispose(threadId);
+    }
+    this.sessions.clear();
   }
 
   // ---- shutdown ----------------------------------------------------------
@@ -262,9 +304,10 @@ export class DiscopilotApp {
   async stop(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
-    for (const [, session] of this.sessions) {
+    for (const [threadId, session] of this.sessions) {
       session.broker.abort();
       await session.actor.disconnect().catch(() => {});
+      this.transport.dispose(threadId);
     }
     this.sessions.clear();
     try {

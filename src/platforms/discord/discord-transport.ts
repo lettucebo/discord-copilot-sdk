@@ -18,29 +18,35 @@ interface SessionRender {
   msgIds: string[];
   latest?: RenderState;
   timer?: ReturnType<typeof setTimeout>;
+  /** Turn counter; a render write for a stale epoch is dropped. */
+  epoch: number;
+  /** Per-session write mutex so timer-flush and final-flush never interleave. */
+  writeChain: Promise<void>;
 }
 
 interface MinimalTextChannel {
   isTextBased(): boolean;
   send(opts: unknown): Promise<{ id: string }>;
-  messages: { fetch(id: string): Promise<{ edit(opts: unknown): Promise<unknown> }> };
+  messages: {
+    fetch(id: string): Promise<{ edit(opts: unknown): Promise<unknown>; delete(): Promise<unknown> }>;
+  };
 }
 
-/** Transport that posts to Discord threads. Debounces render edits (~1s) to
- *  respect rate limits; the final state is always flushed. */
+/** Transport that posts to Discord threads. Renders are debounced (~1s) and
+ *  serialized per session; the final state is always flushed. */
 export class DiscordTransport implements Transport {
   private readonly sessions = new Map<string, SessionRender>();
-  /** One handler per live SessionActor. A decision is broadcast to all; only the
-   *  broker that owns the nonce settles (others no-op), so concurrent threads
-   *  route correctly without the actors sharing state. */
+  /** One handler per live SessionActor; a decision is broadcast to all and only
+   *  the broker owning the nonce settles (others no-op). */
   private readonly decisionHandlers = new Set<
     (nonce: string, decision: Decision, userId: string) => void
   >();
 
   constructor(private readonly client: Client) {}
 
-  onDecision(handler: (nonce: string, decision: Decision, userId: string) => void): void {
+  onDecision(handler: (nonce: string, decision: Decision, userId: string) => void): () => void {
     this.decisionHandlers.add(handler);
+    return () => this.decisionHandlers.delete(handler);
   }
 
   /** Called by the app's interaction router after auth passes. */
@@ -48,18 +54,30 @@ export class DiscordTransport implements Transport {
     for (const h of this.decisionHandlers) h(nonce, decision, userId);
   }
 
-  /** Start a fresh turn's message set for a session. */
+  private ensure(sessionKey: string): SessionRender {
+    let s = this.sessions.get(sessionKey);
+    if (!s) {
+      s = { msgIds: [], epoch: 0, writeChain: Promise.resolve() };
+      this.sessions.set(sessionKey, s);
+    }
+    return s;
+  }
+
+  /** Start a fresh turn: bump the epoch, drop old anchors + pending timer so a
+   *  leftover render can't repost the previous turn or clobber the new one. */
   resetTurn(sessionKey: string): void {
-    const s = this.sessions.get(sessionKey);
-    if (s) s.msgIds = [];
+    const s = this.ensure(sessionKey);
+    s.epoch += 1;
+    s.msgIds = [];
+    s.latest = undefined;
+    if (s.timer) {
+      clearTimeout(s.timer);
+      s.timer = undefined;
+    }
   }
 
   async render(sessionKey: string, state: RenderState): Promise<void> {
-    let s = this.sessions.get(sessionKey);
-    if (!s) {
-      s = { msgIds: [] };
-      this.sessions.set(sessionKey, s);
-    }
+    const s = this.ensure(sessionKey);
     s.latest = state;
     if (s.timer) return; // a flush is already scheduled
     s.timer = setTimeout(() => {
@@ -69,15 +87,29 @@ export class DiscordTransport implements Transport {
     }, RENDER_INTERVAL_MS);
   }
 
-  /** Force-write the latest state now (e.g. at turn idle). */
+  /** Force-write the latest state now (serialized, epoch-fenced). */
   async flush(sessionKey: string): Promise<void> {
     const s = this.sessions.get(sessionKey);
-    if (!s || !s.latest) return;
+    if (!s) return;
+    if (s.timer) {
+      clearTimeout(s.timer);
+      s.timer = undefined;
+    }
+    const epoch = s.epoch;
+    const run = s.writeChain.then(() => this.doFlush(sessionKey, epoch));
+    s.writeChain = run.catch(() => {});
+    await run.catch(() => {});
+  }
+
+  private async doFlush(sessionKey: string, epoch: number): Promise<void> {
+    const s = this.sessions.get(sessionKey);
+    if (!s || s.epoch !== epoch || !s.latest) return; // stale turn or disposed
     const text = formatState(s.latest);
     const chunks = text.length ? chunkText(text, 1900) : [];
     const channel = await this.fetchThread(sessionKey);
     if (!channel) return;
     for (let i = 0; i < chunks.length; i++) {
+      if (s.epoch !== epoch) return; // a new turn started mid-write
       const content = chunks[i]!;
       const existing = s.msgIds[i];
       if (existing) {
@@ -85,22 +117,35 @@ export class DiscordTransport implements Transport {
           const m = await channel.messages.fetch(existing);
           await m.edit({ content, ...NO_MENTIONS });
         } catch {
-          /* message deleted — best effort */
+          /* message deleted/unreachable — best effort */
         }
       } else {
         const m = await channel.send({ content, ...NO_MENTIONS });
         s.msgIds[i] = m.id;
       }
     }
+    // Trim anchors the shorter final output no longer needs.
+    for (let i = chunks.length; i < s.msgIds.length; i++) {
+      const id = s.msgIds[i];
+      if (!id) continue;
+      try {
+        const m = await channel.messages.fetch(id);
+        await m.delete();
+      } catch {
+        /* already gone */
+      }
+    }
+    if (s.msgIds.length > chunks.length) s.msgIds.length = chunks.length;
   }
 
   async showPermission(view: PermissionView): Promise<void> {
     const channel = await this.fetchThread(view.sessionKey);
     if (!channel) return;
+    const bypass = view.summary.includes("SANDBOX BYPASS");
     const embed = new EmbedBuilder()
-      .setColor(0xf1c40f)
-      .setTitle(`🔐 Permission requested: ${view.kind}`)
-      .setDescription("```\n" + view.summary.slice(0, 3900) + "\n```")
+      .setColor(bypass ? 0xe74c3c : 0xf1c40f)
+      .setTitle(`🔐 Permission requested: ${view.kind}${bypass ? " ⚠️ SANDBOX BYPASS" : ""}`)
+      .setDescription("```\n" + sanitizeForCodeBlock(view.summary) + "\n```")
       .setFooter({ text: "Approve applies to this single request only." });
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
@@ -120,6 +165,13 @@ export class DiscordTransport implements Transport {
     if (channel) await channel.send({ content: text.slice(0, 1900), ...NO_MENTIONS });
   }
 
+  /** Release a session's render state + any pending timer. */
+  dispose(sessionKey: string): void {
+    const s = this.sessions.get(sessionKey);
+    if (s?.timer) clearTimeout(s.timer);
+    this.sessions.delete(sessionKey);
+  }
+
   private async fetchThread(id: string): Promise<MinimalTextChannel | undefined> {
     try {
       const ch = await this.client.channels.fetch(id);
@@ -137,4 +189,24 @@ function formatState(state: RenderState): string {
     ? "\n" + state.tools.map((t) => `🔧 ${t.name || "tool"} — ${t.status}`).join("\n")
     : "";
   return (state.assistantText || "") + toolLine;
+}
+
+/**
+ * Make text safe to place inside a Discord ```` ``` ```` block for APPROVAL
+ * display. Two attacks are neutralized without dropping any visible character:
+ *  - **fence breakout**: a zero-width space is inserted after each backtick so
+ *    no ```` ``` ```` run can terminate the block early and let
+ *    attacker-controlled command text render as trusted markdown.
+ *  - **BiDi / control chars**: Unicode directional overrides (and other
+ *    zero-width/format controls) that could visually reorder the command are
+ *    stripped.
+ * The real characters stay visible; only invisible separators/controls change.
+ */
+export function sanitizeForCodeBlock(s: string): string {
+  return s
+    .replace(
+      /[\u202A-\u202E\u2066-\u2069\u200E\u200F\u2028\u2029\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
+      ""
+    )
+    .replace(/`/g, "`\u200b");
 }

@@ -17,13 +17,16 @@ class FakeTransport {
     this._decision = undefined;
   }
   async render(_key, state) { this.lastState = state; }
+  async flush(_key) {}
+  resetTurn(_key) {}
+  dispose(_key) {}
   async showPermission(view) {
     this.permissions.push(view);
     console.log(`  <permission> kind=${view.kind} supported=${view.supported}\n    ${view.summary.replace(/\n/g, "\n    ")}`);
     if (this.autoApprove && this._decision) this._decision(view.nonce, "allow", "smoke-user");
   }
   async notice(_key, text) { this.notices.push(text); console.log(`  <notice> ${text}`); }
-  onDecision(h) { this._decision = h; }
+  onDecision(h) { this._decision = h; return () => { this._decision = undefined; }; }
 }
 
 let pass = 0, fail = 0;
@@ -44,10 +47,10 @@ const actor = await SessionActor.create(client, {
 });
 console.log("SessionActor created; sending prompt …");
 
-await actor.send(
-  "Run the shell command `git rev-parse --abbrev-ref HEAD` using the shell tool, then tell me the current branch name in one short sentence. Do not modify any files."
+await actor.runTurn(
+  "Run the shell command `git rev-parse --abbrev-ref HEAD` using the shell tool, then tell me the current branch name in one short sentence. Do not modify any files.",
+  90_000
 );
-await actor.waitIdle(90_000);
 
 const state = actor.state();
 console.log(`\nfinal assistantText: ${JSON.stringify((state.assistantText || "").slice(0, 160))}`);
