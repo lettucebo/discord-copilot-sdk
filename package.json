@@ -11,6 +11,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "smoke:live": "npm run build && node scripts/smoke-live.mjs",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js"
   },
