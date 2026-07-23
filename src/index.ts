@@ -2,6 +2,8 @@ import { existsSync } from "node:fs";
 import { acquireSingleInstanceLock } from "./core/single-instance.js";
 import { lockPath } from "./core/paths.js";
 import { checkSdkCompat, sdkSelfCheck } from "./copilot/sdk.js";
+import { loadConfig } from "./config.js";
+import { DiscopilotApp } from "./app.js";
 
 /** Load ./.env into process.env if present (Node built-in; no dependency). */
 function loadDotEnv(): void {
@@ -50,11 +52,11 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log(
-    "discopilot — the Discord bot is not implemented yet (P1).\n" +
-      "  npm start -- --selfcheck   verify the local Copilot SDK wiring\n" +
-      "  npm start -- --version     print installed/declared SDK versions"
-  );
+  console.log("Starting discopilot bot …");
+  const config = loadConfig();
+  await DiscopilotApp.start(config);
+  // The Discord gateway connection keeps the event loop alive; shutdown is
+  // handled by the app's SIGINT/SIGTERM handlers.
 }
 
 main().catch((err) => {
