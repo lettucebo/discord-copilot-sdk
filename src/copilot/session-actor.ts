@@ -194,7 +194,9 @@ export class SessionActor {
     });
     s.on("session.error", (e) => {
       const d = data(e);
-      void this.opts.transport.notice(this.opts.sessionKey, `⚠️ ${str(d["message"]) || "session error"}`);
+      void this.opts.transport
+        .notice(this.opts.sessionKey, `⚠️ ${str(d["message"]) || "session error"}`)
+        .catch(() => {});
     });
     s.on("session.usage_info", (e) => {
       const d = data(e);
@@ -213,18 +215,35 @@ export class SessionActor {
     if (this.todosTimer) clearTimeout(this.todosTimer);
     this.todosTimer = setTimeout(() => {
       this.todosTimer = undefined;
-      void this.refreshTodos();
+      // Fire-and-forget: a transient Discord send failure (thread archived, rate
+      // limit, network blip) must NOT become an unhandled rejection that crashes
+      // the process. refreshTodos swallows its own post failure too (defense in
+      // depth); this catch also covers a formatTodos throw.
+      void this.refreshTodos().catch(() => {});
     }, TODOS_DEBOUNCE_MS);
   }
 
   private async refreshTodos(): Promise<void> {
     if (this.lifecycle !== "active") return;
     const rows = await this.readTodos();
-    if (this.lifecycle !== "active") return; // may have changed during await
+    if (this.lifecycle !== "active") return; // may have changed during the async read
     const rendered = formatTodos(rows);
-    if (!rendered || rendered === this.lastTodosRender) return;
-    this.lastTodosRender = rendered;
-    await this.opts.transport.notice(this.opts.sessionKey, rendered);
+    if (rendered === this.lastTodosRender) return; // no change (also dedupes empty→empty)
+    if (!rendered) {
+      // Cleared to nothing: record the empty state so a later reappearance of the
+      // SAME list posts again (A → empty → A must not be suppressed), but there's
+      // nothing to show, so don't post.
+      this.lastTodosRender = rendered;
+      return;
+    }
+    try {
+      await this.opts.transport.notice(this.opts.sessionKey, rendered);
+      // Mark as sent ONLY after a successful post, so a failed send retries on the
+      // next event instead of being silently deduped away.
+      this.lastTodosRender = rendered;
+    } catch {
+      /* leave lastTodosRender unchanged so the next todos_changed retries */
+    }
   }
 
   /** Change model / reasoning effort / context tier on the LIVE session (takes
@@ -470,6 +489,12 @@ export class SessionActor {
     return settled;
   }
 
+  /** True when a freeform ask_user is awaiting a TEXT answer via a thread
+   *  message. Used to reject image-only messages that can't answer the ask. */
+  isAwaitingFreeform(): boolean {
+    return this.freeformAskNonce !== undefined;
+  }
+
   // ---- exit-plan (P3) ---------------------------------------------------
 
   private async handleExitPlan(req: unknown): Promise<unknown> {
@@ -546,13 +571,14 @@ export class SessionActor {
     await (this.session as unknown as { send(o: Record<string, unknown>): Promise<unknown> }).send(payload);
   }
 
-  /** Read the agent's current todos (empty when none / no session db). */
+  /** Read the agent's current todos (empty when none / no session db). The plan
+   *  RPC namespace lives at `session.rpc.plan` (NOT `session.plan`). */
   async readTodos(): Promise<Array<{ id?: string; title?: string; status?: string }>> {
     try {
-      const plan = (this.session as unknown as {
-        plan?: { readSqlTodosWithDependencies?: () => Promise<{ rows?: unknown[] }> };
-      }).plan;
-      const res = await plan?.readSqlTodosWithDependencies?.();
+      const rpc = (this.session as unknown as {
+        rpc?: { plan?: { readSqlTodosWithDependencies?: () => Promise<{ rows?: unknown[] }> } };
+      }).rpc;
+      const res = await rpc?.plan?.readSqlTodosWithDependencies?.();
       const rows = res?.rows;
       return Array.isArray(rows) ? (rows as Array<{ id?: string; title?: string; status?: string }>) : [];
     } catch {

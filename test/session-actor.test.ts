@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { SessionActor, formatTodos } from "../src/copilot/session-actor.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { ApprovalPolicy } from "../src/core/approval-policy.js";
@@ -16,6 +16,15 @@ class FakeSession {
   setModelCalls: Array<{ model: string; options?: unknown }> = [];
   aborted = 0;
   disconnected = 0;
+  todos: Array<{ id?: string; title?: string; status?: string }> = [];
+  rpc = {
+    plan: {
+      readSqlTodosWithDependencies: async (): Promise<{ rows: unknown[]; dependencies: unknown[] }> => ({
+        rows: this.todos,
+        dependencies: [],
+      }),
+    },
+  };
   on(ev: string, h: (e: unknown) => void): void {
     this.handlers.set(ev, h);
   }
@@ -532,5 +541,76 @@ describe("formatTodos (P5)", () => {
     ]);
     expect(out).toContain("✅ a");
     expect(out).toContain("🔄 b");
+  });
+});
+
+describe("todos_changed → checklist (P5)", () => {
+  it("posts a checklist (debounced), dedupes identical state, and re-posts A→empty→A", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = await setup();
+      s.session.todos = [
+        { title: "a", status: "in_progress" },
+        { title: "b", status: "pending" },
+      ];
+      s.session.emit("session.todos_changed", {});
+      await vi.advanceTimersByTimeAsync(800);
+      const todoNotices = (): string[] => s.transport.notices.filter((n) => n.includes("待辦進度"));
+      expect(todoNotices().length).toBe(1);
+
+      // identical state → deduped (no second post)
+      s.session.emit("session.todos_changed", {});
+      await vi.advanceTimersByTimeAsync(800);
+      expect(todoNotices().length).toBe(1);
+
+      // cleared to empty (nothing posted) …
+      s.session.todos = [];
+      s.session.emit("session.todos_changed", {});
+      await vi.advanceTimersByTimeAsync(800);
+      expect(todoNotices().length).toBe(1);
+
+      // … then the SAME list reappears → must post again (not suppressed)
+      s.session.todos = [
+        { title: "a", status: "in_progress" },
+        { title: "b", status: "pending" },
+      ];
+      s.session.emit("session.todos_changed", {});
+      await vi.advanceTimersByTimeAsync(800);
+      expect(todoNotices().length).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a failing checklist notice does not throw and retries on the next event", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = await setup();
+      let fail = true;
+      s.transport.notice = async (_k: string, t: string): Promise<void> => {
+        if (fail && t.includes("待辦進度")) throw new Error("send failed");
+        s.transport.notices.push(t);
+      };
+      s.session.todos = [{ title: "only", status: "pending" }];
+      s.session.emit("session.todos_changed", {});
+      await vi.advanceTimersByTimeAsync(800); // notice throws → swallowed, no crash
+      expect(s.transport.notices.some((n) => n.includes("待辦進度"))).toBe(false);
+
+      // Not marked as sent → the next event with the SAME state retries and posts.
+      fail = false;
+      s.session.emit("session.todos_changed", {});
+      await vi.advanceTimersByTimeAsync(800);
+      expect(s.transport.notices.some((n) => n.includes("待辦進度"))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("readTodos uses session.rpc.plan (not session.plan)", async () => {
+    const s = await setup();
+    s.session.todos = [{ id: "x", title: "x", status: "done" }];
+    const rows = await s.actor.readTodos();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.title).toBe("x");
   });
 });

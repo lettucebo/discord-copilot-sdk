@@ -21,6 +21,7 @@ import { acquireSingleInstanceLock, type InstanceLock } from "./core/single-inst
 import { lockPath } from "./core/paths.js";
 import { resolveControlledRepo } from "./core/repo.js";
 import { gitDiffSummary } from "./core/git.js";
+import { downloadBounded } from "./core/download.js";
 import { shouldResetEffort, validateEffort } from "./core/effort.js";
 import { createCopilotClient, checkSdkCompat } from "./copilot/sdk.js";
 import { PendingInteractionBroker } from "./core/broker.js";
@@ -405,7 +406,7 @@ export class DiscopilotApp {
       await interaction.editReply(`Started a session in <#${thread.id}>. Send prompts there.`);
 
       const prompt = interaction.options.getString("prompt");
-      if (prompt) void this.runTurn(thread.id, prompt);
+      if (prompt) void this.runTurn(thread.id, prompt).catch(() => {});
     } finally {
       this.creating = false;
     }
@@ -565,7 +566,7 @@ export class DiscopilotApp {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const rows = await session.actor.readTodos();
     const rendered = formatTodos(rows);
-    await interaction.editReply({ content: rendered || "目前沒有待辦事項。" });
+    await interaction.editReply({ content: (rendered || "目前沒有待辦事項。").slice(0, 1900) });
   }
 
   // ---- input surface: thread messages -----------------------------------
@@ -576,32 +577,44 @@ export class DiscopilotApp {
     if (!session) return; // not a session thread
     if (!isAuthorized(ctxOf(message), this.policy)) return; // silent for non-owners
     const text = message.content.trim();
-    const images = await this.collectImageAttachments(message);
-    // Text-only messages while a freeform ask_user is pending answer it (rather
-    // than starting a new turn). Messages carrying images always start a turn.
-    if (images.length === 0 && text && session.actor.tryConsumeFreeform(text)) return;
-    if (!text && images.length === 0) {
+    const hasAttachments = message.attachments.size > 0;
+    // A pending freeform ask_user expects a TEXT answer. Route on the ORIGINAL
+    // attachment presence (not download success) so a failed/oversized image
+    // can't have its text silently answer the ask.
+    if (!hasAttachments && text && session.actor.tryConsumeFreeform(text)) return;
+    if (hasAttachments && session.actor.isAwaitingFreeform()) {
+      await this.transport
+        .notice(message.channelId, "⚠️ 正在等你回答上一個提問，請用文字回覆（圖片無法作為答案）。")
+        .catch(() => {});
+      return;
+    }
+    if (!text && !hasAttachments) {
       await this.transport.notice(
         message.channelId,
         "Empty message — is the Message Content intent enabled for this bot?"
       );
       return;
     }
-    const prompt = text || "請看我附上的圖片。";
-    await this.runTurn(message.channelId, prompt, images);
+    // Reserve the turn (via the running guard in runTurn) BEFORE any network I/O,
+    // so image downloads serialize with message arrival and two quick image
+    // messages can't reorder. The download happens inside runTurn.
+    await this.runTurn(message.channelId, text, message);
   }
 
   /** Download a message's image attachments as base64 blobs for the SDK. Only
    *  image/* is accepted (P5 = images); non-images and over-limit files are
-   *  skipped with a notice. Bounded by count and per-file size so a huge upload
-   *  can't blow the prompt budget or memory. */
+   *  skipped with a notice. Bounded by count, per-file size AND a cumulative
+   *  total, with a fetch timeout and a streaming byte cap, so a huge or stalled
+   *  upload can't blow the prompt budget or memory. */
   private async collectImageAttachments(message: Message): Promise<BlobAttachment[]> {
     const MAX_IMAGES = 4;
     const MAX_BYTES = 8 * 1024 * 1024; // 8 MiB per image
+    const MAX_TOTAL_BYTES = 24 * 1024 * 1024; // cap across all images in one message
     const all = [...message.attachments.values()];
     if (all.length === 0) return [];
     const out: BlobAttachment[] = [];
     let skipped = 0;
+    let total = 0;
     for (const att of all) {
       if (out.length >= MAX_IMAGES) {
         skipped++;
@@ -612,36 +625,34 @@ export class DiscopilotApp {
         skipped++;
         continue;
       }
+      // Cheap pre-check on Discord's declared size before any download.
       if (typeof att.size === "number" && att.size > MAX_BYTES) {
         skipped++;
         continue;
       }
-      try {
-        const res = await fetch(att.url);
-        if (!res.ok) {
-          skipped++;
-          continue;
-        }
-        const buf = Buffer.from(await res.arrayBuffer());
-        if (buf.byteLength > MAX_BYTES) {
-          skipped++;
-          continue;
-        }
-        out.push({
-          type: "blob",
-          data: buf.toString("base64"),
-          mimeType: mime,
-          displayName: att.name ?? "image",
-        });
-      } catch {
+      const remaining = Math.min(MAX_BYTES, MAX_TOTAL_BYTES - total);
+      if (remaining <= 0) {
         skipped++;
+        continue;
       }
+      const buf = await downloadBounded(att.url, remaining);
+      if (!buf) {
+        skipped++;
+        continue;
+      }
+      total += buf.byteLength;
+      out.push({
+        type: "blob",
+        data: buf.toString("base64"),
+        mimeType: mime,
+        displayName: att.name ?? "image",
+      });
     }
     if (skipped > 0) {
       await this.transport
         .notice(
           message.channelId,
-          `ℹ️ 已略過 ${skipped} 個附件（僅支援圖片，每張上限 8MB、最多 ${MAX_IMAGES} 張）。`
+          `ℹ️ 已略過 ${skipped} 個附件（僅支援圖片，每張上限 8MB、單則最多 ${MAX_IMAGES} 張且總量 24MB；下載逾時或失敗也會略過）。`
         )
         .catch(() => {});
     }
@@ -649,8 +660,9 @@ export class DiscopilotApp {
   }
 
   /** Run one prompt to real completion (session.idle), guarding against
-   *  overlapping sends per thread. `running` stays set for the WHOLE turn. */
-  private async runTurn(threadId: string, prompt: string, attachments: BlobAttachment[] = []): Promise<void> {
+   *  overlapping sends per thread. `running` stays set for the WHOLE turn, so
+   *  attachment downloads (done here, after the guard) serialize with arrival. */
+  private async runTurn(threadId: string, text: string, message?: Message): Promise<void> {
     const session = this.sessions.get(threadId);
     if (!session) return;
     if (session.actor.isFaulted()) {
@@ -667,9 +679,20 @@ export class DiscopilotApp {
     session.running = true;
     this.transport.resetTurn(threadId);
     try {
-      await session.actor.runTurn(prompt, undefined, attachments);
+      const images = message ? await this.collectImageAttachments(message) : [];
+      const prompt = text || (images.length ? "請看我附上的圖片。" : "");
+      if (!prompt) {
+        // Had attachments but none were usable, and there was no text to send.
+        await this.transport
+          .notice(threadId, "⚠️ 附件都無法使用（僅支援圖片），且訊息沒有文字，已略過。")
+          .catch(() => {});
+        return;
+      }
+      await session.actor.runTurn(prompt, undefined, images);
     } catch (err) {
-      await this.transport.notice(threadId, `⚠️ ${err instanceof Error ? err.message : String(err)}`);
+      await this.transport
+        .notice(threadId, `⚠️ ${err instanceof Error ? err.message : String(err)}`)
+        .catch(() => {});
     } finally {
       await this.transport.flush(threadId).catch(() => {});
       session.running = false;

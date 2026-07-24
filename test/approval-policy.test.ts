@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { ApprovalPolicy, commandExecutable } from "../src/core/approval-policy.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { rmSync, mkdtempSync } from "node:fs";
+import { rmSync, mkdtempSync, chmodSync } from "node:fs";
 
 const tmpFile = (): string => join(tmpdir(), `dp-approvals-${Math.random()}.json`);
 
@@ -82,6 +82,29 @@ describe("ApprovalPolicy", () => {
       expect(p.repoApprovals("/repo")).toEqual([]); // but memory IS cleared (fail-closed now)
     } finally {
       rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("clearRepo RETRIES persistence after a transient failure (no false success)", () => {
+    // Regression: a first clear that fails to write must not let a SECOND clear
+    // report success while the old rules still sit on disk. clearRepo always
+    // re-attempts the write, so once the disk is writable again it truly clears.
+    const f = tmpFile();
+    try {
+      const p = new ApprovalPolicy(f);
+      p.approveForRepo("/repo", "npm"); // durably written (file has npm)
+      chmodSync(f, 0o444); // read-only → next write fails
+      expect(p.clearRepo("/repo")).toBe(false); // honest failure
+      chmodSync(f, 0o644); // access restored
+      expect(p.clearRepo("/repo")).toBe(true); // retry actually persists the cleared map
+      expect(new ApprovalPolicy(f).repoApprovals("/repo")).toEqual([]); // durably gone on reload
+    } finally {
+      try {
+        chmodSync(f, 0o644);
+      } catch {
+        /* ignore */
+      }
+      rmSync(f, { force: true });
     }
   });
 });

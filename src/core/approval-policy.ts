@@ -83,13 +83,13 @@ export class ApprovalPolicy {
   }
 
   /** Forget a repo's persisted approvals (e.g. /approvals clear). Returns true
-   *  if the revocation was durably written to disk. False means it was cleared
-   *  in memory (so THIS process is now fail-closed and will re-prompt) but the
-   *  on-disk file may still hold the old rules and could resurface on restart —
-   *  the caller must report that honestly rather than claim it's fully cleared. */
+   *  only if the current (cleared) map is durably on disk. Always attempts a
+   *  write — even when the in-memory entry is already gone — so that a retry
+   *  after a PRIOR failed clear actually re-attempts persistence instead of
+   *  falsely reporting success while the old rules still sit on disk. Memory is
+   *  cleared first, so THIS process is fail-closed regardless of the disk write. */
   clearRepo(repoPath: string): boolean {
-    if (!this.repo[repoPath]) return true; // nothing to clear ⇒ trivially durable
-    delete this.repo[repoPath];
+    if (this.repo[repoPath]) delete this.repo[repoPath];
     return this.persist();
   }
 

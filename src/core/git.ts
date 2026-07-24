@@ -25,14 +25,18 @@ export async function gitDiffSummary(repoPath: string, staged: boolean): Promise
   if (scope) statArgs.push(scope);
   const stat = (await git(repoPath, statArgs)).trimEnd();
 
-  // Untracked files never show in `git diff`; count them for an honest summary.
-  const porcelain = (await git(repoPath, ["status", "--porcelain", "--untracked-files=all"])).split("\n");
-  const untracked = porcelain.filter((l) => l.startsWith("?? ")).length;
+  // Untracked files never show in `git diff` — count them for an honest summary,
+  // but ONLY for the unstaged view (they're irrelevant to --cached, and skipping
+  // the scan avoids a needless walk of a possibly-huge untracked tree).
+  let untracked = 0;
+  if (!staged) {
+    const porcelain = (await git(repoPath, ["status", "--porcelain", "--untracked-files=all"])).split("\n");
+    untracked = porcelain.filter((l) => l.startsWith("?? ")).length;
+  }
 
   const label = staged ? "已暫存 (staged)" : "工作區 (unstaged)";
   if (!stat) {
-    const note =
-      untracked > 0 && !staged ? `\n（另有 ${untracked} 個未追蹤檔案）` : "";
+    const note = untracked > 0 ? `\n（另有 ${untracked} 個未追蹤檔案）` : "";
     return `📊 **git diff — ${label}**\n沒有變更。${note}`;
   }
 
@@ -41,6 +45,6 @@ export async function gitDiffSummary(repoPath: string, staged: boolean): Promise
   if (body.length > MAX_LEN - fenceOverhead) {
     body = body.slice(0, MAX_LEN - fenceOverhead - 20) + "\n… (已截斷)";
   }
-  const note = untracked > 0 && !staged ? `\n（另有 ${untracked} 個未追蹤檔案）` : "";
+  const note = untracked > 0 ? `\n（另有 ${untracked} 個未追蹤檔案）` : "";
   return `📊 **git diff — ${label}**\n\`\`\`\n${body}\n\`\`\`${note}`;
 }
