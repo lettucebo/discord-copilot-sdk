@@ -119,6 +119,28 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     }
   });
 
+  it("active + resume throws TRANSIENT (network) → record LEFT ACTIVE for retry, not registered", async () => {
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      store.commit(bind());
+      const transport = new FakeTransport();
+      const app = DiscopilotApp.createForTest(
+        cfg,
+        REPO,
+        fakeCopilot({ resumeError: "getaddrinfo ENOTFOUND api.githubcopilot.com" }),
+        transport,
+        store
+      );
+      await reconcile(app, async () => "valid");
+      expect(sessionsOf(app).has("t1")).toBe(false); // not resumed this boot
+      expect(store.get()?.state).toBe("active"); // preserved so a restart retries
+      expect(transport.notices.some((n) => n.includes("暫時無法復原"))).toBe(true);
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
   it("active + thread gone → blocked:thread-gone, never resumes", async () => {
     const f = tmpFile();
     try {

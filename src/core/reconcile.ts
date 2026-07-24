@@ -23,11 +23,26 @@ export type ReconcileAction =
   | { kind: "skip"; reason: string }; // transient failure — leave record unchanged, don't resume
 
 /**
- * Pure reconciliation planner: given the durable record's state, whether the
- * stored binding still matches this bot's config/repo, and the thread status,
- * decide what to do on startup. All Discord/SDK I/O happens in the caller; this
- * function is the decision matrix (unit-tested exhaustively).
+ * Classify a `resumeSession` error. Deliberately CONSERVATIVE: only a definitive
+ * "this session id no longer exists" signal is treated as terminal (`session-lost`
+ * → orphaned). Everything else — network/DNS/timeout/RPC/unknown — is `transient`
+ * so the record is LEFT ACTIVE and a later restart retries, never dropping the
+ * conversation history P2 exists to preserve. (Network strings like "no such host
+ * is known" / ENOTFOUND must NOT be mistaken for a missing session.)
  */
+export function classifyResumeError(message: string): "session-lost" | "transient" {
+  const m = message.toLowerCase();
+  const networkish =
+    /enotfound|econnrefused|econnreset|etimedout|econnaborted|timed? ?out|socket|network|no such host|getaddrinfo|fetch failed|dns|502|503|504|unavailable|refused/.test(
+      m
+    );
+  if (networkish) return "transient";
+  // Precise "the session itself is gone" phrases only.
+  if (/session (?:not found|does not exist|no longer exists|is gone|unknown|expired)/.test(m)) return "session-lost";
+  if (/unknown session|no such session|session id .*(?:not found|invalid|unknown)/.test(m)) return "session-lost";
+  return "transient"; // default: retryable — never lose history on an ambiguous error
+}
+
 export function planReconcile(input: {
   corrupt: boolean;
   state?: SessionState;

@@ -127,14 +127,6 @@ export class SessionActor {
   }
 
   private async init(client: CopilotClient): Promise<void> {
-    this.unsubscribeDecision = this.opts.transport.onDecision((nonce, decision) =>
-      this.onDecision(nonce, decision)
-    );
-    this.unsubscribeChoice = this.opts.transport.onChoice((nonce, index) =>
-      this.onChoice(nonce, index)
-    );
-    this.unsubscribePlan = this.opts.transport.onPlan((nonce, action) => this.onPlan(nonce, action));
-
     const config: Record<string, unknown> = {
       streaming: true, // required for delta events
       workingDirectory: this.opts.workingDirectory,
@@ -169,6 +161,9 @@ export class SessionActor {
       createSession(o: Record<string, unknown>): Promise<CopilotSession>;
       resumeSession(id: string, o: Record<string, unknown>): Promise<CopilotSession>;
     };
+    // Create/resume FIRST. If this throws we haven't wired any transport
+    // subscriptions yet, so a failed create can't leak decision/choice/plan
+    // handlers (the actor is discarded by the caller).
     if (this.opts.resumeSessionId) {
       // Resume preserves conversation history. continuePendingWork:false = treat
       // any tool/permission work that was pending at crash time as INTERRUPTED
@@ -185,6 +180,13 @@ export class SessionActor {
       if (this.opts.createSessionId) config["sessionId"] = this.opts.createSessionId;
       this.session = await c.createSession(config);
     }
+    this.unsubscribeDecision = this.opts.transport.onDecision((nonce, decision) =>
+      this.onDecision(nonce, decision)
+    );
+    this.unsubscribeChoice = this.opts.transport.onChoice((nonce, index) =>
+      this.onChoice(nonce, index)
+    );
+    this.unsubscribePlan = this.opts.transport.onPlan((nonce, action) => this.onPlan(nonce, action));
     this.wireEvents();
   }
 

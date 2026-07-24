@@ -26,8 +26,12 @@ interface Entry {
 export interface RegisterOpts<T> {
   /** Session this prompt belongs to (thread key). */
   sessionKey: string;
-  /** Session incarnation/generation captured at registration — a settle from a
-   *  stale generation is rejected. */
+  /** Session incarnation/generation captured at registration. This is an
+   *  IN-MEMORY, in-process fence: a settle carrying a stale generation is
+   *  rejected (e.g. an in-process resume that replaced the actor). It is NOT a
+   *  durable cross-restart fence — after a crash the process, this broker, and
+   *  all pending entries are gone, and a pre-crash Discord card carries a nonce
+   *  absent from the fresh broker, so it can't settle anything anyway. */
   generation: number;
   /** Discriminator (permission kind / "ask_user" / "exit_plan" / "elicitation"). */
   kind: string;
@@ -45,7 +49,7 @@ export interface RegisterOpts<T> {
  * - each request gets a cryptographically-random nonce;
  * - it settles **exactly once** (first of: user decision, timeout, abort);
  * - a settle is rejected if the nonce is unknown/already-settled or the session
- *   generation is stale (post-resume);
+ *   generation is stale (in-process/post-resume within one run; see RegisterOpts);
  * - timeout and abort settle with the SAFE default (deny/cancel), never leaving
  *   the callback pending;
  * - a single finalizer clears the timer and removes the entry.

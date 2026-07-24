@@ -179,4 +179,31 @@ describe("SessionStore", () => {
       rmSync(f, { force: true });
     }
   });
+
+  it("a NON-ENOENT read error (path is a directory) is corrupt, not 'absent'", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dp-session-isdir-"));
+    try {
+      const s = new SessionStore(dir); // readFileSync(dir) → EISDIR
+      expect(s.isCorrupt()).toBe(true);
+      expect(s.get()).toBeUndefined();
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("restore() writes a prior record back verbatim", () => {
+    const f = tmpFile();
+    try {
+      const s = new SessionStore(f);
+      s.commit(bind({ sessionId: "orig" }));
+      const prev = s.get()!;
+      s.reserve(bind({ sessionId: "new", generation: 2 })); // overwrite
+      expect(s.get()?.sessionId).toBe("new");
+      expect(s.restore(prev)).toBe(true); // roll back
+      expect(s.get()).toMatchObject({ sessionId: "orig", state: "active", generation: 1 });
+      expect(new SessionStore(f).get()?.sessionId).toBe("orig"); // durable
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
 });

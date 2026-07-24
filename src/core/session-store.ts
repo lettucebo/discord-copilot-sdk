@@ -118,8 +118,14 @@ export class SessionStore {
     let raw: string;
     try {
       raw = fs.readFileSync(this.file, "utf8");
-    } catch {
-      return; // no file yet — genuinely absent, not corrupt
+    } catch (err) {
+      // Only a genuinely-absent file is "no session". Any OTHER read error
+      // (permissions, a directory in the way, sharing violation) is treated as
+      // corrupt so startup fails closed rather than silently starting fresh and
+      // dropping a recoverable session.
+      if ((err as { code?: string })?.code === "ENOENT") return;
+      this.corrupt = true;
+      return;
     }
     try {
       const parsed = JSON.parse(raw) as unknown;
@@ -130,15 +136,21 @@ export class SessionStore {
     }
   }
 
+  /** Write back a full prior record verbatim (used to roll back a reserve when a
+   *  subsequent step fails, restoring the still-live previous session). */
+  restore(rec: SessionRecord): boolean {
+    return this.write({ ...rec, updatedAt: Date.now() });
+  }
+
   /** Atomically write (or remove) the record, updating in-memory state ONLY on a
    *  successful write (persist-first). Returns false (and logs) on any I/O error. */
   private write(candidate: SessionRecord | undefined): boolean {
+    const tmp = `${this.file}.tmp`;
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
       if (!candidate) {
         fs.rmSync(this.file, { force: true });
       } else {
-        const tmp = `${this.file}.tmp`;
         fs.writeFileSync(tmp, JSON.stringify(candidate, null, 2), "utf8");
         fs.renameSync(tmp, this.file); // atomic replace
       }
@@ -146,6 +158,7 @@ export class SessionStore {
       this.corrupt = false;
       return true;
     } catch (err) {
+      fs.rmSync(tmp, { force: true }); // don't leak a partial temp file
       console.warn(
         `⚠️  could not persist session store to ${this.file}: ${err instanceof Error ? err.message : String(err)}`
       );

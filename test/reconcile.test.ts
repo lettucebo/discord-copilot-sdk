@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { planReconcile } from "../src/core/reconcile.js";
+import { planReconcile, classifyResumeError } from "../src/core/reconcile.js";
 
 describe("planReconcile", () => {
   it("corrupt store fails startup (never silently fresh)", () => {
@@ -62,5 +62,41 @@ describe("planReconcile", () => {
   it("active with no thread status supplied → safe skip (never accidental resume)", () => {
     const a = planReconcile({ corrupt: false, state: "active", bindingOk: true });
     expect(a.kind).toBe("skip");
+  });
+});
+
+describe("classifyResumeError", () => {
+  it("network / DNS / timeout errors are TRANSIENT (never lose history)", () => {
+    for (const m of [
+      "getaddrinfo ENOTFOUND api.example.com",
+      "no such host is known", // literal Windows DNS message — must NOT be 'session lost'
+      "connect ECONNREFUSED 127.0.0.1:443",
+      "socket hang up (ECONNRESET)",
+      "request timed out",
+      "fetch failed",
+      "503 Service Unavailable",
+      "connection refused",
+    ]) {
+      expect(classifyResumeError(m)).toBe("transient");
+    }
+  });
+
+  it("definitive session-absent phrases are SESSION-LOST", () => {
+    for (const m of [
+      "session not found",
+      "session does not exist",
+      "session no longer exists",
+      "unknown session id",
+      "no such session",
+      "session id abc invalid",
+    ]) {
+      expect(classifyResumeError(m)).toBe("session-lost");
+    }
+  });
+
+  it("ambiguous/unknown errors default to TRANSIENT (retryable, non-destructive)", () => {
+    expect(classifyResumeError("something went wrong")).toBe("transient");
+    expect(classifyResumeError("")).toBe("transient");
+    expect(classifyResumeError("internal error 500")).toBe("transient");
   });
 });

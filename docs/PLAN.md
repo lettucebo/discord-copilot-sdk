@@ -54,7 +54,12 @@
 - `/stop`：先標 `ABORTING` 並**禁止新註冊** → 安全 settle 既有 → 再 `session.abort()`。
 
 ## 4. Session 擁有權、復原與 fencing（移到 P2，但規格先定）
-- **持久化、交易式遞增的 incarnation/generation**，在每次 create/resume 綁定前 +1；每個 callback/event closure 捕捉它；只有 generation == 現行時才允許 publish/settle/DB 變更。
+- **generation/incarnation**：原規格設想「持久化、交易式遞增」的全域 epoch。**P2 實作刻意簡化**為
+  *in-memory、單一行程內* 的 fence（broker 於 registration 捕捉 generation，settle 時比對；create=+1、
+  resume 保留）。理由：崩潰後舊行程／broker／pending 全部消失，崩潰前的 Discord 卡片其 nonce 不在新的
+  broker 中，本來就無法 settle（execution-safe）；跨重啟的持久化 epoch 對本 one-session lab 模型無實際
+  安全增益。若未來需要，再導入完整持久化 epoch（見 P2 design v2 gap #6）。改以「重啟後失效」nonce 提示
+  處理 UX。
 - **single-instance guard 移到 P0/P1**（兩個行程會毀掉所有 process-local 原子性假設）。
 - 對帳表（reconciliation）：
 

@@ -23,7 +23,7 @@ import { resolveControlledRepo } from "./core/repo.js";
 import { gitDiffSummary } from "./core/git.js";
 import { downloadBounded } from "./core/download.js";
 import { SessionStore, type SessionRecord } from "./core/session-store.js";
-import { planReconcile, type ThreadStatus } from "./core/reconcile.js";
+import { planReconcile, classifyResumeError, type ThreadStatus } from "./core/reconcile.js";
 import { randomUUID } from "node:crypto";
 
 import { sendUnlessAborted } from "./core/turn-gate.js";
@@ -448,13 +448,20 @@ export class DiscopilotApp {
         name: `copilot ${new Date().toISOString().slice(5, 16).replace("T", " ")}`,
         autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
       });
+      // Best-effort cleanup of the just-created thread on any abort path below,
+      // so a failed /new doesn't litter empty threads.
+      const dropThread = async (): Promise<void> => {
+        await (thread as unknown as { delete?: () => Promise<unknown> }).delete?.().catch(() => {});
+      };
 
       // Reserve-before-create (P2): durably record a `creating` row with a
       // caller-assigned session id BEFORE tearing down the old session or calling
       // createSession. This OVERWRITES any prior record, so a crash anywhere after
       // this point can never resurrect the superseded session (startup sees
-      // `creating(newId)`, not the old `active` row). If the reserve can't be
-      // persisted, do NOT touch the old session — the current state stays intact.
+      // `creating(newId)`, not the old `active` row). Capture the prior record so
+      // a FAILED (non-crash) teardown can be rolled back, keeping the live old
+      // session fully intact.
+      const prevRecord = this.store.get();
       const sessionId = randomUUID();
       const generation = this.store.nextGeneration();
       const reserved = this.store.reserve({
@@ -466,6 +473,7 @@ export class DiscopilotApp {
         parentChannelId: this.config.DISCORD_PARENT_CHANNEL_ID,
       });
       if (!reserved) {
+        await dropThread();
         await interaction.editReply(
           "⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未建立新的 session。請檢查磁碟／權限後重試。"
         );
@@ -475,36 +483,70 @@ export class DiscopilotApp {
       // v1 runs ONE live session at a time: all sessions share the single
       // controlled working tree, so two concurrent agents could clobber each
       // other's checkout/edits. Refuse to start if the previous one won't end.
-      // (The new record is already reserved, so this can't resurrect the old one.)
       const ended = await this.endAllSessions("A new session was started; this one has ended.");
       if (!ended) {
+        // Teardown failed and the old actor is still live in-memory. Roll the
+        // record back to the (still-live) old session so disk and memory agree
+        // and the old session remains resumable; drop the new thread.
+        if (prevRecord) this.store.restore(prevRecord);
+        else this.store.clear();
+        await dropThread();
         await interaction.editReply(
-          "Could not cleanly end the previous session (it may have faulted). Not starting a " +
-            "new one — retry, or restart the bot if this persists."
+          "無法結束前一個 session（可能已失效），未建立新的。前一個 session 已保留——請重試；若持續發生請重啟 bot。"
         );
         return;
       }
 
       const broker = new PendingInteractionBroker();
-      const actor = await SessionActor.create(this.copilot, {
-        sessionKey: thread.id,
-        workingDirectory: this.repoPath,
-        model: this.config.DEFAULT_MODEL,
-        contextTier: this.config.DEFAULT_CONTEXT_TIER,
-        broker,
-        transport: this.transport,
-        policy: this.approvals,
-        generation,
-        createSessionId: sessionId,
-      });
-      // Promote creating→active. A failed commit means the record isn't durable,
-      // so we must NOT run as active: disconnect the just-created actor and tell
-      // the user. (The reserved row stays `creating`; a restart will orphan it.)
-      if (!this.store.commit()) {
-        await actor.disconnect().catch(() => {});
+      let actor: SessionActor;
+      try {
+        actor = await SessionActor.create(this.copilot, {
+          sessionKey: thread.id,
+          workingDirectory: this.repoPath,
+          model: this.config.DEFAULT_MODEL,
+          contextTier: this.config.DEFAULT_CONTEXT_TIER,
+          broker,
+          transport: this.transport,
+          policy: this.approvals,
+          generation,
+          createSessionId: sessionId,
+        });
+      } catch (err) {
+        // Create failed after the old session was torn down. The record stays
+        // `creating` (→ orphaned on restart, fail-closed); no live actor exists,
+        // so /new can be retried. Reply to the deferred interaction (don't leave
+        // the user staring at "thinking…").
+        await dropThread();
         await interaction.editReply(
-          "⚠️ 無法持久化 session 狀態（commit 失敗），已取消啟動。請檢查磁碟／權限後重試。"
+          `⚠️ 建立 session 失敗（${err instanceof Error ? err.message : String(err)}）。請重試 /new。`
         );
+        return;
+      }
+      // Promote creating→active. A failed commit means the record isn't durable,
+      // so we must NOT run as active. Try a bounded disconnect of the just-created
+      // actor; if that fails the runtime may still be live, so RETAIN the actor as
+      // a fence (registered) — endAllSessions will then refuse the next /new until
+      // a restart, rather than letting a second live actor onto the shared tree.
+      if (!this.store.commit()) {
+        let disconnected = false;
+        try {
+          await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS);
+          disconnected = true;
+        } catch {
+          disconnected = false;
+        }
+        if (disconnected) {
+          await dropThread();
+          await interaction.editReply(
+            "⚠️ 無法持久化 session 狀態（commit 失敗），已取消啟動。請檢查磁碟／權限後重試。"
+          );
+        } else {
+          // Fence: keep the (maybe-live) actor registered so /new stays blocked.
+          this.sessions.set(thread.id, { actor, broker, running: false });
+          await interaction.editReply(
+            "⚠️ 無法持久化 session 狀態，且無法確認前述 runtime 已關閉。已將其設為屏障以避免雙重 session——請重啟 bot。"
+          );
+        }
         return;
       }
       this.sessions.set(thread.id, { actor, broker, running: false });
@@ -545,13 +587,27 @@ export class DiscopilotApp {
       case "retain":
         return;
       case "orphan-interrupted":
-        this.store.setState("orphaned", "interrupted-create");
+        // A required terminal transition: if it can't be persisted, that's a disk
+        // problem — fail startup rather than run with a non-durable state.
+        if (!this.store.setState("orphaned", "interrupted-create")) {
+          throw new Error(`reconcile: could not persist orphaned state at ${sessionStorePath()}`);
+        }
         return;
       case "skip":
         console.warn(`reconcile: not resuming this boot (${action.reason}); record left unchanged.`);
+        if (rec) {
+          await this.transport
+            .notice(
+              rec.threadId,
+              "⚠️ 啟動時暫時無法確認此執行緒狀態，本次未復原。session 記錄已保留——重新啟動 bot 可再嘗試。"
+            )
+            .catch(() => {});
+        }
         return;
       case "block":
-        this.store.setState("blocked", action.reason);
+        if (!this.store.setState("blocked", action.reason)) {
+          throw new Error(`reconcile: could not persist blocked state at ${sessionStorePath()}`);
+        }
         if (rec) {
           await this.transport
             .notice(rec.threadId, `⚠️ 無法復原此 session（${action.reason}）。請用 /new 開新的。`)
@@ -565,8 +621,9 @@ export class DiscopilotApp {
   }
 
   /** Resume the SDK session for an active record; register it and post an honest
-   *  recovery notice. A resume failure is classified session-lost (orphaned) vs
-   *  other (blocked, retryable). */
+   *  recovery notice. A resume failure is classified session-lost (definitive →
+   *  orphaned, terminal) vs transient (record LEFT ACTIVE so a later restart
+   *  retries — never dropping recoverable history). */
   private async resumeRecord(rec: SessionRecord): Promise<void> {
     const broker = new PendingInteractionBroker();
     let actor: SessionActor;
@@ -584,15 +641,25 @@ export class DiscopilotApp {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (/not.?found|unknown session|no session|does not exist|no such/i.test(msg)) {
-        this.store.setState("orphaned", "session-lost");
+      if (classifyResumeError(msg) === "session-lost") {
+        // Definitive: the session id is gone. Mark terminal; a failed persist of
+        // that transition is a disk problem we must surface (fail startup).
+        if (!this.store.setState("orphaned", "session-lost")) {
+          throw new Error(`reconcile: could not persist orphaned state for ${rec.threadId}`);
+        }
         await this.transport
           .notice(rec.threadId, "⚠️ 無法復原（session 已遺失）。請用 /new 開新的。")
           .catch(() => {});
       } else {
-        this.store.setState("blocked", "resume-error");
+        // Transient (network/RPC/unknown): leave the record ACTIVE so the next
+        // restart retries. Do NOT lie that it's blocked. The thread is un-resumed
+        // for THIS boot; the bot still comes up so /new remains usable.
+        console.warn(`reconcile: transient resume failure for ${rec.threadId}: ${msg}`);
         await this.transport
-          .notice(rec.threadId, `⚠️ 復原失敗（${msg}）。可稍後重啟重試，或用 /new。`)
+          .notice(
+            rec.threadId,
+            `⚠️ 暫時無法復原此對話（${msg}）。session 記錄已保留——重新啟動 bot 可再嘗試復原；或用 /new 重新開始。`
+          )
           .catch(() => {});
       }
       return;
