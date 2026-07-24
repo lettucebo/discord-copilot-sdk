@@ -129,7 +129,7 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 **message 404 re-anchor 的已接受殘留（single-owner 取捨，RubberDuck R3/R4）：**
 - 偵測到 anchor 被刪除（10008 / 純 404）時，**只在該槽位補貼一則新訊息**（保留內容），**絕不刪除仍存在的其他 anchor**。因此**永不遺失、永不重複**內容。
 - 殘留 1（順序）：若使用者手動刪除的是**非最後一則**串流訊息，其補貼會出現在頻道**最尾端**而非原位（Discord 無法插入中間位置）。內容完整，但多 chunk 回覆在該回合可能**讀取順序錯置**（下一回合即恢復）。**非「純美觀」**——對程式碼/散文語意可能造成閱讀困擾，但內容不缺不重。
-- 殘留 2（best-effort 渲染）：如同任何 debounced 渲染，暫時性 edit/delete 失敗會在**下一次 flush 重試**；trim 對未確認刪除的 surplus 會**保留追蹤**（不會產生未追蹤的孤兒/重複）。僅當失敗發生在該回合**最後一次 flush** 才會殘留至下一回合。
+- 殘留 2（best-effort 渲染，**pre-existing，非 #8 引入**）：如同任何 debounced 渲染，暫時性 edit/delete 失敗會在**下一次 flush 重試**；trim 對未確認刪除的 surplus 會**保留追蹤**（同回合內不會產生未追蹤孤兒）。但若失敗發生在該回合**最後一次 flush**（無後續 flush），可能持續到下一回合：縮短的回覆若保留 anchor 的 edit 失敗會顯示**過期文字**，或 surplus anchor 刪除失敗會**殘留為重複訊息**（resetTurn 於下一回合清空 msgIds）。此需 Discord API 於最後一刻恰好暫時性失敗，僅造成聊天記錄的雜訊；原始 doFlush 亦有相同性質。完整 exactly-once 訊息對帳子系統對本工具**不成比例**，刻意不做。
 - 此設計**嚴格優於**修正前行為（原本訊息被刪即丟失該段內容）。刻意**不採用**「刪除並重建整段 suffix」（會在暫時性刪除失敗時遺失比基準更多內容），亦不加有狀態 bounded-retry timer（比例原則）。
 
 ## 10. 決策紀錄（已定）

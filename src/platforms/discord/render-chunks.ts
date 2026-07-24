@@ -49,13 +49,23 @@ export function isMessageGone(err: unknown): boolean {
  * and re-post the surviving later anchors to "fix" ordering — deleting messages
  * we can't atomically re-post risks LOSING content if a delete transiently fails
  * mid-way (worse than the pre-fix behavior). Instead we only ever ADD a
- * replacement for the gone slot. Result: content is never lost and never
- * duplicated. Residuals (accepted, single-owner tool): (1) if the user manually
- * deletes a NON-last streamed message, its replacement appears at the tail, so a
- * multi-chunk response can read OUT OF ORDER until the next turn (content is all
- * present); (2) like any debounced best-effort renderer, a transient edit/delete
- * failure is retried on the next flush and only lingers if it happens on the
- * turn's FINAL flush. See docs/PLAN.md §9.1.
+ * replacement for the gone slot. Result: the direct re-anchor path never loses
+ * or duplicates content.
+ *
+ * ACCEPTED RESIDUALS (single-owner lab tool; all PRE-EXISTING best-effort-render
+ * properties, not introduced by the 404 fix — the original doFlush swallowed edit
+ * errors, trimmed unconditionally, and resetTurn clears msgIds):
+ *  1. Ordering: a manually-deleted NON-last streamed message re-anchors at the
+ *     tail, so a multi-chunk reply can read OUT OF ORDER for that turn (content
+ *     complete). Next turn is unaffected.
+ *  2. Final-flush transient: like any debounced renderer, a transient edit/delete
+ *     failure is retried on the NEXT flush. If it happens on the turn's FINAL
+ *     flush (no next flush) it can persist until the next turn: a shrunk reply
+ *     whose retained-anchor edit failed can show stale text, or a surplus anchor
+ *     whose delete failed can linger as a duplicate. This needs a precisely-timed
+ *     Discord API blip and only clutters the chat log; a full exactly-once
+ *     message-reconciliation subsystem is out of scope for this tool. See
+ *     docs/PLAN.md §9.1.
  */
 export async function renderChunks(
   channel: MinimalChannel,
