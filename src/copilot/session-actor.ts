@@ -51,6 +51,11 @@ export interface SessionActorOpts {
   policy: ApprovalPolicy;
   /** Session incarnation (P1: always 1; P2 resume will vary this). */
   generation?: number;
+  /** P2: resume an existing SDK session by id instead of creating a new one. */
+  resumeSessionId?: string;
+  /** P2: caller-assigned id for a NEW session (reserve-before-create), so a crash
+   *  between reserve and create leaves a resumable/identifiable id on disk. */
+  createSessionId?: string;
 }
 
 /** A raw-bytes attachment for send() — Discord images become blobs (P5). */
@@ -160,9 +165,26 @@ export class SessionActor {
     if (this.opts.contextTier) config["contextTier"] = this.opts.contextTier;
 
     // The SDK's SessionConfig is a large generic; we pass a validated subset.
-    this.session = await client.createSession(
-      config as Parameters<CopilotClient["createSession"]>[0]
-    );
+    const c = client as unknown as {
+      createSession(o: Record<string, unknown>): Promise<CopilotSession>;
+      resumeSession(id: string, o: Record<string, unknown>): Promise<CopilotSession>;
+    };
+    if (this.opts.resumeSessionId) {
+      // Resume preserves conversation history. continuePendingWork:false = treat
+      // any tool/permission work that was pending at crash time as INTERRUPTED
+      // (no auto-retry of side-effectful work); suppressResumeEvent avoids
+      // resume-related side effects on a silent reconnect.
+      this.session = await c.resumeSession(this.opts.resumeSessionId, {
+        ...config,
+        continuePendingWork: false,
+        suppressResumeEvent: true,
+      });
+    } else {
+      // Reserve-before-create uses a caller-assigned id so a crash between the
+      // durable reserve and this create leaves an identifiable id on disk.
+      if (this.opts.createSessionId) config["sessionId"] = this.opts.createSessionId;
+      this.session = await c.createSession(config);
+    }
     this.wireEvents();
   }
 
@@ -589,6 +611,12 @@ export class SessionActor {
   /** True once the actor has faulted (needs a fresh /new; can't be reused). */
   isFaulted(): boolean {
     return this.lifecycle === "faulted";
+  }
+
+  /** The underlying SDK session id (stable across resume) — persisted by the app
+   *  so a restart can resume this exact session. */
+  get sessionId(): string {
+    return (this.session as unknown as { sessionId: string }).sessionId;
   }
 
   private clearTodosTimer(): void {

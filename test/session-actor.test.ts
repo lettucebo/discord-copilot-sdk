@@ -16,6 +16,7 @@ class FakeSession {
   setModelCalls: Array<{ model: string; options?: unknown }> = [];
   aborted = 0;
   disconnected = 0;
+  sessionId = "fake-session-id";
   todos: Array<{ id?: string; title?: string; status?: string }> = [];
   rpc = {
     plan: {
@@ -109,17 +110,24 @@ interface Setup {
   broker: PendingInteractionBroker;
   policy: ApprovalPolicy;
   config: Record<string, unknown>;
+  resumeArgs?: { id: string; cfg: Record<string, unknown> };
 }
 
-async function setup(): Promise<Setup> {
+async function setup(extra: Record<string, unknown> = {}): Promise<Setup> {
   const session = new FakeSession();
   const transport = new FakeTransport();
   const broker = new PendingInteractionBroker();
   const policy = new ApprovalPolicy(join(tmpdir(), `discopilot-test-approvals-${Math.random()}.json`));
   let config: Record<string, unknown> = {};
+  const box: { resumeArgs?: { id: string; cfg: Record<string, unknown> } } = {};
   const client = {
     createSession: async (cfg: Record<string, unknown>) => {
       config = cfg;
+      return session;
+    },
+    resumeSession: async (id: string, cfg: Record<string, unknown>) => {
+      config = cfg;
+      box.resumeArgs = { id, cfg };
       return session;
     },
   } as unknown as CopilotClient;
@@ -129,8 +137,9 @@ async function setup(): Promise<Setup> {
     broker,
     transport,
     policy,
+    ...extra,
   });
-  return { actor, session, transport, broker, policy, config };
+  return { actor, session, transport, broker, policy, config, resumeArgs: box.resumeArgs };
 }
 
 // The captured permission callback (typed loosely for the test).
@@ -621,5 +630,29 @@ describe("todos_changed → checklist (P5)", () => {
     const rows = await s.actor.readTodos();
     expect(rows).toHaveLength(1);
     expect(rows[0]?.title).toBe("x");
+  });
+});
+
+describe("SessionActor resume/create-id seam (P2)", () => {
+  it("resumeSessionId → resumeSession(id, {continuePendingWork:false, suppressResumeEvent:true})", async () => {
+    const s = await setup({ resumeSessionId: "sess-123" });
+    expect(s.resumeArgs?.id).toBe("sess-123");
+    expect(s.resumeArgs?.cfg["continuePendingWork"]).toBe(false);
+    expect(s.resumeArgs?.cfg["suppressResumeEvent"]).toBe(true);
+    // still wires the same hardened callbacks
+    expect(typeof s.resumeArgs?.cfg["onPermissionRequest"]).toBe("function");
+    expect(s.resumeArgs?.cfg["enableFileHooks"]).toBe(false);
+  });
+
+  it("createSessionId → createSession includes the reserved sessionId", async () => {
+    const s = await setup({ createSessionId: "reserved-abc" });
+    expect(s.config["sessionId"]).toBe("reserved-abc");
+    expect(s.resumeArgs).toBeUndefined(); // did NOT resume
+  });
+
+  it("no id → plain createSession (no sessionId), sessionId getter exposes the SDK id", async () => {
+    const s = await setup();
+    expect(s.config["sessionId"]).toBeUndefined();
+    expect(s.actor.sessionId).toBe("fake-session-id");
   });
 });

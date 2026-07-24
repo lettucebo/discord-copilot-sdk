@@ -24,3 +24,8 @@ export function stateDir(): string {
 export function lockPath(id: string = instanceId()): string {
   return path.join(stateDir(), `${id}.lock`);
 }
+
+/** Path to the persisted session store for a logical instance (P2 resume). */
+export function sessionStorePath(id: string = instanceId()): string {
+  return path.join(stateDir(), `${id}.session.json`);
+}

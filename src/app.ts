@@ -18,10 +18,14 @@ import {
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Config } from "./config.js";
 import { acquireSingleInstanceLock, type InstanceLock } from "./core/single-instance.js";
-import { lockPath } from "./core/paths.js";
+import { lockPath, sessionStorePath } from "./core/paths.js";
 import { resolveControlledRepo } from "./core/repo.js";
 import { gitDiffSummary } from "./core/git.js";
 import { downloadBounded } from "./core/download.js";
+import { SessionStore, type SessionRecord } from "./core/session-store.js";
+import { planReconcile, type ThreadStatus } from "./core/reconcile.js";
+import { randomUUID } from "node:crypto";
+
 import { sendUnlessAborted } from "./core/turn-gate.js";
 import { shouldResetEffort, validateEffort } from "./core/effort.js";
 import { createCopilotClient, checkSdkCompat } from "./copilot/sdk.js";
@@ -107,13 +111,19 @@ export class DiscopilotApp {
   /** Serializes /new so two near-simultaneous creations can't both pass the
    *  "one live session" teardown and leave two live sessions. */
   private creating = false;
+  /** Durable thread↔session record for crash-safe resume (P2). */
+  private readonly store: SessionStore;
+  /** Startup phase gate (P2): input is rejected until reconciliation completes,
+   *  so a /new can't race startup resume and create a second live actor. */
+  private phase: "booting" | "reconciling" | "ready" | "shuttingDown" = "booting";
 
   private constructor(
     private readonly config: Config,
     private readonly repoPath: string,
     private readonly copilot: CopilotClient,
     private readonly lock: InstanceLock,
-    transportOverride?: Transport
+    transportOverride?: Transport,
+    storeOverride?: SessionStore
   ) {
     this.discord = new Client({
       intents: [
@@ -123,6 +133,7 @@ export class DiscopilotApp {
       ],
     });
     this.transport = transportOverride ?? new DiscordTransport(this.discord);
+    this.store = storeOverride ?? new SessionStore(sessionStorePath());
     this.policy = {
       allowedUserIds: new Set(this.config.DISCORD_ALLOWED_USER_IDS),
       guildId: this.config.DISCORD_GUILD_ID,
@@ -130,18 +141,19 @@ export class DiscopilotApp {
     };
   }
 
-  /** Test-only seam: construct the app with an injected transport (and fake
-   *  copilot/lock), skipping the lock/SDK/login startup, so unit tests can drive
-   *  the real runTurn/stop wiring without a live Discord connection. Not used in
-   *  production (start() is the only production entry point). */
+  /** Test-only seam: construct the app with an injected transport + store (and
+   *  fake copilot/lock), skipping the lock/SDK/login startup, so unit tests can
+   *  drive the real runTurn/stop/reconcile wiring without a live Discord
+   *  connection. Not used in production (start() is the only production entry). */
   static createForTest(
     config: Config,
     repoPath: string,
     copilot: CopilotClient,
-    transport: Transport
+    transport: Transport,
+    store?: SessionStore
   ): DiscopilotApp {
     const noopLock: InstanceLock = { path: "(test)", release: async () => {} };
-    return new DiscopilotApp(config, repoPath, copilot, noopLock, transport);
+    return new DiscopilotApp(config, repoPath, copilot, noopLock, transport, store);
   }
 
   /** Build and fully start the app (lock → SDK → Discord login + commands). */
@@ -198,6 +210,11 @@ export class DiscopilotApp {
   private async onReady(clientId: string): Promise<void> {
     await this.loadModels();
     await this.registerCommands(clientId);
+    // Reconcile the persisted session BEFORE accepting input (phase gate), so a
+    // /new can't race startup resume and leave two live actors on the shared tree.
+    this.phase = "reconciling";
+    await this.reconcileOnStartup();
+    this.phase = "ready";
     console.log(
       `✅ discopilot ready — controlling ${this.repoPath}\n` +
         `   guild=${this.config.DISCORD_GUILD_ID} channel=${this.config.DISCORD_PARENT_CHANNEL_ID}\n` +
@@ -316,6 +333,16 @@ export class DiscopilotApp {
 
   private async onInteraction(interaction: Interaction): Promise<void> {
     try {
+      // Startup gate (P2): reject input until reconciliation finished, so a /new
+      // can't race startup resume. Also blocks during shutdown.
+      if (this.phase !== "ready") {
+        if (interaction.isRepliable()) {
+          await interaction
+            .reply({ content: "⏳ 啟動中，請稍候重試。", flags: MessageFlags.Ephemeral })
+            .catch(() => {});
+        }
+        return;
+      }
       if (interaction.isButton()) {
         await this.onButton(interaction);
         return;
@@ -345,6 +372,17 @@ export class DiscopilotApp {
       return;
     }
     const uid = interaction.user.id;
+    const nonce = perm?.nonce ?? choice?.nonce ?? plan?.nonce ?? "";
+    // Expired-nonce (P2): a card posted before a restart carries a nonce that no
+    // live broker knows. It's already execution-safe (settle would no-op), but
+    // tell the user explicitly instead of silently blanking the buttons as if it
+    // was accepted.
+    if (!this.isNoncePending(nonce)) {
+      await interaction
+        .reply({ content: "此互動已於重啟後失效，未執行任何動作。請重新操作。", flags: MessageFlags.Ephemeral })
+        .catch(() => {});
+      return;
+    }
     if (perm) {
       // Ack Discord BEFORE settling, so an Allow can never run while the user
       // sees "interaction failed"; ack failure delivers the safe default (deny).
@@ -371,6 +409,16 @@ export class DiscopilotApp {
     }
   }
 
+  /** True when some live session's broker still has this nonce pending (i.e. the
+   *  card belongs to the current incarnation, not a pre-restart one). */
+  private isNoncePending(nonce: string): boolean {
+    if (!nonce) return false;
+    for (const s of this.sessions.values()) {
+      if (s.broker.get(nonce) !== undefined) return true;
+    }
+    return false;
+  }
+
   private async cmdNew(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!isAuthorized(ctxOf(interaction), this.policy)) {
       await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
@@ -395,9 +443,39 @@ export class DiscopilotApp {
         await interaction.editReply("Parent channel is not a text channel.");
         return;
       }
+
+      const thread = await (parent as TextChannel).threads.create({
+        name: `copilot ${new Date().toISOString().slice(5, 16).replace("T", " ")}`,
+        autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+      });
+
+      // Reserve-before-create (P2): durably record a `creating` row with a
+      // caller-assigned session id BEFORE tearing down the old session or calling
+      // createSession. This OVERWRITES any prior record, so a crash anywhere after
+      // this point can never resurrect the superseded session (startup sees
+      // `creating(newId)`, not the old `active` row). If the reserve can't be
+      // persisted, do NOT touch the old session — the current state stays intact.
+      const sessionId = randomUUID();
+      const generation = this.store.nextGeneration();
+      const reserved = this.store.reserve({
+        threadId: thread.id,
+        sessionId,
+        generation,
+        repoPath: this.repoPath,
+        guildId: this.config.DISCORD_GUILD_ID,
+        parentChannelId: this.config.DISCORD_PARENT_CHANNEL_ID,
+      });
+      if (!reserved) {
+        await interaction.editReply(
+          "⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未建立新的 session。請檢查磁碟／權限後重試。"
+        );
+        return;
+      }
+
       // v1 runs ONE live session at a time: all sessions share the single
       // controlled working tree, so two concurrent agents could clobber each
       // other's checkout/edits. Refuse to start if the previous one won't end.
+      // (The new record is already reserved, so this can't resurrect the old one.)
       const ended = await this.endAllSessions("A new session was started; this one has ended.");
       if (!ended) {
         await interaction.editReply(
@@ -407,10 +485,6 @@ export class DiscopilotApp {
         return;
       }
 
-      const thread = await (parent as TextChannel).threads.create({
-        name: `copilot ${new Date().toISOString().slice(5, 16).replace("T", " ")}`,
-        autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
-      });
       const broker = new PendingInteractionBroker();
       const actor = await SessionActor.create(this.copilot, {
         sessionKey: thread.id,
@@ -420,7 +494,19 @@ export class DiscopilotApp {
         broker,
         transport: this.transport,
         policy: this.approvals,
+        generation,
+        createSessionId: sessionId,
       });
+      // Promote creating→active. A failed commit means the record isn't durable,
+      // so we must NOT run as active: disconnect the just-created actor and tell
+      // the user. (The reserved row stays `creating`; a restart will orphan it.)
+      if (!this.store.commit()) {
+        await actor.disconnect().catch(() => {});
+        await interaction.editReply(
+          "⚠️ 無法持久化 session 狀態（commit 失敗），已取消啟動。請檢查磁碟／權限後重試。"
+        );
+        return;
+      }
       this.sessions.set(thread.id, { actor, broker, running: false });
       await interaction.editReply(`Started a session in <#${thread.id}>. Send prompts there.`);
 
@@ -429,6 +515,145 @@ export class DiscopilotApp {
     } finally {
       this.creating = false;
     }
+  }
+
+  /** Reconcile the persisted session on startup (P2). Runs while `phase` is
+   *  "reconciling" (input rejected), so it can register a resumed session before
+   *  any /new. `deps.classifyThread` is injectable for tests. Throws on a corrupt
+   *  store so startup fails closed rather than silently starting fresh. */
+  private async reconcileOnStartup(deps?: {
+    classifyThread?: (threadId: string) => Promise<ThreadStatus>;
+  }): Promise<void> {
+    const classify = deps?.classifyThread ?? ((id: string) => this.classifyThread(id));
+    const rec = this.store.get();
+    const corrupt = this.store.isCorrupt();
+
+    let bindingOk: boolean | undefined;
+    let threadStatus: ThreadStatus | undefined;
+    if (!corrupt && rec?.state === "active") {
+      bindingOk = this.bindingOk(rec);
+      if (bindingOk) threadStatus = await classify(rec.threadId);
+    }
+
+    const action = planReconcile({ corrupt, state: rec?.state, bindingOk, threadStatus });
+    switch (action.kind) {
+      case "fail-corrupt":
+        throw new Error(
+          `session store at ${sessionStorePath()} is corrupt; refusing to start. Inspect/remove it and restart.`
+        );
+      case "fresh":
+      case "retain":
+        return;
+      case "orphan-interrupted":
+        this.store.setState("orphaned", "interrupted-create");
+        return;
+      case "skip":
+        console.warn(`reconcile: not resuming this boot (${action.reason}); record left unchanged.`);
+        return;
+      case "block":
+        this.store.setState("blocked", action.reason);
+        if (rec) {
+          await this.transport
+            .notice(rec.threadId, `⚠️ 無法復原此 session（${action.reason}）。請用 /new 開新的。`)
+            .catch(() => {});
+        }
+        return;
+      case "resume":
+        if (rec) await this.resumeRecord(rec);
+        return;
+    }
+  }
+
+  /** Resume the SDK session for an active record; register it and post an honest
+   *  recovery notice. A resume failure is classified session-lost (orphaned) vs
+   *  other (blocked, retryable). */
+  private async resumeRecord(rec: SessionRecord): Promise<void> {
+    const broker = new PendingInteractionBroker();
+    let actor: SessionActor;
+    try {
+      actor = await SessionActor.create(this.copilot, {
+        sessionKey: rec.threadId,
+        workingDirectory: this.repoPath,
+        model: this.config.DEFAULT_MODEL,
+        contextTier: this.config.DEFAULT_CONTEXT_TIER,
+        broker,
+        transport: this.transport,
+        policy: this.approvals,
+        generation: rec.generation,
+        resumeSessionId: rec.sessionId,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/not.?found|unknown session|no session|does not exist|no such/i.test(msg)) {
+        this.store.setState("orphaned", "session-lost");
+        await this.transport
+          .notice(rec.threadId, "⚠️ 無法復原（session 已遺失）。請用 /new 開新的。")
+          .catch(() => {});
+      } else {
+        this.store.setState("blocked", "resume-error");
+        await this.transport
+          .notice(rec.threadId, `⚠️ 復原失敗（${msg}）。可稍後重啟重試，或用 /new。`)
+          .catch(() => {});
+      }
+      return;
+    }
+    this.sessions.set(rec.threadId, { actor, broker, running: false });
+    this.store.commit(); // keep active, refresh updatedAt
+    await this.transport
+      .notice(
+        rec.threadId,
+        "♻️ 已從重啟復原此對話（歷史保留）。上一個回合已中斷且**不會自動續跑**；" +
+          "先前若有指令可能已部分或完全執行，請先確認 repo／程序狀態，再決定是否重送。"
+      )
+      .catch(() => {});
+  }
+
+  /** Whether the stored binding still matches this bot's config + controlled repo.
+   *  A mismatch (e.g. CONTROLLED_REPO_PATH or guild/parent changed between runs)
+   *  must NOT resume — it would run one repo's conversation against another. */
+  private bindingOk(rec: SessionRecord): boolean {
+    const norm = (p: string): string => p.replace(/[\\/]+$/, "").toLowerCase();
+    return (
+      norm(rec.repoPath) === norm(this.repoPath) &&
+      rec.guildId === this.config.DISCORD_GUILD_ID &&
+      rec.parentChannelId === this.config.DISCORD_PARENT_CHANNEL_ID
+    );
+  }
+
+  /** Classify the Discord thread a record is bound to. Distinguishes definitive
+   *  absence/inaccessibility from a transient fetch failure so a startup blip
+   *  can't drop a recoverable session. Unarchives an archived thread if possible. */
+  private async classifyThread(threadId: string): Promise<ThreadStatus> {
+    let ch;
+    try {
+      ch = await this.discord.channels.fetch(threadId);
+    } catch (err) {
+      const e = err as { code?: number; status?: number };
+      if (e?.code === 10003) return "gone"; // Unknown Channel (definitive 404)
+      if (e?.status === 403 || e?.code === 50001) return "inaccessible"; // Missing Access
+      return "transient"; // 429 / 5xx / network / unknown — retryable
+    }
+    if (!ch) return "gone";
+    const anyCh = ch as unknown as {
+      isThread?: () => boolean;
+      guildId?: string;
+      parentId?: string | null;
+      archived?: boolean | null;
+      setArchived?: (v: boolean) => Promise<unknown>;
+      sendable?: boolean;
+    };
+    if (typeof anyCh.isThread === "function" && !anyCh.isThread()) return "inaccessible";
+    if (anyCh.guildId !== this.config.DISCORD_GUILD_ID) return "inaccessible";
+    if (anyCh.parentId !== this.config.DISCORD_PARENT_CHANNEL_ID) return "inaccessible";
+    if (anyCh.archived) {
+      try {
+        await anyCh.setArchived?.(false);
+      } catch {
+        return "archived-unarchivable";
+      }
+    }
+    if (typeof anyCh.sendable === "boolean" && !anyCh.sendable) return "archived-unarchivable";
+    return "valid";
   }
 
   private async cmdStop(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -602,6 +827,7 @@ export class DiscopilotApp {
 
   private async onMessage(message: Message): Promise<void> {
     if (message.author.bot) return;
+    if (this.phase !== "ready") return; // ignore until reconciliation finished
     const session = this.sessions.get(message.channelId);
     if (!session) return; // not a session thread
     if (!isAuthorized(ctxOf(message), this.policy)) return; // silent for non-owners
@@ -789,6 +1015,7 @@ export class DiscopilotApp {
   async stop(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.phase = "shuttingDown"; // reject any late input while tearing down
     for (const [threadId, session] of this.sessions) {
       session.broker.abort();
       await session.actor.disconnect().catch(() => {});
@@ -839,3 +1066,5 @@ async function preflightModel(copilot: CopilotClient, model: string): Promise<vo
 
 // Keep the discord.js thread type referenced (used via casts above).
 export type { AnyThreadChannel };
+
+
