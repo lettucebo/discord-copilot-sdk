@@ -485,14 +485,15 @@ export class DiscopilotApp {
       // other's checkout/edits. Refuse to start if the previous one won't end.
       const ended = await this.endAllSessions("A new session was started; this one has ended.");
       if (!ended) {
-        // Teardown failed and the old actor is still live in-memory. Roll the
-        // record back to the (still-live) old session so disk and memory agree
-        // and the old session remains resumable; drop the new thread.
-        if (prevRecord) this.store.restore(prevRecord);
-        else this.store.clear();
+        // Teardown failed and the old actor is still live in-memory (endAllSessions
+        // retains it → it also FENCES the next /new). Roll the record back to the
+        // still-live old session so disk and memory agree and it stays resumable.
+        const rolledBack = prevRecord ? this.store.restore(prevRecord) : this.store.clear();
         await dropThread();
         await interaction.editReply(
-          "無法結束前一個 session（可能已失效），未建立新的。前一個 session 已保留——請重試；若持續發生請重啟 bot。"
+          rolledBack
+            ? "無法結束前一個 session（可能已失效），未建立新的。前一個 session 已保留——請重試；若持續發生請重啟 bot。"
+            : "⚠️ 無法結束前一個 session，且回滾記錄也失敗（磁碟問題）。前一個 session 仍在執行中，但其記錄可能不一致——請重啟 bot。"
         );
         return;
       }
@@ -512,10 +513,15 @@ export class DiscopilotApp {
           createSessionId: sessionId,
         });
       } catch (err) {
-        // Create failed after the old session was torn down. The record stays
-        // `creating` (→ orphaned on restart, fail-closed); no live actor exists,
-        // so /new can be retried. Reply to the deferred interaction (don't leave
-        // the user staring at "thinking…").
+        // Create failed after the old session was torn down. The RPC may or may
+        // not have created the assigned id, so best-effort DELETE it to remove any
+        // dormant runtime session (it has no actor and can never receive a turn,
+        // so it can't contend for the tree, but we don't want it lingering). The
+        // record stays `creating` (→ orphaned on restart, fail-closed); no live
+        // actor exists, so /new can be retried.
+        await (this.copilot as unknown as { deleteSession?: (id: string) => Promise<unknown> })
+          .deleteSession?.(sessionId)
+          .catch(() => {});
         await dropThread();
         await interaction.editReply(
           `⚠️ 建立 session 失敗（${err instanceof Error ? err.message : String(err)}）。請重試 /new。`

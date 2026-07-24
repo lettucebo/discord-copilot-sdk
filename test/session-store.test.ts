@@ -206,4 +206,19 @@ describe("SessionStore", () => {
       rmSync(f, { force: true });
     }
   });
+
+  it("write failures NEVER throw — commit AND clear return false on an unwritable path", () => {
+    // A directory as the file makes every write throw; the store must still
+    // return false (not throw), so callers' fail-closed handling isn't skipped.
+    const dir = mkdtempSync(join(tmpdir(), "dp-session-nothrow-"));
+    try {
+      const s = new SessionStore(dir);
+      expect(() => {
+        expect(s.commit(bind())).toBe(false);
+        expect(s.clear()).toBe(false);
+      }).not.toThrow();
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
 });

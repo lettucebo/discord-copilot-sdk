@@ -158,7 +158,14 @@ export class SessionStore {
       this.corrupt = false;
       return true;
     } catch (err) {
-      fs.rmSync(tmp, { force: true }); // don't leak a partial temp file
+      // Best-effort temp cleanup — must NOT itself throw, or write() would throw
+      // instead of returning false and callers' fail-closed handling (commit-fail
+      // fence, rollback) would be skipped.
+      try {
+        fs.rmSync(tmp, { force: true });
+      } catch {
+        /* leave the temp file rather than mask the real failure */
+      }
       console.warn(
         `⚠️  could not persist session store to ${this.file}: ${err instanceof Error ? err.message : String(err)}`
       );
