@@ -1,0 +1,67 @@
+# Minimal CI (PLAN.md §9): typecheck + the fake-driven test harness on the two
+# engine floors (^20.19 and >=22.12) across Windows + Ubuntu. No network in the
+# tests themselves: every test uses fakes (fake SDK/Discord/clock), so this never
+# touches real Copilot or Discord. The Windows-only real-icacls test in
+# secure-file.test.ts runs on the windows jobs; it is skipped on Ubuntu.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# bash on both Ubuntu and Windows runners so the steps are identical.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ["20.19", "22.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # The committed package-lock.json resolves against an internal Microsoft
+      # mirror (generated behind a corp proxy) that public runners can't reach, so
+      # `npm ci` would fail. Resolve fresh from the default public registry
+      # instead. (To restore `npm ci` reproducibility, regenerate the lockfile off
+      # the corp network against registry.npmjs.org and commit it.)
+      - name: Install deps (public npm)
+        run: |
+          rm -f package-lock.json
+          npm install --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+
+  lint-scripts:
+    name: lint shell + installer scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.12"
+      # Bash syntax check for the POSIX installer/bootstraps.
+      - run: bash -n install.sh
+      # Node syntax check for the installer engine + its pure libs.
+      - run: |
+          for f in scripts/setup.mjs scripts/lib/*.mjs; do
+            echo "node --check $f"
+            node --check "$f"
+          done

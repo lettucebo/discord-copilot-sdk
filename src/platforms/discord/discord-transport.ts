@@ -9,6 +9,7 @@ import { chunkText } from "../../core/chunk.js";
 import type { RenderState } from "../../core/turn-render.js";
 import type { Decision, PermissionView, PlanView, Transport, UserInputView } from "../../core/transport.js";
 import { encodePermissionId, encodeChoiceId, encodePlanId } from "./custom-id.js";
+import { renderChunks } from "./render-chunks.js";
 import { sanitizeForCodeBlock } from "../../core/text-safety.js";
 
 export { sanitizeForCodeBlock };
@@ -137,45 +138,16 @@ export class DiscordTransport implements Transport {
     const chunks = text.length ? chunkText(text, 1900) : [];
     const channel = await this.fetchThread(sessionKey);
     if (!channel) return;
-    for (let i = 0; i < chunks.length; i++) {
-      if (s.epoch !== epoch) return; // a new turn started mid-write
-      const content = chunks[i]!;
-      const existing = s.msgIds[i];
-      if (existing) {
-        try {
-          const m = await channel.messages.fetch(existing);
-          await m.edit({ content, ...NO_MENTIONS });
-        } catch {
-          /* message deleted/unreachable — best effort */
-        }
-      } else {
-        const m = await channel.send({ content, ...NO_MENTIONS });
-        // A resetTurn/dispose may have landed while the send was in flight; if
-        // so this message belongs to a turn that no longer exists — delete it
-        // instead of recording its id into the new epoch's state.
-        if (s.epoch !== epoch) {
-          try {
-            await m.delete();
-          } catch {
-            /* best effort */
-          }
-          return;
-        }
-        s.msgIds[i] = m.id;
-      }
-    }
-    // Trim anchors the shorter final output no longer needs.
-    for (let i = chunks.length; i < s.msgIds.length; i++) {
-      const id = s.msgIds[i];
-      if (!id) continue;
-      try {
-        const m = await channel.messages.fetch(id);
-        await m.delete();
-      } catch {
-        /* already gone */
-      }
-    }
-    if (s.msgIds.length > chunks.length) s.msgIds.length = chunks.length;
+    // Delegates edit/re-anchor/trim to the unit-tested reconciler. The epoch
+    // guard aborts cleanly if a new turn starts mid-write; a deleted anchor is
+    // re-posted (never silently dropped).
+    await renderChunks(
+      channel,
+      s.msgIds,
+      chunks,
+      () => s.epoch === epoch,
+      (content) => ({ content, ...NO_MENTIONS })
+    );
   }
 
   async showPermission(view: PermissionView): Promise<void> {

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 
 const setup = () => new PendingInteractionBroker();
@@ -23,11 +23,21 @@ describe("PendingInteractionBroker", () => {
     expect(b.size).toBe(0);
   });
 
-  it("times out with the safe default and rejects a late settle", async () => {
-    const b = setup();
-    const { nonce, promise } = b.register(opts({ timeoutMs: 10 }));
-    await expect(promise).resolves.toBe("deny"); // onDefault
-    expect(b.settle(nonce, "allow")).toBe(false); // too late
+  it("times out with the safe default and rejects a late settle (deterministic clock)", async () => {
+    // Deterministic clock (PLAN.md §9): drive the timeout with fake timers rather
+    // than sleeping on a real one, so the test is exact and not wall-clock flaky.
+    vi.useFakeTimers();
+    try {
+      const b = setup();
+      const { nonce, promise } = b.register(opts({ timeoutMs: 10 }));
+      expect(b.size).toBe(1);
+      await vi.advanceTimersByTimeAsync(10); // fire the timeout at exactly t=10ms
+      await expect(promise).resolves.toBe("deny"); // onDefault
+      expect(b.settle(nonce, "allow")).toBe(false); // too late
+      expect(b.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects a settle from a stale generation", async () => {
@@ -73,6 +83,24 @@ describe("PendingInteractionBroker", () => {
     for (let i = 4; i >= 0; i--) expect(b.settle(reqs[i]!.nonce, `r${i}`)).toBe(true);
     const results = await Promise.all(reqs.map((r) => r.promise));
     expect(results).toEqual(["r0", "r1", "r2", "r3", "r4"]);
+    expect(b.size).toBe(0);
+  });
+
+  it("settles concurrent CROSS-session requests out of order, each independently", async () => {
+    // §9 "跨 session 併發亂序": interleave pending requests across two sessions and
+    // settle them out of registration order; each nonce settles only its own
+    // request, unaffected by the others' session or ordering.
+    const b = setup();
+    const a1 = b.register(opts({ sessionKey: "sA", kind: "a1" }));
+    const b1 = b.register(opts({ sessionKey: "sB", kind: "b1" }));
+    const a2 = b.register(opts({ sessionKey: "sA", kind: "a2" }));
+    expect(b.size).toBe(3);
+    expect(b.settle(b1.nonce, "rB1")).toBe(true); // sB first
+    expect(b.settle(a2.nonce, "rA2")).toBe(true); // sA's SECOND before its first
+    expect(b.settle(a1.nonce, "rA1")).toBe(true);
+    expect(await a1.promise).toBe("rA1");
+    expect(await a2.promise).toBe("rA2");
+    expect(await b1.promise).toBe("rB1");
     expect(b.size).toBe(0);
   });
 });

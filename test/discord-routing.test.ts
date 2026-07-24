@@ -8,7 +8,7 @@ import {
   decodePlanId,
 } from "../src/platforms/discord/custom-id.js";
 import { isAuthorized } from "../src/platforms/discord/auth.js";
-import { resolveButtonAck } from "../src/app.js";
+import { resolveButtonAck, decisionBindsToChannel } from "../src/app.js";
 
 describe("custom-id", () => {
   it("round-trips each action + nonce", () => {
@@ -78,6 +78,20 @@ describe("isAuthorized", () => {
 
   it("denies a channel/thread outside the parent", () => {
     expect(isAuthorized({ userId: "u1", guildId: "g1", channelId: "cX", parentId: "cY" }, policy)).toBe(false);
+  });
+});
+
+describe("decisionBindsToChannel (cross-thread guard, §9)", () => {
+  it("allows a decision from the nonce's OWNING thread", () => {
+    expect(decisionBindsToChannel({ sessionKey: "tA" }, "tA")).toBe(true);
+  });
+
+  it("REJECTS a decision arriving from a different thread (cross-thread click can't resolve)", () => {
+    expect(decisionBindsToChannel({ sessionKey: "tA" }, "tB")).toBe(false);
+  });
+
+  it("rejects when there is no pending request (expired / unknown nonce)", () => {
+    expect(decisionBindsToChannel(undefined, "tA")).toBe(false);
   });
 });
 

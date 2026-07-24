@@ -104,6 +104,28 @@
 ## 9. 測試（針對非同步編排）
 fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只 settle 一次/過期點擊拒絕；未授權與跨 thread 點擊無法 resolve；ack 失敗即 deny；modal 路徑；同/跨 session 併發亂序；shutdown/abort 清空 pending；generation 過期 callback 不生效；delta/final 去重；sub-agent 不交錯；未知權限變體 fail-closed；resume 對帳四種情形；message 404 新 anchor。Live smoke（P1 驗收）+ Restart smoke（P2）。最小 CI（Node22 Win/Ubuntu）。
 
+### 9.1 §9 涵蓋對照（實作後補記）
+| §9 需求 | 涵蓋位置 |
+|---|---|
+| 逾時只 settle 一次 / 過期點擊拒絕 | `broker.test.ts`（`settles exactly once`、逾時用**決定性 fake clock** `vi.useFakeTimers`）|
+| 未授權點擊 | `discord-routing.test.ts`（`isAuthorized` 系列）|
+| **跨 thread 點擊無法 resolve** | `discord-routing.test.ts`（`decisionBindsToChannel`）+ `app.ts onButton` 綁定 `pending.sessionKey === interaction.channelId` |
+| ack 失敗即 deny | `discord-routing.test.ts`（`resolveButtonAck`）、`session-actor.test.ts`（`settles deny if the card cannot be posted`）|
+| **同 / 跨 session 併發亂序** | `broker.test.ts`（`out of order` 同 session + `CROSS-session ... out of order` 跨 session）|
+| shutdown/abort 清空 pending | `broker.test.ts`（`abort`）、`session-actor.test.ts`（`stop() ... clears pending`）、`app-stop-flow.test.ts` |
+| generation 過期 callback 不生效 | `broker.test.ts`（`stale generation`）|
+| delta/final 去重 | `transport.test.ts`（`posts once then edits`）、`turn-render.test.ts` |
+| sub-agent 不交錯 | `turn-render.test.ts`（`ignores any sub-agent` / `does not let a sub-agent ... overwrite`）|
+| 未知權限變體 fail-closed | `session-actor.test.ts`（`auto-denies a non-shell permission (fail closed)`）|
+| resume 對帳四種情形 | `reconcile.test.ts`（14）+ `app-reconcile.test.ts`（9）|
+| **message 404 新 anchor** | `render-chunks.ts` + `render-chunks.test.ts`（`RE-ANCHORS ...`、含多 chunk 保序）|
+| 最小 CI（Win/Ubuntu、Node 20.19+22.12）| `.github/workflows/ci.yml` |
+
+**設計決策（與 §9 措辭的差異，刻意記錄）：**
+- **「modal 路徑」= thread 訊息自由輸入**，非 Discord modal 彈窗。行動裝置友善、無彈窗限制；freeform 能力已實作並測試（`session-actor.test.ts` `freeform message answers (wasFreeform=true)`）。不另做 Discord modal（YAGNI，非使用者需求）。
+- **Restart smoke（P2）** 的自動化部分即 `app-reconcile.test.ts`（9 個 app 層 resume 對帳情形，以 fake 驅動）+ `reconcile.test.ts`；真正的「重啟後 live 復原」已於開發時人工驗證（斷線→重啟→喚回暗號 PELICAN-77）。可跑於 CI 的 live-restart 需真實 Discord+Copilot，超出無網路 CI 範圍。
+- **安裝器測試框架**（`secure-file`/`setup-core`/`setup-integration`）屬 **P6 安裝器回歸**，另立 issue 追蹤，不計入本 §9（#8）。
+
 ## 10. 決策紀錄（已定）
 1. **隔離方式 = B（先 lab-only）**：不做 controller/worker 分離；P1 只在**可拋棄的 VM/測試帳號/測試 repo**跑；README + 啟動時明確警告「僅限拋棄式環境」。之後再升級到 A。
 2. **帳號盜用 = 先靠 Discord MFA**；TOTP/本機 step-up 列為未來強化（非 v1）。

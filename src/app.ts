@@ -29,7 +29,7 @@ import { randomUUID } from "node:crypto";
 import { sendUnlessAborted } from "./core/turn-gate.js";
 import { shouldResetEffort, validateEffort } from "./core/effort.js";
 import { createCopilotClient, checkSdkCompat } from "./copilot/sdk.js";
-import { PendingInteractionBroker } from "./core/broker.js";
+import { PendingInteractionBroker, type PendingView } from "./core/broker.js";
 import { SessionActor, type BlobAttachment, formatTodos } from "./copilot/session-actor.js";
 import { ApprovalPolicy } from "./core/approval-policy.js";
 import { DiscordTransport } from "./platforms/discord/discord-transport.js";
@@ -89,6 +89,19 @@ export async function resolveButtonAck(
     return;
   }
   deliver(action);
+}
+
+/** Cross-thread guard (§9: "跨 thread 點擊無法 resolve"). A permission/choice/plan
+ *  decision may only settle a nonce whose owning session is the very thread the
+ *  interaction arrived from. The nonce is unique + Discord-validated, so this is
+ *  defense-in-depth: returns true iff the pending request exists AND its
+ *  sessionKey matches the interaction's channel; false for a missing pending
+ *  (expired) or a mismatched channel (a click from another thread). */
+export function decisionBindsToChannel(
+  pending: { sessionKey: string } | undefined,
+  channelId: string
+): boolean {
+  return pending !== undefined && pending.sessionKey === channelId;
 }
 
 /**
@@ -377,9 +390,20 @@ export class DiscopilotApp {
     // live broker knows. It's already execution-safe (settle would no-op), but
     // tell the user explicitly instead of silently blanking the buttons as if it
     // was accepted.
-    if (!this.isNoncePending(nonce)) {
+    const pending = this.pendingFor(nonce);
+    if (!pending) {
       await interaction
         .reply({ content: "此互動已於重啟後失效，未執行任何動作。請重新操作。", flags: MessageFlags.Ephemeral })
+        .catch(() => {});
+      return;
+    }
+    // Cross-thread guard (§9: "跨 thread 點擊無法 resolve"). A card's buttons only
+    // exist in its OWNING thread, so a decision must come from that thread. The
+    // nonce is unique + Discord-validated, but bind it to the channel anyway as
+    // defense-in-depth: a click whose channel ≠ the nonce's session never settles.
+    if (!decisionBindsToChannel(pending, interaction.channelId)) {
+      await interaction
+        .reply({ content: "此互動不屬於目前的討論串，未執行任何動作。", flags: MessageFlags.Ephemeral })
         .catch(() => {});
       return;
     }
@@ -409,14 +433,16 @@ export class DiscopilotApp {
     }
   }
 
-  /** True when some live session's broker still has this nonce pending (i.e. the
-   *  card belongs to the current incarnation, not a pre-restart one). */
-  private isNoncePending(nonce: string): boolean {
-    if (!nonce) return false;
+  /** The pending view for `nonce` from whichever live session's broker owns it,
+   *  or undefined if no live broker has it (e.g. a pre-restart card). Used both
+   *  to reject expired nonces and to bind a decision to its owning thread. */
+  private pendingFor(nonce: string): PendingView | undefined {
+    if (!nonce) return undefined;
     for (const s of this.sessions.values()) {
-      if (s.broker.get(nonce) !== undefined) return true;
+      const v = s.broker.get(nonce);
+      if (v !== undefined) return v;
     }
-    return false;
+    return undefined;
   }
 
   private async cmdNew(interaction: ChatInputCommandInteraction): Promise<void> {
