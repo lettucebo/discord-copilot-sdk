@@ -519,9 +519,12 @@ export class DiscopilotApp {
         // so it can't contend for the tree, but we don't want it lingering). The
         // record stays `creating` (→ orphaned on restart, fail-closed); no live
         // actor exists, so /new can be retried.
-        await (this.copilot as unknown as { deleteSession?: (id: string) => Promise<unknown> })
-          .deleteSession?.(sessionId)
-          .catch(() => {});
+        await withTimeout(
+          ((this.copilot as unknown as { deleteSession?: (id: string) => Promise<unknown> }).deleteSession?.(
+            sessionId
+          ) ?? Promise.resolve()) as Promise<unknown>,
+          TEARDOWN_TIMEOUT_MS
+        ).catch(() => {});
         await dropThread();
         await interaction.editReply(
           `⚠️ 建立 session 失敗（${err instanceof Error ? err.message : String(err)}）。請重試 /new。`
@@ -1091,7 +1094,9 @@ export class DiscopilotApp {
     this.phase = "shuttingDown"; // reject any late input while tearing down
     for (const [threadId, session] of this.sessions) {
       session.broker.abort();
-      await session.actor.disconnect().catch(() => {});
+      // Bound the disconnect: a retained fence's disconnect can be permanently
+      // hung, and shutdown must not block forever on it.
+      await withTimeout(session.actor.disconnect(), TEARDOWN_TIMEOUT_MS).catch(() => {});
       this.transport.dispose(threadId);
     }
     this.sessions.clear();

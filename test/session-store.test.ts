@@ -2,7 +2,8 @@ import { describe, it, expect } from "vitest";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { rmSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { rmSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+
 
 const tmpFile = (): string => join(tmpdir(), `dp-session-${Math.random()}.json`);
 
@@ -219,6 +220,27 @@ describe("SessionStore", () => {
       }).not.toThrow();
     } finally {
       rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("write() returns false (never throws) even when the temp CLEANUP itself throws", () => {
+    // Fault injection WITHOUT mocking: pre-create a DIRECTORY at the temp path, so
+    // both the main writeFileSync(tmp) AND the catch-block rmSync(tmp) throw
+    // (EISDIR). write() must still return false — a throw here would bypass the
+    // commit-fail fence / rollback in cmdNew. (The plain-directory test above
+    // would pass even against the previous unguarded-cleanup code; this one won't.)
+    const f = tmpFile();
+    mkdirSync(`${f}.tmp`);
+    try {
+      const s = new SessionStore(f);
+      let result: boolean | undefined;
+      expect(() => {
+        result = s.commit(bind());
+      }).not.toThrow();
+      expect(result).toBe(false);
+    } finally {
+      rmSync(`${f}.tmp`, { force: true, recursive: true });
+      rmSync(f, { force: true });
     }
   });
 });
