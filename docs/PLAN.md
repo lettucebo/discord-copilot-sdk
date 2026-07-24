@@ -126,6 +126,10 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 - **Restart smoke（P2）** 的自動化部分即 `app-reconcile.test.ts`（9 個 app 層 resume 對帳情形，以 fake 驅動）+ `reconcile.test.ts`；真正的「重啟後 live 復原」已於開發時人工驗證（斷線→重啟→喚回暗號 PELICAN-77）。可跑於 CI 的 live-restart 需真實 Discord+Copilot，超出無網路 CI 範圍。
 - **安裝器測試框架**（`secure-file`/`setup-core`/`setup-integration`）屬 **P6 安裝器回歸**，另立 issue 追蹤，不計入本 §9（#8）。
 
+**message 404 re-anchor 的已接受殘留（single-owner 取捨，RubberDuck R3）：**
+- re-anchor 在**重建**時會先確認刪除整段過期 anchor 才重貼（避免重複/亂序），且每步都做 epoch 檢查。
+- 若重建清理遇到**暫時性** Discord 錯誤則中止並靠下一次 debounce flush 重試；但在**該回合最後一次 flush** 可能沒有後續 flush，導致被使用者刪除的該段內容維持缺失——即**退回修正前行為**（原本就會在訊息被刪時丟失該段）。此為**嚴格不劣於**基準、且絕不重複/損毀，故**刻意不加**有狀態的 bounded-retry timer（single-owner lab 工具的比例原則）。
+
 ## 10. 決策紀錄（已定）
 1. **隔離方式 = B（先 lab-only）**：不做 controller/worker 分離；P1 只在**可拋棄的 VM/測試帳號/測試 repo**跑；README + 啟動時明確警告「僅限拋棄式環境」。之後再升級到 A。
 2. **帳號盜用 = 先靠 Discord MFA**；TOTP/本機 step-up 列為未來強化（非 v1）。

@@ -194,6 +194,25 @@ describe("renderChunks", () => {
     expect(ids).toEqual(["m1", "m2"]); // untouched; a fresh turn resets msgIds anyway
   });
 
+  it("epoch guard aborts BEFORE the delete if the turn is superseded during the fetch", async () => {
+    const ch = new FakeChannel();
+    ch.seed("m1"); // reported gone → triggers rebuild cleanup
+    const m2 = ch.seed("m2"); // survivor: must NOT be deleted once the turn is superseded
+    ch.fetchError = (id) => (id === "m1" ? { code: 10008 } : undefined);
+    let calls = 0;
+    // true for: renderChunks loop-guard(1), deleteSuffix i=0 guard(2), i=1 guard(3);
+    // flips false at the POST-FETCH check(4) — after fetching m2, before deleting it.
+    const stillCurrent = () => {
+      calls++;
+      return calls < 4;
+    };
+    const ids = ["m1", "m2"];
+    await renderChunks(ch, ids, ["A", "B"], stillCurrent, opts);
+    expect(m2.deleted).toBe(false); // in-flight delete avoided by the post-fetch guard
+    expect(ch.sent).toEqual([]);
+    expect(ids).toEqual(["m1", "m2"]);
+  });
+
   it("trims and deletes anchors the shorter final output no longer needs", async () => {
     const ch = new FakeChannel();
     const m1 = ch.seed("m1");

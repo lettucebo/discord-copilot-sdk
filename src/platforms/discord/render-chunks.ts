@@ -46,6 +46,14 @@ export function isMessageGone(err: unknown): boolean {
  * `stillCurrent()` is checked before every mutation so a new turn started
  * mid-write (epoch bump) abandons cleanly: an in-flight send for a superseded
  * turn is deleted rather than recorded. Mutates `msgIds` in place.
+ *
+ * ACCEPTED RESIDUAL (single-owner tool): if a rebuild's suffix cleanup hits a
+ * TRANSIENT Discord error, it aborts without posting and relies on a later flush
+ * to retry. On the turn's FINAL flush there may be no later flush, so the
+ * user-deleted chunk can stay missing — i.e. it degrades to the PRE-FIX behavior
+ * (which always dropped deleted-message content). This is strictly no worse than
+ * the baseline and never duplicates/corrupts, so a stateful bounded-retry timer
+ * is intentionally not added. See docs/PLAN.md §9.1.
  */
 export async function renderChunks(
   channel: MinimalChannel,
@@ -73,6 +81,7 @@ export async function renderChunks(
         // superseded), ABORT without posting and leave msgIds intact so the next
         // debounced flush retries from a consistent state (no duplicate, no loss).
         if (!(await deleteSuffix(channel, msgIds, i, stillCurrent))) return;
+        if (!stillCurrent()) return; // epoch flipped during cleanup: abort before re-posting
         rebuilding = true; // msgIds is now truncated to i; send the rest fresh
       }
     }
@@ -114,6 +123,7 @@ async function deleteSuffix(
     if (!id) continue;
     try {
       const m = await channel.messages.fetch(id);
+      if (!stillCurrent()) return false; // epoch flipped during fetch: abort before deleting
       await m.delete();
     } catch (err) {
       if (!isMessageGone(err)) return false; // transient: removal not confirmed
