@@ -9,10 +9,13 @@
 export async function downloadBounded(
   url: string,
   maxBytes: number,
-  timeoutMs = 15_000
+  timeoutMs = 15_000,
+  signal?: AbortSignal
 ): Promise<Buffer | null> {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const combined = signal ? AbortSignal.any([timeout, signal]) : timeout;
+    const res = await fetch(url, { signal: combined });
     if (!res.ok) return null;
 
     const declared = Number(res.headers.get("content-length"));

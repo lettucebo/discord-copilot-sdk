@@ -22,6 +22,7 @@ import { lockPath } from "./core/paths.js";
 import { resolveControlledRepo } from "./core/repo.js";
 import { gitDiffSummary } from "./core/git.js";
 import { downloadBounded } from "./core/download.js";
+import { sendUnlessAborted } from "./core/turn-gate.js";
 import { shouldResetEffort, validateEffort } from "./core/effort.js";
 import { createCopilotClient, checkSdkCompat } from "./copilot/sdk.js";
 import { PendingInteractionBroker } from "./core/broker.js";
@@ -36,6 +37,9 @@ interface Session {
   actor: SessionActor;
   broker: PendingInteractionBroker;
   running: boolean;
+  /** Set while a turn is reserved but the prompt hasn't been handed to the agent
+   *  yet (e.g. during image download). /stop aborts this to cancel before send. */
+  currentAbort?: AbortController;
 }
 
 /** Milliseconds a single session teardown may take during /new before we give
@@ -425,6 +429,9 @@ export class DiscopilotApp {
       });
       return;
     }
+    // Cancel a turn that's still reserved but not yet sent (e.g. downloading an
+    // image), then stop any in-flight SDK turn. Both are safe/idempotent.
+    session.currentAbort?.abort();
     const ok = await session.actor.stop();
     await interaction.reply({
       content: ok ? "Abort requested for the current turn." : "Abort attempted but the runtime reported an error.",
@@ -606,7 +613,7 @@ export class DiscopilotApp {
    *  skipped with a notice. Bounded by count, per-file size AND a cumulative
    *  total, with a fetch timeout and a streaming byte cap, so a huge or stalled
    *  upload can't blow the prompt budget or memory. */
-  private async collectImageAttachments(message: Message): Promise<BlobAttachment[]> {
+  private async collectImageAttachments(message: Message, signal?: AbortSignal): Promise<BlobAttachment[]> {
     const MAX_IMAGES = 4;
     const MAX_BYTES = 8 * 1024 * 1024; // 8 MiB per image
     const MAX_TOTAL_BYTES = 24 * 1024 * 1024; // cap across all images in one message
@@ -616,6 +623,7 @@ export class DiscopilotApp {
     let skipped = 0;
     let total = 0;
     for (const att of all) {
+      if (signal?.aborted) break; // /stop during download: bail immediately
       if (out.length >= MAX_IMAGES) {
         skipped++;
         continue;
@@ -635,7 +643,7 @@ export class DiscopilotApp {
         skipped++;
         continue;
       }
-      const buf = await downloadBounded(att.url, remaining);
+      const buf = await downloadBounded(att.url, remaining, 15_000, signal);
       if (!buf) {
         skipped++;
         continue;
@@ -648,7 +656,8 @@ export class DiscopilotApp {
         displayName: att.name ?? "image",
       });
     }
-    if (skipped > 0) {
+    // Suppress the skip notice on an abort — the turn is being cancelled anyway.
+    if (skipped > 0 && !signal?.aborted) {
       await this.transport
         .notice(
           message.channelId,
@@ -677,23 +686,43 @@ export class DiscopilotApp {
       return;
     }
     session.running = true;
+    const ac = new AbortController();
+    session.currentAbort = ac;
     this.transport.resetTurn(threadId);
     try {
-      const images = message ? await this.collectImageAttachments(message) : [];
-      const prompt = text || (images.length ? "請看我附上的圖片。" : "");
-      if (!prompt) {
-        // Had attachments but none were usable, and there was no text to send.
-        await this.transport
-          .notice(threadId, "⚠️ 附件都無法使用（僅支援圖片），且訊息沒有文字，已略過。")
-          .catch(() => {});
-        return;
+      const outcome = await sendUnlessAborted(
+        ac.signal,
+        // prepare: download attachments (may be slow) while /stop can still abort.
+        async () => {
+          const images = message ? await this.collectImageAttachments(message, ac.signal) : [];
+          const prompt = text || (images.length ? "請看我附上的圖片。" : "");
+          return { images, prompt };
+        },
+        // send: only reached when NOT aborted during the download above.
+        async ({ images, prompt }) => {
+          if (!prompt) {
+            // Had attachments but none were usable, and there was no text to send.
+            await this.transport
+              .notice(threadId, "⚠️ 附件都無法使用（僅支援圖片），且訊息沒有文字，已略過。")
+              .catch(() => {});
+            return;
+          }
+          // Committing to the SDK turn: from here a /stop must go through
+          // actor.stop(), not the pre-send abort. No await between this and the
+          // send, so /stop can't interleave and start a turn we meant to cancel.
+          session.currentAbort = undefined;
+          await session.actor.runTurn(prompt, undefined, images);
+        }
+      );
+      if (outcome === "aborted") {
+        await this.transport.notice(threadId, "🛑 已在送出前取消，未啟動這一輪。").catch(() => {});
       }
-      await session.actor.runTurn(prompt, undefined, images);
     } catch (err) {
       await this.transport
         .notice(threadId, `⚠️ ${err instanceof Error ? err.message : String(err)}`)
         .catch(() => {});
     } finally {
+      if (session.currentAbort === ac) session.currentAbort = undefined;
       await this.transport.flush(threadId).catch(() => {});
       session.running = false;
     }
@@ -708,6 +737,7 @@ export class DiscopilotApp {
   private async endAllSessions(reason: string): Promise<boolean> {
     let ok = true;
     for (const [threadId, session] of [...this.sessions]) {
+      session.currentAbort?.abort(); // cancel any pre-send download in flight
       if (session.actor.isFaulted()) {
         ok = false; // fence — needs a restart, don't re-hit the dead runtime
         continue;

@@ -59,4 +59,10 @@ describe("downloadBounded", () => {
     // Nothing listening on this port.
     expect(await downloadBounded("http://127.0.0.1:1/x", 1024, 1000)).toBeNull();
   });
+
+  it("returns null when an external abort signal is already aborted", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    expect(await downloadBounded(`${base}/ok`, 1024, 15_000, ac.signal)).toBeNull();
+  });
 });
