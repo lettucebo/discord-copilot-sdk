@@ -65,8 +65,8 @@ bash install.sh --skip-auth
 > 請**不要**用 `sudo` 執行安裝器（只有套件安裝會在需要時提權）。
 > Do **not** run the installer with `sudo` (only package installs elevate when needed).
 
-安裝器會：偵測前置需求 → 收集設定並**驗證** → 安全寫入 `.env`（權限僅限本人、token 不顯示、原子寫入 + 備份）→ `npm ci` + build → 設定載入健檢 →（可選）設定常駐 → 完成報告。
-The installer will: detect prerequisites → collect + **validate** config → write `.env` securely (owner-only, token never echoed, atomic write + backup) → `npm ci` + build → config-load health check → (optional) residency → done report.
+安裝器會：偵測前置需求 → 收集設定並**驗證** → `npm ci` + build → 用真實 schema 在記憶體驗證設定 → **最後**才安全寫入 `.env`（權限僅限本人、token 不顯示、原子寫入 + 備份）→（可選）設定常駐 → 完成報告。（先建置再寫入，`.env` 是最後一步，npm 過程中不會在磁碟上看到 token。）
+The installer will: detect prerequisites → collect + **validate** config → `npm ci` + build → validate the config in memory against the real schema → **finally** write `.env` securely (owner-only, token never echoed, atomic write + backup) → (optional) residency → done report. (Build first, `.env` written last, so npm never sees the token on disk.)
 
 ---
 
@@ -75,7 +75,7 @@ The installer will: detect prerequisites → collect + **validate** config → w
 > **誠實說明 / Honest scope**：目前的常駐是「**登入後自動啟動並保持存活**」（Windows 排程工作 at-logon／macOS LaunchAgent／Linux systemd `--user`）。真正的「登入前無人值守」需要額外步驟（Linux 的 `loginctl enable-linger`）。macOS／Linux 的常駐**尚未在真機驗證，屬實驗性**。
 > The current residency is **auto-start + keepalive while you are logged in** (Windows Scheduled Task at-logon / macOS LaunchAgent / Linux systemd `--user`). True pre-login unattended startup needs extra steps (`loginctl enable-linger` on Linux). macOS/Linux residency is **experimental and not verified on real hardware**.
 
-- **Windows**：註冊排程工作 `discopilot-<instance>`（開機／登入啟動、失敗自動重啟、無執行時間上限）。
+- **Windows**：註冊排程工作 `discopilot-<instance>`（**登入後**啟動並保持存活、失敗自動重啟、無執行時間上限）。
   - 停止 / Stop：`schtasks /End /TN discopilot-default`
   - 移除 / Remove：`schtasks /Delete /TN discopilot-default /F`
   - 記錄 / Log：`~/.discopilot/logs/discopilot-default.log`

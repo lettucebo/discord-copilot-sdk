@@ -132,6 +132,7 @@ function setupMac(lang) {
   <key>EnvironmentVariables</key><dict>
     <key>HOME</key><string>${esc(os.homedir())}</string>
     <key>PATH</key><string>${esc([cop, "/usr/local/bin", "/usr/bin", "/bin"].filter(Boolean).join(":"))}</string>
+    <key>DISCOPILOT_INSTANCE_ID</key><string>${esc(instanceId())}</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -180,6 +181,7 @@ Type=simple
 WorkingDirectory=${REPO_ROOT}
 Environment=HOME=${os.homedir()}
 Environment=PATH=${[cop, "/usr/local/bin", "/usr/bin", "/bin"].filter(Boolean).join(":")}
+Environment=DISCOPILOT_INSTANCE_ID=${instanceId()}
 ExecStart=${node} dist/index.js
 Restart=always
 RestartSec=3

@@ -79,8 +79,9 @@ describe("mergeEnv", () => {
     const out = mergeEnv("K=old\nK=older\n", { K: "new" });
     // parseEnv resolves duplicates to the LAST value — that must be the new one.
     expect(parseEnv(out).K).toBe("new");
-    // the earlier duplicate is neutralized (commented) so it can't shadow it
-    expect(out).toContain("# (superseded) K=old");
+    // the earlier duplicate is neutralized (commented) with its value REDACTED
+    expect(out).toContain("# (superseded) K=<redacted>");
+    expect(out).not.toContain("K=old");
   });
 
   it("round-trips a Windows path with backslashes + spaces WITHOUT corruption", () => {

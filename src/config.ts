@@ -19,7 +19,7 @@ const optionalSnowflake = z.preprocess(
  * touch (⚠️ no isolation in v1 — run only in a disposable environment).
  */
 export const ConfigSchema = z.object({
-  DISCORD_BOT_TOKEN: z.string().min(1, "DISCORD_BOT_TOKEN is required"),
+  DISCORD_BOT_TOKEN: z.string().trim().min(1, "DISCORD_BOT_TOKEN is required"),
   DISCORD_ALLOWED_USER_IDS: z
     .string()
     .min(1, "DISCORD_ALLOWED_USER_IDS is required")
@@ -28,7 +28,7 @@ export const ConfigSchema = z.object({
   DISCORD_GUILD_ID: snowflake,
   DISCORD_PARENT_CHANNEL_ID: snowflake,
   DEV_GUILD_ID: optionalSnowflake,
-  CONTROLLED_REPO_PATH: z.string().min(1, "CONTROLLED_REPO_PATH is required"),
+  CONTROLLED_REPO_PATH: z.string().trim().min(1, "CONTROLLED_REPO_PATH is required"),
   DEFAULT_MODEL: z.string().min(1).default("claude-sonnet-5"),
   DEFAULT_CONTEXT_TIER: z.enum(["default", "long_context"]).default("default"),
   PERMISSION_POLICY: z.enum(["ask"]).default("ask"),

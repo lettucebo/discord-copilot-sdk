@@ -77,8 +77,9 @@ export function mergeEnv(existingText, updates) {
       return { kind: "kv", key: line.key, raw: serializeLine(line.key, String(wanted.get(line.key))) };
     }
     // Earlier duplicate of a managed key → neutralize it so it can't shadow the
-    // effective (last) line if the file order were ever reinterpreted.
-    return { kind: "other", raw: `# (superseded) ${line.raw}` };
+    // effective (last) line. Redact the VALUE (it may be a stale secret) while
+    // keeping the key name for traceability.
+    return { kind: "other", raw: `# (superseded) ${line.key}=<redacted>` };
   });
 
   while (out.length && out[out.length - 1].kind === "other" && out[out.length - 1].raw === "") out.pop();

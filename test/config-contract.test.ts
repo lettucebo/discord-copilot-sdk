@@ -40,6 +40,8 @@ const corpus = [
   { name: "missing repo path", values: { ...base(), CONTROLLED_REPO_PATH: "" } },
   { name: "bad dev guild id", values: { ...base(), DEV_GUILD_ID: "xx" } },
   { name: "bad context tier", values: { ...base(), DEFAULT_CONTEXT_TIER: "huge" } },
+  { name: "whitespace-only token", values: { ...base(), DISCORD_BOT_TOKEN: "   " } },
+  { name: "whitespace-only repo path", values: { ...base(), CONTROLLED_REPO_PATH: "  " } },
 ];
 
 describe("installer validators ⇄ runtime config contract", () => {

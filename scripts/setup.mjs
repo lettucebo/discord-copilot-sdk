@@ -98,9 +98,11 @@ function askHidden(question) {
       stdin.pause();
       stdin.removeListener("data", onData);
       stdin.removeListener("error", onErr);
+      stdin.removeListener("end", onEnd);
       fn(arg);
     };
     const onErr = (e) => finish(reject, e instanceof Error ? e : new SetupError(String(e)));
+    const onEnd = () => finish(reject, new SetupError("input stream closed before a value was entered"));
     const onData = (chunk) => {
       try {
         for (const b of chunk) {
@@ -123,6 +125,7 @@ function askHidden(question) {
     stdin.resume();
     stdin.on("data", onData);
     stdin.on("error", onErr);
+    stdin.on("end", onEnd);
   });
 }
 
@@ -164,18 +167,29 @@ function backupEnv(lang) {
   const dir = path.join(STATE_DIR, "env-backups");
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const dest = path.join(dir, `.env.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`);
-  fs.copyFileSync(ENV_PATH, dest);
+  // Create the backup EMPTY, lock its ACL, THEN copy the secret bytes in — so the
+  // token never lands in a world-readable backup even briefly. Fail closed: if the
+  // ACL can't be applied, remove the (still-empty) backup and abort.
+  fs.writeFileSync(dest, "", { encoding: "utf8", mode: 0o600, flag: "wx" });
+  if (process.platform === "win32") {
+    try {
+      applyWindowsAcl(dest);
+    } catch (e) {
+      try {
+        fs.rmSync(dest, { force: true });
+      } catch {
+        /* ignore */
+      }
+      throw new SetupError(
+        "could not secure the .env backup; aborting: " + (e instanceof Error ? e.message : String(e))
+      );
+    }
+  }
+  fs.writeFileSync(dest, fs.readFileSync(ENV_PATH));
   try {
     fs.chmodSync(dest, 0o600);
   } catch {
-    /* windows: chmod is not a DACL */
-  }
-  if (process.platform === "win32") {
-    try {
-      lockdownWindowsAcl(dest);
-    } catch {
-      /* backup ACL is best-effort; the backup dir under ~/.discopilot is already user-scoped */
-    }
+    /* windows */
   }
   info(t("backedUp", lang) + " " + dest);
   return dest;
@@ -189,40 +203,74 @@ function secureWrite(targetPath, contents) {
     /* ignore */
   }
   // Create the temp EMPTY first (exclusive), lock its ACL on Windows, and only
-  // THEN write the secret bytes — so the token never lands in a world-readable
-  // file even briefly. chmod covers unix; icacls covers Windows (fail-closed).
+  // THEN write the secret bytes. If the ACL fails, delete THIS temp (it's ours,
+  // just created) and abort — never leave an unprotected secret behind.
   fs.writeFileSync(tmp, "", { encoding: "utf8", mode: 0o600, flag: "wx" });
-  if (process.platform === "win32") lockdownWindowsAcl(tmp);
+  if (process.platform === "win32") {
+    try {
+      applyWindowsAcl(tmp);
+    } catch (e) {
+      try {
+        fs.rmSync(tmp, { force: true });
+      } catch {
+        /* ignore */
+      }
+      throw new SetupError(
+        "could not apply a Windows ACL to the .env temp file; aborting to avoid an unprotected secret: " +
+          (e instanceof Error ? e.message : String(e))
+      );
+    }
+  }
   fs.writeFileSync(tmp, contents, { encoding: "utf8" });
-  fs.renameSync(tmp, targetPath);
-  hardenExisting(targetPath);
+  fs.renameSync(tmp, targetPath); // rename preserves the temp's locked DACL
+  try {
+    fs.chmodSync(targetPath, 0o600);
+  } catch {
+    /* windows: DACL already applied via the temp */
+  }
 }
 
-/** Ensure an existing secret file is owner-only (used for a written OR unchanged
- *  .env, so re-runs always leave it hardened). */
+/** Best-effort harden of an EXISTING committed .env (unchanged re-run path).
+ *  MUST NOT delete the file on ACL failure — deleting a valid existing .env is
+ *  strictly worse than leaving it with imperfect permissions. */
 function hardenExisting(file) {
   try {
     fs.chmodSync(file, 0o600);
   } catch {
     /* windows */
   }
-  if (process.platform === "win32") lockdownWindowsAcl(file);
+  if (process.platform === "win32") {
+    try {
+      applyWindowsAcl(file);
+    } catch (e) {
+      warn("could not harden the existing .env ACL (left in place): " + (e instanceof Error ? e.message : String(e)));
+    }
+  }
 }
 
-function lockdownWindowsAcl(file) {
-  // Restrict to the current user only (remove inheritance). Fail closed: if we
-  // can't secure it, don't leave a world-readable secret behind.
-  try {
-    const user = process.env.USERNAME ? `${process.env.USERDOMAIN || os.hostname()}\\${process.env.USERNAME}` : os.userInfo().username;
-    execFileSync("icacls", [file, "/inheritance:r", "/grant:r", `${user}:F`], { stdio: "ignore" });
-  } catch {
-    try {
-      fs.rmSync(file, { force: true });
-    } catch {
-      /* ignore */
-    }
-    throw new SetupError("could not apply a Windows ACL to the .env temp file; aborting to avoid an unprotected secret");
-  }
+/** Apply an owner-only DACL to `file` (remove inheritance, drop broad principals,
+ *  grant only the current user). Throws on failure; NEVER deletes the file — the
+ *  caller decides whether a failure means "remove my just-created temp" or
+ *  "warn and keep the existing file". */
+function applyWindowsAcl(file) {
+  const user = process.env.USERNAME
+    ? `${process.env.USERDOMAIN || os.hostname()}\\${process.env.USERNAME}`
+    : os.userInfo().username;
+  execFileSync(
+    "icacls",
+    [
+      file,
+      "/inheritance:r",
+      // Drop broad principals that may exist as explicit ACEs on an older file.
+      "/remove:g",
+      "*S-1-1-0", // Everyone
+      "*S-1-5-32-545", // Users
+      "*S-1-5-11", // Authenticated Users
+      "/grant:r",
+      `${user}:(F)`,
+    ],
+    { stdio: "ignore" }
+  );
 }
 
 function ensureEnvNotTracked() {
@@ -315,8 +363,10 @@ async function main() {
     return;
   }
 
-  // 7) Guard, then BUILD FIRST — before any secret touches the disk, so npm
-  //    lifecycle scripts can never read the token from a written .env.
+  // 7) Guard, then BUILD FIRST — on a FRESH install no .env exists yet, so npm
+  //    lifecycle scripts can't read a token from disk. (On a re-run the previous
+  //    .env is still present during npm; the token is the user's own on their own
+  //    machine, so this is acceptable for a single-owner lab.)
   ensureEnvNotTracked();
   info("\n" + c(1, t("buildHeader", lang)));
   run("npm", ["ci"], sanitizedChildEnv());
@@ -327,7 +377,6 @@ async function main() {
   //    same parser+schema the bot uses (parseEnv → parseConfig), so a config the
   //    runtime would reject fails the install BEFORE we write anything.
   const { parseConfig } = await import(pathToFileURL(path.join(REPO_ROOT, "dist", "config.js")).href);
-  const { parseEnv } = await import("node:util");
   try {
     parseConfig(parseEnv(merged));
   } catch (e) {
