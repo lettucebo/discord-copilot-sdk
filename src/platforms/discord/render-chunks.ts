@@ -65,11 +65,15 @@ export async function renderChunks(
         await m.edit(sendOpts(content));
         continue; // edited in place
       } catch (err) {
-        if (!isMessageGone(err)) continue; // transient: leave the anchor as-is
-        // Definitive: this anchor was deleted. Preserve order by re-posting this
-        // and every following chunk at the tail; drop the stale later anchors.
-        rebuilding = true;
-        await deleteAnchors(channel, msgIds, i + 1);
+        if (!isMessageGone(err)) continue; // transient edit: leave as-is; next flush retries
+        // This anchor is gone. A replacement can only land at the channel TAIL,
+        // so before posting anything we must delete the WHOLE stale suffix —
+        // otherwise a surviving later anchor becomes an out-of-order duplicate.
+        // If that cleanup can't be confirmed (transient failure or the turn was
+        // superseded), ABORT without posting and leave msgIds intact so the next
+        // debounced flush retries from a consistent state (no duplicate, no loss).
+        if (!(await deleteSuffix(channel, msgIds, i, stillCurrent))) return;
+        rebuilding = true; // msgIds is now truncated to i; send the rest fresh
       }
     }
     const m = await channel.send(sendOpts(content));
@@ -85,22 +89,36 @@ export async function renderChunks(
     }
     msgIds[i] = m.id;
   }
-  // Trim anchors the shorter final output no longer needs.
-  await deleteAnchors(channel, msgIds, chunks.length);
-  if (msgIds.length > chunks.length) msgIds.length = chunks.length;
+  // Trim anchors the shorter final output no longer needs (best effort — a
+  // transient failure here just leaves a surplus message to clean next flush).
+  await deleteSuffix(channel, msgIds, chunks.length, stillCurrent);
 }
 
-/** Best-effort delete of anchor messages at slots [from, end). Missing ones are
- *  ignored (already gone). Does not shrink `msgIds` (the caller trims). */
-async function deleteAnchors(channel: MinimalChannel, msgIds: string[], from: number): Promise<void> {
+/**
+ * Delete anchor messages at slots [from, end) and, on success, truncate `msgIds`
+ * to `from`. Returns false (WITHOUT truncating) if the turn was superseded or a
+ * delete/fetch failed for a NON-gone (transient) reason — so the rebuild caller
+ * aborts rather than posting replacements while a stale anchor still exists (an
+ * out-of-order duplicate). An already-gone anchor is fine (skipped). Checked
+ * before every network step so an epoch flip abandons cleanly.
+ */
+async function deleteSuffix(
+  channel: MinimalChannel,
+  msgIds: string[],
+  from: number,
+  stillCurrent: () => boolean
+): Promise<boolean> {
   for (let i = from; i < msgIds.length; i++) {
+    if (!stillCurrent()) return false;
     const id = msgIds[i];
     if (!id) continue;
     try {
       const m = await channel.messages.fetch(id);
       await m.delete();
-    } catch {
-      /* already gone */
+    } catch (err) {
+      if (!isMessageGone(err)) return false; // transient: removal not confirmed
     }
   }
+  if (msgIds.length > from) msgIds.length = from;
+  return true;
 }

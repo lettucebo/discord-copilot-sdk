@@ -5,6 +5,7 @@ class FakeMsg implements MinimalMessage {
   edited?: string;
   deleted = false;
   editError?: unknown;
+  deleteError?: unknown;
   constructor(
     public id: string,
     private store: Map<string, FakeMsg>
@@ -15,6 +16,7 @@ class FakeMsg implements MinimalMessage {
     return {};
   }
   async delete(): Promise<unknown> {
+    if (this.deleteError) throw this.deleteError;
     this.deleted = true;
     this.store.delete(this.id);
     return {};
@@ -141,6 +143,55 @@ describe("renderChunks", () => {
     await renderChunks(ch, ids, ["retry later"], always, opts);
     expect(ch.sent).toEqual([]); // no duplicate post
     expect(ids).toEqual(["m1"]); // slot unchanged
+  });
+
+  it("ABORTS the rebuild (no duplicate) if deleting a stale later anchor fails transiently", async () => {
+    const ch = new FakeChannel();
+    ch.seed("m1"); // will be reported gone
+    const m2 = ch.seed("m2"); // survivor whose delete will transiently fail
+    ch.fetchError = (id) => (id === "m1" ? { code: 10008 } : undefined);
+    m2.deleteError = { status: 429 }; // cleanup can't be confirmed
+    const ids = ["m1", "m2"];
+    await renderChunks(ch, ids, ["A", "B"], always, opts);
+    // Must NOT post replacements while m2 still exists — that would duplicate B.
+    expect(ch.sent).toEqual([]);
+    expect(m2.deleted).toBe(false); // survivor still there
+    expect(ids).toEqual(["m1", "m2"]); // state intact for the next flush to retry
+  });
+
+  it("self-heals on the retry after a transient cleanup failure", async () => {
+    const ch = new FakeChannel();
+    ch.seed("m1");
+    const m2 = ch.seed("m2");
+    ch.fetchError = (id) => (id === "m1" ? { code: 10008 } : undefined);
+    m2.deleteError = { status: 429 };
+    const ids = ["m1", "m2"];
+    await renderChunks(ch, ids, ["A", "B"], always, opts); // aborts
+    expect(ch.sent).toEqual([]);
+    // next flush: m2's delete now succeeds
+    m2.deleteError = undefined;
+    await renderChunks(ch, ids, ["A", "B"], always, opts);
+    expect(m2.deleted).toBe(true);
+    expect(ch.sent).toEqual(["A", "B"]); // re-posted in order
+    expect(ids).toEqual(["new1", "new2"]);
+  });
+
+  it("epoch guard covers rebuild cleanup: a flip mid-delete aborts without posting", async () => {
+    const ch = new FakeChannel();
+    ch.seed("m1");
+    ch.seed("m2");
+    ch.fetchError = (id) => (id === "m1" ? { code: 10008 } : undefined);
+    let calls = 0;
+    // true for: loop-guard(i=0), pre-edit path... then flips false at the first
+    // deleteSuffix stillCurrent check so cleanup aborts before any send.
+    const stillCurrent = () => {
+      calls++;
+      return calls < 2;
+    };
+    const ids = ["m1", "m2"];
+    await renderChunks(ch, ids, ["A", "B"], stillCurrent, opts);
+    expect(ch.sent).toEqual([]); // nothing posted into a superseded turn
+    expect(ids).toEqual(["m1", "m2"]); // untouched; a fresh turn resets msgIds anyway
   });
 
   it("trims and deletes anchors the shorter final output no longer needs", async () => {

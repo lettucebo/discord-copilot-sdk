@@ -41,13 +41,13 @@
 - `resolvedByHook` / approval hook 偵測：啟用時啟動失敗或用隔離 SDK 設定，避免繞過 broker。
 
 ## 3. PendingInteractionBroker（明確狀態機，非 boolean）
-狀態：`PUBLISHING → OPEN → CLAIMED_ACK → SETTLED`；modal 分支 `OPEN → MODAL_OPEN → CLAIMED_ACK → SETTLED`；終態 `TIMED_OUT` / `ABORTED`。
+狀態：`PUBLISHING → OPEN → CLAIMED_ACK → SETTLED`；modal 分支 `OPEN → MODAL_OPEN → CLAIMED_ACK → SETTLED`；終態 `TIMED_OUT` / `ABORTED`。（見 §9.1：實作的自由輸入改用 thread 訊息，未走 Discord modal 分支。）
 不變式：
 - **CAS/claim 同步發生在任何 await 之前**。
 - 核准**只在** Discord ack 成功 + generation 仍有效 + 稽核已 commit **之後**才送達 SDK。
 - 短 ack 期限：Discord 失敗即安全 deny。
 - **單一 finalizer**：清所有 timer、移除 parent/modal map、abort signal、只 resolve 一次。
-- 「自己輸入」以 `showModal()` 為**初次**回應；modal 建**一次性 child nonce + 獨立逾時**；未提交終將安全逾時。
+- 「自己輸入」以 `showModal()` 為**初次**回應；modal 建**一次性 child nonce + 獨立逾時**；未提交終將安全逾時。**（已由 §9.1 取代：實作改為 thread 訊息自由輸入，行動裝置友善；本條 modal 設計不採用。）**
 - nonce **密碼學隨機、絕不重用**；逾時已終結 server 端條目後，遲到點擊安全（停用元件僅美觀）。
 - **控制/broker 流量不得排在被 `session.send()`/turn 阻塞的佇列後**（否則 SDK 等的權限卡片卡在同一 turn 後面 → 死鎖）。
 - 逾時預設：Permission 2–5 分→`user-not-available`；ask_user 10–15 分→丟 typed timeout；exit-plan→`{approved:false}`；elicitation→`{action:"cancel"}`。
@@ -96,7 +96,7 @@
   - **手動啟動、無 resume**；重啟即標 session/interaction interrupted。
   - **驗收**：手機開 thread → 要求 `git status` → 檢視並 approve/deny **確切請求** → 收到串流輸出 → 成功 abort 一個 turn。
 - **P2**：resume + reconciliation（第 4 節）+ generation fencing。
-- **P3**：其餘 callback UI（ask_user modal、exit-plan、elicitation、memory/mcp/url… 的呈現）。
+- **P3**：其餘 callback UI（ask_user〔自由輸入以 thread 訊息呈現，非 Discord modal；見 §9.1〕、exit-plan、elicitation、memory/mcp/url… 的呈現）。
 - **P4**：pickers（/model /effort /context /mode）、queue/steer、usage。
 - **P5**：attachments/images 輸入、todo/plan、changed-file/git diff 摘要。
 - **P6**：跨平台 installer + 常駐。
