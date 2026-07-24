@@ -8,8 +8,8 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { parseEnv } from "node:util";
-import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { execFileSync, execSync } from "node:child_process";
 import { mergeEnv } from "./lib/env-file.mjs";
 import { t, detectLang, normalizeLang } from "./lib/i18n.mjs";
 import { MANAGED_KEYS, validateConfig } from "./lib/validate.mjs";
@@ -77,30 +77,19 @@ function ask(question, def) {
 }
 
 /** Hidden (no-echo) input for secrets. Requires a real TTY; NEVER falls back to
- *  visible input. Restores terminal mode on every exit path. */
+ *  visible input. Buffers raw bytes and decodes once (so a multi-byte char split
+ *  across stream chunks can't corrupt input), and restores terminal mode on every
+ *  exit path (resolve, reject, or a handler throw). */
 function askHidden(question) {
   return new Promise((resolve, reject) => {
     const { stdin, stdout } = process;
     if (!stdin.isTTY) return reject(new SetupError("no TTY for hidden input"));
     stdout.write(question + ": ");
-    let buf = "";
-    const onData = (chunk) => {
-      for (const ch of chunk.toString("utf8")) {
-        if (ch === "\r" || ch === "\n") {
-          cleanup();
-          stdout.write("\n");
-          return resolve(buf);
-        }
-        if (ch === "\u0003") {
-          cleanup();
-          stdout.write("\n");
-          return reject(new SetupError("cancelled"));
-        }
-        if (ch === "\u007f" || ch === "\b") buf = buf.slice(0, -1);
-        else if (ch >= " ") buf += ch;
-      }
-    };
-    const cleanup = () => {
+    const bytes = [];
+    let done = false;
+    const finish = (fn, arg) => {
+      if (done) return;
+      done = true;
       try {
         stdin.setRawMode(false);
       } catch {
@@ -108,10 +97,32 @@ function askHidden(question) {
       }
       stdin.pause();
       stdin.removeListener("data", onData);
+      stdin.removeListener("error", onErr);
+      fn(arg);
+    };
+    const onErr = (e) => finish(reject, e instanceof Error ? e : new SetupError(String(e)));
+    const onData = (chunk) => {
+      try {
+        for (const b of chunk) {
+          if (b === 0x0d || b === 0x0a) {
+            stdout.write("\n");
+            return finish(resolve, Buffer.from(bytes).toString("utf8"));
+          }
+          if (b === 0x03) {
+            stdout.write("\n");
+            return finish(reject, new SetupError("cancelled"));
+          }
+          if (b === 0x7f || b === 0x08) bytes.pop();
+          else if (b >= 0x20) bytes.push(b);
+        }
+      } catch (e) {
+        finish(reject, e instanceof Error ? e : new SetupError(String(e)));
+      }
     };
     stdin.setRawMode(true);
     stdin.resume();
     stdin.on("data", onData);
+    stdin.on("error", onErr);
   });
 }
 
@@ -133,17 +144,15 @@ function onPath(exe) {
   }
 }
 
-/** Copilot auth probe with a bounded timeout → verified | unauthenticated |
- *  indeterminate. Never hangs; never claims success it can't confirm. */
+/** Copilot auth state. The CLI has no non-interactive status probe, so we cannot
+ *  positively CONFIRM a login from files (e.g. config.json / mcp-config.json exist
+ *  before `/login`). We therefore NEVER claim "verified": we only distinguish
+ *  "unauthenticated" (copilot present but ~/.copilot absent → never ran it) from
+ *  "indeterminate" (configured, but login can't be confirmed here). */
 function copilotAuthState() {
   if (!onPath("copilot")) return "indeterminate";
-  // A real login writes token/host files under ~/.copilot; treat their presence
-  // as "verified" (best-effort — we cannot run an interactive login here).
   try {
-    const dir = path.join(os.homedir(), ".copilot");
-    if (!fs.existsSync(dir)) return "unauthenticated";
-    const files = fs.readdirSync(dir).join(" ");
-    return /token|host|apps|config|mcp/i.test(files) ? "verified" : "unauthenticated";
+    return fs.existsSync(path.join(os.homedir(), ".copilot")) ? "indeterminate" : "unauthenticated";
   } catch {
     return "indeterminate";
   }
@@ -159,7 +168,14 @@ function backupEnv(lang) {
   try {
     fs.chmodSync(dest, 0o600);
   } catch {
-    /* windows */
+    /* windows: chmod is not a DACL */
+  }
+  if (process.platform === "win32") {
+    try {
+      lockdownWindowsAcl(dest);
+    } catch {
+      /* backup ACL is best-effort; the backup dir under ~/.discopilot is already user-scoped */
+    }
   }
   info(t("backedUp", lang) + " " + dest);
   return dest;
@@ -172,15 +188,25 @@ function secureWrite(targetPath, contents) {
   } catch {
     /* ignore */
   }
-  // Exclusive create so we never clobber a racing temp; owner-only bits.
-  fs.writeFileSync(tmp, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  // Create the temp EMPTY first (exclusive), lock its ACL on Windows, and only
+  // THEN write the secret bytes — so the token never lands in a world-readable
+  // file even briefly. chmod covers unix; icacls covers Windows (fail-closed).
+  fs.writeFileSync(tmp, "", { encoding: "utf8", mode: 0o600, flag: "wx" });
   if (process.platform === "win32") lockdownWindowsAcl(tmp);
+  fs.writeFileSync(tmp, contents, { encoding: "utf8" });
   fs.renameSync(tmp, targetPath);
+  hardenExisting(targetPath);
+}
+
+/** Ensure an existing secret file is owner-only (used for a written OR unchanged
+ *  .env, so re-runs always leave it hardened). */
+function hardenExisting(file) {
   try {
-    fs.chmodSync(targetPath, 0o600);
+    fs.chmodSync(file, 0o600);
   } catch {
     /* windows */
   }
+  if (process.platform === "win32") lockdownWindowsAcl(file);
 }
 
 function lockdownWindowsAcl(file) {
@@ -241,17 +267,16 @@ async function main() {
     ok(t("prereqOk", lang));
   }
 
-  // 2) Auth (3-state; never a false "ok").
+  // 2) Auth: never a false "ok". Only a definite "unauthenticated" (copilot on
+  //    PATH but ~/.copilot absent) fails a non-interactive run; "indeterminate"
+  //    just warns (we can't confirm a login from here).
   info("\n" + c(1, t("authHeader", lang)));
   if (FLAGS.skipAuth) {
     warn(t("authSkip", lang));
   } else {
     const state = copilotAuthState();
-    if (state === "verified") ok("copilot: verified");
-    else {
-      warn(t("authUnknown", lang) + ` (${state})`);
-      if (!interactive) throw new SetupError(t("authUnknown", lang));
-    }
+    warn(t("authUnknown", lang) + ` (${state})`);
+    if (!interactive && state === "unauthenticated") throw new SetupError(t("authUnknown", lang));
   }
 
   // 3) Load existing .env as defaults (read-only) and collect config in memory.
@@ -290,10 +315,31 @@ async function main() {
     return;
   }
 
-  // 7) COMMIT: guard, backup, atomic secure write.
+  // 7) Guard, then BUILD FIRST — before any secret touches the disk, so npm
+  //    lifecycle scripts can never read the token from a written .env.
   ensureEnvNotTracked();
+  info("\n" + c(1, t("buildHeader", lang)));
+  run("npm", ["ci"], sanitizedChildEnv());
+  run("npm", ["run", "build"], sanitizedChildEnv());
+
+  // 8) Validate the MERGED config through the REAL runtime schema (in memory —
+  //    no .env file, no ambient env, no token in this process's env). This is the
+  //    same parser+schema the bot uses (parseEnv → parseConfig), so a config the
+  //    runtime would reject fails the install BEFORE we write anything.
+  const { parseConfig } = await import(pathToFileURL(path.join(REPO_ROOT, "dist", "config.js")).href);
+  const { parseEnv } = await import("node:util");
+  try {
+    parseConfig(parseEnv(merged));
+  } catch (e) {
+    throw new SetupError(t("healthFail", lang) + " " + (e instanceof Error ? e.message : String(e)));
+  }
+  ok(t("healthOk", lang));
+
+  // 9) COMMIT: write .env LAST, after all validation + build succeeded. Because
+  //    it's the final mutation there is nothing to roll back.
   info("\n" + c(1, t("writingEnv", lang)));
   if (fs.existsSync(ENV_PATH) && fs.readFileSync(ENV_PATH, "utf8") === merged) {
+    hardenExisting(ENV_PATH); // ensure an unchanged .env is still owner-only
     info(t("envUnchanged", lang));
   } else {
     backupEnv(lang);
@@ -301,17 +347,7 @@ async function main() {
     ok(t("wroteEnv", lang));
   }
 
-  // 8) Build (sanitized child env), then a real config-load health check.
-  info("\n" + c(1, t("buildHeader", lang)));
-  run("npm", ["ci"], sanitizedChildEnv());
-  run("npm", ["run", "build"], sanitizedChildEnv());
-  execFileSync(process.execPath, ["-e", "import('./dist/config.js').then(m=>m.loadConfig())"], {
-    cwd: REPO_ROOT,
-    stdio: "ignore",
-  });
-  ok(t("healthOk", lang));
-
-  // 9) Residency (opt-in; honest login-keepalive labeling).
+  // 10) Residency (opt-in; honest login-keepalive labeling).
   const wantResidency = FLAGS.residency ?? (interactive ? /^y/i.test(await ask(t("residencyPrompt", lang) + " ", "")) : false);
   if (wantResidency) {
     await setupResidency(lang);
@@ -382,8 +418,14 @@ function previewMasked(values, lang) {
 }
 
 function run(cmd, args, env) {
-  const realCmd = process.platform === "win32" && cmd === "npm" ? "npm.cmd" : cmd;
-  execFileSync(realCmd, args, { cwd: REPO_ROOT, stdio: "inherit", env });
+  // On Windows npm is npm.cmd and Node refuses to spawn .cmd without a shell
+  // (EINVAL, post CVE-2024-27980). Use execSync with a shell there (args are
+  // hardcoded, no user input) to avoid the shell+args DEP0190 warning.
+  if (process.platform === "win32" && cmd === "npm") {
+    execSync(`npm ${args.join(" ")}`, { cwd: REPO_ROOT, stdio: "inherit", env });
+  } else {
+    execFileSync(cmd, args, { cwd: REPO_ROOT, stdio: "inherit", env });
+  }
 }
 
 function report(lang) {

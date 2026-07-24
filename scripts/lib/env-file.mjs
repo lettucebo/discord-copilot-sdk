@@ -1,10 +1,10 @@
 // Pure .env parse / merge / serialize, matching Node's built-in `util.parseEnv`
 // (the parser `process.loadEnvFile` uses). Node built-ins only — safe to run
-// before `npm install`. Verified against parseEnv semantics:
-//  - unquoted `#` begins an inline comment; unquoted trailing whitespace is trimmed;
-//  - a value is quote-stripped only if it STARTS with a matching ' or " quote;
-//  - Node does NOT support `\"`-escaped quotes inside a quoted value, so a value
-//    containing a double-quote (or a newline) cannot be represented and is rejected.
+// before `npm install`. serializeLine is SELF-VERIFYING: it picks the first
+// representation that round-trips EXACTLY through the real parseEnv, so it can
+// never silently corrupt a value (e.g. a Windows path like `C:\new repo`, where
+// a double-quoted `\n` would be turned into a newline — unquoted preserves it).
+import { parseEnv } from "node:util";
 
 const KV_RE = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/;
 
@@ -26,53 +26,66 @@ export function parseLines(text) {
   });
 }
 
-/** Serialize a single KEY=value line for Node's parseEnv. Quotes when the value
- *  has whitespace / `#` / a quote char (so it round-trips), and REJECTS values
- *  that parseEnv cannot represent (embedded `"` or newline). */
+/** Serialize a single KEY=value line. Tries candidate representations and returns
+ *  the FIRST that round-trips EXACTLY through Node's own parseEnv; throws if the
+ *  value cannot be represented (embedded NUL / newline, or an unrepresentable
+ *  quote). This guarantees the written value equals the value the runtime loads. */
 export function serializeLine(key, value) {
   if (typeof value !== "string") throw new Error(`value for ${key} must be a string`);
-  if (value.includes('"')) {
-    throw new Error(`value for ${key} contains a double-quote, which .env cannot safely represent`);
+  if (value.includes("\0")) throw new Error(`value for ${key} contains a NUL byte`);
+  if (/[\r\n]/.test(value)) throw new Error(`value for ${key} contains a newline, which .env cannot represent`);
+
+  const candidates = value === "" ? [`${key}=`] : [`${key}=${value}`]; // prefer unquoted (preserves backslashes)
+  if (value !== "" && !value.includes('"')) candidates.push(`${key}="${value}"`); // fall back to double-quoted
+  for (const line of candidates) {
+    let parsed;
+    try {
+      parsed = parseEnv(line);
+    } catch {
+      continue;
+    }
+    if (parsed[key] === value) return line;
   }
-  if (/[\r\n]/.test(value)) {
-    throw new Error(`value for ${key} contains a newline, which .env cannot safely represent`);
-  }
-  if (value === "") return `${key}=`;
-  const needsQuote = /[#\s'"]/.test(value);
-  return needsQuote ? `${key}="${value}"` : `${key}=${value}`;
+  throw new Error(`value for ${key} cannot be safely represented in .env`);
 }
 
 /**
  * Merge `updates` (a plain object of KEY→value) into existing `.env` text,
- * changing ONLY those keys: the first existing occurrence of each key is
- * rewritten in place; keys not present are appended. All other lines (comments,
- * blanks, unmanaged keys, order, and the file's EOL style) are preserved. A key
- * whose update value is `undefined`/`null` is skipped (not written).
+ * changing ONLY those keys. Because Node's parseEnv resolves a duplicated key to
+ * its LAST occurrence, we rewrite the LAST occurrence of each managed key (and
+ * blank out any earlier duplicate managed lines to a comment so the written value
+ * is unambiguously the effective one). Keys not present are appended. All other
+ * lines (comments, blanks, unmanaged keys, order, EOL) are preserved. A key whose
+ * update value is `undefined`/`null` is skipped.
  */
 export function mergeEnv(existingText, updates) {
   const eol = detectEol(existingText || "");
   const lines = parseLines(existingText || "");
-  const remaining = new Map(
-    Object.entries(updates).filter(([, v]) => v !== undefined && v !== null)
-  );
+  const wanted = new Map(Object.entries(updates).filter(([, v]) => v !== undefined && v !== null));
 
-  const out = lines.map((line) => {
-    if (line.kind === "kv" && remaining.has(line.key)) {
-      const value = remaining.get(line.key);
-      remaining.delete(line.key);
-      return { kind: "kv", key: line.key, raw: serializeLine(line.key, String(value)) };
-    }
-    return line;
+  // Index of the LAST occurrence of each managed key.
+  const lastIndex = new Map();
+  lines.forEach((line, i) => {
+    if (line.kind === "kv" && wanted.has(line.key)) lastIndex.set(line.key, i);
   });
 
-  // Drop trailing empty lines so appends don't create a widening gap; we re-add
-  // exactly one terminating EOL at the end.
-  while (out.length && out[out.length - 1].kind === "other" && out[out.length - 1].raw === "") {
-    out.pop();
-  }
-  for (const [key, value] of remaining) {
-    out.push({ kind: "kv", key, raw: serializeLine(key, String(value)) });
+  const applied = new Set();
+  const out = lines.map((line, i) => {
+    if (line.kind !== "kv" || !wanted.has(line.key)) return line;
+    if (lastIndex.get(line.key) === i) {
+      applied.add(line.key);
+      return { kind: "kv", key: line.key, raw: serializeLine(line.key, String(wanted.get(line.key))) };
+    }
+    // Earlier duplicate of a managed key → neutralize it so it can't shadow the
+    // effective (last) line if the file order were ever reinterpreted.
+    return { kind: "other", raw: `# (superseded) ${line.raw}` };
+  });
+
+  while (out.length && out[out.length - 1].kind === "other" && out[out.length - 1].raw === "") out.pop();
+  for (const [key, value] of wanted) {
+    if (!applied.has(key)) out.push({ kind: "kv", key, raw: serializeLine(key, String(value)) });
   }
 
   return out.map((l) => l.raw).join(eol) + eol;
 }
+

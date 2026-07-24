@@ -117,6 +117,12 @@ elif [ -n "$missing" ] && [ "$DRY" = "1" ]; then
 fi
 
 # --- hand off to the shared bilingual config engine ---
+# Forward --lang ONLY if the user explicitly chose one (or --yes, which is
+# non-interactive); otherwise let setup.mjs show its interactive chooser,
+# defaulting to DISCOPILOT_LOCALE.
 echo "$(msg handoff)"
 DIR="$(cd "$(dirname "$0")" && pwd)"
-exec node "$DIR/scripts/setup.mjs" --lang "$lang" ${FWD[@]+"${FWD[@]}"}
+LANGFWD=()
+if [ -n "$LANG_OPT" ]; then LANGFWD=(--lang "$lang"); fi
+case " ${FWD[*]-} " in *" --yes "*) [ ${#LANGFWD[@]} -eq 0 ] && LANGFWD=(--lang "$lang") ;; esac
+exec node "$DIR/scripts/setup.mjs" ${LANGFWD[@]+"${LANGFWD[@]}"} ${FWD[@]+"${FWD[@]}"}

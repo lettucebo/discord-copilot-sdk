@@ -29,6 +29,7 @@ function runtimeAccepts(values) {
 const corpus = [
   { name: "valid minimal", values: base() },
   { name: "valid with DEV_GUILD_ID", values: { ...base(), DEV_GUILD_ID: "111111111" } },
+  { name: "empty DEV_GUILD_ID (shipped in .env.example) is accepted as unset", values: { ...base(), DEV_GUILD_ID: "" } },
   { name: "valid multi user ids", values: { ...base(), DISCORD_ALLOWED_USER_IDS: "111111111, 222222222" } },
   { name: "valid long_context", values: { ...base(), DEFAULT_CONTEXT_TIER: "long_context" } },
   { name: "missing token", values: { ...base(), DISCORD_BOT_TOKEN: "" } },

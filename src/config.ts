@@ -5,6 +5,12 @@ const csv = (v: string): string[] =>
   v.split(",").map((s) => s.trim()).filter(Boolean);
 
 const snowflake = z.string().regex(/^\d{5,25}$/, "must be a Discord snowflake id");
+/** An optional snowflake where an empty string (e.g. `DEV_GUILD_ID=` shipped in
+ *  .env.example) is treated as "not set" rather than an invalid value. */
+const optionalSnowflake = z.preprocess(
+  (v) => (v === "" ? undefined : v),
+  snowflake.optional()
+);
 
 /**
  * discopilot config schema (v1, lab-only). Parsed from environment variables.
@@ -21,7 +27,7 @@ export const ConfigSchema = z.object({
     .pipe(z.array(snowflake).min(1, "at least one allowed user id is required")),
   DISCORD_GUILD_ID: snowflake,
   DISCORD_PARENT_CHANNEL_ID: snowflake,
-  DEV_GUILD_ID: snowflake.optional(),
+  DEV_GUILD_ID: optionalSnowflake,
   CONTROLLED_REPO_PATH: z.string().min(1, "CONTROLLED_REPO_PATH is required"),
   DEFAULT_MODEL: z.string().min(1).default("claude-sonnet-5"),
   DEFAULT_CONTEXT_TIER: z.enum(["default", "long_context"]).default("default"),

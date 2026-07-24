@@ -90,14 +90,14 @@ if ($needInstall.Count -gt 0 -and -not $DryRun) {
   if (-not (Test-Cmd 'winget')) { throw (Msg 'needWinget') }
   foreach ($p in $needInstall) {
     Write-Host ((Msg 'installing') + " " + $p.id + " …")
-    try {
-      winget install --id $p.id -e --source winget --accept-package-agreements --accept-source-agreements --silent
-    } catch {
-      throw ((Msg 'installedManual') + $p.id)
-    }
+    winget install --id $p.id -e --source winget --accept-package-agreements --accept-source-agreements --silent
+    # Native commands don't throw on non-zero under PS 5.1 even with -Stop, so
+    # check the exit code explicitly.
+    if ($LASTEXITCODE -ne 0) { throw ((Msg 'installedManual') + $p.id) }
   }
-  # Refresh PATH for THIS process so we can re-verify.
-  $env:PATH = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
+  # Refresh PATH for THIS process (PREPEND the machine+user PATH so any
+  # process-only entries are kept) so we can re-verify.
+  $env:PATH = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User') + ';' + $env:PATH
   $stillMissing = @()
   foreach ($p in $needInstall) { if (-not (& $p.ok)) { $stillMissing += $p.cmd } }
   if ($stillMissing.Count -gt 0) {
@@ -113,7 +113,12 @@ Write-Host (Msg 'nowNode') -ForegroundColor Cyan
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $setup = Join-Path $scriptDir 'scripts\setup.mjs'
 
-$fwd = @('--lang', $L)
+# Forward --lang ONLY when the user explicitly chose one, so a plain ./install.ps1
+# still shows setup.mjs's interactive language chooser (defaulting to the OS
+# locale, which we pass via DISCOPILOT_LOCALE). --Yes is non-interactive, so pin
+# the resolved language there.
+$fwd = @()
+if ($PSBoundParameters.ContainsKey('Lang') -or $Yes) { $fwd += @('--lang', $L) }
 if ($Yes)         { $fwd += '--yes' }
 if ($DryRun)      { $fwd += '--dry-run' }
 if ($Residency)   { $fwd += '--residency' }

@@ -23,17 +23,26 @@ describe("serializeLine → round-trips through Node parseEnv", () => {
     }
   });
 
-  it("quotes exactly the values that need it", () => {
+  it("chooses a representation that round-trips (prefers unquoted to preserve backslashes)", () => {
     expect(serializeLine("K", "simple")).toBe("K=simple");
     expect(serializeLine("K", "")).toBe("K=");
-    expect(serializeLine("K", "a b")).toBe('K="a b"');
-    expect(serializeLine("K", "a#b")).toBe('K="a#b"');
-    expect(serializeLine("K", "C:\\x y")).toBe('K="C:\\x y"');
+    // mid-space is preserved unquoted by parseEnv, so unquoted is chosen
+    expect(serializeLine("K", "a b")).toBe("K=a b");
+    expect(parseEnv(serializeLine("K", "a b")).K).toBe("a b");
+    // a `#` would start a comment unquoted, so the quoted form is chosen
+    expect(parseEnv(serializeLine("K", "a#b")).K).toBe("a#b");
+    // trailing whitespace is trimmed unquoted, so the quoted form is chosen
+    expect(parseEnv(serializeLine("K", "x   ")).K).toBe("x   ");
+    // a Windows path stays unquoted (quoting would corrupt \n)
+    expect(serializeLine("K", "C:\\new repo")).toBe("K=C:\\new repo");
   });
 
-  it("rejects values .env cannot represent (embedded quote / newline)", () => {
-    expect(() => serializeLine("K", 'a"b')).toThrow(/double-quote/);
+  it("rejects only values with no round-tripping representation (NUL / newline)", () => {
     expect(() => serializeLine("K", "a\nb")).toThrow(/newline/);
+    expect(() => serializeLine("K", "a\0b")).toThrow(/NUL/);
+    // a mid double-quote is representable UNQUOTED (parseEnv only strips a leading
+    // quote), so it must NOT throw and must round-trip.
+    expect(parseEnv(serializeLine("K", 'a"b')).K).toBe('a"b');
   });
 });
 
@@ -66,10 +75,21 @@ describe("mergeEnv", () => {
     expect(parsed.NEWKEY).toBe("v");
   });
 
-  it("updates the FIRST occurrence of a duplicated key in place", () => {
+  it("updates the EFFECTIVE (last) occurrence so parseEnv reads the new value", () => {
     const out = mergeEnv("K=old\nK=older\n", { K: "new" });
-    // first line rewritten; the merge changes only the first occurrence
-    expect(out.split(/\r?\n/)[0]).toBe("K=new");
+    // parseEnv resolves duplicates to the LAST value — that must be the new one.
+    expect(parseEnv(out).K).toBe("new");
+    // the earlier duplicate is neutralized (commented) so it can't shadow it
+    expect(out).toContain("# (superseded) K=old");
+  });
+
+  it("round-trips a Windows path with backslashes + spaces WITHOUT corruption", () => {
+    // Regression: double-quoting `C:\new repo` makes parseEnv turn \n into a
+    // newline. serializeLine must pick a representation that round-trips exactly.
+    for (const p of ["C:\\new repo", "C:\\a\\rb\\nc", "C:\\Program Files\\repo", "/home/me/proj dir"]) {
+      const out = mergeEnv("CONTROLLED_REPO_PATH=\n", { CONTROLLED_REPO_PATH: p });
+      expect(parseEnv(out).CONTROLLED_REPO_PATH).toBe(p);
+    }
   });
 
   it("preserves CRLF when the source uses CRLF", () => {
