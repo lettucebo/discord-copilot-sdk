@@ -476,6 +476,15 @@ describe("SessionActor abort + teardown", () => {
     expect(s.actor.usage()).toEqual({ currentTokens: 1234, tokenLimit: 1_000_000 });
   });
 
+  it("reconfigure resetEffort clears the effort (unsupported on the new model)", async () => {
+    const s = await setup();
+    await s.actor.reconfigure({ model: "m1", effort: "high" });
+    expect(s.actor.config().effort).toBe("high");
+    await s.actor.reconfigure({ model: "m2", resetEffort: true });
+    expect(s.actor.config()).toEqual({ model: "m2", effort: undefined, context: undefined });
+    expect(s.session.setModelCalls.at(-1)).toEqual({ model: "m2", options: {} }); // no reasoningEffort sent
+  });
+
   it("a FAILED disconnect faults the actor and never reports success on retry", async () => {
     const s = await setup();
     s.session.disconnect = async () => {

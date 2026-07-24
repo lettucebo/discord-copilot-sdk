@@ -425,7 +425,7 @@ export class DiscopilotApp {
       });
       return;
     }
-    const change: { model?: string; effort?: string; context?: "default" | "long_context" } = {};
+    const change: { model?: string; effort?: string; context?: "default" | "long_context"; resetEffort?: boolean } = {};
     const cur = session.actor.config();
     if (interaction.commandName === "model") {
       const id = interaction.options.getString("id", true);
@@ -434,9 +434,15 @@ export class DiscopilotApp {
         return;
       }
       change.model = id;
+      // If the new model doesn't support the currently-set effort, drop it rather
+      // than sending an unsupported effort the runtime would reject.
+      const supported = this.modelEfforts.get(id);
+      if (cur.effort && supported && supported.length && !supported.includes(cur.effort)) {
+        change.resetEffort = true;
+      }
     } else if (interaction.commandName === "effort") {
       const level = interaction.options.getString("level", true);
-      const supported = this.modelEfforts.get(change.model ?? cur.model ?? "");
+      const supported = this.modelEfforts.get(cur.model ?? "");
       if (supported && supported.length && !supported.includes(level)) {
         await interaction.reply({
           content: `Model \`${cur.model}\` supports effort: ${supported.join(", ")}.`,
@@ -476,8 +482,9 @@ export class DiscopilotApp {
     const u = session.actor.usage();
     const c = session.actor.config();
     const header = `model=\`${c.model ?? "?"}\` effort=\`${c.effort ?? "default"}\` context=\`${c.context ?? "default"}\``;
+    const pct = u && u.tokenLimit > 0 ? Math.round((u.currentTokens / u.tokenLimit) * 100) : undefined;
     const body = u
-      ? `\ntokens: ${u.currentTokens.toLocaleString()} / ${u.tokenLimit.toLocaleString()} (${Math.round((u.currentTokens / u.tokenLimit) * 100)}%)`
+      ? `\ntokens: ${u.currentTokens.toLocaleString()} / ${u.tokenLimit.toLocaleString()}${pct !== undefined ? ` (${pct}%)` : ""}`
       : "\n(no usage reported yet — send a message first)";
     await interaction.reply({ content: header + body, flags: MessageFlags.Ephemeral });
   }

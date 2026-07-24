@@ -194,12 +194,18 @@ export class SessionActor {
 
   /** Change model / reasoning effort / context tier on the LIVE session (takes
    *  effect next message; history preserved). Any subset may be provided; the
-   *  rest keep their current values. */
-  async reconfigure(opts: { model?: string; effort?: string; context?: "default" | "long_context" }): Promise<void> {
+   *  rest keep their current values. `resetEffort` clears effort (e.g. when the
+   *  new model doesn't support the current one). */
+  async reconfigure(opts: {
+    model?: string;
+    effort?: string;
+    context?: "default" | "long_context";
+    resetEffort?: boolean;
+  }): Promise<void> {
     if (this.lifecycle !== "active") throw new Error(`session is ${this.lifecycle}`);
     const model = opts.model ?? this.currentModel;
     if (!model) throw new Error("no model set for this session");
-    const effort = opts.effort ?? this.currentEffort;
+    const effort = opts.resetEffort ? undefined : opts.effort ?? this.currentEffort;
     const context = opts.context ?? this.currentContext;
     const s = this.session as unknown as {
       setModel(m: string, o?: { reasoningEffort?: string; contextTier?: string }): Promise<unknown>;
