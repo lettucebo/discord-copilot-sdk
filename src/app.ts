@@ -31,7 +31,7 @@ import { ApprovalPolicy } from "./core/approval-policy.js";
 import { DiscordTransport } from "./platforms/discord/discord-transport.js";
 import { decodePermissionId, decodeChoiceId, decodePlanId } from "./platforms/discord/custom-id.js";
 import { isAuthorized, type AuthContext, type AuthPolicy } from "./platforms/discord/auth.js";
-import type { Decision } from "./core/transport.js";
+import type { Decision, Transport } from "./core/transport.js";
 
 interface Session {
   actor: SessionActor;
@@ -96,7 +96,7 @@ export async function resolveButtonAck(
  */
 export class DiscopilotApp {
   private readonly discord: Client;
-  private readonly transport: DiscordTransport;
+  private readonly transport: Transport;
   private readonly sessions = new Map<string, Session>();
   private readonly policy: AuthPolicy;
   /** Shared approval memory (session + persisted repo rules) across sessions. */
@@ -112,7 +112,8 @@ export class DiscopilotApp {
     private readonly config: Config,
     private readonly repoPath: string,
     private readonly copilot: CopilotClient,
-    private readonly lock: InstanceLock
+    private readonly lock: InstanceLock,
+    transportOverride?: Transport
   ) {
     this.discord = new Client({
       intents: [
@@ -121,12 +122,26 @@ export class DiscopilotApp {
         GatewayIntentBits.MessageContent,
       ],
     });
-    this.transport = new DiscordTransport(this.discord);
+    this.transport = transportOverride ?? new DiscordTransport(this.discord);
     this.policy = {
       allowedUserIds: new Set(this.config.DISCORD_ALLOWED_USER_IDS),
       guildId: this.config.DISCORD_GUILD_ID,
       parentChannelId: this.config.DISCORD_PARENT_CHANNEL_ID,
     };
+  }
+
+  /** Test-only seam: construct the app with an injected transport (and fake
+   *  copilot/lock), skipping the lock/SDK/login startup, so unit tests can drive
+   *  the real runTurn/stop wiring without a live Discord connection. Not used in
+   *  production (start() is the only production entry point). */
+  static createForTest(
+    config: Config,
+    repoPath: string,
+    copilot: CopilotClient,
+    transport: Transport
+  ): DiscopilotApp {
+    const noopLock: InstanceLock = { path: "(test)", release: async () => {} };
+    return new DiscopilotApp(config, repoPath, copilot, noopLock, transport);
   }
 
   /** Build and fully start the app (lock → SDK → Discord login + commands). */
@@ -431,12 +446,19 @@ export class DiscopilotApp {
     }
     // Cancel a turn that's still reserved but not yet sent (e.g. downloading an
     // image), then stop any in-flight SDK turn. Both are safe/idempotent.
-    session.currentAbort?.abort();
-    const ok = await session.actor.stop();
+    const ok = await this.stopSession(session);
     await interaction.reply({
       content: ok ? "Abort requested for the current turn." : "Abort attempted but the runtime reported an error.",
       flags: MessageFlags.Ephemeral,
     });
+  }
+
+  /** The core of /stop: abort a still-reserved (pre-send) turn so an in-flight
+   *  attachment download is cancelled and never reaches the agent, then stop any
+   *  live SDK turn. Extracted so the /stop wiring is unit-testable end to end. */
+  private async stopSession(session: Session): Promise<boolean> {
+    session.currentAbort?.abort();
+    return session.actor.stop();
   }
 
   /** /model, /effort, /context — reconfigure the current thread's session. */

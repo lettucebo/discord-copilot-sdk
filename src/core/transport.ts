@@ -49,6 +49,12 @@ export interface Transport {
   onChoice(handler: (nonce: string, index: number, userId: string) => void): () => void;
   /** Register the sink for exit-plan action/reject selections. */
   onPlan(handler: (nonce: string, action: number | "reject", userId: string) => void): () => void;
+  /** Deliver a user permission decision to all registered onDecision sinks. */
+  deliverDecision(nonce: string, decision: Decision, userId: string): void;
+  /** Deliver an ask_user choice-button selection to all onChoice sinks. */
+  deliverChoice(nonce: string, index: number, userId: string): void;
+  /** Deliver an exit-plan action/reject to all onPlan sinks. */
+  deliverPlan(nonce: string, action: number | "reject", userId: string): void;
   /** Flush the latest render for a session immediately (e.g. at turn end). */
   flush(sessionKey: string): Promise<void>;
   /** Begin a fresh turn's message set for a session. */

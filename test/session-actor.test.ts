@@ -91,6 +91,15 @@ class FakeTransport implements Transport {
       this.plan = undefined;
     };
   }
+  deliverDecision(nonce: string, decision: Decision, userId: string): void {
+    this.decision?.(nonce, decision, userId);
+  }
+  deliverChoice(nonce: string, index: number, userId: string): void {
+    this.choice?.(nonce, index, userId);
+  }
+  deliverPlan(nonce: string, action: number | "reject", userId: string): void {
+    this.plan?.(nonce, action, userId);
+  }
 }
 
 interface Setup {
