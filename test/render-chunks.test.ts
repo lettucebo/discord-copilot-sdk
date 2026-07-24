@@ -173,6 +173,32 @@ describe("renderChunks", () => {
     expect(ids).toEqual(["m1"]);
   });
 
+  it("keeps tracking a surplus anchor whose delete fails transiently (no untracked orphan)", async () => {
+    const ch = new FakeChannel();
+    const m1 = ch.seed("m1");
+    const m2 = ch.seed("m2"); // surplus; its delete will transiently fail
+    m2.deleteError = { status: 429 };
+    const ids = ["m1", "m2"];
+    await renderChunks(ch, ids, ["shrunk"], always, opts);
+    expect(m1.edited).toBe("shrunk");
+    expect(m2.deleted).toBe(false); // couldn't delete...
+    expect(ids).toEqual(["m1", "m2"]); // ...so still TRACKED (retry next flush), not orphaned
+  });
+
+  it("self-heals the surplus trim on the retry once the delete succeeds", async () => {
+    const ch = new FakeChannel();
+    ch.seed("m1");
+    const m2 = ch.seed("m2");
+    m2.deleteError = { status: 429 };
+    const ids = ["m1", "m2"];
+    await renderChunks(ch, ids, ["shrunk"], always, opts); // m2 delete fails, stays tracked
+    expect(ids).toEqual(["m1", "m2"]);
+    m2.deleteError = undefined; // next flush: delete now works
+    await renderChunks(ch, ids, ["shrunk"], always, opts);
+    expect(m2.deleted).toBe(true);
+    expect(ids).toEqual(["m1"]);
+  });
+
   it("epoch guard: a send for a turn that ended mid-write is deleted, not recorded", async () => {
     const ch = new FakeChannel();
     let calls = 0;

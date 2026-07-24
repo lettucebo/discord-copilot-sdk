@@ -50,10 +50,12 @@ export function isMessageGone(err: unknown): boolean {
  * we can't atomically re-post risks LOSING content if a delete transiently fails
  * mid-way (worse than the pre-fix behavior). Instead we only ever ADD a
  * replacement for the gone slot. Result: content is never lost and never
- * duplicated; the sole residual is a rare COSMETIC mis-ordering — if the user
- * manually deletes a NON-last streamed message, its replacement appears at the
- * tail instead of in place. This strictly dominates the pre-fix behavior (which
- * dropped a deleted message's content entirely). See docs/PLAN.md §9.1.
+ * duplicated. Residuals (accepted, single-owner tool): (1) if the user manually
+ * deletes a NON-last streamed message, its replacement appears at the tail, so a
+ * multi-chunk response can read OUT OF ORDER until the next turn (content is all
+ * present); (2) like any debounced best-effort renderer, a transient edit/delete
+ * failure is retried on the next flush and only lingers if it happens on the
+ * turn's FINAL flush. See docs/PLAN.md §9.1.
  */
 export async function renderChunks(
   channel: MinimalChannel,
@@ -89,17 +91,21 @@ export async function renderChunks(
     }
     msgIds[i] = m.id;
   }
-  // Trim anchors the shorter final output no longer needs. Best effort: an
-  // already-gone or transiently-unreachable one is left for the next flush.
-  for (let i = chunks.length; i < msgIds.length; i++) {
-    const id = msgIds[i];
-    if (!id) continue;
-    try {
-      const m = await channel.messages.fetch(id);
-      await m.delete();
-    } catch {
-      /* already gone / transient — surplus message, not content loss */
+  // Trim anchors the shorter final output no longer needs, from the END. Only
+  // drop an id from tracking once its message is confirmed deleted (or already
+  // gone); on a TRANSIENT delete failure, stop and keep tracking it so the next
+  // flush retries — never truncate past an unconfirmed delete (that would orphan
+  // an untracked message → a visible duplicate that never gets cleaned).
+  while (msgIds.length > chunks.length) {
+    const id = msgIds[msgIds.length - 1];
+    if (id) {
+      try {
+        const m = await channel.messages.fetch(id);
+        await m.delete();
+      } catch (err) {
+        if (!isMessageGone(err)) break; // transient: retain tracking, retry next flush
+      }
     }
+    msgIds.pop();
   }
-  if (msgIds.length > chunks.length) msgIds.length = chunks.length;
 }

@@ -118,7 +118,7 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 | sub-agent 不交錯 | `turn-render.test.ts`（`ignores any sub-agent` / `does not let a sub-agent ... overwrite`）|
 | 未知權限變體 fail-closed | `session-actor.test.ts`（`auto-denies a non-shell permission (fail closed)`）|
 | resume 對帳四種情形 | `reconcile.test.ts`（14）+ `app-reconcile.test.ts`（9）|
-| **message 404 新 anchor** | `render-chunks.ts` + `render-chunks.test.ts`（`RE-ANCHORS ...`、含多 chunk 保序）|
+| **message 404 新 anchor** | `render-chunks.ts` + `render-chunks.test.ts`（`RE-ANCHORS ...`、survivor-safety；補貼於尾端，見下方殘留）|
 | 最小 CI（Win/Ubuntu、Node 20.19+22.12）| `.github/workflows/ci.yml` |
 
 **設計決策（與 §9 措辭的差異，刻意記錄）：**
@@ -126,10 +126,11 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 - **Restart smoke（P2）** 的自動化部分即 `app-reconcile.test.ts`（9 個 app 層 resume 對帳情形，以 fake 驅動）+ `reconcile.test.ts`；真正的「重啟後 live 復原」已於開發時人工驗證（斷線→重啟→喚回暗號 PELICAN-77）。可跑於 CI 的 live-restart 需真實 Discord+Copilot，超出無網路 CI 範圍。
 - **安裝器測試框架**（`secure-file`/`setup-core`/`setup-integration`）屬 **P6 安裝器回歸**，另立 issue 追蹤，不計入本 §9（#8）。
 
-**message 404 re-anchor 的已接受殘留（single-owner 取捨，RubberDuck R3）：**
+**message 404 re-anchor 的已接受殘留（single-owner 取捨，RubberDuck R3/R4）：**
 - 偵測到 anchor 被刪除（10008 / 純 404）時，**只在該槽位補貼一則新訊息**（保留內容），**絕不刪除仍存在的其他 anchor**。因此**永不遺失、永不重複**內容。
-- 唯一殘留為**罕見的視覺順序**：若使用者手動刪除的是**非最後一則**串流訊息，其補貼會出現在頻道**最尾端**而非原位（Discord 無法插入中間位置）。內容完整，僅位置略偏。
-- 此設計**嚴格優於**修正前行為（原本訊息被刪即丟失該段內容）。刻意**不採用**「刪除並重建整段 suffix」的做法——那會在暫時性刪除失敗時**遺失比基準更多**的內容；也刻意不加有狀態的 bounded-retry timer（single-owner lab 工具的比例原則）。
+- 殘留 1（順序）：若使用者手動刪除的是**非最後一則**串流訊息，其補貼會出現在頻道**最尾端**而非原位（Discord 無法插入中間位置）。內容完整，但多 chunk 回覆在該回合可能**讀取順序錯置**（下一回合即恢復）。**非「純美觀」**——對程式碼/散文語意可能造成閱讀困擾，但內容不缺不重。
+- 殘留 2（best-effort 渲染）：如同任何 debounced 渲染，暫時性 edit/delete 失敗會在**下一次 flush 重試**；trim 對未確認刪除的 surplus 會**保留追蹤**（不會產生未追蹤的孤兒/重複）。僅當失敗發生在該回合**最後一次 flush** 才會殘留至下一回合。
+- 此設計**嚴格優於**修正前行為（原本訊息被刪即丟失該段內容）。刻意**不採用**「刪除並重建整段 suffix」（會在暫時性刪除失敗時遺失比基準更多內容），亦不加有狀態 bounded-retry timer（比例原則）。
 
 ## 10. 決策紀錄（已定）
 1. **隔離方式 = B（先 lab-only）**：不做 controller/worker 分離；P1 只在**可拋棄的 VM/測試帳號/測試 repo**跑；README + 啟動時明確警告「僅限拋棄式環境」。之後再升級到 A。
