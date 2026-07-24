@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { SessionActor } from "../src/copilot/session-actor.js";
+import { SessionActor, formatTodos } from "../src/copilot/session-actor.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { ApprovalPolicy } from "../src/core/approval-policy.js";
 import type { CopilotClient } from "@github/copilot-sdk";
@@ -495,5 +495,42 @@ describe("SessionActor abort + teardown", () => {
     // The retry must REJECT (fence), not resolve — else /new would delete a
     // session whose runtime may still be live.
     await expect(s.actor.disconnect()).rejects.toThrow(/faulted/);
+  });
+});
+
+describe("formatTodos (P5)", () => {
+  it("returns empty string when there are no titled todos", () => {
+    expect(formatTodos([])).toBe("");
+    expect(formatTodos([{ id: "1", status: "pending" }])).toBe(""); // no title → skipped
+    expect(formatTodos([{ title: "   " }])).toBe(""); // blank title → skipped
+  });
+
+  it("maps statuses to icons and preserves order", () => {
+    const out = formatTodos([
+      { title: "done thing", status: "done" },
+      { title: "current", status: "in_progress" },
+      { title: "later", status: "pending" },
+      { title: "stuck", status: "blocked" },
+    ]);
+    const lines = out.split("\n");
+    expect(lines[0]).toContain("(1/4)"); // 1 done of 4
+    expect(lines[1]).toBe("✅ done thing");
+    expect(lines[2]).toBe("🔄 current");
+    expect(lines[3]).toBe("⬜ later");
+    expect(lines[4]).toBe("🚫 stuck");
+  });
+
+  it("treats unknown/absent status as pending", () => {
+    expect(formatTodos([{ title: "x", status: "weird" }])).toContain("⬜ x");
+    expect(formatTodos([{ title: "y" }])).toContain("⬜ y");
+  });
+
+  it("accepts alternate spellings (completed / in-progress)", () => {
+    const out = formatTodos([
+      { title: "a", status: "completed" },
+      { title: "b", status: "in-progress" },
+    ]);
+    expect(out).toContain("✅ a");
+    expect(out).toContain("🔄 b");
   });
 });

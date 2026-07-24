@@ -18,6 +18,9 @@ const FAULT_DISCONNECT_MS = 5_000;
  *  card lives in a Discord embed description (≤4096). Beyond this we auto-deny
  *  rather than show a partial/undisplayable command. */
 const MAX_CARD_LEN = 3900;
+/** Debounce window for the signal-only session.todos_changed event: the agent
+ *  may write its todos table many times per turn, so we coalesce bursts. */
+const TODOS_DEBOUNCE_MS = 700;
 
 /** Safe-default permission result (deny). Used for timeout/abort and for
  *  permission kinds discopilot has no UI for (fail-closed). */
@@ -48,6 +51,14 @@ export interface SessionActorOpts {
   policy: ApprovalPolicy;
   /** Session incarnation (P1: always 1; P2 resume will vary this). */
   generation?: number;
+}
+
+/** A raw-bytes attachment for send() — Discord images become blobs (P5). */
+export interface BlobAttachment {
+  type: "blob";
+  data: string; // base64
+  mimeType: string;
+  displayName?: string;
 }
 
 /**
@@ -92,6 +103,9 @@ export class SessionActor {
   private currentContext?: "default" | "long_context";
   /** Latest usage snapshot from session.usage_info (for /usage). */
   private lastUsage?: { currentTokens: number; tokenLimit: number };
+  /** Debounce timer + last rendered checklist for session.todos_changed (P5). */
+  private todosTimer?: ReturnType<typeof setTimeout>;
+  private lastTodosRender?: string;
   /** Per-nonce exit-plan metadata (actions for index→action mapping). */
   private readonly pendingPlan = new Map<string, { actions: string[] }>();
 
@@ -190,6 +204,27 @@ export class SessionActor {
         this.lastUsage = { currentTokens: cur, tokenLimit: lim };
       }
     });
+    // Signal-only: the agent wrote its todos table. Debounce, fetch, and post a
+    // checklist only when the rendered content actually changed (avoid spam).
+    s.on("session.todos_changed", () => this.scheduleTodosRefresh());
+  }
+
+  private scheduleTodosRefresh(): void {
+    if (this.todosTimer) clearTimeout(this.todosTimer);
+    this.todosTimer = setTimeout(() => {
+      this.todosTimer = undefined;
+      void this.refreshTodos();
+    }, TODOS_DEBOUNCE_MS);
+  }
+
+  private async refreshTodos(): Promise<void> {
+    if (this.lifecycle !== "active") return;
+    const rows = await this.readTodos();
+    if (this.lifecycle !== "active") return; // may have changed during await
+    const rendered = formatTodos(rows);
+    if (!rendered || rendered === this.lastTodosRender) return;
+    this.lastTodosRender = rendered;
+    await this.opts.transport.notice(this.opts.sessionKey, rendered);
   }
 
   /** Change model / reasoning effort / context tier on the LIVE session (takes
@@ -498,19 +533,43 @@ export class SessionActor {
     );
   }
 
-  /** Send a user prompt, starting a fresh turn's render state. Rejects once the
-   *  actor is closed/faulted so a dead session can't accept new work. */
-  async send(prompt: string): Promise<void> {
+  /** Send a user prompt (with optional blob attachments, e.g. images from
+   *  Discord), starting a fresh turn's render state. Rejects once the actor is
+   *  closed/faulted so a dead session can't accept new work. */
+  async send(prompt: string, attachments: BlobAttachment[] = []): Promise<void> {
     if (this.lifecycle !== "active") {
       throw new Error(`session is ${this.lifecycle} and cannot accept new prompts`);
     }
     this.renderer = new TurnRenderer();
-    await (this.session as unknown as { send(o: { prompt: string }): Promise<unknown> }).send({ prompt });
+    const payload: Record<string, unknown> = { prompt };
+    if (attachments.length) payload["attachments"] = attachments;
+    await (this.session as unknown as { send(o: Record<string, unknown>): Promise<unknown> }).send(payload);
+  }
+
+  /** Read the agent's current todos (empty when none / no session db). */
+  async readTodos(): Promise<Array<{ id?: string; title?: string; status?: string }>> {
+    try {
+      const plan = (this.session as unknown as {
+        plan?: { readSqlTodosWithDependencies?: () => Promise<{ rows?: unknown[] }> };
+      }).plan;
+      const res = await plan?.readSqlTodosWithDependencies?.();
+      const rows = res?.rows;
+      return Array.isArray(rows) ? (rows as Array<{ id?: string; title?: string; status?: string }>) : [];
+    } catch {
+      return [];
+    }
   }
 
   /** True once the actor has faulted (needs a fresh /new; can't be reused). */
   isFaulted(): boolean {
     return this.lifecycle === "faulted";
+  }
+
+  private clearTodosTimer(): void {
+    if (this.todosTimer) {
+      clearTimeout(this.todosTimer);
+      this.todosTimer = undefined;
+    }
   }
 
   /**
@@ -521,9 +580,9 @@ export class SessionActor {
    * reported as a timeout). If even the abort doesn't yield idle within a grace
    * window, the session is destroyed (faulted) so it is never reused mid-turn.
    */
-  async runTurn(prompt: string, watchdogMs = TURN_WATCHDOG_MS): Promise<void> {
+  async runTurn(prompt: string, watchdogMs = TURN_WATCHDOG_MS, attachments: BlobAttachment[] = []): Promise<void> {
     const idle = this.nextIdle();
-    await this.send(prompt);
+    await this.send(prompt, attachments);
     const outcome = await this.awaitTurnEnd(idle, watchdogMs);
     if (outcome === "watchdog") {
       await this.opts.transport.notice(
@@ -613,6 +672,7 @@ export class SessionActor {
     this.unsubscribeDecision?.();
     this.unsubscribeChoice?.();
     this.unsubscribePlan?.();
+    this.clearTodosTimer();
     // Transition to `closed` ONLY after the RPC confirms; on failure become a
     // permanent fault fence and rethrow, so a retry can't masquerade as success.
     this.disconnectPromise = this.session.disconnect().then(
@@ -640,6 +700,7 @@ export class SessionActor {
     this.unsubscribeDecision?.();
     this.unsubscribeChoice?.();
     this.unsubscribePlan?.();
+    this.clearTodosTimer();
     const timeout = new Promise<void>((res) => {
       const t = setTimeout(res, FAULT_DISCONNECT_MS);
       (t as { unref?: () => void }).unref?.();
@@ -649,6 +710,33 @@ export class SessionActor {
       timeout,
     ]);
   }
+}
+
+/** Render the agent's todos as a compact Discord checklist. Returns "" when
+ *  there are no titled todos (so callers can skip posting). Status maps to an
+ *  icon; unknown statuses fall back to a pending box. Order is preserved. */
+export function formatTodos(
+  rows: Array<{ id?: string; title?: string; status?: string }>
+): string {
+  const items = rows
+    .map((r) => {
+      const title = typeof r.title === "string" ? r.title.trim() : "";
+      if (!title) return undefined;
+      const status = (typeof r.status === "string" ? r.status : "").trim().toLowerCase();
+      const icon =
+        status === "done" || status === "completed" || status === "complete"
+          ? "✅"
+          : status === "in_progress" || status === "in-progress" || status === "active" || status === "running"
+            ? "🔄"
+            : status === "blocked" || status === "cancelled" || status === "canceled"
+              ? "🚫"
+              : "⬜";
+      return `${icon} ${title}`;
+    })
+    .filter((s): s is string => s !== undefined);
+  if (items.length === 0) return "";
+  const done = items.filter((s) => s.startsWith("✅")).length;
+  return `📋 **待辦進度** (${done}/${items.length})\n${items.join("\n")}`;
 }
 
 /** Executables that must NEVER get a session/repo "always" scope, because

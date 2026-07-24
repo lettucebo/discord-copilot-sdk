@@ -20,9 +20,11 @@ import type { Config } from "./config.js";
 import { acquireSingleInstanceLock, type InstanceLock } from "./core/single-instance.js";
 import { lockPath } from "./core/paths.js";
 import { resolveControlledRepo } from "./core/repo.js";
+import { gitDiffSummary } from "./core/git.js";
+import { shouldResetEffort, validateEffort } from "./core/effort.js";
 import { createCopilotClient, checkSdkCompat } from "./copilot/sdk.js";
 import { PendingInteractionBroker } from "./core/broker.js";
-import { SessionActor } from "./copilot/session-actor.js";
+import { SessionActor, type BlobAttachment, formatTodos } from "./copilot/session-actor.js";
 import { ApprovalPolicy } from "./core/approval-policy.js";
 import { DiscordTransport } from "./platforms/discord/discord-transport.js";
 import { decodePermissionId, decodeChoiceId, decodePlanId } from "./platforms/discord/custom-id.js";
@@ -192,8 +194,13 @@ export class DiscopilotApp {
       const models = await this.copilot.listModels();
       this.modelIds = models.map((m) => m.id).slice(0, 25);
       for (const m of models) {
-        const efforts = (m.supportedReasoningEfforts as string[] | undefined) ?? [];
-        if (efforts.length) this.modelEfforts.set(m.id, efforts);
+        // Store EVERY listed model. Empty array (or absent, per the SDK contract
+        // "only present if the model supports reasoning effort") = known "no
+        // effort support". A MISSING map entry means the model wasn't in the
+        // snapshot at all — which must NOT be treated as unsupported. This
+        // three-state distinction gates effort validation in cmdReconfigure.
+        const raw = m.supportedReasoningEfforts as string[] | undefined;
+        this.modelEfforts.set(m.id, Array.isArray(raw) ? raw : []);
       }
     } catch (err) {
       console.warn(`⚠️  could not list models for /model choices: ${err instanceof Error ? err.message : err}`);
@@ -264,6 +271,17 @@ export class DiscopilotApp {
           o.setName("clear").setDescription("Clear this session + repo approvals").setRequired(false)
         )
         .toJSON(),
+      new SlashCommandBuilder()
+        .setName("diff")
+        .setDescription("Show a git diff summary of the controlled repo")
+        .addBooleanOption((o) =>
+          o.setName("staged").setDescription("Show staged (--cached) changes instead").setRequired(false)
+        )
+        .toJSON(),
+      new SlashCommandBuilder()
+        .setName("todos")
+        .setDescription("Show the agent's current todo checklist")
+        .toJSON(),
     ];
     // Register in the AUTHORIZED guild so command availability matches the auth
     // policy (DEV_GUILD_ID is intentionally not used here to avoid registering
@@ -289,6 +307,8 @@ export class DiscopilotApp {
         else if (c === "model" || c === "effort" || c === "context") await this.cmdReconfigure(interaction);
         else if (c === "usage") await this.cmdUsage(interaction);
         else if (c === "approvals") await this.cmdApprovals(interaction);
+        else if (c === "diff") await this.cmdDiff(interaction);
+        else if (c === "todos") await this.cmdTodos(interaction);
       }
     } catch (err) {
       console.error("interaction error:", err);
@@ -435,19 +455,16 @@ export class DiscopilotApp {
       }
       change.model = id;
       // If the new model doesn't support the currently-set effort, drop it rather
-      // than sending an unsupported effort the runtime would reject.
-      const supported = this.modelEfforts.get(id);
-      if (cur.effort && supported && supported.length && !supported.includes(cur.effort)) {
+      // than sending an unsupported effort the runtime would reject. Unknown
+      // model (not in snapshot) leaves the effort untouched.
+      if (shouldResetEffort(cur.effort, this.modelEfforts.get(id))) {
         change.resetEffort = true;
       }
     } else if (interaction.commandName === "effort") {
       const level = interaction.options.getString("level", true);
-      const supported = this.modelEfforts.get(cur.model ?? "");
-      if (supported && supported.length && !supported.includes(level)) {
-        await interaction.reply({
-          content: `Model \`${cur.model}\` supports effort: ${supported.join(", ")}.`,
-          flags: MessageFlags.Ephemeral,
-        });
+      const check = validateEffort(cur.model, level, this.modelEfforts.get(cur.model ?? ""));
+      if (!check.ok) {
+        await interaction.reply({ content: check.message, flags: MessageFlags.Ephemeral });
         return;
       }
       change.effort = level;
@@ -501,11 +518,13 @@ export class DiscopilotApp {
     const repoRules = this.approvals.repoApprovals(this.repoPath);
     if (clear) {
       if (this.sessions.has(interaction.channelId)) this.approvals.clearSession(interaction.channelId);
-      this.approvals.clearRepo(this.repoPath);
+      const durable = this.approvals.clearRepo(this.repoPath);
+      const tail = durable
+        ? "Future commands will prompt again."
+        : "⚠️ 已在記憶體中清除（本次執行不會再自動核准），但寫入磁碟失敗 — 重啟後 repo 規則可能重現，請檢查檔案權限。";
       await interaction.reply({
         content:
-          `Cleared approvals — session: ${fmtList(sessionRules)} · repo: ${fmtList(repoRules)}. ` +
-          `Future commands will prompt again.`,
+          `Cleared approvals — session: ${fmtList(sessionRules)} · repo: ${fmtList(repoRules)}. ` + tail,
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -516,6 +535,39 @@ export class DiscopilotApp {
     });
   }
 
+  private async cmdDiff(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isAuthorized(ctxOf(interaction), this.policy)) {
+      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const staged = interaction.options.getBoolean("staged") ?? false;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      const summary = await gitDiffSummary(this.repoPath, staged);
+      await interaction.editReply({ content: summary });
+    } catch (err) {
+      await interaction.editReply({
+        content: `⚠️ 無法取得 git diff：${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+
+  private async cmdTodos(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isAuthorized(ctxOf(interaction), this.policy)) {
+      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const session = this.sessions.get(interaction.channelId);
+    if (!session) {
+      await interaction.reply({ content: "Run this inside a session thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const rows = await session.actor.readTodos();
+    const rendered = formatTodos(rows);
+    await interaction.editReply({ content: rendered || "目前沒有待辦事項。" });
+  }
+
   // ---- input surface: thread messages -----------------------------------
 
   private async onMessage(message: Message): Promise<void> {
@@ -523,23 +575,82 @@ export class DiscopilotApp {
     const session = this.sessions.get(message.channelId);
     if (!session) return; // not a session thread
     if (!isAuthorized(ctxOf(message), this.policy)) return; // silent for non-owners
-    const prompt = message.content.trim();
-    if (!prompt) {
+    const text = message.content.trim();
+    const images = await this.collectImageAttachments(message);
+    // Text-only messages while a freeform ask_user is pending answer it (rather
+    // than starting a new turn). Messages carrying images always start a turn.
+    if (images.length === 0 && text && session.actor.tryConsumeFreeform(text)) return;
+    if (!text && images.length === 0) {
       await this.transport.notice(
         message.channelId,
         "Empty message — is the Message Content intent enabled for this bot?"
       );
       return;
     }
-    // If the agent is awaiting a freeform ask_user answer, this message answers
-    // it (rather than starting a new turn or hitting the "still working" guard).
-    if (session.actor.tryConsumeFreeform(prompt)) return;
-    await this.runTurn(message.channelId, prompt);
+    const prompt = text || "請看我附上的圖片。";
+    await this.runTurn(message.channelId, prompt, images);
+  }
+
+  /** Download a message's image attachments as base64 blobs for the SDK. Only
+   *  image/* is accepted (P5 = images); non-images and over-limit files are
+   *  skipped with a notice. Bounded by count and per-file size so a huge upload
+   *  can't blow the prompt budget or memory. */
+  private async collectImageAttachments(message: Message): Promise<BlobAttachment[]> {
+    const MAX_IMAGES = 4;
+    const MAX_BYTES = 8 * 1024 * 1024; // 8 MiB per image
+    const all = [...message.attachments.values()];
+    if (all.length === 0) return [];
+    const out: BlobAttachment[] = [];
+    let skipped = 0;
+    for (const att of all) {
+      if (out.length >= MAX_IMAGES) {
+        skipped++;
+        continue;
+      }
+      const mime = (att.contentType ?? "").split(";")[0]!.trim().toLowerCase();
+      if (!mime.startsWith("image/")) {
+        skipped++;
+        continue;
+      }
+      if (typeof att.size === "number" && att.size > MAX_BYTES) {
+        skipped++;
+        continue;
+      }
+      try {
+        const res = await fetch(att.url);
+        if (!res.ok) {
+          skipped++;
+          continue;
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.byteLength > MAX_BYTES) {
+          skipped++;
+          continue;
+        }
+        out.push({
+          type: "blob",
+          data: buf.toString("base64"),
+          mimeType: mime,
+          displayName: att.name ?? "image",
+        });
+      } catch {
+        skipped++;
+      }
+    }
+    if (skipped > 0) {
+      await this.transport
+        .notice(
+          message.channelId,
+          `ℹ️ 已略過 ${skipped} 個附件（僅支援圖片，每張上限 8MB、最多 ${MAX_IMAGES} 張）。`
+        )
+        .catch(() => {});
+    }
+    return out;
   }
 
   /** Run one prompt to real completion (session.idle), guarding against
    *  overlapping sends per thread. `running` stays set for the WHOLE turn. */
-  private async runTurn(threadId: string, prompt: string): Promise<void> {
+  private async runTurn(threadId: string, prompt: string, attachments: BlobAttachment[] = []): Promise<void> {
     const session = this.sessions.get(threadId);
     if (!session) return;
     if (session.actor.isFaulted()) {
@@ -556,7 +667,7 @@ export class DiscopilotApp {
     session.running = true;
     this.transport.resetTurn(threadId);
     try {
-      await session.actor.runTurn(prompt);
+      await session.actor.runTurn(prompt, undefined, attachments);
     } catch (err) {
       await this.transport.notice(threadId, `⚠️ ${err instanceof Error ? err.message : String(err)}`);
     } finally {

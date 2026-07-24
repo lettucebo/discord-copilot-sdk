@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { ApprovalPolicy, commandExecutable } from "../src/core/approval-policy.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { rmSync } from "node:fs";
+import { rmSync, mkdtempSync } from "node:fs";
 
 const tmpFile = (): string => join(tmpdir(), `dp-approvals-${Math.random()}.json`);
 
@@ -55,11 +55,33 @@ describe("ApprovalPolicy", () => {
       p.approveForRepo("/repo", "npm");
       expect(p.sessionApprovals("s1")).toEqual(["git"]);
       expect(p.repoApprovals("/repo")).toEqual(["npm"]);
-      p.clearRepo("/repo");
+      expect(p.clearRepo("/repo")).toBe(true); // durable success
       expect(p.repoApprovals("/repo")).toEqual([]);
       expect(new ApprovalPolicy(f).repoApprovals("/repo")).toEqual([]); // persisted
     } finally {
       rmSync(f, { force: true });
+    }
+  });
+
+  it("clearRepo returns true when there is nothing to clear (trivially durable)", () => {
+    const p = new ApprovalPolicy(tmpFile());
+    expect(p.clearRepo("/nope")).toBe(true);
+  });
+
+  it("clearRepo reports FALSE (fail-closed, honest) when the disk write fails", () => {
+    // Point the store file at an existing DIRECTORY so writeFileSync throws
+    // (EISDIR/EPERM) — simulating a persistence failure on revocation.
+    const dir = mkdtempSync(join(tmpdir(), "dp-approve-dir-"));
+    try {
+      const p = new ApprovalPolicy(dir);
+      // Seed in memory (this write also fails, but that's fail-safe for a grant).
+      p.approveForRepo("/repo", "npm");
+      expect(p.repoApprovals("/repo")).toEqual(["npm"]); // in memory regardless
+      const durable = p.clearRepo("/repo");
+      expect(durable).toBe(false); // revocation could not be persisted
+      expect(p.repoApprovals("/repo")).toEqual([]); // but memory IS cleared (fail-closed now)
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
     }
   });
 });

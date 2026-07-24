@@ -82,12 +82,15 @@ export class ApprovalPolicy {
     return [...(this.repo[repoPath] ?? [])];
   }
 
-  /** Forget a repo's persisted approvals (e.g. /approvals clear). */
-  clearRepo(repoPath: string): void {
-    if (this.repo[repoPath]) {
-      delete this.repo[repoPath];
-      this.persist();
-    }
+  /** Forget a repo's persisted approvals (e.g. /approvals clear). Returns true
+   *  if the revocation was durably written to disk. False means it was cleared
+   *  in memory (so THIS process is now fail-closed and will re-prompt) but the
+   *  on-disk file may still hold the old rules and could resurface on restart —
+   *  the caller must report that honestly rather than claim it's fully cleared. */
+  clearRepo(repoPath: string): boolean {
+    if (!this.repo[repoPath]) return true; // nothing to clear ⇒ trivially durable
+    delete this.repo[repoPath];
+    return this.persist();
   }
 
   private load(): void {
@@ -105,11 +108,19 @@ export class ApprovalPolicy {
     }
   }
 
-  private persist(): void {
+  private persist(): boolean {
     try {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
       fs.writeFileSync(this.file, JSON.stringify(this.repo, null, 2), "utf8");
-    } catch {
-      /* best effort */
+      return true;
+    } catch (err) {
+      // Surface the failure (not silent). A failed WRITE of a granted approval is
+      // fail-safe (it just won't survive restart); a failed write of a REVOCATION
+      // is reported to the user via clearRepo's boolean so they aren't misled.
+      console.warn(
+        `⚠️  could not persist approvals to ${this.file}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return false;
     }
   }
 }
