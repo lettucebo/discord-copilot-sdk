@@ -42,6 +42,7 @@ const corpus = [
   { name: "bad context tier", values: { ...base(), DEFAULT_CONTEXT_TIER: "huge" } },
   { name: "whitespace-only token", values: { ...base(), DISCORD_BOT_TOKEN: "   " } },
   { name: "whitespace-only repo path", values: { ...base(), CONTROLLED_REPO_PATH: "  " } },
+  { name: "whitespace-only model", values: { ...base(), DEFAULT_MODEL: "   " } },
 ];
 
 describe("installer validators ⇄ runtime config contract", () => {
@@ -64,5 +65,16 @@ describe("installer validators ⇄ runtime config contract", () => {
     ]) {
       expect(managed.has(k)).toBe(true);
     }
+  });
+
+  it("runtime preserves CONTROLLED_REPO_PATH EXACTLY (no trimming that would redirect the repo)", () => {
+    // A trailing space is a real, different Unix directory — the runtime must not
+    // silently transform it away from what the installer wrote.
+    const p = "/tmp/disposable ";
+    const cfg = parseConfig({ ...base(), CONTROLLED_REPO_PATH: p });
+    expect(cfg.CONTROLLED_REPO_PATH).toBe(p);
+    // token likewise preserved verbatim
+    const cfg2 = parseConfig({ ...base(), DISCORD_BOT_TOKEN: " tok " });
+    expect(cfg2.DISCORD_BOT_TOKEN).toBe(" tok ");
   });
 });
