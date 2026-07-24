@@ -33,8 +33,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         node: ["20.19", "22.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
       # The committed package-lock.json resolves against an internal Microsoft
@@ -53,8 +53,8 @@ jobs:
     name: lint shell + installer scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: "22.12"
       # Bash syntax check for the POSIX installer/bootstraps.
@@ -65,3 +65,4 @@ jobs:
             echo "node --check $f"
             node --check "$f"
           done
+
