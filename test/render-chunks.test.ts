@@ -108,20 +108,20 @@ describe("renderChunks", () => {
     expect(ids).toEqual(["new1"]);
   });
 
-  it("preserves ORDER when the FIRST of several anchors is gone (re-posts all)", async () => {
+  it("re-anchors the FIRST gone slot WITHOUT touching the surviving anchors", async () => {
     const ch = new FakeChannel();
-    ch.seed("m1"); // will be reported gone
-    const m2 = ch.seed("m2");
+    ch.seed("m1"); // reported gone
+    const m2 = ch.seed("m2"); // survivor — must be edited in place, never deleted
     ch.fetchError = (id) => (id === "m1" ? { code: 10008 } : undefined);
     const ids = ["m1", "m2"];
     await renderChunks(ch, ids, ["A", "B"], always, opts);
-    // m1 gone → rebuild from slot 0: delete the stale m2, re-post A then B at the tail.
-    expect(ch.sent).toEqual(["A", "B"]); // correct order, nothing reversed
-    expect(ids).toEqual(["new1", "new2"]);
-    expect(m2.deleted).toBe(true); // stale later anchor removed
+    expect(ch.sent).toEqual(["A"]); // gone slot re-anchored (content preserved)
+    expect(m2.edited).toBe("B"); // survivor edited in place
+    expect(m2.deleted).toBe(false); // NEVER deleted → no content-loss risk
+    expect(ids).toEqual(["new1", "m2"]); // A now at the tail (rare cosmetic re-order)
   });
 
-  it("preserves ORDER when a MIDDLE anchor is gone (keeps earlier, re-posts from the gap)", async () => {
+  it("re-anchors a MIDDLE gone slot, keeping earlier + later survivors intact", async () => {
     const ch = new FakeChannel();
     const m1 = ch.seed("m1");
     ch.seed("m2"); // reported gone
@@ -129,10 +129,27 @@ describe("renderChunks", () => {
     ch.fetchError = (id) => (id === "m2" ? { code: 10008 } : undefined);
     const ids = ["m1", "m2", "m3"];
     await renderChunks(ch, ids, ["A", "B", "C"], always, opts);
-    expect(m1.edited).toBe("A"); // earlier anchor kept + edited in place
-    expect(m3.deleted).toBe(true); // stale later anchor removed
-    expect(ch.sent).toEqual(["B", "C"]); // re-posted in order after A
-    expect(ids).toEqual(["m1", "new1", "new2"]);
+    expect(m1.edited).toBe("A"); // earlier survivor edited in place
+    expect(m3.edited).toBe("C"); // later survivor edited in place (NOT deleted)
+    expect(m3.deleted).toBe(false); // key: survivors are never deleted → no loss
+    expect(ch.sent).toEqual(["B"]); // only the gone chunk is re-posted
+    expect(ids).toEqual(["m1", "new1", "m3"]); // B's content preserved
+  });
+
+  it("a TRANSIENT delete failure of a survivor cannot lose content (survivors are never deleted)", async () => {
+    // Regression for the rebuild content-loss bug: re-anchoring the FIRST slot
+    // must not delete m2 at all, so a flaky delete can never drop m2's content.
+    const ch = new FakeChannel();
+    ch.seed("m1");
+    const m2 = ch.seed("m2");
+    ch.fetchError = (id) => (id === "m1" ? { code: 10008 } : undefined);
+    m2.deleteError = { status: 500 }; // would matter only if we tried to delete it
+    const ids = ["m1", "m2"];
+    await renderChunks(ch, ids, ["A", "B"], always, opts);
+    expect(m2.deleted).toBe(false); // we never even attempt to delete a survivor
+    expect(m2.edited).toBe("B"); // its content stays, edited in place
+    expect(ch.sent).toEqual(["A"]); // gone slot's content re-anchored
+    expect(ids).toEqual(["new1", "m2"]);
   });
 
   it("does NOT re-anchor on a TRANSIENT edit failure (leaves the anchor as-is)", async () => {
@@ -143,74 +160,6 @@ describe("renderChunks", () => {
     await renderChunks(ch, ids, ["retry later"], always, opts);
     expect(ch.sent).toEqual([]); // no duplicate post
     expect(ids).toEqual(["m1"]); // slot unchanged
-  });
-
-  it("ABORTS the rebuild (no duplicate) if deleting a stale later anchor fails transiently", async () => {
-    const ch = new FakeChannel();
-    ch.seed("m1"); // will be reported gone
-    const m2 = ch.seed("m2"); // survivor whose delete will transiently fail
-    ch.fetchError = (id) => (id === "m1" ? { code: 10008 } : undefined);
-    m2.deleteError = { status: 429 }; // cleanup can't be confirmed
-    const ids = ["m1", "m2"];
-    await renderChunks(ch, ids, ["A", "B"], always, opts);
-    // Must NOT post replacements while m2 still exists — that would duplicate B.
-    expect(ch.sent).toEqual([]);
-    expect(m2.deleted).toBe(false); // survivor still there
-    expect(ids).toEqual(["m1", "m2"]); // state intact for the next flush to retry
-  });
-
-  it("self-heals on the retry after a transient cleanup failure", async () => {
-    const ch = new FakeChannel();
-    ch.seed("m1");
-    const m2 = ch.seed("m2");
-    ch.fetchError = (id) => (id === "m1" ? { code: 10008 } : undefined);
-    m2.deleteError = { status: 429 };
-    const ids = ["m1", "m2"];
-    await renderChunks(ch, ids, ["A", "B"], always, opts); // aborts
-    expect(ch.sent).toEqual([]);
-    // next flush: m2's delete now succeeds
-    m2.deleteError = undefined;
-    await renderChunks(ch, ids, ["A", "B"], always, opts);
-    expect(m2.deleted).toBe(true);
-    expect(ch.sent).toEqual(["A", "B"]); // re-posted in order
-    expect(ids).toEqual(["new1", "new2"]);
-  });
-
-  it("epoch guard covers rebuild cleanup: a flip mid-delete aborts without posting", async () => {
-    const ch = new FakeChannel();
-    ch.seed("m1");
-    ch.seed("m2");
-    ch.fetchError = (id) => (id === "m1" ? { code: 10008 } : undefined);
-    let calls = 0;
-    // true for: loop-guard(i=0), pre-edit path... then flips false at the first
-    // deleteSuffix stillCurrent check so cleanup aborts before any send.
-    const stillCurrent = () => {
-      calls++;
-      return calls < 2;
-    };
-    const ids = ["m1", "m2"];
-    await renderChunks(ch, ids, ["A", "B"], stillCurrent, opts);
-    expect(ch.sent).toEqual([]); // nothing posted into a superseded turn
-    expect(ids).toEqual(["m1", "m2"]); // untouched; a fresh turn resets msgIds anyway
-  });
-
-  it("epoch guard aborts BEFORE the delete if the turn is superseded during the fetch", async () => {
-    const ch = new FakeChannel();
-    ch.seed("m1"); // reported gone → triggers rebuild cleanup
-    const m2 = ch.seed("m2"); // survivor: must NOT be deleted once the turn is superseded
-    ch.fetchError = (id) => (id === "m1" ? { code: 10008 } : undefined);
-    let calls = 0;
-    // true for: renderChunks loop-guard(1), deleteSuffix i=0 guard(2), i=1 guard(3);
-    // flips false at the POST-FETCH check(4) — after fetching m2, before deleting it.
-    const stillCurrent = () => {
-      calls++;
-      return calls < 4;
-    };
-    const ids = ["m1", "m2"];
-    await renderChunks(ch, ids, ["A", "B"], stillCurrent, opts);
-    expect(m2.deleted).toBe(false); // in-flight delete avoided by the post-fetch guard
-    expect(ch.sent).toEqual([]);
-    expect(ids).toEqual(["m1", "m2"]);
   });
 
   it("trims and deletes anchors the shorter final output no longer needs", async () => {

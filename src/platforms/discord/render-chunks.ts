@@ -35,25 +35,25 @@ export function isMessageGone(err: unknown): boolean {
 /**
  * Reconcile the on-screen anchor messages (`msgIds`) with the latest `chunks`:
  *  - edit an existing anchor in place;
- *  - if that anchor is GONE (deleted), RE-ANCHOR — because a new message can only
- *    be posted at the channel TAIL (Discord has no insert-in-place), re-posting
- *    just the gone chunk would put it AFTER later chunks. So on the first gone
- *    anchor we switch to REBUILD mode: delete the now-stale later anchors and
- *    re-post this chunk and every following one fresh, preserving chunk order;
+ *  - if that anchor is GONE (deleted), RE-ANCHOR it: post a NEW message and
+ *    record its id in that slot, so the chunk's content is never lost;
  *  - a TRANSIENT edit failure is left as-is (best effort; never duplicate);
- *  - append fresh anchors for added chunks; delete + trim anchors no longer used.
+ *  - append fresh anchors for added chunks; best-effort trim anchors no longer used.
  *
  * `stillCurrent()` is checked before every mutation so a new turn started
  * mid-write (epoch bump) abandons cleanly: an in-flight send for a superseded
  * turn is deleted rather than recorded. Mutates `msgIds` in place.
  *
- * ACCEPTED RESIDUAL (single-owner tool): if a rebuild's suffix cleanup hits a
- * TRANSIENT Discord error, it aborts without posting and relies on a later flush
- * to retry. On the turn's FINAL flush there may be no later flush, so the
- * user-deleted chunk can stay missing — i.e. it degrades to the PRE-FIX behavior
- * (which always dropped deleted-message content). This is strictly no worse than
- * the baseline and never duplicates/corrupts, so a stateful bounded-retry timer
- * is intentionally not added. See docs/PLAN.md §9.1.
+ * DESIGN (why not rebuild the whole suffix): Discord has no insert-in-place, so a
+ * re-anchored message lands at the channel TAIL. We deliberately DO NOT delete
+ * and re-post the surviving later anchors to "fix" ordering — deleting messages
+ * we can't atomically re-post risks LOSING content if a delete transiently fails
+ * mid-way (worse than the pre-fix behavior). Instead we only ever ADD a
+ * replacement for the gone slot. Result: content is never lost and never
+ * duplicated; the sole residual is a rare COSMETIC mis-ordering — if the user
+ * manually deletes a NON-last streamed message, its replacement appears at the
+ * tail instead of in place. This strictly dominates the pre-fix behavior (which
+ * dropped a deleted message's content entirely). See docs/PLAN.md §9.1.
  */
 export async function renderChunks(
   channel: MinimalChannel,
@@ -62,27 +62,18 @@ export async function renderChunks(
   stillCurrent: () => boolean,
   sendOpts: (content: string) => unknown
 ): Promise<void> {
-  let rebuilding = false; // once an anchor is found gone, re-post the rest at the tail
   for (let i = 0; i < chunks.length; i++) {
     if (!stillCurrent()) return; // a new turn started mid-write
     const content = chunks[i]!;
-    const existing = rebuilding ? undefined : msgIds[i];
+    const existing = msgIds[i];
     if (existing) {
       try {
         const m = await channel.messages.fetch(existing);
         await m.edit(sendOpts(content));
         continue; // edited in place
       } catch (err) {
-        if (!isMessageGone(err)) continue; // transient edit: leave as-is; next flush retries
-        // This anchor is gone. A replacement can only land at the channel TAIL,
-        // so before posting anything we must delete the WHOLE stale suffix —
-        // otherwise a surviving later anchor becomes an out-of-order duplicate.
-        // If that cleanup can't be confirmed (transient failure or the turn was
-        // superseded), ABORT without posting and leave msgIds intact so the next
-        // debounced flush retries from a consistent state (no duplicate, no loss).
-        if (!(await deleteSuffix(channel, msgIds, i, stillCurrent))) return;
-        if (!stillCurrent()) return; // epoch flipped during cleanup: abort before re-posting
-        rebuilding = true; // msgIds is now truncated to i; send the rest fresh
+        if (!isMessageGone(err)) continue; // transient: leave the anchor as-is
+        // definitive: the anchor was deleted — re-anchor this slot (post below).
       }
     }
     const m = await channel.send(sendOpts(content));
@@ -98,37 +89,17 @@ export async function renderChunks(
     }
     msgIds[i] = m.id;
   }
-  // Trim anchors the shorter final output no longer needs (best effort — a
-  // transient failure here just leaves a surplus message to clean next flush).
-  await deleteSuffix(channel, msgIds, chunks.length, stillCurrent);
-}
-
-/**
- * Delete anchor messages at slots [from, end) and, on success, truncate `msgIds`
- * to `from`. Returns false (WITHOUT truncating) if the turn was superseded or a
- * delete/fetch failed for a NON-gone (transient) reason — so the rebuild caller
- * aborts rather than posting replacements while a stale anchor still exists (an
- * out-of-order duplicate). An already-gone anchor is fine (skipped). Checked
- * before every network step so an epoch flip abandons cleanly.
- */
-async function deleteSuffix(
-  channel: MinimalChannel,
-  msgIds: string[],
-  from: number,
-  stillCurrent: () => boolean
-): Promise<boolean> {
-  for (let i = from; i < msgIds.length; i++) {
-    if (!stillCurrent()) return false;
+  // Trim anchors the shorter final output no longer needs. Best effort: an
+  // already-gone or transiently-unreachable one is left for the next flush.
+  for (let i = chunks.length; i < msgIds.length; i++) {
     const id = msgIds[i];
     if (!id) continue;
     try {
       const m = await channel.messages.fetch(id);
-      if (!stillCurrent()) return false; // epoch flipped during fetch: abort before deleting
       await m.delete();
-    } catch (err) {
-      if (!isMessageGone(err)) return false; // transient: removal not confirmed
+    } catch {
+      /* already gone / transient — surplus message, not content loss */
     }
   }
-  if (msgIds.length > from) msgIds.length = from;
-  return true;
+  if (msgIds.length > chunks.length) msgIds.length = chunks.length;
 }
