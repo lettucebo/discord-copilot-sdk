@@ -32,10 +32,10 @@ export interface SessionBinding {
 }
 
 /**
- * Durable store for discopilot's single current thread↔session mapping, so a bot
+ * Durable store for discord-copilot-sdk's single current thread↔session mapping, so a bot
  * restart can resume the active Discord thread instead of orphaning it.
  *
- * Persisted as JSON at a per-instance path under `~/.discopilot`.
+ * Persisted as JSON at a per-instance path under `~/.discord-copilot-sdk`.
  *
  * Safety properties (P2):
  * - **Atomic**: writes go to a temp file then rename over the target, so a crash

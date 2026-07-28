@@ -13,7 +13,7 @@ export interface PermissionView {
   sessionKey: string;
   kind: string;
   summary: string;
-  /** false ⇒ discopilot has no UI for this kind and it will be denied. */
+  /** false ⇒ discord-copilot-sdk has no UI for this kind and it will be denied. */
   supported: boolean;
   /** true ⇒ the request can be approved for the session / repo, so the wider
    *  approval buttons (session/always) are offered. */

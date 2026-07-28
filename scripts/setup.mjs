@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// discopilot installer core — the ONE config engine (bilingual zh-TW / English).
+// discord-copilot-sdk installer core — the ONE config engine (bilingual zh-TW / English).
 // Node built-ins ONLY (runs before `npm install`). Invoked by install.ps1 /
 // install.sh, or directly: `node scripts/setup.mjs [--lang zh|en] [--yes]
 // [--no-residency|--residency] [--dry-run] [--skip-auth]`.
@@ -21,7 +21,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
 const ENV_PATH = path.join(REPO_ROOT, ".env");
 const EXAMPLE_PATH = path.join(REPO_ROOT, ".env.example");
-const STATE_DIR = path.join(os.homedir(), ".discopilot");
+const STATE_DIR = path.join(os.homedir(), ".discord-copilot-sdk");
 
 // ---- flags ---------------------------------------------------------------
 const argv = process.argv.slice(2);
@@ -243,7 +243,7 @@ async function main() {
 
   // Repo-root guard (verified via import.meta location AND package.json name).
   const pkg = readJson(path.join(REPO_ROOT, "package.json"));
-  if (!pkg || pkg.name !== "discopilot") throw new SetupError(t("notInRepo", lang));
+  if (!pkg || pkg.name !== "discord-copilot-sdk") throw new SetupError(t("notInRepo", lang));
 
   // 1) Read-only prerequisite detection.
   info("\n" + c(1, t("prereqHeader", lang)));

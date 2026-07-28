@@ -2,9 +2,9 @@ import { describe, it, expect } from "vitest";
 import { detectLang, normalizeLang, t, LANGS, MESSAGES, messageKeys } from "../scripts/lib/i18n.mjs";
 
 describe("detectLang", () => {
-  it("uses DISCOPILOT_LOCALE first (Windows path)", () => {
-    expect(detectLang({ DISCOPILOT_LOCALE: "zh-TW", LANG: "en_US.UTF-8" })).toBe("zh");
-    expect(detectLang({ DISCOPILOT_LOCALE: "en-US" })).toBe("en");
+  it("uses DISCORD_COPILOT_SDK_LOCALE first (Windows path)", () => {
+    expect(detectLang({ DISCORD_COPILOT_SDK_LOCALE: "zh-TW", LANG: "en_US.UTF-8" })).toBe("zh");
+    expect(detectLang({ DISCORD_COPILOT_SDK_LOCALE: "en-US" })).toBe("en");
   });
 
   it("falls back through LC_ALL / LANG (unix)", () => {

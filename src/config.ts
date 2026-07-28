@@ -13,7 +13,7 @@ const optionalSnowflake = z.preprocess(
 );
 
 /**
- * discopilot config schema (v1, lab-only). Parsed from environment variables.
+ * discord-copilot-sdk config schema (v1, lab-only). Parsed from environment variables.
  * Discord scope is intentionally narrow: a single guild + parent channel + an
  * explicit user allow-list. `CONTROLLED_REPO_PATH` is the ONE repo a session may
  * touch (⚠️ no isolation in v1 — run only in a disposable environment).

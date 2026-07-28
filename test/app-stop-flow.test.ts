@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { DiscopilotApp, type Session } from "../src/app.js";
+import { DiscordCopilotApp, type Session } from "../src/app.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Transport } from "../src/core/transport.js";
 
@@ -97,7 +97,7 @@ const cfg = {
   DEFAULT_MODEL: "claude-sonnet-5",
   DEFAULT_CONTEXT_TIER: "default",
   PERMISSION_POLICY: "ask",
-} as unknown as Parameters<typeof DiscopilotApp.createForTest>[0];
+} as unknown as Parameters<typeof DiscordCopilotApp.createForTest>[0];
 
 const fakeCopilot = {} as unknown as CopilotClient;
 
@@ -106,9 +106,9 @@ function imageMessage(url: string): unknown {
   return { channelId: "thread-1", attachments: new Map([["a", att]]) };
 }
 
-function buildAppWithSession(): { app: DiscopilotApp; actor: FakeActor; transport: FakeTransport; session: Session } {
+function buildAppWithSession(): { app: DiscordCopilotApp; actor: FakeActor; transport: FakeTransport; session: Session } {
   const transport = new FakeTransport();
-  const app = DiscopilotApp.createForTest(cfg, "C:\\repo", fakeCopilot, transport);
+  const app = DiscordCopilotApp.createForTest(cfg, "C:\\repo", fakeCopilot, transport);
   const actor = new FakeActor();
   // Typed on purpose: a `Record<string, unknown>` fixture silently drifts from
   // the real Session shape and fails at runtime instead of at typecheck.

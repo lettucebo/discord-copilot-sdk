@@ -134,7 +134,7 @@ async function setup(extra: Record<string, unknown> = {}): Promise<Setup> {
   const session = new FakeSession();
   const transport = new FakeTransport();
   const broker = new PendingInteractionBroker();
-  const policy = new ApprovalPolicy(join(tmpdir(), `discopilot-test-approvals-${Math.random()}.json`));
+  const policy = new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`));
   let config: Record<string, unknown> = {};
   const box: { resumeArgs?: { id: string; cfg: Record<string, unknown> } } = {};
   const client = {
@@ -186,7 +186,7 @@ describe("SessionActor config hardening", () => {
     //   "custom instruction files (.github/copilot-instructions.md, AGENTS.md,
     //    etc.) are always loaded from the working directory regardless of this
     //    setting."
-    // discopilot points the agent at a repo it does not trust, so a repo that
+    // discord-copilot-sdk points the agent at a repo it does not trust, so a repo that
     // ships an AGENTS.md could otherwise steer the agent — the exact hole
     // enableFileHooks:false exists to close.
     const s = await setup();
@@ -313,7 +313,7 @@ describe("SessionActor permission handling", () => {
     expect(view.canOfferSession).toBe(true);
     expect(view.scopeCommands).toEqual(["git"]); // discloses the executable, not the full command
     s.transport.decision!(view.nonce, "session", "u1");
-    expect(await r1).toEqual({ kind: "approve-once" }); // SDK gets approve-once; discopilot stored the rule
+    expect(await r1).toEqual({ kind: "approve-once" }); // SDK gets approve-once; discord-copilot-sdk stored the rule
     expect(s.policy.isApproved("t", "C:\\repo", ["git"])).toBe(true);
     // A DIFFERENT git command is now auto-approved WITHOUT a new card.
     const before = s.transport.permissions.length;
@@ -858,7 +858,7 @@ describe("SessionActor resume/create-id seam (P2)", () => {
       workingDirectory: "C:\\repo",
       broker: new PendingInteractionBroker(),
       transport: new FakeTransport(),
-      policy: new ApprovalPolicy(join(tmpdir(), `discopilot-test-approvals-${Math.random()}.json`)),
+      policy: new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`)),
       resumeSessionId: "sess-123",
       model: "gpt-5.4", // the startup default — must NOT win
       contextTier: "default",

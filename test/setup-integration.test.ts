@@ -20,7 +20,7 @@ const VALID_ENV = [
   "DISCORD_ALLOWED_USER_IDS=123456789012345678",
   "DISCORD_GUILD_ID=234567890123456789",
   "DISCORD_PARENT_CHANNEL_ID=345678901234567890",
-  "CONTROLLED_REPO_PATH=/tmp/discopilot-fixture-repo",
+  "CONTROLLED_REPO_PATH=/tmp/discord-copilot-sdk-fixture-repo",
   "DEV_GUILD_ID=",
   "DEFAULT_MODEL=claude-sonnet-5",
   "DEFAULT_CONTEXT_TIER=default",
@@ -33,14 +33,14 @@ let binDir; // stub-bin prepended to PATH
 function makeFixture(withEnv) {
   const repo = fs.mkdtempSync(path.join(tmpdir(), "dp-int-"));
   fs.cpSync(REAL_SCRIPTS, path.join(repo, "scripts"), { recursive: true });
-  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "discopilot", version: "0.0.0" }));
+  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version: "0.0.0" }));
   fs.writeFileSync(path.join(repo, ".env.example"), "DISCORD_BOT_TOKEN=\nDEV_GUILD_ID=\n");
   if (withEnv) fs.writeFileSync(path.join(repo, ".env"), VALID_ENV);
   return repo;
 }
 
 function runSetup(repo, args) {
-  // Isolate HOME/USERPROFILE so any accidental STATE_DIR write (~/.discopilot)
+  // Isolate HOME/USERPROFILE so any accidental STATE_DIR write (~/.discord-copilot-sdk)
   // lands in the fixture, never the real home, and would be observable.
   const home = fs.mkdtempSync(path.join(tmpdir(), "dp-int-home-"));
   const env = {
@@ -140,17 +140,17 @@ describe("setup.mjs --dry-run orchestration (integration)", () => {
     }
   });
 
-  it("rejects a non-discopilot repo root (guard) with the guard message and no mutation", () => {
+  it("rejects a non-discord-copilot-sdk repo root (guard) with the guard message and no mutation", () => {
     const repo = makeFixture(true);
     try {
-      fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "not-discopilot" }));
+      fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "not-discord-copilot-sdk" }));
       const before = fs.readFileSync(path.join(repo, ".env"), "utf8");
       const r = runSetup(repo, ["--dry-run", "--yes", "--skip-auth", "--lang", "en"]);
       expect(r.error).toBeUndefined();
       expect(r.signal).toBeNull();
       expect(r.status).toBe(1);
       const out = (r.stdout || "") + (r.stderr || "");
-      expect(out).toMatch(/no package\.json with name=discopilot found/i); // the repo-root guard text
+      expect(out).toMatch(/no package\.json with name=discord-copilot-sdk found/i); // the repo-root guard text
       expect(fs.readFileSync(path.join(repo, ".env"), "utf8")).toBe(before);
     } finally {
       fs.rmSync(repo, { recursive: true, force: true });

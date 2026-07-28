@@ -2,7 +2,7 @@
 // are unit-testable in isolation. Node built-ins only (runs before npm install).
 
 /**
- * Does this Node satisfy discopilot's engines (^20.19 || >=22.12)? The boundary
+ * Does this Node satisfy discord-copilot-sdk's engines (^20.19 || >=22.12)? The boundary
  * versions matter: 20.18 is too old, 20.19 is the first supported 20.x; 21.x is
  * unsupported (odd/non-LTS); 22.11 is too old, 22.12 is the first supported 22.x.
  * @param {string} v e.g. process.versions.node ("22.12.0")

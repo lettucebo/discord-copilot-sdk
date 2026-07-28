@@ -1,9 +1,9 @@
-# discopilot
+# discord-copilot-sdk
 
 Control your **local GitHub Copilot** from **Discord** — with the full "GitHub Copilot app"
 experience — from anywhere, including your phone.
 
-`discopilot` is a Discord bot that drives the local Copilot engine through the official
+`discord-copilot-sdk` is a Discord bot that drives the local Copilot engine through the official
 [`@github/copilot-sdk`](https://www.npmjs.com/package/@github/copilot-sdk) (JSON-RPC). Each
 Discord thread maps to a Copilot session; the bot streams the agent's messages, tool calls and
 todo checklists into the thread, and surfaces permission / choice / plan prompts as Discord
@@ -12,7 +12,7 @@ device. Token usage and the live model/effort/context tier are available on dema
 `/usage`.
 
 > Sibling project to [`seam-acp`](https://github.com/lettucebo/seam-acp): seam-acp bridges
-> Discord to multiple agents over the ACP protocol; **discopilot is Copilot-only and
+> Discord to multiple agents over the ACP protocol; **discord-copilot-sdk is Copilot-only and
 > SDK-native**, giving the fullest, most official Copilot experience (native ask_user,
 > plan approval, usage, per-model context up to ~1M via `contextTier: long_context`).
 
@@ -24,7 +24,7 @@ Still lab-only — read the security model below before running it.
 
 ## ⚠️ Security model (read before running)
 
-discopilot v1 is **lab-only**. It runs shell/file tools **as the user that starts the bot**,
+discord-copilot-sdk v1 is **lab-only**. It runs shell/file tools **as the user that starts the bot**,
 against a single controlled repo — there is no sandbox in v1 (the isolated controller/worker
 split is deferred). Run it only on a disposable machine/VM you don't mind the agent modifying.
 
@@ -45,7 +45,7 @@ Mitigations that **are** in place:
   is auto-denied rather than shown partially.
 - **Access gate**: only allow-listed user id(s), in the configured guild + parent channel/threads,
   can drive a session. (This gates *input*; anyone who can read the channel can read *output* — use
-  a private channel.) Secrets (`DISCORD_*`/`DISCOPILOT_*`) are stripped from the agent's runtime env.
+  a private channel.) Secrets (`DISCORD_*`/`DISCORD_COPILOT_SDK_*`) are stripped from the agent's runtime env.
 
 **Known limitation — inherited approvals:** the bot uses your logged-in Copilot (`~/.copilot`), so
 any blanket "always allow" approval rules you've saved there apply and would bypass the per-command
@@ -78,7 +78,7 @@ Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-
 
 - Drives a **local** session end-to-end: `listModels()`, `createSession()`, `send()`, full
   event stream (`assistant.message`/`reasoning`/deltas, `tool.execution_*`,
-  `session.usage_info`/`plan_changed`/`idle`). discopilot renders assistant messages and
+  `session.usage_info`/`plan_changed`/`idle`). discord-copilot-sdk renders assistant messages and
   tool calls; reasoning is intentionally **not** rendered into the thread.
 - Native interactive callbacks: `onPermissionRequest`, `onUserInputRequest` (ask_user),
   `onExitPlanMode`, `onElicitationRequest`.
@@ -127,7 +127,7 @@ instead; nothing in-flight is thrown away either way.
 
 `/queue message:…` holds a prompt until the current turn finishes, then runs it
 (`/queue` alone lists what's pending, `/queue clear:true` empties it). The queue
-is kept **inside discopilot**, not handed to the runtime's own queue: an
+is kept **inside discord-copilot-sdk**, not handed to the runtime's own queue: an
 `abort()` does *not* drain the runtime queue (a queued message still ran after
 one), so `/stop` could not have honestly stopped it. As it is, `/stop` drops the
 queue and says how many it discarded. The queue is volatile — a restart forgets

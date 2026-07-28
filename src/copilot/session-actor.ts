@@ -23,7 +23,7 @@ const MAX_CARD_LEN = 3900;
 const TODOS_DEBOUNCE_MS = 700;
 
 /** Safe-default permission result (deny). Used for timeout/abort and for
- *  permission kinds discopilot has no UI for (fail-closed). */
+ *  permission kinds discord-copilot-sdk has no UI for (fail-closed). */
 const DENY_UNAVAILABLE = { kind: "user-not-available" } as const;
 const DENIED_BY_USER = { kind: "denied-interactively-by-user" } as const;
 const APPROVE_ONCE = { kind: "approve-once" } as const;
@@ -47,7 +47,7 @@ export interface SessionActorOpts {
   contextTier?: "default" | "long_context";
   broker: PendingInteractionBroker;
   transport: Transport;
-  /** discopilot-side approval memory (session + persisted repo rules). */
+  /** discord-copilot-sdk-side approval memory (session + persisted repo rules). */
   policy: ApprovalPolicy;
   /** Session incarnation (P1: always 1; P2 resume will vary this). */
   generation?: number;
@@ -163,7 +163,7 @@ export class SessionActor {
       // enableConfigDiscovery:false is NOT sufficient. The SDK states that
       // "custom instruction files (.github/copilot-instructions.md, AGENTS.md,
       // etc.) are always loaded from the working directory regardless of this
-      // setting" (types.d.ts). discopilot points the agent at a repo it does not
+      // setting" (types.d.ts). discord-copilot-sdk points the agent at a repo it does not
       // trust, so a repo shipping an AGENTS.md could otherwise inject standing
       // instructions — the same trust-boundary hole enableFileHooks:false closes
       // for permission hooks.
@@ -354,7 +354,7 @@ export class SessionActor {
    * - after a RESUME the cache would otherwise hold this process's startup
    *   defaults, not the model/effort/tier the user actually selected before the
    *   restart;
-   * - `/usage` would otherwise report what discopilot *asked for* rather than
+   * - `/usage` would otherwise report what discord-copilot-sdk *asked for* rather than
    *   what the session is on, which is not evidence of anything.
    *
    * A fresh session legitimately answers `{}` (nothing explicitly selected, so
@@ -453,7 +453,7 @@ export class SessionActor {
     // A command is eligible for auto-approve / a wider scope only when it is a
     // SIMPLE command (no shell metacharacters that could chain/pipe/redirect/
     // substitute a different command) AND every executable is a safe, specific
-    // name (not a shell/runtime/wrapper/exec-launcher). This keeps discopilot
+    // name (not a shell/runtime/wrapper/exec-launcher). This keeps discord-copilot-sdk
     // from trusting the runtime's command parse blindly.
     const simple = isSimpleCommand(fullCommandText);
     const allSafe = executables.length > 0 && executables.every(isSafeExecutable);
@@ -519,10 +519,10 @@ export class SessionActor {
     this.opts.broker.settle(nonce, this.buildDecision(nonce, decision), this.generation);
   }
 
-  /** Map a UI decision to the SDK response, recording discopilot-side approval
+  /** Map a UI decision to the SDK response, recording discord-copilot-sdk-side approval
    *  rules for the wider scopes. The SDK's native session/location approval is
    *  not honored in this CLI setup (verified), so session/always store a
-   *  discopilot rule and return approve-once; future matching commands are
+   *  discord-copilot-sdk rule and return approve-once; future matching commands are
    *  auto-approved before a card is shown. Fail-closed: a wider decision the
    *  request didn't authorize denies. */
   private buildDecision(nonce: string, decision: Decision): unknown {
@@ -541,7 +541,7 @@ export class SessionActor {
       // "Always (this repo)" promises it survives a restart.
       this.postAudit(
         `⚠️ 「Always」規則 \`${sanitizeForInlineCode(meta.executable, YOLO_TARGET_MAX)}\` 寫入磁碟失敗 — ` +
-          "本次執行仍有效，但重啟後會消失。請檢查 `~/.discopilot` 的權限。"
+          "本次執行仍有效，但重啟後會消失。請檢查 `~/.discord-copilot-sdk` 的權限。"
       );
     }
     return APPROVE_ONCE;
@@ -1051,7 +1051,7 @@ function isSafeExecutable(exe: string): boolean {
 
 /** A command is "simple" (safe to auto-approve / offer a wider scope for) only
  *  if it has NO shell metacharacters that could chain, pipe, redirect, or
- *  substitute a DIFFERENT command in — since discopilot trusts the runtime's
+ *  substitute a DIFFERENT command in — since discord-copilot-sdk trusts the runtime's
  *  `commands[]` parse and a false negative there would run untrusted code. When
  *  any of these appear, the request always shows a per-request card instead. */
 function isSimpleCommand(fullCommandText: string): boolean {

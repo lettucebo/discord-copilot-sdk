@@ -1,5 +1,5 @@
 {
-  "name": "discopilot",
+  "name": "discord-copilot-sdk",
   "version": "0.0.1",
   "private": true,
   "description": "Control your local GitHub Copilot from Discord via the official @github/copilot-sdk.",

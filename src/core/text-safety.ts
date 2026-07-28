@@ -35,7 +35,7 @@ export function sanitizeForCodeBlock(s: string): string {
  * defeats a ``` fence run by inserting a zero-width space AFTER each backtick,
  * but a single literal backtick still CLOSES an inline span — after which the
  * remainder renders as markdown and can spoof the reader (e.g. forge a line that
- * looks like discopilot's own output). So here backticks are REPLACED, not
+ * looks like discord-copilot-sdk's own output). So here backticks are REPLACED, not
  * escaped, and newlines/tabs are flattened so one entry can't fake several.
  * Truncation happens last and can't split an escape because none are inserted.
  */

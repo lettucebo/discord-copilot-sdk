@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { existsSync, writeFileSync, rmSync } from "node:fs";
 import { acquireSingleInstanceLock } from "../src/core/single-instance.js";
 
-const lockPath = join(tmpdir(), `discopilot-test-${process.pid}-${Math.random().toString(36).slice(2)}.lock`);
+const lockPath = join(tmpdir(), `discord-copilot-sdk-test-${process.pid}-${Math.random().toString(36).slice(2)}.lock`);
 
 afterEach(() => {
   try { rmSync(lockPath, { force: true }); } catch { /* ignore */ }

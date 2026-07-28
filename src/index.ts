@@ -3,7 +3,7 @@ import { acquireSingleInstanceLock } from "./core/single-instance.js";
 import { lockPath } from "./core/paths.js";
 import { checkSdkCompat, sdkSelfCheck } from "./copilot/sdk.js";
 import { loadConfig } from "./config.js";
-import { DiscopilotApp } from "./app.js";
+import { DiscordCopilotApp } from "./app.js";
 
 /** Load ./.env into process.env if present (Node built-in; no dependency). */
 function loadDotEnv(): void {
@@ -23,7 +23,7 @@ async function main(): Promise<void> {
   if (args.has("--version")) {
     const c = checkSdkCompat();
     console.log(
-      `discopilot • @github/copilot-sdk installed ${c.installed} (declared ${c.declared})` +
+      `discord-copilot-sdk • @github/copilot-sdk installed ${c.installed} (declared ${c.declared})` +
         (c.ok ? "" : "  ⚠️ mismatch")
     );
     return;
@@ -52,9 +52,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log("Starting discopilot bot …");
+  console.log("Starting discord-copilot-sdk bot …");
   const config = loadConfig();
-  await DiscopilotApp.start(config);
+  await DiscordCopilotApp.start(config);
   // The Discord gateway connection keeps the event loop alive; shutdown is
   // handled by the app's SIGINT/SIGTERM handlers.
 }

@@ -6,7 +6,7 @@ import { resolveControlledRepo } from "../src/core/repo.js";
 
 let dir: string;
 beforeAll(() => {
-  dir = mkdtempSync(path.join(os.tmpdir(), "discopilot-repo-"));
+  dir = mkdtempSync(path.join(os.tmpdir(), "discord-copilot-sdk-repo-"));
 });
 afterAll(() => {
   rmSync(dir, { recursive: true, force: true });

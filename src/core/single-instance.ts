@@ -47,14 +47,14 @@ export async function acquireSingleInstanceLock(
     const holder = await readHolderPidWithRetry(lockPath);
     if (holder === undefined) {
       throw new Error(
-        `A discopilot lock exists at ${lockPath} but its owner is indeterminate ` +
+        `A discord-copilot-sdk lock exists at ${lockPath} but its owner is indeterminate ` +
           `(empty/unreadable). Refusing to start (fail-closed). If you are sure no ` +
           `instance is running, delete the lock file and retry.`
       );
     }
     if (holder !== process.pid && isAlive(holder)) {
       throw new Error(
-        `Another discopilot instance is already running (pid ${holder}, lock ${lockPath}). Refusing to start.`
+        `Another discord-copilot-sdk instance is already running (pid ${holder}, lock ${lockPath}). Refusing to start.`
       );
     }
     // Stale (dead holder) or ours (pid reuse after a crash) — reclaim and retry.

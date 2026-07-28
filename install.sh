@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# discopilot macOS/Linux installer (bootstrap). Ensures prerequisites (Node, git,
+# discord-copilot-sdk macOS/Linux installer (bootstrap). Ensures prerequisites (Node, git,
 # GitHub Copilot CLI) then hands off to the shared bilingual config engine
 # scripts/setup.mjs. Language: detected from the locale, overridable with --lang.
 # Compatible with macOS's system bash 3.2 (no associative arrays / mapfile).
@@ -41,12 +41,12 @@ lang="en"
 hint="${LC_ALL:-${LC_MESSAGES:-${LANGUAGE:-${LANG:-}}}}"
 case "$hint" in zh*|Zh*|ZH*) lang="zh" ;; esac
 case "$LANG_OPT" in zh) lang="zh" ;; en) lang="en" ;; esac
-if [ "$lang" = "zh" ]; then export DISCOPILOT_LOCALE="zh-TW"; else export DISCOPILOT_LOCALE="en-US"; fi
+if [ "$lang" = "zh" ]; then export DISCORD_COPILOT_SDK_LOCALE="zh-TW"; else export DISCORD_COPILOT_SDK_LOCALE="en-US"; fi
 
 msg() { # msg <key>
   if [ "$lang" = "zh" ]; then
     case "$1" in
-      banner) echo "discopilot 安裝（前置準備）" ;;
+      banner) echo "discord-copilot-sdk 安裝（前置準備）" ;;
       checking) echo "檢查前置需求（Node / git / Copilot CLI）…" ;;
       installing) echo "正在安裝" ;;
       manual) echo "無法自動安裝，請手動安裝後重新執行：" ;;
@@ -57,7 +57,7 @@ msg() { # msg <key>
     esac
   else
     case "$1" in
-      banner) echo "discopilot install (bootstrap)" ;;
+      banner) echo "discord-copilot-sdk install (bootstrap)" ;;
       checking) echo "Checking prerequisites (Node / git / Copilot CLI)…" ;;
       installing) echo "Installing" ;;
       manual) echo "Could not auto-install; please install manually and re-run: " ;;
@@ -119,7 +119,7 @@ fi
 # --- hand off to the shared bilingual config engine ---
 # Forward --lang ONLY if the user explicitly chose one (or --yes, which is
 # non-interactive); otherwise let setup.mjs show its interactive chooser,
-# defaulting to DISCOPILOT_LOCALE.
+# defaulting to DISCORD_COPILOT_SDK_LOCALE.
 echo "$(msg handoff)"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 LANGFWD=()

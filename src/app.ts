@@ -201,7 +201,7 @@ export async function applyYoloToggle(
  * through the auth gate to the orchestration core, and shuts everything down in
  * reverse order (lock released last).
  */
-export class DiscopilotApp {
+export class DiscordCopilotApp {
   private readonly discord: Client;
   private readonly transport: Transport;
   private readonly sessions = new Map<string, Session>();
@@ -254,13 +254,13 @@ export class DiscopilotApp {
     copilot: CopilotClient,
     transport: Transport,
     store?: SessionStore
-  ): DiscopilotApp {
+  ): DiscordCopilotApp {
     const noopLock: InstanceLock = { path: "(test)", release: async () => {} };
-    return new DiscopilotApp(config, repoPath, copilot, noopLock, transport, store);
+    return new DiscordCopilotApp(config, repoPath, copilot, noopLock, transport, store);
   }
 
   /** Build and fully start the app (lock → SDK → Discord login + commands). */
-  static async start(config: Config): Promise<DiscopilotApp> {
+  static async start(config: Config): Promise<DiscordCopilotApp> {
     const repoPath = resolveControlledRepo(config.CONTROLLED_REPO_PATH);
     const compat = checkSdkCompat();
     if (!compat.ok) {
@@ -274,12 +274,12 @@ export class DiscopilotApp {
     }
     const lock = await acquireSingleInstanceLock(lockPath());
     let copilot: CopilotClient | undefined;
-    let app: DiscopilotApp | undefined;
+    let app: DiscordCopilotApp | undefined;
     try {
       copilot = createCopilotClient({ workingDirectory: repoPath });
       await copilot.start();
       await preflightModel(copilot, config.DEFAULT_MODEL);
-      app = new DiscopilotApp(config, repoPath, copilot, lock);
+      app = new DiscordCopilotApp(config, repoPath, copilot, lock);
       await app.login();
       return app;
     } catch (err) {
@@ -319,7 +319,7 @@ export class DiscopilotApp {
     await this.reconcileOnStartup();
     this.phase = "ready";
     console.log(
-      `✅ discopilot ready — controlling ${this.repoPath}\n` +
+      `✅ discord-copilot-sdk ready — controlling ${this.repoPath}\n` +
         `   guild=${this.config.DISCORD_GUILD_ID} channel=${this.config.DISCORD_PARENT_CHANNEL_ID}\n` +
         `   model=${this.config.DEFAULT_MODEL} contextTier=${this.config.DEFAULT_CONTEXT_TIER} (${this.modelIds.length} models)\n` +
         `   ⚠️  lab mode: tools run as this OS user with no sandbox. The bot uses your\n` +
@@ -1143,7 +1143,7 @@ export class DiscopilotApp {
       });
       return;
     }
-    // Report the RUNTIME's view, not what discopilot asked for. Echoing the local
+    // Report the RUNTIME's view, not what discord-copilot-sdk asked for. Echoing the local
     // cache made /usage useless as evidence: after a resume it would show this
     // process's startup defaults, and a setModel that the runtime quietly
     // ignored would still read back as applied. Falls back to the cache when the

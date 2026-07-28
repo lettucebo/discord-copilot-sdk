@@ -4,18 +4,18 @@ import { mkdirSync } from "node:fs";
 
 /**
  * Logical instance identity. Multiple intentional deployments on one host use
- * distinct ids (e.g. DISCOPILOT_INSTANCE_ID=work). Ownership is defined by this
+ * distinct ids (e.g. DISCORD_COPILOT_SDK_INSTANCE_ID=work). Ownership is defined by this
  * id, NOT by the (mutable) installation path. Defaults to "default".
  */
 export function instanceId(): string {
-  const raw = (process.env.DISCOPILOT_INSTANCE_ID ?? "default").trim();
+  const raw = (process.env.DISCORD_COPILOT_SDK_INSTANCE_ID ?? "default").trim();
   return /^[A-Za-z0-9._-]{1,64}$/.test(raw) ? raw : "default";
 }
 
 /** Stable per-user application state directory (created on demand). Unlike
  *  os.tmpdir(), this is not swept by temp cleaners while the bot runs. */
 export function stateDir(): string {
-  const dir = path.join(os.homedir(), ".discopilot");
+  const dir = path.join(os.homedir(), ".discord-copilot-sdk");
   mkdirSync(dir, { recursive: true });
   return dir;
 }

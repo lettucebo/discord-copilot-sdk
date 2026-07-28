@@ -3,15 +3,15 @@ import path from "node:path";
 import { stateDir } from "./paths.js";
 
 /**
- * discopilot-side approval policy.
+ * discord-copilot-sdk-side approval policy.
  *
  * The local Copilot CLI reports `canOfferSessionApproval: false` for shell
  * commands and does NOT honor an `approve-for-session` decision (verified: a
- * second `git` command re-prompts). So discopilot remembers approved
+ * second `git` command re-prompts). So discord-copilot-sdk remembers approved
  * *executables* itself and auto-approves matching requests (as approve-once to
  * the SDK) without showing a card:
  *  - **session** scope: in memory, per sessionKey, dropped when the session ends;
- *  - **repo** scope: persisted to `~/.discopilot/approvals.json`, keyed by the
+ *  - **repo** scope: persisted to `~/.discord-copilot-sdk/approvals.json`, keyed by the
  *    controlled repo path, surviving restarts.
  *
  * Safety: a request is auto-approved only when EVERY parsed command executable

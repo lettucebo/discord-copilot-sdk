@@ -5,12 +5,12 @@
 export const LANGS = ["zh", "en"];
 
 /** Detect the preferred installer language from environment locale hints.
- *  install.ps1 sets DISCOPILOT_LOCALE from Get-Culture on Windows (where LANG is
+ *  install.ps1 sets DISCORD_COPILOT_SDK_LOCALE from Get-Culture on Windows (where LANG is
  *  usually absent); unix shells expose LC_ALL/LC_MESSAGES/LANGUAGE/LANG. Anything
  *  starting with "zh" → Traditional Chinese; otherwise English. */
 export function detectLang(env = {}) {
   const hint =
-    env.DISCOPILOT_LOCALE ||
+    env.DISCORD_COPILOT_SDK_LOCALE ||
     env.LC_ALL ||
     env.LC_MESSAGES ||
     env.LANGUAGE ||
@@ -41,10 +41,10 @@ const MESSAGES = {
   zh: {
     langPrompt: "語言 / Language：[1] 繁體中文  [2] English",
     langChosen: "已選擇語言：繁體中文",
-    banner: "discopilot 安裝精靈",
+    banner: "discord-copilot-sdk 安裝精靈",
     labWarning:
       "⚠️ 僅限實驗用（v1）：agent 會以你的身分執行 shell 指令並修改檔案，沒有隔離。請只在可拋棄的 VM／測試帳號／測試 repo 上使用。",
-    notInRepo: "請在 discopilot 專案根目錄執行（找不到 name=discopilot 的 package.json）。請先 clone 再執行。",
+    notInRepo: "請在 discord-copilot-sdk 專案根目錄執行（找不到 name=discord-copilot-sdk 的 package.json）。請先 clone 再執行。",
     prereqHeader: "檢查前置需求…",
     prereqNodeOld: "Node 版本過舊（需要 >= 20.19 或 22.12）。目前：",
     prereqMissing: "缺少：",
@@ -96,10 +96,10 @@ const MESSAGES = {
   en: {
     langPrompt: "語言 / Language: [1] 繁體中文  [2] English",
     langChosen: "Language set to: English",
-    banner: "discopilot installer",
+    banner: "discord-copilot-sdk installer",
     labWarning:
       "⚠️ LAB-ONLY (v1): the agent runs shell commands and edits files as you, with no isolation. Use only on a disposable VM / test account / throwaway repo.",
-    notInRepo: "Run this from the discopilot repo root (no package.json with name=discopilot found). Clone it first.",
+    notInRepo: "Run this from the discord-copilot-sdk repo root (no package.json with name=discord-copilot-sdk found). Clone it first.",
     prereqHeader: "Checking prerequisites…",
     prereqNodeOld: "Node is too old (need >= 20.19 or 22.12). Found: ",
     prereqMissing: "Missing: ",

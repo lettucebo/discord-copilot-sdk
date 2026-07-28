@@ -1,4 +1,4 @@
-# 執行計畫 v3：discopilot — Discord 前端控制本機 Copilot（SDK-native）
+# 執行計畫 v3：discord-copilot-sdk — Discord 前端控制本機 Copilot（SDK-native）
 
 > **v1 目標（收斂後）**：一個 **Discord frontend for a supported local Copilot SDK session** —
 > 從手機/Discord 對一個受控 repo 開一個私密 thread、串流看到 Copilot 輸出、對一個 shell 權限請求
@@ -97,7 +97,7 @@
   - **驗收**：手機開 thread → 要求 `git status` → 檢視並 approve/deny **確切請求** → 收到串流輸出 → 成功 abort 一個 turn。
 - **P2**：resume + reconciliation（第 4 節）+ generation fencing。
 - **P3**：其餘 callback UI（ask_user〔自由輸入以 thread 訊息呈現，非 Discord modal；見 §9.1〕、exit-plan、elicitation、memory/mcp/url… 的呈現）。
-- **P4**：pickers（/model /effort /context）、usage。`/mode` **未實作**（Copilot 的 agent mode 由 runtime 決定，discopilot 不提供切換）；`/yolo`、`/rename` 為後續新增。queue/steer 未實作 —— 回合進行中送出的訊息會被**丟棄**並回覆說明，不會排隊。
+- **P4**：pickers（/model /effort /context）、usage。`/mode` **未實作**（Copilot 的 agent mode 由 runtime 決定，discord-copilot-sdk 不提供切換）；`/yolo`、`/rename` 為後續新增。queue/steer 未實作 —— 回合進行中送出的訊息會被**丟棄**並回覆說明，不會排隊。
 - **P5**：attachments/images 輸入、todo/plan、changed-file/git diff 摘要。
 - **P6**：跨平台 installer + 常駐。
 
@@ -135,7 +135,7 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 ## 10. 決策紀錄（已定）
 1. **隔離方式 = B（先 lab-only）**：不做 controller/worker 分離；P1 只在**可拋棄的 VM/測試帳號/測試 repo**跑；README + 啟動時明確警告「僅限拋棄式環境」。之後再升級到 A。
 2. **帳號盜用 = 先靠 Discord MFA**；TOTP/本機 step-up 列為未來強化（非 v1）。
-3. **GitHub repo = private，於 P0 建立**（lettucebo/discopilot）。
+3. **GitHub repo = private，於 P0 建立**（lettucebo/discord-copilot-sdk）。
 4. **SDK = 使用最新版 `1.0.7-preview.3`（npm `latest`；依使用者要求）** + lockfile + 啟動相容檢查（declared 取自 package.json，單一真相來源）。
 5. **P1 受控 repo = 可拋棄測試 repo（待定）**：開始 P1 live 測試前指定或另建一個 throwaway repo；**不對重要 repo**。
 

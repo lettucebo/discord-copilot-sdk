@@ -39,13 +39,13 @@ export function installedSdkVersion(): string {
   );
 }
 
-/** SDK version discopilot declares — single source of truth is our own
+/** SDK version discord-copilot-sdk declares — single source of truth is our own
  *  package.json dependency pin (no duplicated constant). */
 export function declaredSdkVersion(): string {
   return (
     readPkgField(
       path.dirname(fileURLToPath(import.meta.url)),
-      "discopilot",
+      "discord-copilot-sdk",
       (p) => (p["dependencies"] as Record<string, string> | undefined)?.["@github/copilot-sdk"]
     ) ?? "unknown"
   );
@@ -57,7 +57,7 @@ export interface SdkCompat {
   ok: boolean;
 }
 
-/** Does the installed SDK match the version discopilot was built against? */
+/** Does the installed SDK match the version discord-copilot-sdk was built against? */
 export function checkSdkCompat(): SdkCompat {
   const installed = installedSdkVersion();
   const declared = declaredSdkVersion();
@@ -65,8 +65,13 @@ export function checkSdkCompat(): SdkCompat {
 }
 
 /** Build the sanitized environment handed to the Copilot runtime. Strips the
- *  controller's Discord/discopilot secrets so a tool the agent runs cannot read
- *  them from its process env. (Defense-in-depth, not isolation — see PLAN §1.) */
+ *  controller's own secrets and settings so a tool the agent runs cannot read
+ *  them from its process env. (Defense-in-depth, not isolation — see PLAN §1.)
+ *
+ *  `DISCORD_` covers both the bot token and this project's own
+ *  `DISCORD_COPILOT_SDK_*` settings. `DISCOPILOT_` is the pre-rename prefix,
+ *  kept deliberately: a variable left over from the old name in a shell profile
+ *  or wrapper script must still never reach the agent. */
 export function sanitizeRuntimeEnv(
   base: NodeJS.ProcessEnv
 ): Record<string, string | undefined> {

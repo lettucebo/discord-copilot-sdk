@@ -9,7 +9,7 @@ import { ApprovalPolicy } from "../dist/core/approval-policy.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const REPO = "C:\\Source\\Repos\\discopilot";
+const REPO = "C:\\Source\\Repos\\discord-copilot-sdk";
 
 class FakeTransport {
   constructor() {
@@ -51,7 +51,7 @@ const actor = await SessionActor.create(client, {
   contextTier: "long_context",
   broker,
   transport,
-  policy: new ApprovalPolicy(join(tmpdir(), `discopilot-smoke-approvals-${Date.now()}.json`)),
+  policy: new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-smoke-approvals-${Date.now()}.json`)),
 });
 console.log("SessionActor created; sending prompt …");
 

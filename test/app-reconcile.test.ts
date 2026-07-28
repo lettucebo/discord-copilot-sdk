@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { DiscopilotApp } from "../src/app.js";
+import { DiscordCopilotApp } from "../src/app.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Transport } from "../src/core/transport.js";
@@ -29,7 +29,7 @@ const cfg = {
   DEFAULT_MODEL: "claude-sonnet-5",
   DEFAULT_CONTEXT_TIER: "default",
   PERMISSION_POLICY: "ask",
-} as unknown as Parameters<typeof DiscopilotApp.createForTest>[0];
+} as unknown as Parameters<typeof DiscordCopilotApp.createForTest>[0];
 
 class FakeTransport implements Transport {
   notices: string[] = [];
@@ -77,10 +77,10 @@ function fakeCopilot(opts: { resumeError?: string } = {}): CopilotClient {
   } as unknown as CopilotClient;
 }
 
-function sessionsOf(app: DiscopilotApp): Map<string, unknown> {
+function sessionsOf(app: DiscordCopilotApp): Map<string, unknown> {
   return (app as unknown as { sessions: Map<string, unknown> }).sessions;
 }
-function reconcile(app: DiscopilotApp, classify: () => Promise<string>): Promise<void> {
+function reconcile(app: DiscordCopilotApp, classify: () => Promise<string>): Promise<void> {
   return (app as unknown as {
     reconcileOnStartup(d?: { classifyThread?: (id: string) => Promise<string> }): Promise<void>;
   }).reconcileOnStartup({ classifyThread: classify });
@@ -93,7 +93,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const store = new SessionStore(f);
       store.commit(bind());
       const transport = new FakeTransport();
-      const app = DiscopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(true);
       expect(store.get()?.state).toBe("active");
@@ -109,7 +109,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const store = new SessionStore(f);
       store.commit(bind());
       const transport = new FakeTransport();
-      const app = DiscopilotApp.createForTest(cfg, REPO, fakeCopilot({ resumeError: "session not found" }), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot({ resumeError: "session not found" }), transport, store);
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(false);
       expect(store.get()?.state).toBe("orphaned");
@@ -125,7 +125,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const store = new SessionStore(f);
       store.commit(bind());
       const transport = new FakeTransport();
-      const app = DiscopilotApp.createForTest(
+      const app = DiscordCopilotApp.createForTest(
         cfg,
         REPO,
         fakeCopilot({ resumeError: "getaddrinfo ENOTFOUND api.githubcopilot.com" }),
@@ -153,7 +153,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
           return fakeSession;
         },
       } as unknown as CopilotClient;
-      const app = DiscopilotApp.createForTest(cfg, REPO, client, new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, client, new FakeTransport(), store);
       await reconcile(app, async () => "gone");
       expect(store.get()?.state).toBe("blocked");
       expect(store.get()?.reason).toBe("thread-gone");
@@ -169,7 +169,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     try {
       const store = new SessionStore(f);
       store.commit(bind({ repoPath: "C:\\different-repo" }));
-      const app = DiscopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
       let classifyCalls = 0;
       await reconcile(app, async () => {
         classifyCalls++;
@@ -189,7 +189,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     try {
       const store = new SessionStore(f);
       store.commit(bind());
-      const app = DiscopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "transient");
       expect(store.get()?.state).toBe("active"); // preserved for a later retry
       expect(sessionsOf(app).has("t1")).toBe(false);
@@ -203,7 +203,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     try {
       const store = new SessionStore(f);
       store.reserve(bind()); // creating
-      const app = DiscopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "valid");
       expect(store.get()?.state).toBe("orphaned");
       expect(sessionsOf(app).has("t1")).toBe(false);
@@ -216,7 +216,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
-      const app = DiscopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).size).toBe(0);
     } finally {
@@ -230,7 +230,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       writeFileSync(f, "{ not valid json", "utf8");
       const store = new SessionStore(f);
       expect(store.isCorrupt()).toBe(true);
-      const app = DiscopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
       await expect(reconcile(app, async () => "valid")).rejects.toThrow(/corrupt/i);
     } finally {
       rmSync(f, { force: true });

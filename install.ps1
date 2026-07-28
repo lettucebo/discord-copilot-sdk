@@ -1,6 +1,6 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
-  discopilot Windows installer (bootstrap). Ensures prerequisites (Node, git,
+  discord-copilot-sdk Windows installer (bootstrap). Ensures prerequisites (Node, git,
   GitHub Copilot CLI) then hands off to the shared bilingual config engine
   scripts/setup.mjs. Language: detected from the Windows UI culture, overridable
   with -Lang; setup.mjs shows the interactive chooser.
@@ -30,12 +30,12 @@ function Resolve-Lang {
   if ($ui -like 'zh*') { return 'zh' } else { return 'en' }
 }
 $L = Resolve-Lang
-$env:DISCOPILOT_LOCALE = if ($L -eq 'zh') { 'zh-TW' } else { 'en-US' }
+$env:DISCORD_COPILOT_SDK_LOCALE = if ($L -eq 'zh') { 'zh-TW' } else { 'en-US' }
 
 # --- tiny bilingual bootstrap strings (Node not guaranteed yet) ---
 $T = @{
   zh = @{
-    banner   = 'discopilot 安裝（前置準備）'
+    banner   = 'discord-copilot-sdk 安裝（前置準備）'
     checking = '檢查前置需求（Node / git / Copilot CLI）…'
     haveNode = 'Node 版本'
     installing = '正在安裝'
@@ -46,7 +46,7 @@ $T = @{
     dry = '（-DryRun：不會安裝或變更任何東西。）'
   }
   en = @{
-    banner   = 'discopilot install (bootstrap)'
+    banner   = 'discord-copilot-sdk install (bootstrap)'
     checking = 'Checking prerequisites (Node / git / Copilot CLI)…'
     haveNode = 'Node version'
     installing = 'Installing'
@@ -115,7 +115,7 @@ $setup = Join-Path $scriptDir 'scripts\setup.mjs'
 
 # Forward --lang ONLY when the user explicitly chose one, so a plain ./install.ps1
 # still shows setup.mjs's interactive language chooser (defaulting to the OS
-# locale, which we pass via DISCOPILOT_LOCALE). --Yes is non-interactive, so pin
+# locale, which we pass via DISCORD_COPILOT_SDK_LOCALE). --Yes is non-interactive, so pin
 # the resolved language there.
 $fwd = @()
 if ($PSBoundParameters.ContainsKey('Lang') -or $Yes) { $fwd += @('--lang', $L) }
