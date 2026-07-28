@@ -37,6 +37,10 @@ export const ConfigSchema = z.object({
   DEFAULT_MODEL: nonBlank("DEFAULT_MODEL must not be blank").default("claude-sonnet-5"),
   DEFAULT_CONTEXT_TIER: z.enum(["default", "long_context"]).default("default"),
   PERMISSION_POLICY: z.enum(["ask"]).default("ask"),
+  /** Model used to name a new thread from its first message. `off` disables it
+   *  (threads then fall back to a truncated first line). Empty = auto-pick the
+   *  cheapest available model from `TITLE_MODEL_PREFERENCE`. */
+  TITLE_MODEL: z.preprocess((v) => (v === "" ? undefined : v), z.string().optional()),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

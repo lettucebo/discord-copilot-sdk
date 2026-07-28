@@ -8,7 +8,7 @@ import {
   decodePlanId,
 } from "../src/platforms/discord/custom-id.js";
 import { isAuthorized } from "../src/platforms/discord/auth.js";
-import { resolveButtonAck, decisionBindsToChannel, applyYoloToggle } from "../src/app.js";
+import { resolveButtonAck, decisionBindsToChannel, applyYoloToggle, approvalScopeKeys } from "../src/app.js";
 
 describe("custom-id", () => {
   it("round-trips each action + nonce", () => {
@@ -180,6 +180,28 @@ describe("applyYoloToggle (ack-before-allow for blanket approval)", () => {
     expect(await enabling).toBe(false); // superseded — must NOT re-enable
     expect(c.state.on).toBe(false);
     expect(c.log).toContain("enable:superseded");
+  });
+});
+
+describe("approvalScopeKeys (/approvals must not lie about revocation)", () => {
+  it("covers the live session even when the command is run from the parent channel", () => {
+    // The bug: scoping to interaction.channelId meant /approvals clear:true from
+    // the parent channel cleared only the on-disk repo rules, left the live
+    // session's in-memory rules intact, and still replied "Cleared approvals …
+    // Future commands will prompt again."
+    expect(approvalScopeKeys(["thread-1"])).toEqual(["thread-1"]);
+  });
+
+  it("covers the session when run INSIDE its own thread (same answer)", () => {
+    expect(approvalScopeKeys(["thread-1"])).toContain("thread-1");
+  });
+
+  it("is empty when nothing is live — there is genuinely nothing in memory to clear", () => {
+    expect(approvalScopeKeys([])).toEqual([]);
+  });
+
+  it("de-duplicates", () => {
+    expect(approvalScopeKeys(["a", "a", "b"])).toEqual(["a", "b"]);
   });
 });
 

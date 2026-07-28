@@ -152,7 +152,12 @@ export class DiscordTransport implements Transport {
 
   async showPermission(view: PermissionView): Promise<void> {
     const channel = await this.fetchThread(view.sessionKey);
-    if (!channel) return;
+    // Never report false success: fetchThread swallows every failure (rate
+    // limit, 5xx, deleted thread). Returning normally would leave the actor's
+    // broker entry pending for the full permission timeout with no card and no
+    // notice; throwing lets it settle deny immediately. Same contract as
+    // showUserInput/showPlan below.
+    if (!channel) throw new Error("permission thread unavailable");
     const bypass = view.summary.includes("SANDBOX BYPASS");
     const embed = new EmbedBuilder()
       .setColor(bypass ? 0xe74c3c : 0xf1c40f)

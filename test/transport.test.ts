@@ -123,6 +123,7 @@ describe("DiscordTransport permission card", () => {
       summary: "$ rm -rf ~",
       supported: true,
       canOfferSession: false,
+      scopeCommands: ["rm"],
     });
     const ids = buttonIds(ch.sent[0]!);
     expect(ids.map((id) => decodePermissionId(id)!.action)).toEqual(["once", "deny"]);
@@ -155,6 +156,7 @@ describe("DiscordTransport permission card", () => {
       summary: "$ echo ```pwned```",
       supported: true,
       canOfferSession: false,
+      scopeCommands: ["echo"],
     });
     const embed = (ch.sent[0]!.opts!["embeds"] as Array<{ data: { description: string } }>)[0]!;
     const desc = embed.data.description;
@@ -168,8 +170,8 @@ describe("DiscordTransport onDecision", () => {
     const t = new DiscordTransport(fakeClient(new FakeChannel()));
     const h = vi.fn();
     const off = t.onDecision(h);
-    t.deliverDecision("n", "allow", "u1");
-    expect(h).toHaveBeenCalledWith("n", "allow", "u1");
+    t.deliverDecision("n", "once", "u1");
+    expect(h).toHaveBeenCalledWith("n", "once", "u1");
     off();
     t.deliverDecision("n", "deny", "u1");
     expect(h).toHaveBeenCalledTimes(1);
@@ -229,6 +231,25 @@ describe("DiscordTransport ask_user / plan cards", () => {
     const t = new DiscordTransport({ channels: { fetch: async () => null } } as unknown as Client);
     await expect(
       t.showUserInput({ nonce: "n", sessionKey: "x", question: "Q", choices: [], allowFreeform: true })
+    ).rejects.toThrow();
+  });
+
+  it("showPermission throws when the thread is unavailable (no false success)", async () => {
+    // Symmetry with showUserInput/showPlan: fetchThread swallows every failure
+    // (rate limit, 5xx, deleted thread). Returning normally reports success, so
+    // the actor keeps the broker entry pending for the full 5-minute timeout —
+    // no card, no notice, a dead thread on the flagship interaction.
+    const t = new DiscordTransport({ channels: { fetch: async () => null } } as unknown as Client);
+    await expect(
+      t.showPermission({
+        nonce: "n",
+        sessionKey: "x",
+        kind: "shell",
+        summary: "$ git status",
+        supported: true,
+        canOfferSession: false,
+        scopeCommands: ["git"],
+      })
     ).rejects.toThrow();
   });
 

@@ -160,6 +160,14 @@ export class SessionActor {
       enableFileHooks: false,
       enableConfigDiscovery: false,
       enableSkills: false,
+      // enableConfigDiscovery:false is NOT sufficient. The SDK states that
+      // "custom instruction files (.github/copilot-instructions.md, AGENTS.md,
+      // etc.) are always loaded from the working directory regardless of this
+      // setting" (types.d.ts). discopilot points the agent at a repo it does not
+      // trust, so a repo shipping an AGENTS.md could otherwise inject standing
+      // instructions — the same trust-boundary hole enableFileHooks:false closes
+      // for permission hooks.
+      skipCustomInstructions: true,
       onPermissionRequest: (req: unknown) => this.handlePermission(req),
       // Interactive UIs (P3): ask_user → choice buttons + freeform; exit-plan →
       // action buttons + reject. Elicitation stays fail-closed (cancel) with a
@@ -190,11 +198,22 @@ export class SessionActor {
       // any tool/permission work that was pending at crash time as INTERRUPTED
       // (no auto-retry of side-effectful work); suppressResumeEvent avoids
       // resume-related side effects on a silent reconnect.
+      //
+      // model/contextTier are deliberately STRIPPED here: the resumed session
+      // already carries whatever the operator selected with /model, /effort and
+      // /context before the restart, and re-sending this process's startup
+      // defaults would silently downgrade that choice. The real values are read
+      // back from the runtime below.
+      const { model: _m, contextTier: _c, ...resumeConfig } = config;
       this.session = await c.resumeSession(this.opts.resumeSessionId, {
-        ...config,
+        ...resumeConfig,
         continuePendingWork: false,
         suppressResumeEvent: true,
       });
+      // Keep the constructor's defaults only as a last resort: if the runtime
+      // can't tell us, showing the configured default is better than showing
+      // nothing (and `reconfigure` needs SOME model to merge onto).
+      await this.syncConfigFromRuntime();
     } else {
       // Reserve-before-create uses a caller-assigned id so a crash between the
       // durable reserve and this create leaves an identifiable id on disk.
@@ -233,9 +252,7 @@ export class SessionActor {
     s.on("tool.execution_complete", handle("tool.execution_complete"));
     s.on("session.idle", () => {
       this.aborting = false; // a real idle means any in-flight abort has settled
-      const waiters = this.idleWaiters;
-      this.idleWaiters = [];
-      for (const w of waiters) w();
+      this.releaseIdleWaiters();
     });
     s.on("session.error", (e) => {
       const d = data(e);
@@ -272,6 +289,9 @@ export class SessionActor {
     if (this.lifecycle !== "active") return;
     const rows = await this.readTodos();
     if (this.lifecycle !== "active") return; // may have changed during the async read
+    // A FAILED read is not "the list is now empty" — treating it as empty would
+    // record an empty render and suppress the next real update.
+    if (rows === undefined) return;
     const rendered = formatTodos(rows);
     if (rendered === this.lastTodosRender) return; // no change (also dedupes empty→empty)
     if (!rendered) {
@@ -318,9 +338,50 @@ export class SessionActor {
     this.currentContext = context;
   }
 
-  /** Current session config for display (/model /effort /context). */
+  /** Current session config for display (/model /effort /context). Reflects the
+   *  last known runtime state — call `syncConfigFromRuntime()` first when the
+   *  value is about to be shown to a human. */
   config(): { model?: string; effort?: string; context?: string } {
     return { model: this.currentModel, effort: this.currentEffort, context: this.currentContext };
+  }
+
+  /**
+   * Replace the cached config with the RUNTIME's own view
+   * (`session.rpc.model.getCurrent`, which the SDK documents as restored from
+   * the session journal on resume).
+   *
+   * Two reasons this is not optional:
+   * - after a RESUME the cache would otherwise hold this process's startup
+   *   defaults, not the model/effort/tier the user actually selected before the
+   *   restart;
+   * - `/usage` would otherwise report what discopilot *asked for* rather than
+   *   what the session is on, which is not evidence of anything.
+   *
+   * A fresh session legitimately answers `{}` (nothing explicitly selected, so
+   * the runtime default applies) — that is not a failure, and it must not wipe a
+   * value we set locally in the same process. Never throws: display code must
+   * degrade to the cache, not error.
+   */
+  async syncConfigFromRuntime(): Promise<boolean> {
+    try {
+      const rpc = (this.session as unknown as {
+        rpc?: { model?: { getCurrent?: () => Promise<Record<string, unknown>> } };
+      }).rpc;
+      const fn = rpc?.model?.getCurrent;
+      if (!fn) return false;
+      const cur = (await fn.call(rpc!.model)) ?? {};
+      const str = (v: unknown): string | undefined =>
+        typeof v === "string" && v.length > 0 ? v : undefined;
+      const model = str(cur["modelId"]);
+      if (!model) return false; // `{}` = nothing selected yet; keep what we know
+      this.currentModel = model;
+      this.currentEffort = str(cur["reasoningEffort"]);
+      const tier = str(cur["contextTier"]);
+      this.currentContext = tier === "long_context" || tier === "default" ? tier : undefined;
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Latest token usage snapshot, if any (/usage). */
@@ -358,7 +419,7 @@ export class SessionActor {
       } catch {
         /* keep the generic fallback */
       }
-      this.postYoloAudit(`⚡ YOLO auto-approved — ${detail}`);
+      this.postAudit(`⚡ YOLO auto-approved — ${detail}`);
       return APPROVE_ONCE;
     }
     if (kind !== "shell") {
@@ -474,7 +535,15 @@ export class SessionActor {
       return APPROVE_ONCE;
     }
     // decision === "always"
-    this.opts.policy.approveForRepo(this.opts.workingDirectory, meta.executable);
+    const durable = this.opts.policy.approveForRepo(this.opts.workingDirectory, meta.executable);
+    if (!durable) {
+      // The rule is live for THIS process but did not reach disk. Say so:
+      // "Always (this repo)" promises it survives a restart.
+      this.postAudit(
+        `⚠️ 「Always」規則 \`${sanitizeForInlineCode(meta.executable, YOLO_TARGET_MAX)}\` 寫入磁碟失敗 — ` +
+          "本次執行仍有效，但重啟後會消失。請檢查 `~/.discopilot` 的權限。"
+      );
+    }
     return APPROVE_ONCE;
   }
 
@@ -629,24 +698,37 @@ export class SessionActor {
     if (this.lifecycle !== "active") {
       throw new Error(`session is ${this.lifecycle} and cannot accept new prompts`);
     }
+    // A new user-initiated turn is the boundary at which any earlier abort stops
+    // applying. This is NOT belt-and-braces: probing the runtime (2026-07-28)
+    // showed abort() with no turn in flight resolves successfully but emits no
+    // `session.idle`, and `session.idle` is the only other thing that clears the
+    // flag. Without this reset a stray /stop on an idle session silently
+    // auto-denies EVERY permission of the next turn with no card and no notice.
+    this.aborting = false;
     this.renderer = new TurnRenderer();
     const payload: Record<string, unknown> = { prompt };
     if (attachments.length) payload["attachments"] = attachments;
     await (this.session as unknown as { send(o: Record<string, unknown>): Promise<unknown> }).send(payload);
   }
 
-  /** Read the agent's current todos (empty when none / no session db). The plan
-   *  RPC namespace lives at `session.rpc.plan` (NOT `session.plan`). */
-  async readTodos(): Promise<Array<{ id?: string; title?: string; status?: string }>> {
+  /** Read the agent's current todos. Returns `undefined` when the read FAILED
+   *  (RPC error / namespace absent), which the caller must not present as "no
+   *  todos" — an empty list and a broken read are different answers, and quietly
+   *  showing "目前沒有待辦事項" for a failure hides a real problem. An empty array
+   *  means genuinely none. The plan RPC namespace lives at `session.rpc.plan`
+   *  (NOT `session.plan`). */
+  async readTodos(): Promise<Array<{ id?: string; title?: string; status?: string }> | undefined> {
     try {
       const rpc = (this.session as unknown as {
         rpc?: { plan?: { readSqlTodosWithDependencies?: () => Promise<{ rows?: unknown[] }> } };
       }).rpc;
-      const res = await rpc?.plan?.readSqlTodosWithDependencies?.();
+      const fn = rpc?.plan?.readSqlTodosWithDependencies;
+      if (!fn) return undefined; // no plan namespace: a read we could not perform
+      const res = await fn.call(rpc!.plan);
       const rows = res?.rows;
       return Array.isArray(rows) ? (rows as Array<{ id?: string; title?: string; status?: string }>) : [];
     } catch {
-      return [];
+      return undefined;
     }
   }
 
@@ -735,8 +817,11 @@ export class SessionActor {
   }
 
   /** Abort the current turn and settle any pending prompts (deny). New
-   *  permissions fail closed until the real `session.idle` arrives (which
-   *  clears `aborting`). Returns whether the abort call itself succeeded. */
+   *  permissions fail closed until either the real `session.idle` arrives or the
+   *  user starts the next turn (`send()` clears the flag) — the runtime does NOT
+   *  emit `session.idle` when there was no turn to abort, so without that second
+   *  release a stray /stop would latch fail-closed forever. Returns whether the
+   *  abort call itself succeeded. */
   async stop(): Promise<boolean> {
     this.aborting = true;
     this.opts.broker.abortSession(this.opts.sessionKey);
@@ -775,9 +860,11 @@ export class SessionActor {
     return true;
   }
 
-  /** Queue a YOLO audit notice. Fire-and-forget for the caller (never awaited on
-   *  the approval path) but serialized per session so entries stay in order. */
-  private postYoloAudit(text: string): void {
+  /** Queue an out-of-band audit/warning notice (YOLO auto-approvals, a
+   *  non-durable "Always" rule). Fire-and-forget for the caller (never awaited
+   *  on the approval path, so a Discord outage cannot gate tool execution) but
+   *  serialized per session so entries stay in order. */
+  private postAudit(text: string): void {
     this.auditChain = this.auditChain
       .then(() => this.opts.transport.notice(this.opts.sessionKey, text))
       .then(
@@ -811,14 +898,28 @@ export class SessionActor {
     this.disconnectPromise = this.session.disconnect().then(
       () => {
         this.lifecycle = "closed";
+        // Release anyone waiting for a `session.idle` that can no longer arrive
+        // (e.g. /new tore this session down mid-turn). Without this the old
+        // runTurn sits until its watchdog fires and then posts a bogus
+        // "did not stop cleanly" notice into a thread the user has left.
+        this.releaseIdleWaiters();
       },
       (err) => {
         this.lifecycle = "faulted";
         this.disconnectPromise = undefined;
+        this.releaseIdleWaiters();
         throw err;
       }
     );
     return this.disconnectPromise;
+  }
+
+  /** Resolve every pending `nextIdle()` waiter. Used on teardown, where the
+   *  runtime will never emit another `session.idle`. */
+  private releaseIdleWaiters(): void {
+    const waiters = this.idleWaiters;
+    this.idleWaiters = [];
+    for (const w of waiters) w();
   }
 
   /** Terminal fault path: mark the actor faulted (rejects further turns) and
@@ -941,10 +1042,15 @@ function describePermissionTarget(r: Record<string, unknown>, kind: string): str
     return "";
   };
   const safeKind = sanitizeForInlineCode(kind, YOLO_KIND_MAX) || "unknown";
+  // Field names verified against a live runtime probe (2026-07-28):
+  //   shell → fullCommandText | write → fileName (NOT `path`)
+  // The legacy `path`/`filePath`/`file` keys are kept as a tail fallback for
+  // kinds we have not probed, but `fileName` must come first or every write
+  // audit degrades to a bare `write` with no record of WHAT was written.
   const target =
     kind === "shell"
       ? pick("fullCommandText", "command")
-      : pick("path", "filePath", "file", "url", "uri", "tool", "toolName", "server", "name");
+      : pick("fileName", "path", "filePath", "file", "url", "uri", "tool", "toolName", "server", "name");
   if (!target) return `\`${safeKind}\``;
   return `\`${safeKind}\`: \`${sanitizeForInlineCode(target, YOLO_TARGET_MAX)}\``;
 }
@@ -982,9 +1088,16 @@ function summarizePermission(r: Record<string, unknown>): string {
     parts.push(`⚠️ SANDBOX BYPASS requested${reason ? `: ${reason}` : ""}`);
   }
   if (r["hasWriteFileRedirection"] === true) parts.push("• writes files via redirection (>)");
-  const paths = Array.isArray(r["possiblePaths"]) ? (r["possiblePaths"] as unknown[]) : [];
-  const pathList = paths.filter((p): p is string => typeof p === "string");
+  const strList = (key: string): string[] =>
+    (Array.isArray(r[key]) ? (r[key] as unknown[]) : []).filter((p): p is string => typeof p === "string");
+  const pathList = strList("possiblePaths");
   if (pathList.length) parts.push(`• paths: ${pathList.join(", ")}`);
+  // Hosts the command may contact. Verified present on real shell requests
+  // (live probe, 2026-07-28). Risk-relevant on its own: the command text can
+  // hide the destination behind a variable, so without this an approver cannot
+  // see that a command exfiltrates to (or fetches from) a remote host.
+  const urlList = strList("possibleUrls");
+  if (urlList.length) parts.push(`• urls: ${urlList.join(", ")}`);
   if (parts.length === 0) {
     // Unknown shape — show the raw request rather than approve blind.
     try {

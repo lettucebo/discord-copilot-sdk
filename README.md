@@ -5,9 +5,11 @@ experience — from anywhere, including your phone.
 
 `discopilot` is a Discord bot that drives the local Copilot engine through the official
 [`@github/copilot-sdk`](https://www.npmjs.com/package/@github/copilot-sdk) (JSON-RPC). Each
-Discord thread maps to a Copilot session; the bot streams the agent's messages, reasoning,
-tool calls, plans and usage into the thread, and surfaces permission / choice / plan prompts
-as Discord buttons, selects and modals that you respond to from any device.
+Discord thread maps to a Copilot session; the bot streams the agent's messages, tool calls and
+todo checklists into the thread, and surfaces permission / choice / plan prompts as Discord
+**buttons** (plus plain thread messages for free-text answers) that you respond to from any
+device. Token usage and the live model/effort/context tier are available on demand via
+`/usage`.
 
 > Sibling project to [`seam-acp`](https://github.com/lettucebo/seam-acp): seam-acp bridges
 > Discord to multiple agents over the ACP protocol; **discopilot is Copilot-only and
@@ -16,7 +18,9 @@ as Discord buttons, selects and modals that you respond to from any device.
 
 ## Status
 
-🚧 **Early scaffold.** Architecture and phased plan in [`docs/PLAN.md`](docs/PLAN.md).
+**Working end-to-end and installable** (`install.ps1` / `install.sh`, see
+[`INSTALL.md`](INSTALL.md)). Architecture and phase history in [`docs/PLAN.md`](docs/PLAN.md).
+Still lab-only — read the security model below before running it.
 
 ## ⚠️ Security model (read before running)
 
@@ -31,7 +35,9 @@ Mitigations that **are** in place:
   and interactive callback (ask_user / exit-plan / elicitation) **fails closed** (deny/cancel).
 - **Repo can't reconfigure the agent**: `enableFileHooks`, `enableConfigDiscovery` and
   `enableSkills` are disabled, so a controlled-repo `.github/hooks` file can't auto-approve
-  ("`resolvedByHook`") a command behind your back.
+  ("`resolvedByHook`") a command behind your back. `skipCustomInstructions` is also set —
+  the SDK loads `AGENTS.md` / `.github/copilot-instructions.md` *regardless* of
+  `enableConfigDiscovery`, so without it a repo could still ship standing instructions.
 - **Spoofing-resistant cards**: the command is shown escaped (no markdown/code-fence breakout),
   commands containing bidirectional/control characters are auto-denied, and an over-long command
   is auto-denied rather than shown partially.
@@ -54,7 +60,10 @@ card — including the kinds that normally fail closed (file writes, etc.). It e
   resets it to **OFF**, and the recovery notice says so;
 - enabling it takes effect **only after Discord acknowledges the warning**, so a failed reply can't
   leave a session silently unguarded;
-- every auto-approval still posts a compact audit notice (kind + bounded target, never the payload);
+- every auto-approval posts a compact audit notice (kind + bounded target, never the payload).
+  The notice is **best effort**: it is never awaited on the approval path, so a Discord outage
+  delays or drops the line rather than blocking the tool — do not treat the thread as a
+  guaranteed-complete audit log;
 - an approval card that was **already waiting** still needs your decision;
 - `ask_user` and exit-plan still ask — YOLO approves *permissions*, it does not answer questions or
   pick plan actions;
@@ -67,7 +76,8 @@ Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-
 
 - Drives a **local** session end-to-end: `listModels()`, `createSession()`, `send()`, full
   event stream (`assistant.message`/`reasoning`/deltas, `tool.execution_*`,
-  `session.usage_info`/`plan_changed`/`idle`).
+  `session.usage_info`/`plan_changed`/`idle`). discopilot renders assistant messages and
+  tool calls; reasoning is intentionally **not** rendered into the thread.
 - Native interactive callbacks: `onPermissionRequest`, `onUserInputRequest` (ask_user),
   `onExitPlanMode`, `onElicitationRequest`.
 - **`contextTier: "long_context"` unlocks a 936K effective window** (200K default) — something
@@ -81,13 +91,27 @@ Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-
 
 ## Quick start
 
-_TBD — see [`docs/PLAN.md`](docs/PLAN.md) for the build phases._
+Full instructions (including the guided installer) are in [`INSTALL.md`](INSTALL.md).
+From a clone:
 
 ```bash
 cp .env.example .env   # fill in DISCORD_BOT_TOKEN + DISCORD_ALLOWED_USER_IDS
 npm install
 npm run dev
 ```
+
+## Threads
+
+Each `/new` opens a thread. Its name is generated from your first message by a
+small, cheap model (`gemini-3.5-flash` by default) running in a **throwaway
+session**, so a long first prompt still becomes a short, readable name and your
+own session's history/context is never touched. `/rename title:…` overrides it;
+`TITLE_MODEL=off` disables the titler and falls back to a truncated first line.
+
+There is deliberately no `#001` ordinal: Discord already orders a channel's
+threads by creation (verified — posting the newest message into an older thread
+does not move it above a newer one), so a number would only consume sidebar
+width.
 
 ## License
 

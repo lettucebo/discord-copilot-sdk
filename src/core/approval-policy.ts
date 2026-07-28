@@ -56,15 +56,20 @@ export class ApprovalPolicy {
     set.add(n);
   }
 
-  /** Remember an executable for this repo, persisted across restarts. */
-  approveForRepo(repoPath: string, executable: string): void {
+  /** Remember an executable for this repo, persisted across restarts. Returns
+   *  whether the rule is DURABLE: false means it applies to this process only
+   *  and will vanish on restart, which the caller must surface — telling the
+   *  operator a command is remembered "for this repo" when it is not is a lie
+   *  about a security control. */
+  approveForRepo(repoPath: string, executable: string): boolean {
     const n = norm(executable);
-    if (!n) return;
+    if (!n) return false;
     const list = this.repo[repoPath] ?? (this.repo[repoPath] = []);
     if (!list.includes(n)) {
       list.push(n);
-      this.persist();
+      return this.persist();
     }
+    return true; // already present (and previously persisted)
   }
 
   /** Drop a session's in-memory approvals (on session teardown). */

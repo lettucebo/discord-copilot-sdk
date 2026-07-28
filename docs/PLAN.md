@@ -50,7 +50,7 @@
 - 「自己輸入」以 `showModal()` 為**初次**回應；modal 建**一次性 child nonce + 獨立逾時**；未提交終將安全逾時。**（已由 §9.1 取代：實作改為 thread 訊息自由輸入，行動裝置友善；本條 modal 設計不採用。）**
 - nonce **密碼學隨機、絕不重用**；逾時已終結 server 端條目後，遲到點擊安全（停用元件僅美觀）。
 - **控制/broker 流量不得排在被 `session.send()`/turn 阻塞的佇列後**（否則 SDK 等的權限卡片卡在同一 turn 後面 → 死鎖）。
-- 逾時預設：Permission 2–5 分→`user-not-available`；ask_user 10–15 分→丟 typed timeout；exit-plan→`{approved:false}`；elicitation→`{action:"cancel"}`。
+- 逾時（實作值）：permission / ask_user / exit-plan 共用 `PERMISSION_TIMEOUT_MS = 5 分`（`session-actor.ts`）。逾時後 permission→`user-not-available`；ask_user→丟出錯誤；exit-plan→`{approved:false}`。elicitation 不等待，直接 `{action:"cancel"}` 並發通知。
 - `/stop`：先標 `ABORTING` 並**禁止新註冊** → 安全 settle 既有 → 再 `session.abort()`。
 
 ## 4. Session 擁有權、復原與 fencing（移到 P2，但規格先定）
@@ -97,7 +97,7 @@
   - **驗收**：手機開 thread → 要求 `git status` → 檢視並 approve/deny **確切請求** → 收到串流輸出 → 成功 abort 一個 turn。
 - **P2**：resume + reconciliation（第 4 節）+ generation fencing。
 - **P3**：其餘 callback UI（ask_user〔自由輸入以 thread 訊息呈現，非 Discord modal；見 §9.1〕、exit-plan、elicitation、memory/mcp/url… 的呈現）。
-- **P4**：pickers（/model /effort /context /mode）、queue/steer、usage。
+- **P4**：pickers（/model /effort /context）、usage。`/mode` **未實作**（Copilot 的 agent mode 由 runtime 決定，discopilot 不提供切換）；`/yolo`、`/rename` 為後續新增。queue/steer 未實作 —— 回合進行中送出的訊息會被**丟棄**並回覆說明，不會排隊。
 - **P5**：attachments/images 輸入、todo/plan、changed-file/git diff 摘要。
 - **P6**：跨平台 installer + 常駐。
 

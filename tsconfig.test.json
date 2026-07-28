@@ -1,0 +1,20 @@
+{
+  // Typecheck the TESTS too. The main tsconfig deliberately keeps `rootDir: src`
+  // so `npm run build` emits a clean dist/, which left test/ completely
+  // unchecked — that is how fixtures drifted from the SDK's real shapes (e.g. a
+  // write-permission fixture using `path` when the runtime sends `fileName`,
+  // and an `"allow"` decision that is not in the Decision union) while the suite
+  // stayed green. Run via `npm run typecheck`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    // The setup/installer helpers are plain .mjs; infer their types rather than
+    // demanding declaration files, so what actually gets checked is the TYPED
+    // surface — the part that can silently drift from the SDK.
+    "allowJs": true,
+    "checkJs": false,
+    "noImplicitAny": false
+  },
+  "include": ["src", "test"]
+}

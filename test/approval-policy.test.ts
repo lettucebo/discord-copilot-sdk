@@ -85,6 +85,28 @@ describe("ApprovalPolicy", () => {
     }
   });
 
+  it("approveForRepo reports FALSE when the rule could not be persisted", () => {
+    // "Always (this repo)" promises the rule survives a restart. When the write
+    // fails the rule is live for THIS process only, and saying nothing would
+    // leave the operator believing a security decision is recorded when it is
+    // not. The grant itself still applies in memory (fail-safe for a grant).
+    const dir = mkdtempSync(join(tmpdir(), "dp-approve-nodisk-"));
+    try {
+      const p = new ApprovalPolicy(dir);
+      expect(p.approveForRepo("/repo", "npm")).toBe(false);
+      expect(p.repoApprovals("/repo")).toEqual(["npm"]);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("approveForRepo reports TRUE on a durable write and for an already-known rule", () => {
+    const p = new ApprovalPolicy(tmpFile());
+    expect(p.approveForRepo("/repo", "npm")).toBe(true);
+    expect(p.approveForRepo("/repo", "npm")).toBe(true); // idempotent
+    expect(p.approveForRepo("/repo", "   ")).toBe(false); // nothing to record
+  });
+
   it("clearRepo RETRIES persistence after a transient failure (no false success)", () => {
     // Regression: a first clear that fails to write must not let a SECOND clear
     // report success while the old rules still sit on disk. clearRepo always
