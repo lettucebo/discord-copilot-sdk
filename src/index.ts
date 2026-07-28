@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { acquireSingleInstanceLock } from "./core/single-instance.js";
-import { lockPath } from "./core/paths.js";
+import { lockPath, legacyStateDir, legacyNameWarnings } from "./core/paths.js";
 import { checkSdkCompat, sdkSelfCheck } from "./copilot/sdk.js";
 import { loadConfig } from "./config.js";
 import { DiscordCopilotApp } from "./app.js";
@@ -13,6 +13,15 @@ function loadDotEnv(): void {
     (process as unknown as { loadEnvFile?: (p?: string) => void }).loadEnvFile?.(".env");
   } catch {
     /* malformed/unreadable .env — ignore; config validation will surface it */
+  }
+}
+
+/** Surface `discopilot`-era leftovers instead of silently misreading them. The
+ *  old names are NOT honoured — see `legacyNameWarnings` for why — so the only
+ *  responsible thing left is to say so out loud. */
+function reportLegacyNames(): void {
+  for (const line of legacyNameWarnings(process.env, existsSync(legacyStateDir()))) {
+    console.warn(line);
   }
 }
 
@@ -30,6 +39,7 @@ async function main(): Promise<void> {
   }
 
   if (args.has("--selfcheck")) {
+    reportLegacyNames();
     const lock = await acquireSingleInstanceLock(lockPath());
     try {
       const compat = checkSdkCompat();
@@ -53,6 +63,7 @@ async function main(): Promise<void> {
   }
 
   console.log("Starting discord-copilot-sdk bot …");
+  reportLegacyNames();
   const config = loadConfig();
   await DiscordCopilotApp.start(config);
   // The Discord gateway connection keeps the event loop alive; shutdown is

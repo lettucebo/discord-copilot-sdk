@@ -22,6 +22,28 @@ device. Token usage and the live model/effort/context tier are available on dema
 [`INSTALL.md`](INSTALL.md)). Architecture and phase history in [`docs/PLAN.md`](docs/PLAN.md).
 Still lab-only — read the security model below before running it.
 
+### Formerly `discopilot`
+
+The project was renamed to `discord-copilot-sdk`. GitHub redirects the old
+repository name, so `git clone https://github.com/lettucebo/discopilot.git` still
+works — but only for as long as no new repository takes that name, so prefer the
+current URL. (The Discord application itself is still called **DisPilot**; that
+name lives in the Discord Developer Portal, not in this repo.)
+
+The old names are **not** honoured as configuration:
+
+| Old | New |
+| --- | --- |
+| `~/.discopilot` | `~/.discord-copilot-sdk` |
+| `DISCOPILOT_*` | `DISCORD_COPILOT_SDK_*` |
+
+If either is found on the host, startup says so and tells you what to move —
+rather than silently reading the wrong state or ignoring your settings. Saved
+approval rules are deliberately **not** carried across for you: restoring an
+"Always (this repo)" grant you'd forgotten about is the one direction this
+project doesn't move in. A leftover `DISCOPILOT_*` variable is still stripped
+from the agent's environment.
+
 ## ⚠️ Security model (read before running)
 
 discord-copilot-sdk v1 is **lab-only**. It runs shell/file tools **as the user that starts the bot**,

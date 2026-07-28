@@ -2,6 +2,15 @@ import os from "node:os";
 import path from "node:path";
 import { mkdirSync } from "node:fs";
 
+/** The state directory this project used before it was renamed from
+ *  `discopilot`. Exported so the startup check and the docs can't drift apart. */
+export const LEGACY_STATE_DIR_NAME = ".discopilot";
+
+/** The environment prefix this project used before it was renamed. Still
+ *  stripped from the agent's environment (see `sanitizeRuntimeEnv`), but NOT
+ *  honoured as configuration. */
+export const LEGACY_ENV_PREFIX = "DISCOPILOT_";
+
 /**
  * Logical instance identity. Multiple intentional deployments on one host use
  * distinct ids (e.g. DISCORD_COPILOT_SDK_INSTANCE_ID=work). Ownership is defined by this
@@ -18,6 +27,51 @@ export function stateDir(): string {
   const dir = path.join(os.homedir(), ".discord-copilot-sdk");
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** Where a pre-rename install kept its state. Never read — only reported. */
+export function legacyStateDir(): string {
+  return path.join(os.homedir(), LEGACY_STATE_DIR_NAME);
+}
+
+/**
+ * Warnings about `discopilot`-era leftovers found on this host.
+ *
+ * These are deliberately warnings and NOT fallbacks. Honouring the old env
+ * prefix would create a permanent second configuration surface for a name that
+ * no longer exists, and silently adopting the old state directory would restore
+ * saved "Always (this repo)" approval grants the operator may have forgotten —
+ * the one direction this project never moves in. Losing a grant is the fail-safe
+ * outcome; the resumable session record is the part worth telling them about, so
+ * they can move it across on purpose.
+ *
+ * Pure (takes the environment and the directory's existence) so it is testable
+ * without touching the real home directory.
+ */
+export function legacyNameWarnings(
+  env: NodeJS.ProcessEnv,
+  legacyStateDirExists: boolean
+): string[] {
+  const out: string[] = [];
+  if (legacyStateDirExists) {
+    out.push(
+      `⚠️  Found a pre-rename state directory at ~/${LEGACY_STATE_DIR_NAME} — it is NOT read. ` +
+        `This project now uses ~/.discord-copilot-sdk. If it holds a session you still want to ` +
+        `resume, move *.session.json across; saved approval rules are deliberately not restored ` +
+        `for you, so re-grant them from Discord if you still want them.`
+    );
+  }
+  const legacy = Object.keys(env).filter((k) =>
+    k.toUpperCase().startsWith(LEGACY_ENV_PREFIX)
+  );
+  if (legacy.length) {
+    out.push(
+      `⚠️  Ignoring pre-rename environment variable(s): ${legacy.join(", ")}. ` +
+        `Rename the prefix to DISCORD_COPILOT_SDK_ (e.g. DISCORD_COPILOT_SDK_INSTANCE_ID). ` +
+        `They are still stripped from the agent's environment, but they configure nothing.`
+    );
+  }
+  return out;
 }
 
 /** Path to the single-instance lock file for a logical instance. */
