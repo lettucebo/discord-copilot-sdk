@@ -44,6 +44,23 @@ any blanket "always allow" approval rules you've saved there apply and would byp
 Discord prompt. For a true approve-per-command demo, run under an account/home **without** saved
 auto-approvals. Full isolation is the deferred controller/worker split.
 
+### ⚡ YOLO mode (`/yolo mode:on`) — opt-in, removes the approval gate
+
+`/yolo mode:on` makes **one thread's session** auto-approve **every** permission request with no
+card — including the kinds that normally fail closed (file writes, etc.). It exists for
+"just get it done" runs; it is the single deliberate exception to approve-per-command, so:
+
+- it is **per-session** (one thread) and **never persisted** — a restart or session recovery
+  resets it to **OFF**, and the recovery notice says so;
+- enabling it takes effect **only after Discord acknowledges the warning**, so a failed reply can't
+  leave a session silently unguarded;
+- every auto-approval still posts a compact audit notice (kind + bounded target, never the payload);
+- an approval card that was **already waiting** still needs your decision;
+- `ask_user` and exit-plan still ask — YOLO approves *permissions*, it does not answer questions or
+  pick plan actions;
+- `/stop` still wins: teardown fails closed regardless of YOLO;
+- `/usage` shows `⚡ YOLO: ON` so you can tell at a glance. Turn it off with `/yolo mode:off`.
+
 ## Why the SDK (verified)
 
 Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-1):

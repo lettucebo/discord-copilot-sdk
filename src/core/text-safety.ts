@@ -28,3 +28,22 @@ export function hasBidiOrControls(s: string): boolean {
 export function sanitizeForCodeBlock(s: string): string {
   return s.replace(UNSAFE_STRIP, "").replace(/`/g, "`\u200b");
 }
+
+/**
+ * Make text safe to place inside a SINGLE-backtick INLINE code span, and bound
+ * its length. This is NOT the same problem as `sanitizeForCodeBlock`: that one
+ * defeats a ``` fence run by inserting a zero-width space AFTER each backtick,
+ * but a single literal backtick still CLOSES an inline span — after which the
+ * remainder renders as markdown and can spoof the reader (e.g. forge a line that
+ * looks like discopilot's own output). So here backticks are REPLACED, not
+ * escaped, and newlines/tabs are flattened so one entry can't fake several.
+ * Truncation happens last and can't split an escape because none are inserted.
+ */
+export function sanitizeForInlineCode(s: string, max = 200): string {
+  const flat = s
+    .replace(UNSAFE_STRIP, "") // bidi/控制字元（不含 \t\n\r）
+    .replace(/[\r\n\t]+/g, " ") // 攤平換行/tab：一則通知只能是一行
+    .replace(/`/g, "'") // 反引號無法逃脫 inline code span
+    .trim();
+  return flat.length > max ? flat.slice(0, max) + "…" : flat;
+}

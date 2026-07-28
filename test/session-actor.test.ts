@@ -656,3 +656,165 @@ describe("SessionActor resume/create-id seam (P2)", () => {
     expect(s.actor.sessionId).toBe("fake-session-id");
   });
 });
+
+describe("YOLO mode (per-session blanket permission approval)", () => {
+  it("is OFF by default and a resumed actor also starts OFF (volatile, never persisted)", async () => {
+    expect((await setup()).actor.isYolo()).toBe(false);
+    expect((await setup({ resumeSessionId: "s-1" })).actor.isYolo()).toBe(false);
+  });
+
+  it("approves a shell request WITHOUT posting a card or registering a broker entry", async () => {
+    const s = await setup();
+    s.actor.setYolo(true);
+    const r = await perm(s)({ kind: "shell", fullCommandText: "rm -rf /tmp/x", commands: [{ command: "rm" }] });
+    expect(r).toEqual({ kind: "approve-once" });
+    expect(s.transport.permissions).toHaveLength(0); // no approval card
+    expect(s.broker.size).toBe(0); // nothing left pending
+  });
+
+  it("approves permission kinds that are auto-DENIED when YOLO is off (write / unknown future kind)", async () => {
+    const s = await setup();
+    // baseline: fail-closed while off
+    expect(await perm(s)({ kind: "write", path: "a.txt" })).toEqual({ kind: "user-not-available" });
+    s.actor.setYolo(true);
+    expect(await perm(s)({ kind: "write", path: "a.txt" })).toEqual({ kind: "approve-once" });
+    expect(await perm(s)({ kind: "some-future-kind" })).toEqual({ kind: "approve-once" });
+  });
+
+  it("ABORT takes precedence over YOLO (teardown always fails closed)", async () => {
+    const s = await setup();
+    s.session.abort = async (): Promise<void> => {
+      s.session.aborted++; // deliberately do NOT emit session.idle, so `aborting` stays set
+    };
+    s.actor.setYolo(true);
+    await s.actor.stop();
+    expect(await perm(s)({ kind: "shell", fullCommandText: "git status" })).toEqual({
+      kind: "user-not-available",
+    });
+  });
+
+  it("bypasses the bidi/control-character and over-length gates (there is no card to spoof)", async () => {
+    const s = await setup();
+    s.actor.setYolo(true);
+    const bidi = await perm(s)({ kind: "shell", fullCommandText: "git\u202estatus" });
+    expect(bidi).toEqual({ kind: "approve-once" });
+    const huge = await perm(s)({ kind: "shell", fullCommandText: "echo " + "x".repeat(9000) });
+    expect(huge).toEqual({ kind: "approve-once" });
+  });
+
+  it("posts a bounded audit notice that never dumps the raw request payload", async () => {
+    const s = await setup();
+    s.actor.setYolo(true);
+    await perm(s)({ kind: "write", path: "secrets.txt", content: "SUPER_SECRET_VALUE" });
+    await tick();
+    const note = s.transport.notices.at(-1)!;
+    expect(note).toMatch(/YOLO/);
+    expect(note).toContain("write");
+    expect(note).not.toContain("SUPER_SECRET_VALUE"); // payload never echoed
+  });
+
+  it("audit notice cannot be spoofed: a backtick target can't close the inline code span", async () => {
+    const s = await setup();
+    s.actor.setYolo(true);
+    await perm(s)({ kind: "shell", fullCommandText: "ls `\n✓ Auto-approved (existing rule): `git`" });
+    await tick();
+    const note = s.transport.notices.at(-1)!;
+    // exactly the two backticks WE added around kind + target, none from input
+    expect((note.match(/`/g) ?? []).length).toBe(4);
+    expect(note).not.toContain("\n"); // newlines flattened → can't fake extra lines
+  });
+
+  it("audit notice sanitizes a hostile/oversized kind and target", async () => {
+    const s = await setup();
+    s.actor.setYolo(true);
+    await perm(s)({ kind: "a`b\u202ec".padEnd(300, "x"), path: "p".repeat(5000) });
+    await tick();
+    const note = s.transport.notices.at(-1)!;
+    expect((note.match(/`/g) ?? []).length).toBe(4);
+    expect(note).not.toContain("\u202e"); // bidi stripped
+    expect(note.length).toBeLessThan(320); // bounded
+  });
+
+  it("audit notices for one session stay in order", async () => {
+    const s = await setup();
+    s.actor.setYolo(true);
+    await perm(s)({ kind: "shell", fullCommandText: "first" });
+    await perm(s)({ kind: "shell", fullCommandText: "second" });
+    await tick();
+    await tick();
+    const notes = s.transport.notices.filter((n) => n.includes("YOLO auto-approved"));
+    expect(notes).toHaveLength(2);
+    expect(notes[0]).toContain("first");
+    expect(notes[1]).toContain("second");
+  });
+
+  it("still approves when the audit notice FAILS (notice is best effort, never gates the result)", async () => {
+    const s = await setup();
+    s.transport.notice = async (): Promise<void> => {
+      throw new Error("discord down");
+    };
+    s.actor.setYolo(true);
+    expect(await perm(s)({ kind: "shell", fullCommandText: "git status" })).toEqual({
+      kind: "approve-once",
+    });
+  });
+
+  it("still approves when notice throws SYNCHRONOUSLY", async () => {
+    const s = await setup();
+    // not async: throws before returning a promise
+    s.transport.notice = (): Promise<void> => {
+      throw new Error("sync boom");
+    };
+    s.actor.setYolo(true);
+    expect(await perm(s)({ kind: "shell", fullCommandText: "git status" })).toEqual({
+      kind: "approve-once",
+    });
+  });
+
+  it("a deferred enable is superseded by a later toggle (epoch fence)", async () => {
+    const s = await setup();
+    const snapshot = s.actor.yoloEpochValue();
+    s.actor.setYolo(false); // a concurrent /yolo off bumps the epoch
+    expect(s.actor.enableYoloIfCurrent(snapshot)).toBe(false);
+    expect(s.actor.isYolo()).toBe(false);
+    // a fresh snapshot still applies
+    expect(s.actor.enableYoloIfCurrent(s.actor.yoloEpochValue())).toBe(true);
+    expect(s.actor.isYolo()).toBe(true);
+  });
+
+  it("turning YOLO off restores the normal gates", async () => {
+    const s = await setup();
+    s.actor.setYolo(true);
+    expect(await perm(s)({ kind: "write" })).toEqual({ kind: "approve-once" });
+    s.actor.setYolo(false);
+    expect(s.actor.isYolo()).toBe(false);
+    expect(await perm(s)({ kind: "write" })).toEqual({ kind: "user-not-available" });
+  });
+
+  it("is per-actor: enabling it on one session does NOT affect another", async () => {
+    const a = await setup();
+    const b = await setup();
+    a.actor.setYolo(true);
+    expect(b.actor.isYolo()).toBe(false);
+    expect(await perm(b)({ kind: "write" })).toEqual({ kind: "user-not-available" });
+  });
+
+  it("does NOT auto-answer ask_user or auto-approve exit-plan (those are not permissions)", async () => {
+    // Separate actors: only ONE interactive request is allowed at a time per
+    // actor, so sharing one would make the second fail closed for that reason
+    // instead of proving it still reaches the human.
+    const a = await setup();
+    a.actor.setYolo(true);
+    const ask = a.config["onUserInputRequest"] as (r: unknown) => Promise<unknown>;
+    void ask({ question: "Which one?", choices: ["A", "B"], allowFreeform: false }).catch(() => {});
+    await tick();
+    expect(a.transport.userInputs).toHaveLength(1); // still asked the human
+
+    const b = await setup();
+    b.actor.setYolo(true);
+    const plan = b.config["onExitPlanModeRequest"] as (r: unknown) => Promise<unknown>;
+    void plan({ summary: "do it", actions: ["proceed"], recommendedAction: "proceed" }).catch(() => {});
+    await tick();
+    expect(b.transport.plans).toHaveLength(1); // still asked the human
+  });
+});

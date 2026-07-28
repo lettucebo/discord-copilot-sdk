@@ -8,7 +8,7 @@ import {
   decodePlanId,
 } from "../src/platforms/discord/custom-id.js";
 import { isAuthorized } from "../src/platforms/discord/auth.js";
-import { resolveButtonAck, decisionBindsToChannel } from "../src/app.js";
+import { resolveButtonAck, decisionBindsToChannel, applyYoloToggle } from "../src/app.js";
 
 describe("custom-id", () => {
   it("round-trips each action + nonce", () => {
@@ -92,6 +92,94 @@ describe("decisionBindsToChannel (cross-thread guard, §9)", () => {
 
   it("rejects when there is no pending request (expired / unknown nonce)", () => {
     expect(decisionBindsToChannel(undefined, "tA")).toBe(false);
+  });
+});
+
+describe("applyYoloToggle (ack-before-allow for blanket approval)", () => {
+  const ctl = (): { epoch: () => number; disable: () => void; enableIfCurrent: (e: number) => boolean; state: { on: boolean; epoch: number }; log: string[] } => {
+    const state = { on: false, epoch: 0 };
+    const log: string[] = [];
+    return {
+      state,
+      log,
+      epoch: () => state.epoch,
+      disable: () => {
+        state.epoch++;
+        state.on = false;
+        log.push("disable");
+      },
+      enableIfCurrent: (e: number) => {
+        if (e !== state.epoch) {
+          log.push("enable:superseded");
+          return false;
+        }
+        state.on = true;
+        log.push("enable");
+        return true;
+      },
+    };
+  };
+
+  it("enables YOLO only AFTER Discord acknowledges the warning", async () => {
+    const c = ctl();
+    const applied = await applyYoloToggle(
+      true,
+      async () => {
+        c.log.push("ack");
+      },
+      c
+    );
+    expect(c.log).toEqual(["ack", "enable"]); // ack strictly first
+    expect(applied).toBe(true);
+    expect(c.state.on).toBe(true);
+  });
+
+  it("does NOT enable YOLO when the warning fails to post (fail-safe)", async () => {
+    const c = ctl();
+    await expect(
+      applyYoloToggle(
+        true,
+        async () => {
+          throw new Error("interaction failed");
+        },
+        c
+      )
+    ).rejects.toThrow("interaction failed");
+    expect(c.state.on).toBe(false); // stays OFF
+    expect(c.log).toEqual([]);
+  });
+
+  it("disables YOLO FIRST, even if the confirmation cannot be posted", async () => {
+    const c = ctl();
+    const applied = await applyYoloToggle(
+      false,
+      async () => {
+        c.log.push("ack");
+        throw new Error("interaction failed");
+      },
+      c
+    );
+    expect(c.log).toEqual(["disable", "ack"]); // applied before (and despite) the ack
+    expect(applied).toBe(false);
+    expect(c.state.on).toBe(false);
+  });
+
+  it("RACE: a slow /yolo on cannot re-enable after a later /yolo off confirmed OFF", async () => {
+    const c = ctl();
+    let releaseAck: (() => void) | undefined;
+    const slowAck = (): Promise<void> =>
+      new Promise<void>((r) => {
+        releaseAck = r;
+      });
+    const enabling = applyYoloToggle(true, slowAck, c); // ack still in flight
+    // meanwhile the operator turns it OFF and sees the confirmation
+    const disabling = await applyYoloToggle(false, async () => {}, c);
+    expect(disabling).toBe(false);
+    expect(c.state.on).toBe(false);
+    releaseAck!(); // the older ON ack finally resolves
+    expect(await enabling).toBe(false); // superseded — must NOT re-enable
+    expect(c.state.on).toBe(false);
+    expect(c.log).toContain("enable:superseded");
   });
 });
 

@@ -3,7 +3,7 @@ import { PendingInteractionBroker } from "../core/broker.js";
 import { TurnRenderer } from "../core/turn-render.js";
 import type { Decision, Transport } from "../core/transport.js";
 import { normalizeSdkEvent } from "./normalize.js";
-import { sanitizeForCodeBlock, hasBidiOrControls } from "../core/text-safety.js";
+import { sanitizeForCodeBlock, sanitizeForInlineCode, hasBidiOrControls } from "../core/text-safety.js";
 import { ApprovalPolicy, commandExecutable } from "../core/approval-policy.js";
 
 const PERMISSION_TIMEOUT_MS = 5 * 60_000;
@@ -74,6 +74,11 @@ export interface BlobAttachment {
  * P1 scope: shell permission has real approve/deny UI; every other permission
  * kind and the other callbacks (ask_user / exit-plan / elicitation) fail closed
  * with the safe default so a missing UI can never wedge or silently auto-approve.
+ *
+ * The ONE deliberate exception is YOLO mode (`setYolo`), an explicit per-session
+ * opt-in that auto-approves every PERMISSION request without a card. It never
+ * applies to ask_user (which must not fabricate an answer) or exit-plan (which
+ * selects control flow, not permission), and the abort guard still wins.
  */
 export class SessionActor {
   private session!: CopilotSession;
@@ -92,6 +97,22 @@ export class SessionActor {
   private readonly pendingPerms = new Map<string, PendingPermMeta>();
   /** True while a /stop abort is in flight — new permissions fail closed. */
   private aborting = false;
+  /** YOLO mode: auto-approve EVERY SDK permission request for this session.
+   *  Deliberately actor-local and volatile — it is never persisted, so a crash,
+   *  restart or P2 resume always comes back with it OFF (fail-safe). It does NOT
+   *  touch the shared ApprovalPolicy, so the executable-rule engine keeps all of
+   *  its fail-closed invariants. */
+  private yolo = false;
+  /** Monotonic toggle counter fencing DEFERRED YOLO enables. `/yolo on` may only
+   *  take effect after Discord acknowledges the warning, so a `/yolo off` issued
+   *  while that ack is in flight would otherwise be overwritten by the late
+   *  enable — leaving the operator looking at an "OFF" confirmation while
+   *  permissions are auto-approved. Every toggle bumps this; a deferred enable
+   *  applies only if its snapshot is still current. */
+  private yoloEpoch = 0;
+  /** Serializes YOLO audit notices so they can't interleave/reorder with each
+   *  other. Kept OFF the approval path (never awaited there). */
+  private auditChain: Promise<void> = Promise.resolve();
   private unsubscribeDecision?: () => void;
   private unsubscribeChoice?: () => void;
   private unsubscribePlan?: () => void;
@@ -321,6 +342,25 @@ export class SessionActor {
     const r = (req ?? {}) as Record<string, unknown>;
     const kind = typeof r["kind"] === "string" ? (r["kind"] as string) : "unknown";
     if (this.aborting) return DENY_UNAVAILABLE; // tearing down — fail closed
+    // YOLO: blanket approval for this session. Checked SYNCHRONOUSLY right after
+    // the abort guard so the decision can't interleave with a concurrent
+    // `/yolo off`, and placed before every other gate — the kind/bidi/length
+    // gates all exist to protect the human reading the approval card, and under
+    // YOLO there is no card. The audit notice is best effort and must never gate
+    // the result (a Discord outage may not block tool execution).
+    if (this.yolo) {
+      // Building the descriptor must never break the approval path (a hostile
+      // request object could throw from a property getter), so it is guarded and
+      // degrades to a generic entry.
+      let detail = `\`${kind}\``;
+      try {
+        detail = describePermissionTarget(r, kind);
+      } catch {
+        /* keep the generic fallback */
+      }
+      this.postYoloAudit(`⚡ YOLO auto-approved — ${detail}`);
+      return APPROVE_ONCE;
+    }
     if (kind !== "shell") {
       await this.opts.transport.notice(
         this.opts.sessionKey,
@@ -709,6 +749,43 @@ export class SessionActor {
     }
   }
 
+  /** Enable/disable YOLO (blanket permission approval) for THIS session only.
+   *  Volatile by design — see the `yolo` field. Every call bumps the toggle
+   *  epoch, which invalidates any deferred enable still awaiting its ack. */
+  setYolo(on: boolean): void {
+    this.yoloEpoch++;
+    this.yolo = on;
+  }
+
+  /** Whether YOLO is currently on for this session. */
+  isYolo(): boolean {
+    return this.yolo;
+  }
+
+  /** Snapshot of the toggle epoch, taken BEFORE awaiting a Discord ack. */
+  yoloEpochValue(): number {
+    return this.yoloEpoch;
+  }
+
+  /** Apply a deferred enable, but ONLY if no other toggle happened since
+   *  `epoch`. Returns whether it was applied (false ⇒ superseded, stays as-is). */
+  enableYoloIfCurrent(epoch: number): boolean {
+    if (epoch !== this.yoloEpoch) return false;
+    this.yolo = true;
+    return true;
+  }
+
+  /** Queue a YOLO audit notice. Fire-and-forget for the caller (never awaited on
+   *  the approval path) but serialized per session so entries stay in order. */
+  private postYoloAudit(text: string): void {
+    this.auditChain = this.auditChain
+      .then(() => this.opts.transport.notice(this.opts.sessionKey, text))
+      .then(
+        () => {},
+        () => {}
+      );
+  }
+
   state() {
     return this.renderer.state();
   }
@@ -834,6 +911,42 @@ function isSimpleCommand(fullCommandText: string): boolean {
 
 function dedupe(items: string[]): string[] {
   return [...new Set(items)];
+}
+
+/** Max length of the target shown in a YOLO audit notice. */
+const YOLO_TARGET_MAX = 200;
+/** Max length of the permission KIND shown in a YOLO audit notice (the SDK could
+ *  introduce a long or hostile kind string; it is untrusted input like any other). */
+const YOLO_KIND_MAX = 40;
+
+/**
+ * A SHORT, bounded, sanitized descriptor of what a permission request targets,
+ * for the YOLO audit notice. Deliberately generic (YOLO covers every permission
+ * kind, including ones added by future SDK versions) and deliberately NOT a dump
+ * of the request: payload-bearing fields (file contents, diffs, MCP arguments,
+ * memory facts) may be huge or sensitive, so only identifying fields are shown.
+ *
+ * Under YOLO this notice is the ONLY record of what was auto-approved, and both
+ * `kind` and the target are attacker-influenceable (a filename or command the
+ * model was steered into producing). Both are therefore sanitized for INLINE
+ * code — a stray backtick would close the span and let the rest render as
+ * markdown, which could forge a convincing fake audit line.
+ */
+function describePermissionTarget(r: Record<string, unknown>, kind: string): string {
+  const pick = (...keys: string[]): string => {
+    for (const k of keys) {
+      const v = r[k];
+      if (typeof v === "string" && v.trim().length > 0) return v.trim();
+    }
+    return "";
+  };
+  const safeKind = sanitizeForInlineCode(kind, YOLO_KIND_MAX) || "unknown";
+  const target =
+    kind === "shell"
+      ? pick("fullCommandText", "command")
+      : pick("path", "filePath", "file", "url", "uri", "tool", "toolName", "server", "name");
+  if (!target) return `\`${safeKind}\``;
+  return `\`${safeKind}\`: \`${sanitizeForInlineCode(target, YOLO_TARGET_MAX)}\``;
 }
 
 /** Pull parsed command identifiers (e.g. ["git"]) from a shell permission

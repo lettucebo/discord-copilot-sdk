@@ -105,6 +105,45 @@ export function decisionBindsToChannel(
 }
 
 /**
+ * Apply a `/yolo` toggle with the ack-before-allow invariant (same rule as
+ * `resolveButtonAck`): turning the guard OFF (`on === true`, i.e. enabling
+ * blanket approval) happens only after Discord has ACKNOWLEDGED the warning, so
+ * a failed reply can never leave a session silently unguarded. Turning YOLO off
+ * is applied FIRST, because failing to confirm that must still be safe.
+ *
+ * Interaction handlers run concurrently, so the deferred enable is also FENCED:
+ * the toggle epoch is snapshotted before the ack and the enable is dropped if
+ * anything toggled meanwhile. Without it, `/yolo on` (slow ack) racing a
+ * `/yolo off` could land AFTER the off, leaving the operator staring at an "OFF"
+ * confirmation while permissions are auto-approved.
+ *
+ * Returns whether YOLO ended up enabled by this call.
+ */
+export interface YoloControl {
+  /** Current toggle epoch (bumped by every toggle). */
+  epoch: () => number;
+  /** Disable immediately (also bumps the epoch). */
+  disable: () => void;
+  /** Enable iff `epoch` is still current; returns whether it applied. */
+  enableIfCurrent: (epoch: number) => boolean;
+}
+
+export async function applyYoloToggle(
+  on: boolean,
+  ack: () => Promise<unknown>,
+  ctl: YoloControl
+): Promise<boolean> {
+  if (!on) {
+    ctl.disable(); // safe direction: apply immediately, confirm best-effort
+    await ack().catch(() => {});
+    return false;
+  }
+  const epoch = ctl.epoch(); // snapshot BEFORE awaiting Discord
+  await ack(); // throws ⇒ YOLO stays OFF (fail-safe)
+  return ctl.enableIfCurrent(epoch); // superseded by a later toggle ⇒ no-op
+}
+
+/**
  * Composition root: owns the single-instance lock, the Copilot SDK client, the
  * Discord gateway connection, and the per-thread SessionActor map. Wires the
  * three input surfaces (slash commands, thread messages, permission buttons)
@@ -332,6 +371,17 @@ export class DiscopilotApp {
         .setName("todos")
         .setDescription("Show the agent's current todo checklist")
         .toJSON(),
+      new SlashCommandBuilder()
+        .setName("yolo")
+        .setDescription("⚠️ Auto-approve EVERY permission in this session (no prompts)")
+        .addStringOption((o) =>
+          o
+            .setName("mode")
+            .setDescription("Turn blanket auto-approval on or off")
+            .setRequired(true)
+            .addChoices({ name: "on", value: "on" }, { name: "off", value: "off" })
+        )
+        .toJSON(),
     ];
     // Register in the AUTHORIZED guild so command availability matches the auth
     // policy (DEV_GUILD_ID is intentionally not used here to avoid registering
@@ -369,6 +419,7 @@ export class DiscopilotApp {
         else if (c === "approvals") await this.cmdApprovals(interaction);
         else if (c === "diff") await this.cmdDiff(interaction);
         else if (c === "todos") await this.cmdTodos(interaction);
+        else if (c === "yolo") await this.cmdYolo(interaction);
       }
     } catch (err) {
       console.error("interaction error:", err);
@@ -705,7 +756,8 @@ export class DiscopilotApp {
       .notice(
         rec.threadId,
         "♻️ 已從重啟復原此對話（歷史保留）。上一個回合已中斷且**不會自動續跑**；" +
-          "先前若有指令可能已部分或完全執行，請先確認 repo／程序狀態，再決定是否重送。"
+          "先前若有指令可能已部分或完全執行，請先確認 repo／程序狀態，再決定是否重送。" +
+          "\n🛡️ YOLO 模式已重置為 **OFF**（不會跨重啟保留）。"
       )
       .catch(() => {});
   }
@@ -855,12 +907,62 @@ export class DiscopilotApp {
     }
     const u = session.actor.usage();
     const c = session.actor.config();
+    const yolo = session.actor.isYolo() ? "\n⚡ **YOLO: ON** — every permission is auto-approved (`/yolo mode:off`)" : "";
     const header = `model=\`${c.model ?? "?"}\` effort=\`${c.effort ?? "default"}\` context=\`${c.context ?? "default"}\``;
     const pct = u && u.tokenLimit > 0 ? Math.round((u.currentTokens / u.tokenLimit) * 100) : undefined;
     const body = u
       ? `\ntokens: ${u.currentTokens.toLocaleString()} / ${u.tokenLimit.toLocaleString()}${pct !== undefined ? ` (${pct}%)` : ""}`
       : "\n(no usage reported yet — send a message first)";
-    await interaction.reply({ content: header + body, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: header + body + yolo, flags: MessageFlags.Ephemeral });
+  }
+
+  /** `/yolo on|off` — blanket permission auto-approval for THIS session.
+   *
+   *  Safety ordering mirrors the ack-before-allow invariant used for buttons:
+   *  turning YOLO **on** happens only AFTER Discord has acknowledged the reply,
+   *  so a failed reply can never leave the session silently unguarded. Turning
+   *  it **off** happens FIRST, because a failure there must still be safe. */
+  private async cmdYolo(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isAuthorized(ctxOf(interaction), this.policy)) {
+      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const session = this.sessions.get(interaction.channelId);
+    if (!session) {
+      await interaction.reply({
+        content: "Run this inside a session thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const on = interaction.options.getString("mode", true) === "on";
+    const warning =
+      "⚠️ **YOLO ON for this thread** — every permission request is auto-approved with **no prompt**, " +
+      "including file writes and other kinds that are normally refused. Tools run as your OS user with no sandbox.\n" +
+      "• Any approval card already waiting still needs your decision.\n" +
+      "• This is **not** persisted: a restart or session recovery resets it to OFF.\n" +
+      "• Turn it off with `/yolo mode:off`.";
+    await applyYoloToggle(
+      on,
+      () =>
+        interaction.reply({
+          content: on ? warning : "🛡️ YOLO **OFF** — permissions will prompt again.",
+          flags: MessageFlags.Ephemeral,
+        }),
+      {
+        epoch: () => session.actor.yoloEpochValue(),
+        disable: () => session.actor.setYolo(false),
+        enableIfCurrent: (e) => session.actor.enableYoloIfCurrent(e),
+      }
+    ).then(async (enabled) => {
+      // Only announce when the enable actually took effect (a concurrent
+      // `/yolo off` may have superseded it).
+      if (enabled) {
+        await this.transport
+          .notice(interaction.channelId, "⚡ **YOLO mode ON** — permissions are now auto-approved for this session.")
+          .catch(() => {});
+      }
+    });
   }
 
   private async cmdApprovals(interaction: ChatInputCommandInteraction): Promise<void> {
