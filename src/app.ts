@@ -27,7 +27,7 @@ import { planReconcile, classifyResumeError, type ThreadStatus } from "./core/re
 import { randomUUID } from "node:crypto";
 
 import { sendUnlessAborted } from "./core/turn-gate.js";
-import { shouldResetEffort, validateEffort } from "./core/effort.js";
+import { shouldResetEffort, validateEffort, EFFORT_LEVELS } from "./core/effort.js";
 import { createCopilotClient, checkSdkCompat } from "./copilot/sdk.js";
 import { PendingInteractionBroker, type PendingView } from "./core/broker.js";
 import { SessionActor, type BlobAttachment, formatTodos } from "./copilot/session-actor.js";
@@ -325,14 +325,9 @@ export class DiscopilotApp {
         .addStringOption((o) =>
           o
             .setName("level")
-            .setDescription("Reasoning effort")
+            .setDescription("Reasoning effort (validated against the current model)")
             .setRequired(true)
-            .addChoices(
-              { name: "low", value: "low" },
-              { name: "medium", value: "medium" },
-              { name: "high", value: "high" },
-              { name: "xhigh", value: "xhigh" }
-            )
+            .addChoices(...EFFORT_LEVELS.map((l) => ({ name: l, value: l })))
         )
         .toJSON(),
       new SlashCommandBuilder()

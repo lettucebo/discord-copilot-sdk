@@ -28,6 +28,22 @@ export function shouldResetEffort(
 
 export type EffortValidation = { ok: true } | { ok: false; message: string };
 
+/**
+ * The reasoning-effort levels offered by `/effort`, ascending.
+ *
+ * Discord slash-command choices are STATIC (fixed at registration) while the
+ * supported set is PER MODEL, so this must be the UNION of everything the
+ * runtime can accept — otherwise a level is simply unreachable from Discord.
+ * Verified against `listModels()` on 2026-07-28 (20 models): `max` (claude
+ * sonnet/opus, gpt-5.6-*), `none` (gpt-5.x) and `minimal` (gemini-3.5-flash)
+ * were all missing from the original low/medium/high/xhigh list, so e.g. the
+ * default model claude-sonnet-5 could not be set to its highest effort.
+ *
+ * Offering a level a given model doesn't support is harmless: `validateEffort`
+ * rejects it with the model's actual supported list before anything is sent.
+ */
+export const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
 /** Validate a requested effort `level` against the current model's supported
  *  set. Unknown model (undefined) → allowed (lenient). Known-but-empty → the
  *  model has no reasoning effort. Known non-empty → must include the level. */
