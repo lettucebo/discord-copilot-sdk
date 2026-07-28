@@ -61,5 +61,18 @@ function cleanLine(line: string): string {
 }
 
 function truncate(s: string, max: number): string {
-  return s.length <= max ? s : s.slice(0, max - 1) + "…";
+  if (s.length <= max) return s;
+  // Cut on CODE POINTS, not UTF-16 units: splitting a surrogate pair leaves a
+  // lone surrogate, and `threads.create()` rejects such a name on a path with no
+  // local catch (cmdNew), leaving the deferred ephemeral reply hanging forever.
+  // Then shrink until the UTF-16 length also fits, because it is not documented
+  // which unit Discord counts and the stricter reading costs at most a character.
+  const points = [...s];
+  let take = Math.min(points.length, max - 1);
+  let out = points.slice(0, take).join("") + "…";
+  while (out.length > max && take > 0) {
+    take--;
+    out = points.slice(0, take).join("") + "…";
+  }
+  return out;
 }

@@ -711,6 +711,36 @@ export class SessionActor {
     await (this.session as unknown as { send(o: Record<string, unknown>): Promise<unknown> }).send(payload);
   }
 
+  /**
+   * Inject a prompt into the turn that is ALREADY running ("steer").
+   *
+   * Uses the runtime's `mode: "immediate"` delivery. Measured behaviour
+   * (2026-07-28, probes):
+   * - during a TOOL LOOP it lands at the next tool boundary and genuinely
+   *   redirects the agent (a run of 8 sequential commands stopped after 4);
+   * - during a single long generation it does NOT interrupt — it runs straight
+   *   after, which is the best achievable without discarding in-flight work;
+   * - it jumps ahead of anything already queued in the runtime;
+   * - the whole busy period still emits exactly ONE `session.idle`, so the
+   *   original `runTurn` keeps waiting and no second turn must be started.
+   *
+   * Unlike `send()` this must NOT clear `aborting`: a steer racing a `/stop`
+   * has to lose. It also seals the current render block so the agent's output
+   * after the steer starts a NEW message below the user's, instead of being
+   * edited into the message that was already in flight.
+   */
+  async steer(prompt: string, attachments: BlobAttachment[] = []): Promise<void> {
+    if (this.lifecycle !== "active") {
+      throw new Error(`session is ${this.lifecycle} and cannot accept new prompts`);
+    }
+    if (this.aborting) throw new Error("session is aborting; steering is not available");
+    await this.beginInteractionCard(); // flush + reset the render block
+    const payload: Record<string, unknown> = { prompt, mode: "immediate" };
+    if (attachments.length) payload["attachments"] = attachments;
+    await (this.session as unknown as { send(o: Record<string, unknown>): Promise<unknown> }).send(payload);
+    this.refreshWatchdog();
+  }
+
   /** Read the agent's current todos. Returns `undefined` when the read FAILED
    *  (RPC error / namespace absent), which the caller must not present as "no
    *  todos" — an empty list and a broken read are different answers, and quietly
@@ -793,23 +823,41 @@ export class SessionActor {
         settled = true;
         clearTimeout(wd);
         clearTimeout(hard);
+        this.refreshWatchdog = () => {};
         resolve(r);
       };
       void idle.then(() => done(watchdogFired ? "watchdog" : "idle"));
-      wd = setTimeout(() => {
-        watchdogFired = true;
-        void this.stop(); // abort; expect session.idle to follow
-      }, watchdogMs);
-      hard = setTimeout(() => {
-        // Permanently fault the actor (it will refuse new turns) and best-effort
-        // destroy the runtime session, but never let a hung disconnect RPC keep
-        // the turn pending — cap it and resolve "faulted" regardless.
-        void this.markFaulted().finally(() => done("faulted"));
-      }, watchdogMs + FAULT_GRACE_MS);
-      (wd as { unref?: () => void }).unref?.();
-      (hard as { unref?: () => void }).unref?.();
+      const arm = (): void => {
+        wd = setTimeout(() => {
+          watchdogFired = true;
+          void this.stop(); // abort; expect session.idle to follow
+        }, watchdogMs);
+        hard = setTimeout(() => {
+          // Permanently fault the actor (it will refuse new turns) and best-effort
+          // destroy the runtime session, but never let a hung disconnect RPC keep
+          // the turn pending — cap it and resolve "faulted" regardless.
+          void this.markFaulted().finally(() => done("faulted"));
+        }, watchdogMs + FAULT_GRACE_MS);
+        (wd as { unref?: () => void }).unref?.();
+        (hard as { unref?: () => void }).unref?.();
+      };
+      // A steer extends the same busy period (the runtime emits ONE idle for all
+      // of it), so without restarting the clock a prompt injected late in a long
+      // turn could be killed by a watchdog that started before the user asked
+      // for it. Cleared on settle by `done`.
+      this.refreshWatchdog = () => {
+        if (settled) return;
+        clearTimeout(wd);
+        clearTimeout(hard);
+        arm();
+      };
+      arm();
     });
   }
+
+  /** Restart the running turn's watchdog, if there is one. Replaced for the
+   *  lifetime of each `awaitTurnEnd`; a no-op when no turn is in flight. */
+  private refreshWatchdog: () => void = () => {};
 
   /** A promise that resolves the next time the session goes idle. */
   private nextIdle(): Promise<void> {

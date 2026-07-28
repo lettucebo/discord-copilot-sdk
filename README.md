@@ -38,6 +38,8 @@ Mitigations that **are** in place:
   ("`resolvedByHook`") a command behind your back. `skipCustomInstructions` is also set —
   the SDK loads `AGENTS.md` / `.github/copilot-instructions.md` *regardless* of
   `enableConfigDiscovery`, so without it a repo could still ship standing instructions.
+  This stops the agent being **configured** by the repo; it is not a claim that repo
+  *content* can't influence it (file contents and tool output still reach the model).
 - **Spoofing-resistant cards**: the command is shown escaped (no markdown/code-fence breakout),
   commands containing bidirectional/control characters are auto-denied, and an over-long command
   is auto-denied rather than shown partially.
@@ -104,14 +106,32 @@ npm run dev
 
 Each `/new` opens a thread. Its name is generated from your first message by a
 small, cheap model (`gemini-3.5-flash` by default) running in a **throwaway
-session**, so a long first prompt still becomes a short, readable name and your
-own session's history/context is never touched. `/rename title:…` overrides it;
-`TITLE_MODEL=off` disables the titler and falls back to a truncated first line.
+session with no tools**, so a long first prompt still becomes a short, readable
+name and your own session's history/context is never touched. `/rename title:…`
+overrides it; `TITLE_MODEL=off` disables the titler and falls back to a
+truncated first line.
 
 There is deliberately no `#001` ordinal: Discord already orders a channel's
-threads by creation (verified — posting the newest message into an older thread
-does not move it above a newer one), so a number would only consume sidebar
-width.
+threads by creation (verified on the desktop client — posting the newest message
+into an older thread does not move it above a newer one), so a number would only
+consume sidebar width.
+
+## Steering and queueing
+
+A plain message sent **while a turn is running** *steers* that turn rather than
+being dropped. It is delivered with the runtime's `mode: "immediate"`, which
+lands at the next tool-call boundary — measured: a run of eight sequential
+commands stopped after four and followed the new instruction. During a single
+long generation there is no boundary to land on, so it runs immediately after
+instead; nothing in-flight is thrown away either way.
+
+`/queue message:…` holds a prompt until the current turn finishes, then runs it
+(`/queue` alone lists what's pending, `/queue clear:true` empties it). The queue
+is kept **inside discopilot**, not handed to the runtime's own queue: an
+`abort()` does *not* drain the runtime queue (a queued message still ran after
+one), so `/stop` could not have honestly stopped it. As it is, `/stop` drops the
+queue and says how many it discarded. The queue is volatile — a restart forgets
+it — and capped at 10.
 
 ## License
 

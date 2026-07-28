@@ -24,6 +24,18 @@ describe("deriveThreadTitle", () => {
     expect(t.length).toBeLessThanOrEqual(THREAD_NAME_MAX);
   });
 
+  it("never truncates through a surrogate pair (a lone surrogate makes Discord reject the name)", () => {
+    // The rejection surfaces on cmdNew's threads.create(), which has no local
+    // catch — the deferred ephemeral reply would hang forever.
+    for (let pad = 90; pad <= 104; pad++) {
+      const t = deriveThreadTitle("a".repeat(pad) + "😀" + "b".repeat(20));
+      expect(t.length).toBeLessThanOrEqual(THREAD_NAME_MAX);
+      // isWellFormed() is ES2024; fall back to a manual lone-surrogate scan.
+      const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(t);
+      expect(lone, `pad=${pad} produced a lone surrogate: ${JSON.stringify(t)}`).toBe(false);
+    }
+  });
+
   it("returns empty for a prompt with no usable text so the caller can fall back", () => {
     expect(deriveThreadTitle("")).toBe("");
     expect(deriveThreadTitle("   \n\n  ")).toBe("");

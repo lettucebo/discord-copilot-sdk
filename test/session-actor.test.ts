@@ -39,8 +39,11 @@ class FakeSession {
     this.handlers.get(ev)?.(e);
   }
   turnInFlight = false;
+  /** Full option objects handed to the SDK, so a test can assert `mode`. */
+  sentOptions: Array<Record<string, unknown>> = [];
   async send(o: { prompt: string }): Promise<void> {
     this.sent.push(o.prompt);
+    this.sentOptions.push({ ...o });
     this.turnInFlight = true;
   }
   async setModel(model: string, options?: unknown): Promise<void> {
@@ -542,6 +545,34 @@ describe("SessionActor abort + teardown", () => {
     expect(await perm(s)({ kind: "shell", fullCommandText: "git status" })).toEqual({
       kind: "user-not-available",
     });
+  });
+
+  it("steer() injects into the RUNNING turn with mode:immediate and seals the render block", async () => {
+    // Measured against the real runtime (2026-07-28): mode:"immediate" lands at
+    // the next tool boundary and genuinely redirects a tool loop, jumps ahead of
+    // anything already queued, and the whole busy period still emits ONE idle —
+    // so the original runTurn keeps waiting and no second turn is started.
+    const s = await setup();
+    await s.actor.send("long job");
+    await s.actor.steer("actually, do this instead");
+    expect(s.session.sentOptions.at(-1)).toEqual({ prompt: "actually, do this instead", mode: "immediate" });
+  });
+
+  it("steer() refuses while aborting, so a steer racing /stop always loses", async () => {
+    const s = await setup();
+    await s.actor.send("long job");
+    s.session.abort = async (): Promise<void> => {
+      s.session.aborted++; // no idle yet — still tearing down
+    };
+    await s.actor.stop();
+    await expect(s.actor.steer("sneak this in")).rejects.toThrow(/aborting/);
+    expect(s.session.sent).not.toContain("sneak this in");
+  });
+
+  it("steer() refuses on a closed session", async () => {
+    const s = await setup();
+    await s.actor.disconnect();
+    await expect(s.actor.steer("hi")).rejects.toThrow(/closed|faulted/);
   });
 
   it("disconnect() unsubscribes the decision handler and disconnects", async () => {

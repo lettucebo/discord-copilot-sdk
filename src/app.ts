@@ -39,7 +39,10 @@ import { decodePermissionId, decodeChoiceId, decodePlanId } from "./platforms/di
 import { isAuthorized, type AuthContext, type AuthPolicy } from "./platforms/discord/auth.js";
 import type { Decision, Transport } from "./core/transport.js";
 
-interface Session {
+/** One live Discord thread ↔ Copilot session. Exported so tests can build a
+ *  TYPED fixture — an untyped `as Record<string, unknown>` fixture is how a
+ *  missing field reaches runtime instead of the typechecker. */
+export interface Session {
   actor: SessionActor;
   broker: PendingInteractionBroker;
   running: boolean;
@@ -50,7 +53,29 @@ interface Session {
    *  first message, an explicit /rename, or because it is a RESUMED thread that
    *  was already named). Gates the one automatic rename per session. */
   titled: boolean;
+  /** Bumped by every explicit /rename. A titler that was already in flight
+   *  compares this before writing, so it can never clobber a name the operator
+   *  just chose. */
+  titleEpoch: number;
+  /** Prompts waiting to run after the current turn, added with `/queue`. Held
+   *  HERE and not in the runtime's own queue on purpose: `session.abort()` does
+   *  NOT drain the runtime queue (verified — a queued message still ran after an
+   *  abort), so `/stop` could not honestly stop anything we had pushed there. */
+  queue: string[];
 }
+
+/** The subset of an SDK session the throwaway titler uses. */
+interface TitlerSession {
+  sessionId?: string;
+  on(ev: string, h: (e: unknown) => void): void;
+  send(o: Record<string, unknown>): Promise<unknown>;
+  disconnect?: () => Promise<unknown>;
+}
+
+/** Most prompts `/queue` will hold. A queue is a convenience, not a job runner;
+ *  an unbounded one just defers a pile of work the operator has forgotten
+ *  about onto an unattended machine. */
+const QUEUE_MAX = 10;
 
 /** Milliseconds a single session teardown may take during /new before we give
  *  up on it (and keep it for a later retry) rather than stalling. */
@@ -410,6 +435,16 @@ export class DiscopilotApp {
           o.setName("title").setDescription("New title for this thread").setRequired(true)
         )
         .toJSON(),
+      new SlashCommandBuilder()
+        .setName("queue")
+        .setDescription("Queue a prompt to run after the current turn (a plain message steers instead)")
+        .addStringOption((o) =>
+          o.setName("message").setDescription("Prompt to run next").setRequired(false)
+        )
+        .addBooleanOption((o) =>
+          o.setName("clear").setDescription("Discard everything currently queued").setRequired(false)
+        )
+        .toJSON(),
     ];
     // Register in the AUTHORIZED guild so command availability matches the auth
     // policy (DEV_GUILD_ID is intentionally not used here to avoid registering
@@ -449,6 +484,7 @@ export class DiscopilotApp {
         else if (c === "todos") await this.cmdTodos(interaction);
         else if (c === "yolo") await this.cmdYolo(interaction);
         else if (c === "rename") await this.cmdRename(interaction);
+        else if (c === "queue") await this.cmdQueue(interaction);
       }
     } catch (err) {
       console.error("interaction error:", err);
@@ -671,20 +707,41 @@ export class DiscopilotApp {
           );
         } else {
           // Fence: keep the (maybe-live) actor registered so /new stays blocked.
-          this.sessions.set(thread.id, { actor, broker, running: false, titled: true });
+          this.sessions.set(thread.id, { actor, broker, running: false, titled: true, titleEpoch: 0, queue: [] });
           await interaction.editReply(
             "⚠️ 無法持久化 session 狀態，且無法確認前述 runtime 已關閉。已將其設為屏障以避免雙重 session——請重啟 bot。"
           );
         }
         return;
       }
-      this.sessions.set(thread.id, { actor, broker, running: false, titled: Boolean(promptOption) });
+      const session: Session = { actor, broker, running: false, titled: false, titleEpoch: 0, queue: [] };
+      this.sessions.set(thread.id, session);
       await interaction.editReply(`Started a session in <#${thread.id}>. Send prompts there.`);
 
-      if (promptOption) void this.runTurn(thread.id, promptOption).catch(() => {});
+      if (promptOption) {
+        // Title this the same way a first thread message is titled — the thread
+        // was created with the local heuristic so it is never nameless, and the
+        // model's shorter name replaces it a few seconds later.
+        this.startTitling(thread.id, session, promptOption);
+        void this.runTurn(thread.id, promptOption).catch(() => {});
+      }
     } finally {
       this.creating = false;
     }
+  }
+
+  /** Fire the one-shot thread titler for `text`, fenced so it can never run
+   *  twice or overwrite a later `/rename`. Fire-and-forget by design: naming is
+   *  cosmetic and must never delay or fail a turn. */
+  private startTitling(threadId: string, session: Session, text: string): void {
+    if (session.titled || !text) return;
+    session.titled = true;
+    const epoch = session.titleEpoch;
+    void this.titleThreadFromFirstMessage(
+      threadId,
+      text,
+      () => this.sessions.get(threadId) === session && session.titleEpoch === epoch
+    ).catch(() => {});
   }
 
   /** Rename a session thread. Never throws: a rename is cosmetic and must not
@@ -718,10 +775,19 @@ export class DiscopilotApp {
    * available, RPC error, timeout, junk reply), so a thread is never left
    * nameless and a turn is never blocked. Exactly ONE rename happens either way,
    * which keeps this clear of Discord's channel-rename rate limit.
+   *
+   * `epoch` fences the write: `/rename` bumps the session's title epoch, so an
+   * explicit name the operator just chose can never be overwritten seconds later
+   * by a titler that was already in flight.
    */
-  private async titleThreadFromFirstMessage(threadId: string, firstMessage: string): Promise<void> {
+  private async titleThreadFromFirstMessage(
+    threadId: string,
+    firstMessage: string,
+    isCurrent: () => boolean
+  ): Promise<void> {
     const heuristic = deriveThreadTitle(firstMessage);
     const generated = await this.generateTitle(firstMessage);
+    if (!isCurrent()) return; // superseded by /rename (or the session is gone)
     await this.retitleThread(threadId, generated || heuristic);
   }
 
@@ -729,57 +795,77 @@ export class DiscopilotApp {
    *  cosmetic and must never surface an error to the user. */
   private async generateTitle(firstMessage: string): Promise<string> {
     if (this.config.TITLE_MODEL === "off") return "";
-    const model = pickTitleModel(this.modelIds, this.config.TITLE_MODEL);
+    // Resolve against every model the runtime listed, NOT `modelIds` — that is
+    // truncated to Discord's 25-choice cap for the /model command, so a title
+    // model past index 24 would silently never be picked.
+    const model = pickTitleModel([...this.modelEfforts.keys()], this.config.TITLE_MODEL);
     if (!model) return "";
-    let sessionId: string | undefined;
+    // `withTimeout` does not cancel the underlying call, and the SDK registers
+    // the session in its client map before the create RPC — so a create that
+    // lands AFTER we gave up would otherwise be live in the runtime with no
+    // reference to it anywhere here (a permanent leak, once per timed-out
+    // title). Attach the salvage ONLY on the timeout path: a flag checked inside
+    // a handler attached up front is racy, because that handler runs before the
+    // `await` continuation that would have set it — which disposes the session
+    // the instant it is created.
+    const creating = this.copilot.createSession({
+      workingDirectory: this.repoPath,
+      model,
+      streaming: false,
+      // The titler reads ONE string and must never touch the machine. Denying
+      // permissions is NOT enough: only tools that ASK are stopped that way, and
+      // the default (copilot-cli) tool set is ambient. `availableTools: []`
+      // leaves it with no tools at all — verified against the runtime: 0 tool
+      // invocations and 0 permission requests, vs glob/view/powershell by
+      // default.
+      availableTools: [],
+      enableFileHooks: false,
+      enableConfigDiscovery: false,
+      enableSkills: false,
+      skipCustomInstructions: true,
+      onPermissionRequest: () => ({ kind: "user-not-available" }),
+    } as never) as unknown as Promise<TitlerSession>;
     try {
-      const session = (await withTimeout(
-        this.copilot.createSession({
-          workingDirectory: this.repoPath,
-          model,
-          streaming: false,
-          // Same trust hardening as a real session, plus: the titler reads ONE
-          // string and must never touch the machine, so every permission is
-          // refused outright rather than surfaced anywhere.
-          enableFileHooks: false,
-          enableConfigDiscovery: false,
-          enableSkills: false,
-          skipCustomInstructions: true,
-          onPermissionRequest: () => ({ kind: "user-not-available" }),
-        } as never) as Promise<unknown>,
-        TITLE_TIMEOUT_MS
-      )) as {
-        sessionId?: string;
-        on(ev: string, h: (e: unknown) => void): void;
-        send(o: Record<string, unknown>): Promise<unknown>;
-        disconnect?: () => Promise<unknown>;
-      };
-      sessionId = session.sessionId;
-      let text = "";
-      session.on("assistant.message", (e) => {
-        const d = (e as { data?: Record<string, unknown> })?.data ?? {};
-        const c = d["content"] ?? d["text"];
-        if (typeof c === "string" && c.trim()) text = c;
+      const session = await withTimeout(creating, TITLE_TIMEOUT_MS).catch((err: unknown) => {
+        void creating.then(
+          (s) => this.disposeTitler(s),
+          () => {}
+        );
+        throw err;
       });
-      const idle = new Promise<void>((resolve) => session.on("session.idle", () => resolve()));
-      await session.send({ prompt: buildTitlePrompt(firstMessage) });
-      await withTimeout(idle, TITLE_TIMEOUT_MS);
-      await session.disconnect?.().catch(() => {});
-      return cleanModelTitle(text);
+      try {
+        let text = "";
+        session.on("assistant.message", (e) => {
+          const d = (e as { data?: Record<string, unknown> })?.data ?? {};
+          const c = d["content"] ?? d["text"];
+          if (typeof c === "string" && c.trim()) text = c;
+        });
+        const idle = new Promise<void>((resolve) => session.on("session.idle", () => resolve()));
+        await session.send({ prompt: buildTitlePrompt(firstMessage) });
+        await withTimeout(idle, TITLE_TIMEOUT_MS);
+        return cleanModelTitle(text);
+      } finally {
+        await this.disposeTitler(session);
+      }
     } catch (err) {
       console.warn(`⚠️  title model failed: ${err instanceof Error ? err.message : err}`);
       return "";
-    } finally {
-      // Don't leave a throwaway session behind in the runtime's session list.
-      if (sessionId) {
-        await withTimeout(
-          ((this.copilot as unknown as { deleteSession?: (id: string) => Promise<unknown> }).deleteSession?.(
-            sessionId
-          ) ?? Promise.resolve()) as Promise<unknown>,
-          TEARDOWN_TIMEOUT_MS
-        ).catch(() => {});
-      }
     }
+  }
+
+  /** Tear a throwaway titler session down: disconnect (releases handlers and
+   *  stops any still-running turn) then delete it from the runtime's session
+   *  list. Both bounded, both best effort — a titler must never be able to stall
+   *  or fail anything. */
+  private async disposeTitler(session: TitlerSession): Promise<void> {
+    await withTimeout(session.disconnect?.() ?? Promise.resolve(), TEARDOWN_TIMEOUT_MS).catch(() => {});
+    const id = session.sessionId;
+    if (!id) return;
+    await withTimeout(
+      ((this.copilot as unknown as { deleteSession?: (i: string) => Promise<unknown> }).deleteSession?.(id) ??
+        Promise.resolve()) as Promise<unknown>,
+      TEARDOWN_TIMEOUT_MS
+    ).catch(() => {});
   }
 
   /** Reconcile the persisted session on startup (P2). Runs while `phase` is
@@ -889,7 +975,7 @@ export class DiscopilotApp {
     }
     // A resumed thread was already named by the run that created it — never
     // re-title it from whatever the user happens to type first after a restart.
-    this.sessions.set(rec.threadId, { actor, broker, running: false, titled: true });
+    this.sessions.set(rec.threadId, { actor, broker, running: false, titled: true, titleEpoch: 0, queue: [] });
     this.store.commit(); // keep active, refresh updatedAt
     await this.transport
       .notice(
@@ -970,9 +1056,17 @@ export class DiscopilotApp {
     // operator sees "the application did not respond" with no idea whether the
     // abort landed.
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    // Drop anything queued FIRST, so a slow abort can't let drainQueue start the
+    // next prompt while the operator is watching this one stop. "Stop" has to
+    // mean the session goes quiet, not "stop this one and start the next".
+    const dropped = session.queue.length;
+    session.queue = [];
     const ok = await this.stopSession(session);
+    const tail = dropped ? ` 已同時丟棄佇列中的 ${dropped} 則。` : "";
     await interaction.editReply({
-      content: ok ? "Abort requested for the current turn." : "Abort attempted but the runtime reported an error.",
+      content:
+        (ok ? "Abort requested for the current turn." : "Abort attempted but the runtime reported an error.") +
+        tail,
     });
   }
 
@@ -1209,11 +1303,69 @@ export class DiscopilotApp {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const ok = await this.retitleThread(interaction.channelId, title);
     // An explicit rename also counts as "titled" either way, so a later first
-    // message can't silently overwrite what the operator just chose.
+    // message can't silently overwrite what the operator just chose — and the
+    // epoch bump invalidates a titler that is ALREADY in flight, which would
+    // otherwise land seconds later and undo this.
     session.titled = true;
+    session.titleEpoch++;
     await interaction.editReply({
       content: ok ? `已改名為 **${title}**。` : "⚠️ 改名失敗（權限或 Discord 速率限制）。稍後再試。",
     });
+  }
+
+  /**
+   * `/queue` — hold a prompt until the current turn finishes.
+   *
+   * The queue lives HERE, not in the runtime. The SDK does offer
+   * `send({mode:"enqueue"})`, but `session.abort()` does NOT drain the runtime's
+   * queue (verified: a queued message still ran after an abort), which would
+   * make `/stop` a lie. Holding it locally keeps "stop means stop".
+   *
+   * Volatile by design, like YOLO: a restart drops the queue rather than
+   * resurrecting work the operator has long forgotten about.
+   */
+  private async cmdQueue(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isAuthorized(ctxOf(interaction), this.policy)) {
+      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const session = this.sessions.get(interaction.channelId);
+    if (!session) {
+      await interaction.reply({ content: "Run this inside a session thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const reply = (content: string): Promise<unknown> =>
+      interaction.reply({ content, flags: MessageFlags.Ephemeral });
+
+    if (interaction.options.getBoolean("clear")) {
+      const n = session.queue.length;
+      session.queue = [];
+      await reply(n ? `🗑️ 已清空佇列（丟棄 ${n} 則）。` : "佇列本來就是空的。");
+      return;
+    }
+    const text = (interaction.options.getString("message") ?? "").trim();
+    if (!text) {
+      // No message + no clear = show what's pending.
+      if (!session.queue.length) await reply("佇列是空的。用 `/queue message:…` 排入下一則。");
+      else {
+        const list = session.queue.map((q, i) => `${i + 1}. ${q.slice(0, 120)}`).join("\n");
+        await reply(`📋 佇列中的 ${session.queue.length} 則（重啟不保留）：\n${list}`.slice(0, 1900));
+      }
+      return;
+    }
+    if (session.queue.length >= QUEUE_MAX) {
+      await reply(`⚠️ 佇列已滿（上限 ${QUEUE_MAX} 則）。先讓它跑完，或用 \`/queue clear:true\` 清空。`);
+      return;
+    }
+    session.queue.push(text);
+    if (!session.running) {
+      // Nothing to wait for — reply first (the interaction token is short), then
+      // start it. drainQueue is the single place a queued item is consumed.
+      await reply("▶️ 目前沒有在執行，直接開始這一則。");
+      void this.drainQueue(interaction.channelId).catch(() => {});
+      return;
+    }
+    await reply(`📥 已排入佇列（第 ${session.queue.length} 位，會在目前回合結束後執行）。`);
   }
 
   // ---- input surface: thread messages -----------------------------------
@@ -1253,15 +1405,8 @@ export class DiscopilotApp {
       );
       return;
     }
-    // Name the thread after its first real prompt, exactly once. Fire-and-forget:
-    // Discord rate-limits channel renames and discord.js QUEUES rather than
-    // rejecting, so awaiting this could stall a turn behind a rename bucket. The
-    // flag is set before the async call so a fast second message can't queue a
-    // second rename.
-    if (!session.titled && text) {
-      session.titled = true;
-      void this.titleThreadFromFirstMessage(message.channelId, text);
-    }
+    // Name the thread after its first real prompt, exactly once.
+    this.startTitling(message.channelId, session, text);
     // Reserve the turn (via the running guard in runTurn) BEFORE any network I/O,
     // so image downloads serialize with message arrival and two quick image
     // messages can't reorder. The download happens inside runTurn.
@@ -1342,12 +1487,27 @@ export class DiscopilotApp {
       return;
     }
     if (session.running) {
-      // Say it is DISCARDED. "Please wait" reads like a queue, so the operator
-      // walks away expecting their prompt to run next — it never will.
-      await this.transport.notice(
-        threadId,
-        "⏳ 上一則訊息還在處理中，**這則已被略過（不會排隊）**。等回覆完成後請重送，或用 `/stop` 中止目前的回合。"
-      );
+      // A message arriving mid-turn STEERS the running turn rather than being
+      // dropped. `mode: "immediate"` lands at the next tool boundary (measured:
+      // a run of 8 sequential commands stopped after 4) and jumps ahead of
+      // anything already queued; during a single long generation it runs
+      // straight after instead, which is the best achievable without throwing
+      // away in-flight work. Attachments are deliberately NOT downloaded here:
+      // steering must be immediate, and a slow download would defeat the point.
+      try {
+        await session.actor.steer(text);
+        await this.transport
+          .notice(threadId, "↪️ 已插入目前回合（steer）。工具執行到下一個段落時才會轉向。")
+          .catch(() => {});
+      } catch (err) {
+        await this.transport
+          .notice(
+            threadId,
+            `⚠️ 無法插入目前回合（${err instanceof Error ? err.message : String(err)}）。` +
+              "可用 `/queue` 排到這一輪之後，或 `/stop` 中止。"
+          )
+          .catch(() => {});
+      }
       return;
     }
     session.running = true;
@@ -1391,6 +1551,23 @@ export class DiscopilotApp {
       await this.transport.flush(threadId).catch(() => {});
       session.running = false;
     }
+    // Drain ONE queued prompt, outside the `finally` so a queued item can never
+    // interfere with this turn's cleanup, and one at a time so each drained turn
+    // gets the same guards (fault check, /stop, steering) as any other.
+    await this.drainQueue(threadId);
+  }
+
+  /** Start the next `/queue`d prompt, if any. `/stop` empties the queue, so a
+   *  stopped turn never resurrects work the operator asked to abandon. */
+  private async drainQueue(threadId: string): Promise<void> {
+    const session = this.sessions.get(threadId);
+    if (!session || session.running || session.queue.length === 0) return;
+    const next = session.queue.shift()!;
+    const left = session.queue.length;
+    await this.transport
+      .notice(threadId, `▶️ 開始執行佇列中的訊息${left ? `（還有 ${left} 則）` : ""}：\n> ${next.slice(0, 300)}`)
+      .catch(() => {});
+    await this.runTurn(threadId, next);
   }
 
   /** Tear down every live session. A cleanly-disconnected session is removed; a

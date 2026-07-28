@@ -65,11 +65,12 @@ export class ApprovalPolicy {
     const n = norm(executable);
     if (!n) return false;
     const list = this.repo[repoPath] ?? (this.repo[repoPath] = []);
-    if (!list.includes(n)) {
-      list.push(n);
-      return this.persist();
-    }
-    return true; // already present (and previously persisted)
+    if (!list.includes(n)) list.push(n);
+    // Persist unconditionally, including when the rule was already in memory: an
+    // EARLIER grant whose write failed leaves the entry present but not on disk,
+    // and returning true then would be exactly the false "it's remembered" this
+    // return value exists to prevent. A redundant write is cheap.
+    return this.persist();
   }
 
   /** Drop a session's in-memory approvals (on session teardown). */

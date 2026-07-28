@@ -107,6 +107,21 @@ describe("ApprovalPolicy", () => {
     expect(p.approveForRepo("/repo", "   ")).toBe(false); // nothing to record
   });
 
+  it("approveForRepo keeps reporting FALSE while the rule is in memory but not on disk", () => {
+    // Regression: the already-present branch used to return true unconditionally
+    // ("previously persisted"), which is exactly wrong after a FIRST grant whose
+    // write failed — the rule is live for this process only, and the second call
+    // would claim it is remembered across restarts.
+    const dir = mkdtempSync(join(tmpdir(), "dp-approve-repeat-"));
+    try {
+      const p = new ApprovalPolicy(dir);
+      expect(p.approveForRepo("/repo", "npm")).toBe(false);
+      expect(p.approveForRepo("/repo", "npm")).toBe(false);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
   it("clearRepo RETRIES persistence after a transient failure (no false success)", () => {
     // Regression: a first clear that fails to write must not let a SECOND clear
     // report success while the old rules still sit on disk. clearRepo always

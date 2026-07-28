@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { DiscopilotApp } from "../src/app.js";
+import { DiscopilotApp, type Session } from "../src/app.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Transport } from "../src/core/transport.js";
 
@@ -106,11 +106,20 @@ function imageMessage(url: string): unknown {
   return { channelId: "thread-1", attachments: new Map([["a", att]]) };
 }
 
-function buildAppWithSession(): { app: DiscopilotApp; actor: FakeActor; transport: FakeTransport; session: Record<string, unknown> } {
+function buildAppWithSession(): { app: DiscopilotApp; actor: FakeActor; transport: FakeTransport; session: Session } {
   const transport = new FakeTransport();
   const app = DiscopilotApp.createForTest(cfg, "C:\\repo", fakeCopilot, transport);
   const actor = new FakeActor();
-  const session = { actor, broker: {}, running: false } as Record<string, unknown>;
+  // Typed on purpose: a `Record<string, unknown>` fixture silently drifts from
+  // the real Session shape and fails at runtime instead of at typecheck.
+  const session: Session = {
+    actor: actor as unknown as Session["actor"],
+    broker: {} as unknown as Session["broker"],
+    running: false,
+    titled: true,
+    titleEpoch: 0,
+    queue: [],
+  };
   (app as unknown as { sessions: Map<string, unknown> }).sessions.set("thread-1", session);
   return { app, actor, transport, session };
 }
@@ -127,7 +136,7 @@ describe("/stop during image download (app-level wiring)", () => {
 
     const p = runTurn("thread-1", "幫我看這張圖", imageMessage(`${base}/hang`)); // has TEXT + hanging image
     await tick(); // let the fetch get in flight and currentAbort be installed
-    expect(session["currentAbort"]).toBeInstanceOf(AbortController);
+    expect(session.currentAbort).toBeInstanceOf(AbortController);
 
     await stopSession(session); // the real /stop core: abort + actor.stop()
     await p;
@@ -137,8 +146,8 @@ describe("/stop during image download (app-level wiring)", () => {
     expect(actor.runTurnCalls.length).toBe(0); // agent turn NEVER started
     expect(actor.stopCalls).toBe(1); // /stop reached the actor
     expect(transport.notices.some((n) => n.includes("取消"))).toBe(true);
-    expect(session["running"]).toBe(false); // running cleared
-    expect(session["currentAbort"]).toBeUndefined(); // controller cleared
+    expect(session.running).toBe(false); // running cleared
+    expect(session.currentAbort).toBeUndefined(); // controller cleared
   });
 
   it("starts the agent turn normally when NOT stopped", async () => {
