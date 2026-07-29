@@ -156,6 +156,33 @@ export function approvalScopeKeys(liveSessionKeys: Iterable<string>): string[] {
 }
 
 /**
+ * Whether a message arrived in a thread WE created under the configured parent
+ * channel — i.e. a thread that once carried a session and no longer does.
+ *
+ * `/new` ends the previous session (v1 runs one at a time), after which typing
+ * into the old thread did nothing at all: `onMessage` returned silently because
+ * there was no live session for that channel. The thread does carry a "this one
+ * has ended" notice from when it was superseded, but anything typed afterwards
+ * vanished with no explanation.
+ *
+ * Deliberately narrow, and fails closed on anything unknown: we only speak in
+ * threads the bot itself opened under the configured parent, never in the parent
+ * channel and never in the operator's own threads.
+ */
+export function isOurEndedThread(o: {
+  channelIsThread: boolean;
+  threadParentId?: string;
+  threadOwnerId?: string;
+  configuredParentChannelId: string;
+  botUserId?: string;
+}): boolean {
+  if (!o.channelIsThread) return false;
+  if (!o.threadParentId || o.threadParentId !== o.configuredParentChannelId) return false;
+  if (!o.botUserId || !o.threadOwnerId || o.threadOwnerId !== o.botUserId) return false;
+  return true;
+}
+
+/**
  * Apply a `/yolo` toggle with the ack-before-allow invariant (same rule as
  * `resolveButtonAck`): turning the guard OFF (`on === true`, i.e. enabling
  * blanket approval) happens only after Discord has ACKNOWLEDGED the warning, so
@@ -211,6 +238,10 @@ export class DiscordCopilotApp {
   private modelIds: string[] = [];
   private readonly modelEfforts = new Map<string, string[]>();
   private shuttingDown = false;
+  /** Threads already told their session is spent, so the courtesy notice is
+   *  posted once rather than on every message. Volatile: a restart may repeat it
+   *  once, which is harmless. */
+  private readonly endedHinted = new Set<string>();
   /** Serializes /new so two near-simultaneous creations can't both pass the
    *  "one live session" teardown and leave two live sessions. */
   private creating = false;
@@ -1373,7 +1404,10 @@ export class DiscordCopilotApp {
   private async onMessage(message: Message): Promise<void> {
     if (message.author.bot) return;
     const session = this.sessions.get(message.channelId);
-    if (!session) return; // not a session thread
+    if (!session) {
+      await this.hintEndedSession(message);
+      return; // not a live session thread
+    }
     if (!isAuthorized(ctxOf(message), this.policy)) return; // silent for non-owners
     // Startup gate, checked AFTER the thread+author checks so it can never spam
     // unrelated channels. resumeRecord registers the session and posts its
@@ -1411,6 +1445,40 @@ export class DiscordCopilotApp {
     // so image downloads serialize with message arrival and two quick image
     // messages can't reorder. The download happens inside runTurn.
     await this.runTurn(message.channelId, text, message);
+  }
+
+  /** Tell an authorized operator that the thread they just typed into is a spent
+   *  session, instead of silently swallowing the message. Once per thread per
+   *  process, and only in threads this bot opened under the configured parent —
+   *  see `isOurEndedThread`. Never throws: this is a courtesy, not a feature. */
+  private async hintEndedSession(message: Message): Promise<void> {
+    try {
+      if (this.endedHinted.has(message.channelId)) return;
+      if (!isAuthorized(ctxOf(message), this.policy)) return; // silent for non-owners
+      const ch = message.channel as unknown as {
+        isThread?: () => boolean;
+        parentId?: string | null;
+        ownerId?: string | null;
+      };
+      const ours = isOurEndedThread({
+        channelIsThread: ch.isThread?.() === true,
+        threadParentId: ch.parentId ?? undefined,
+        threadOwnerId: ch.ownerId ?? undefined,
+        configuredParentChannelId: this.config.DISCORD_PARENT_CHANNEL_ID,
+        botUserId: this.discord.user?.id,
+      });
+      if (!ours) return;
+      this.endedHinted.add(message.channelId);
+      await this.transport
+        .notice(
+          message.channelId,
+          "💤 這個討論串的 session 已經結束（v1 一次只跑一個 session，後來的 `/new` 會接手），訊息不會送出。" +
+            "請到最新的討論串繼續，或在父頻道用 `/new` 開一個新的。"
+        )
+        .catch(() => {});
+    } catch {
+      /* a courtesy notice must never affect message handling */
+    }
   }
 
   /** Download a message's image attachments as base64 blobs for the SDK. Only

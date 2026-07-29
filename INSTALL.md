@@ -16,6 +16,9 @@ The installer is **bilingual** (Traditional Chinese + English): it defaults to y
 - **GitHub Copilot CLI**（`copilot`）— 已用 `copilot` → `/login` 登入 / signed in via `copilot` then `/login`
 - 一個 **Discord bot token**、你的 **Discord user ID**、目標 **guild ID** 與 **父頻道 ID**（建議私密頻道）/ a Discord bot token, your user ID, the target guild ID, and a parent channel ID (private channel recommended)
 
+> 🤖 **還沒有 bot？** 請先看 [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) —— 建立 bot、開啟必要的 Message Content Intent、用正確權限邀請、取得上面四個值。
+> 🤖 **No bot yet?** Start with [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) — create the bot, enable the required Message Content Intent, invite it with the right permissions, and collect the four values above.
+
 > 安裝器可以幫你自動安裝 Node / git / Copilot CLI（Windows 用 winget、macOS 用 brew、Linux 用 apt/dnf）。
 > The installer can auto-install Node / git / Copilot CLI (winget on Windows, brew on macOS, apt/dnf on Linux).
 

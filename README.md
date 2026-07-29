@@ -116,6 +116,9 @@ Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-
 ## Quick start
 
 Full instructions (including the guided installer) are in [`INSTALL.md`](INSTALL.md).
+Setting up the Discord bot itself — application, the required Message Content
+intent, invite permissions, and the four IDs — is in
+[`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md).
 From a clone:
 
 ```bash
