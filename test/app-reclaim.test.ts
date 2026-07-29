@@ -38,6 +38,7 @@ class NullTransport implements Transport {
 
 let repo: string;
 let storeFile: string;
+let worktreeDir: string;
 
 const cfgFor = (r: string): Parameters<typeof DiscordCopilotApp.createForTest>[0] =>
   ({
@@ -65,6 +66,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // The worktree lives OUTSIDE `repo` (that is the point of a worktree), so
+  // removing the repo alone leaks a full checkout into the temp dir on every run.
+  if (worktreeDir) await fs.promises.rm(worktreeDir, { recursive: true, force: true }).catch(() => {});
   await fs.promises.rm(repo, { recursive: true, force: true }).catch(() => {});
   await fs.promises.rm(storeFile, { force: true }).catch(() => {});
 });
@@ -72,6 +76,7 @@ afterEach(async () => {
 /** A stopped session's record + a real worktree on its own branch. */
 async function seed(): Promise<{ app: DiscordCopilotApp; store: SessionStore; dir: string; branch: string }> {
   const dir = path.join(repo, "..", `${path.basename(repo)}-wt`);
+  worktreeDir = dir;
   const branch = "copilot/t-x";
   await addWorktree(repo, dir, branch);
   const store = new SessionStore(storeFile);
