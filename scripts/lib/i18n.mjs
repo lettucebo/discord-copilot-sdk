@@ -83,7 +83,8 @@ const MESSAGES = {
     residency247Pw: "該帳號的 Windows 密碼（輸入時不會顯示）：",
     residency247NoTty: "⚠️ 非互動模式無法安全詢問密碼，已改用「登入後保活」。要 24/7 請在互動終端機重跑並加 --residency-24x7。",
     residency247NoPw: "⚠️ 未輸入密碼，已改用「登入後保活」。",
-    residency247Mac: "⚠️ macOS 無法在登入前以你的身分執行（LaunchDaemon 會以 root 執行，Copilot 會是未登入狀態），因此僅設定為登入後保活。",
+    residency247Mac:
+      "⚠️ macOS 無法在登入前以你的身分執行（LaunchAgent 綁定登入，LaunchDaemon 會以 root 執行 agent 的指令），因此僅設定為登入後保活。",
     residencyWin247: "已註冊 Windows 排程工作（24/7，開機即啟動）：",
     residencyWin: "已註冊 Windows 排程工作（登入後保活）：",
     residencyMac: "已產生 launchd plist 並載入（僅登入後；未在真機驗證，實驗性）：",
@@ -148,7 +149,7 @@ const MESSAGES = {
       "⚠️ A password cannot be asked for safely in non-interactive mode; using login-keepalive instead. For 24/7, re-run in an interactive terminal with --residency-24x7.",
     residency247NoPw: "⚠️ No password entered; using login-keepalive instead.",
     residency247Mac:
-      "⚠️ macOS cannot run as you before login (a LaunchDaemon runs as root, leaving Copilot unauthenticated), so this is login-keepalive only.",
+      "⚠️ macOS cannot run as you before login (a LaunchAgent is login-bound; a LaunchDaemon would run the agent's shell commands as root), so this is login-keepalive only.",
     residencyWin247: "Registered Windows Scheduled Task (24/7, starts at boot): ",
     residencyWin: "Registered Windows Scheduled Task (login-keepalive): ",
     residencyMac: "Generated + loaded launchd plist (login-only; not verified on real hardware, experimental): ",

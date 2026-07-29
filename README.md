@@ -128,10 +128,14 @@ gh api repos/lettucebo/discord-copilot-sdk/contents/get.sh -H "Accept: applicati
 ```
 
 Append `-Residency24x7` / `--residency-24x7` to also install **true 24/7**
-residency (starts at boot, no login required). See the residency section of
-[`INSTALL.md`](INSTALL.md) for what that costs — on Windows it means the task has
-to hold your account password, because the Copilot CLI's login lives in your user
-profile and a service account would be unauthenticated.
+residency (starts at boot, no login required). On Windows that means the
+Scheduled Task has to hold your account password — not because Copilot cannot
+authenticate headlessly (the SDK does expose `gitHubToken`; this app hardcodes
+`useLoggedInUser: true`), but because the agent edits files in your repo and
+worktrees as **you**, and running as a user with nobody logged in is what Windows
+charges a stored password for. If you only need "keep running while I'm away",
+plain `-Residency` plus a locked screen costs nothing and stores no secret. See
+the residency section of [`INSTALL.md`](INSTALL.md).
 
 Full instructions, including the plain `irm`/`curl` one-liners for when this repo
 is public, are in [`INSTALL.md`](INSTALL.md). Setting up the Discord bot itself —

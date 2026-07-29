@@ -138,12 +138,43 @@ The installer asks separately. **Login-keepalive is the default**; a password is
 
 ### 為什麼 24/7 需要密碼？/ Why does 24/7 need a password?
 
-Copilot CLI 的登入狀態存在**你的使用者設定檔**裡（`%USERPROFILE%\.copilot`），而 SDK **沒有任何 token 環境變數**可用。所以常駐程序必須**以你本人的身分**執行 —— 用 SYSTEM 或服務帳號會變成未登入狀態。Windows 要在無人登入時以某個使用者身分執行，就必須讓排程工作持有該帳號的密碼。
+**不是**因為 Copilot 無法用 token 認證 —— SDK 其實有 `gitHubToken` 選項，是這個 app 自己寫死了 `useLoggedInUser: true`（`src/copilot/sdk.ts`）。
 
-The Copilot CLI's login lives in **your user profile** (`%USERPROFILE%\.copilot`), and the SDK exposes **no token environment variable**. So the resident process must run **as you** — SYSTEM or a service account would be unauthenticated. Running as a user with nobody logged in is exactly what Windows requires a stored password for.
+真正的原因是**檔案身分**：agent 會在 `CONTROLLED_REPO_PATH` 執行指令、改檔案，並在你家目錄下建立 git worktree。換一個帳號執行會把這些檔案的擁有者搞亂；用 SYSTEM 執行則等於讓任意指令以 SYSTEM 身分跑 —— 對一個「agent 以你的身分執行 shell 指令」的工具來說更糟。
 
-> 密碼交給 **Windows 認證管理員**（作用域僅限該工作），**不會**寫進任何檔案、`.env` 或指令列。安裝器用隱藏輸入詢問，並透過子行程環境變數傳給 PowerShell —— 因為 `schtasks /RP` 和 `powershell -Command "…$pw…"` 都會把密碼留在指令列，機器上任何程序都能讀到。
-> The password goes to **Windows Credential Manager**, scoped to the task. It is **never** written to a file, `.env`, or a command line: the installer reads it with hidden input and hands it to PowerShell through the child process environment, because `schtasks /RP` and `powershell -Command "…$pw…"` both leave secrets in argv where any process can read them via `Win32_Process`.
+Windows 要在**無人登入**時以某個使用者身分執行，就必須讓排程工作持有該帳號的密碼。這是 Windows 的規則，不是 Copilot 的限制。
+
+It is **not** because Copilot cannot authenticate with a token — the SDK does
+expose `gitHubToken`; this app hardcodes `useLoggedInUser: true`
+(`src/copilot/sdk.ts`). The real reason is **file ownership**: the agent runs
+commands and edits files in `CONTROLLED_REPO_PATH` and creates git worktrees
+under your home directory. Another account would scramble ownership across all of
+it, and SYSTEM would run arbitrary commands as SYSTEM — worse for a tool whose
+security note is "the agent runs shell commands as you". Running as a user with
+nobody logged in is what Windows requires a stored password for.
+
+### 先考慮這個：登入後鎖定螢幕 / Consider this first: stay logged in, lock the screen
+
+如果你只是要「人不在的時候繼續跑」，**登入後保活 + 鎖定螢幕**就夠了 —— 沒有任何密碼被儲存，桌面也是鎖住的。它唯一做不到的是**重開機後自動恢復**。
+
+If you only need "keep running while I'm away", **login-keepalive plus a locked
+screen** is enough: no stored secret, no unlocked desktop. The only thing it does
+not survive is a reboot. Choose 24/7 only when unattended reboots matter.
+
+> 密碼交給 **Windows 認證管理員**，**不會**寫進任何檔案、`.env` 或指令列。安裝器用隱藏輸入詢問，並透過子行程環境變數傳給 PowerShell —— 因為 `schtasks /RP` 和 `powershell -Command "…$pw…"` 都會把密碼留在指令列，機器上任何程序都能讀到。
+> 誠實補充：子行程環境**不是**密文通道 —— 同使用者的程序仍可透過 `ReadProcessMemory` 讀取 PEB，管理員／SYSTEM 更不受限。它只是比指令列少了「隨手可見」這一層。
+> The password goes to **Windows Credential Manager** and is **never** written to
+> a file, `.env`, or a command line: the installer reads it with hidden input and
+> passes it through the child process environment, because `schtasks /RP` and
+> `powershell -Command "…$pw…"` both leave secrets in argv where any process can
+> read them via `Win32_Process`. To be honest about the limit: a child
+> environment is **not** a secret channel — a same-user process can still recover
+> it from the PEB via `ReadProcessMemory`, and admins/SYSTEM more easily. It
+> removes the casual exposure, not a determined one.
+
+> 換 Windows 密碼後，排程工作會失效，必須重跑安裝器重新註冊。
+> After a Windows password change the task's stored credential goes stale and the
+> task fails until you re-run the installer.
 
 > **非互動絕不升級 / Non-interactive never escalates**：`--yes`／CI／管線輸入下無法安全詢問密碼，因此即使加了 `--residency-24x7` 也會退回登入後保活並明講原因。
 > With `--yes`, in CI, or through a pipe there is no safe way to ask, so `--residency-24x7` falls back to login-keepalive and says so.

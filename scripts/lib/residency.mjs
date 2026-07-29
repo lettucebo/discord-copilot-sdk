@@ -59,7 +59,7 @@ function gitDir() {
  *    non-interactive falls back to `logon` instead of prompting, or reading a
  *    secret from a flag/env where it would land in shell history
  *  - macOS can never be `always`: a LaunchAgent is login-bound and a LaunchDaemon
- *    runs as root, leaving Copilot unauthenticated
+ *    runs as root, which would run the agent's shell commands as root
  */
 export function chooseResidencyMode({ requested, platform, interactive, hasTty }) {
   if (!requested) return "logon";
@@ -74,11 +74,10 @@ export function chooseResidencyMode({ requested, platform, interactive, hasTty }
  *  - `"logon"`  (default) — auto-start + keepalive WHILE LOGGED IN. Stops at logout.
  *  - `"always"` — true 24/7: starts at boot, before and without any login.
  *
- * 24/7 is Windows- and Linux-only, and for an honest reason: the Copilot CLI's
- * login lives in the user's own profile, so the resident process MUST run as
- * that user. On macOS a LaunchAgent is login-bound and a LaunchDaemon runs as
- * root — neither can be that user before login — so macOS is reported as
- * login-keepalive rather than quietly sold as 24/7.
+ * 24/7 is Windows- and Linux-only. On macOS a LaunchAgent is login-bound and a
+ * LaunchDaemon runs as root; running the agent as root would mean arbitrary
+ * shell commands execute as root, which is worse than not having 24/7 — so
+ * macOS is reported as login-keepalive rather than quietly sold as 24/7.
  */
 export async function setupResidency(lang, opts = {}) {
   if (process.platform === "win32") return setupWindows(lang, opts);
@@ -96,8 +95,11 @@ export async function setupResidency(lang, opts = {}) {
  * `mode`:
  *  - `"logon"`  — starts at logon, keepalive WHILE LOGGED IN. Stops at logout.
  *  - `"always"` — starts at boot, before and without any login. Requires the
- *    task to carry the user's credentials, because the Copilot CLI's login lives
- *    in that user's profile and a SYSTEM/service account would be unauthenticated.
+ *    task to carry the user's credentials — not because Copilot cannot
+ *    authenticate headlessly (the SDK exposes `gitHubToken`; this app chooses
+ *    `useLoggedInUser: true`), but because the agent edits files in the
+ *    controlled repo and its worktrees AS THIS USER. Running as a user with
+ *    nobody logged in is what Windows charges a stored password for.
  *
  * The password is NEVER passed to this function — it is read at runtime from the
  * CHILD PROCESS ENVIRONMENT (`pwEnvVar`). That is the point: `schtasks /RP` and

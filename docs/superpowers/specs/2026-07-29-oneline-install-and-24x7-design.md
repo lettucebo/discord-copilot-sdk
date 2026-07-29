@@ -24,29 +24,57 @@ And one honesty bug: the installer prompt says
 Log out and the bot stops. Calling that "24/7" is the same class of false message
 the reviewers kept finding this session.
 
-## The constraint that decides the design (verified, not assumed)
+## The constraint that decides the design
 
-`node_modules/@github/copilot-sdk` contains **no token environment variable** —
-no `GH_TOKEN`, `GITHUB_TOKEN`, or `COPILOT_TOKEN`. The runtime relies entirely on
-the CLI's logged-in state under `%USERPROFILE%\.copilot` (which includes a
-DPAPI-encrypted `m-encryption-key.enc`).
+> **⚠️ CORRECTION (post-review).** The original text here claimed the SDK exposes
+> no token and that Copilot auth therefore forces the resident process to run as
+> the human user. **That is false.** It came from a bad search: I grepped
+> `dist/*.js` for env-var *names* (`GH_TOKEN`/`GITHUB_TOKEN`/`COPILOT_TOKEN`) and
+> treated the empty result as proof, never reading the *options* in
+> `types.d.ts`.
+>
+> `@github/copilot-sdk` `CopilotClientOptions` does expose:
+> - `gitHubToken` — "GitHub token to use for authentication. **This takes
+>   priority over other authentication methods.**"
+> - `useLoggedInUser` — "@default true (**but defaults to false when
+>   `gitHubToken` is provided**)"
+>
+> `src/copilot/sdk.ts:99` hardcodes `useLoggedInUser: true`, so the restriction
+> is **this app's choice**, not a Copilot limitation.
 
-**Therefore 24/7 must run as the same OS user.** Running as SYSTEM, a service
-account, or in Docker gives an unauthenticated Copilot. This eliminates the
-obvious answers before they are proposed.
+The design must therefore separate two requirements that the original wrongly
+fused:
+
+**1. Copilot authentication** — solvable with an explicit token. A headless
+service identity is possible; nothing here needs a human login.
+
+**2. OS execution identity** — the real constraint for *this* bot. The agent runs
+shell commands, edits files in `CONTROLLED_REPO_PATH`, and creates git worktrees
+under `${stateDir()}-worktrees` in the user's home. Another account breaks file
+ownership across all of that, and SYSTEM would mean arbitrary commands execute as
+SYSTEM — strictly worse for a tool whose entire security note is "the agent runs
+shell commands as you".
+
+So 24/7 still wants to run as the human user, but for **file ownership**, not
+because Copilot could not authenticate otherwise. That is a product choice and
+must be stated as one.
 
 ## Options considered for 24/7 (Windows)
 
-| | A. Scheduled Task, "whether logged on or not" | B. auto-logon + existing at-logon task | C. PM2 / Docker |
-|---|---|---|---|
-| runs before login | yes | yes (after auto-logon) | no / auth broken |
-| password stored | Windows Credential Manager, scoped to the task | LSA secret `DefaultPassword` | n/a |
-| leaves a desktop unlocked | no (session 0) | **yes** | n/a |
-| chosen | **yes** | no | no |
+| | A. Task, "whether logged on or not" | B. auto-logon + at-logon task | C. stay logged in, screen locked | D. service account + token |
+|---|---|---|---|---|
+| survives reboot | yes | yes | **no** | yes |
+| survives logout | yes | yes | n/a | yes |
+| password stored | task credential | LSA `DefaultPassword` | **none** | none (token instead) |
+| unlocked desktop | no | **yes** | no | no |
+| runs as you (file ownership) | yes | yes | yes | **no** |
 
-**A is chosen.** B leaves an unlocked desktop for anyone with physical access —
-a strictly worse trade for the same benefit. C cannot work at all given the
-constraint above: a container has no access to the host user's Copilot login.
+**C is the honest default** for "keep running while I'm away" — no stored secret,
+no unlocked desktop — and it was missing from the original comparison. **A** is
+an advanced escape hatch for a disposable lab machine, and is the only option
+that survives a reboot without a stored secret being someone else's problem. B
+stays rejected: same benefit, unlocked desktop. D becomes viable once token auth
+exists, but it changes file ownership, so it is separate work.
 
 ## Design
 

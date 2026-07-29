@@ -22,7 +22,8 @@ describe("chooseResidencyMode", () => {
   });
 
   it("never gives macOS 24/7, because it cannot run as you before login", () => {
-    // LaunchAgent = login-bound; LaunchDaemon = root, so Copilot is unauthenticated.
+    // LaunchAgent = login-bound; LaunchDaemon = root, which would run the
+    // agent's arbitrary shell commands as root.
     expect(chooseResidencyMode({ requested: true, platform: "darwin", interactive: true, hasTty: true })).toBe("logon");
   });
 
@@ -54,9 +55,9 @@ describe("buildWindowsRegisterScript", () => {
   });
 
   it("24/7 mode starts at BOOT and carries the user's credentials", () => {
-    // Copilot's login lives in the user's profile, so a SYSTEM/service account
-    // would be unauthenticated — the task has to run as the user, which on
-    // Windows means it must hold that user's password.
+    // The agent edits files in the controlled repo and its worktrees AS THIS
+    // USER, so the task must run as them. Windows charges a stored password for
+    // running as a user with nobody logged in.
     const s = buildWindowsRegisterScript({ ...base, mode: "always", user: "HOST\\alice" });
     expect(s).toContain("-AtStartup");
     expect(s).toContain("-User 'HOST\\alice'");
