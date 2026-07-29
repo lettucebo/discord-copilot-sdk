@@ -330,3 +330,50 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
     }
   });
 });
+
+describe("startup announcement for records whose thread is gone", () => {
+  // Every other reconcile notice is posted into rec.threadId — exactly what is
+  // missing when the reason is `thread-gone`. Without a parent-channel line
+  // those records (one full checkout each) accumulate in total silence.
+  class KeyedTransport extends FakeTransport {
+    sent: Array<{ key: string; text: string }> = [];
+    override async notice(k: string, t: string): Promise<void> {
+      this.sent.push({ key: k, text: t });
+    }
+  }
+
+  it("posts ONE parent-channel line naming the thread id and its worktree", async () => {
+    const f = tmpFile();
+    const wt = join(`${stateDir()}-worktrees`, "dead"); // where bindingOk requires it to be
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "dead", workDir: wt, branch: "copilot/t-dead" }));
+      store.commit("dead");
+      const transport = new KeyedTransport();
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      await reconcile(app, async () => "gone");
+
+      const parent = transport.sent.filter((m) => m.key === "c1");
+      expect(parent).toHaveLength(1);
+      expect(parent[0]!.text).toContain("dead"); // the id you must pass to /end
+      expect(parent[0]!.text).toContain(wt); // the disk it holds
+      expect(parent[0]!.text).toContain("/end thread:"); // how to reclaim it
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
+  it("stays silent when nothing is unreachable", async () => {
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind()); store.commit("t1");
+      const transport = new KeyedTransport();
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      await reconcile(app, async () => "valid");
+      expect(transport.sent.filter((m) => m.key === "c1")).toHaveLength(0);
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+});

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { planReconcile, classifyResumeError } from "../src/core/reconcile.js";
+import { planReconcile, classifyResumeError, classifyRecordDisposition } from "../src/core/reconcile.js";
 
 describe("planReconcile", () => {
   it("corrupt store fails startup (never silently fresh)", () => {
@@ -98,5 +98,42 @@ describe("classifyResumeError", () => {
     expect(classifyResumeError("something went wrong")).toBe("transient");
     expect(classifyResumeError("")).toBe("transient");
     expect(classifyResumeError("internal error 500")).toBe("transient");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// classifyRecordDisposition
+// ---------------------------------------------------------------------------
+describe("classifyRecordDisposition", () => {
+  it("a record with a live session is never reapable", () => {
+    for (const s of ["creating", "active", "orphaned", "blocked"] as const) {
+      expect(classifyRecordDisposition(s, true, false)).toBe("live");
+      expect(classifyRecordDisposition(s, true, true)).toBe("live");
+    }
+  });
+
+  it("refuses to reap a `creating` record while a /new is in flight", () => {
+    // cmdNew writes the record BEFORE the multi-second SessionActor.create(),
+    // and only registers the live session after. Reaping in that window deletes
+    // the worktree and record out from under /new, which then fails its commit
+    // and blames the disk while deleting the operator's brand-new thread.
+    expect(classifyRecordDisposition("creating", false, true)).toBe("in-flight");
+  });
+
+  it("treats a `creating` leftover as reapable once no /new is running", () => {
+    expect(classifyRecordDisposition("creating", false, false)).toBe("reapable");
+  });
+
+  it("never reaps an `active` record with no live session — reconcile kept it on purpose", () => {
+    // A transient resume failure deliberately leaves the record active so the
+    // NEXT restart retries. Deleting it destroys the only pointer to a Copilot
+    // conversation that would have come back.
+    expect(classifyRecordDisposition("active", false, false)).toBe("retry-pending");
+    expect(classifyRecordDisposition("active", false, true)).toBe("retry-pending");
+  });
+
+  it("reaps only the terminal states", () => {
+    expect(classifyRecordDisposition("orphaned", false, false)).toBe("reapable");
+    expect(classifyRecordDisposition("blocked", false, false)).toBe("reapable");
   });
 });

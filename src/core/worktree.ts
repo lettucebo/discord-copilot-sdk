@@ -97,17 +97,26 @@ export async function addWorktree(repo: string, dir: string, branch: string): Pr
 }
 
 /**
- * Remove a session's worktree — but ONLY when git reports it clean.
+ * Remove a session's worktree — but ONLY when it is provably safe.
  *
- * Uncommitted work is the operator's, not ours to discard: a worktree with any
- * local content — modified, untracked OR ignored — is left in place (and
- * reported) so `/end` can never silently delete something that exists only
- * there.
+ * Two independent gates, because "git status is clean" answers a narrower
+ * question than people assume:
+ *
+ * 1. **No local content.** Modified, untracked OR ignored — any of them keeps
+ *    the tree. Uncommitted work is the operator's, not ours to discard.
+ * 2. **HEAD is still the branch we recorded.** A clean tree on a *detached*
+ *    HEAD can carry commits that nothing else points at; the worktree's own
+ *    HEAD is the only ref holding them, and `git worktree remove` deletes it,
+ *    making that work unreachable and GC-eligible. "The branch survives" is no
+ *    protection there — the branch never moved. Same for a HEAD switched to a
+ *    different branch than the record's: what we promise to keep is not what is
+ *    actually checked out, so we refuse and let a human look.
  */
 export async function removeWorktreeIfClean(
   repo: string,
-  dir: string
-): Promise<"removed" | "kept-dirty" | "failed"> {
+  dir: string,
+  expectBranch?: string
+): Promise<"removed" | "kept-dirty" | "kept-detached" | "failed"> {
   try {
     // `--ignored=matching` matters: plain `git status --porcelain` hides
     // .gitignore'd paths, so a worktree whose only local content is ignored
@@ -117,6 +126,16 @@ export async function removeWorktreeIfClean(
     if (stdout.trim().length > 0) return "kept-dirty";
   } catch {
     return "failed"; // can't prove it's clean → keep it
+  }
+  if (expectBranch) {
+    try {
+      // `symbolic-ref` fails outright on a detached HEAD — exactly the case we
+      // must not delete. Also covers an in-progress rebase, which detaches.
+      const { stdout } = await run("git", ["symbolic-ref", "--quiet", "HEAD"], { cwd: dir });
+      if (stdout.trim() !== `refs/heads/${expectBranch}`) return "kept-detached";
+    } catch {
+      return "kept-detached";
+    }
   }
   try {
     await run("git", ["worktree", "remove", dir], { cwd: repo });

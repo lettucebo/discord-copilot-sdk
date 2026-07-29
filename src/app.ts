@@ -23,7 +23,12 @@ import { resolveControlledRepo } from "./core/repo.js";
 import { gitDiffSummary } from "./core/git.js";
 import { downloadBounded } from "./core/download.js";
 import { SessionStore, type SessionRecord } from "./core/session-store.js";
-import { planReconcile, classifyResumeError, type ThreadStatus } from "./core/reconcile.js";
+import {
+  planReconcile,
+  classifyResumeError,
+  classifyRecordDisposition,
+  type ThreadStatus,
+} from "./core/reconcile.js";
 import { deriveThreadTitle, THREAD_NAME_MAX } from "./core/thread-name.js";
 import { pickTitleModel, buildTitlePrompt, cleanModelTitle } from "./core/title.js";
 import {
@@ -552,6 +557,12 @@ export class DiscordCopilotApp {
       new SlashCommandBuilder()
         .setName("end")
         .setDescription("End THIS thread's session (other sessions keep running)")
+        .addStringOption((o) =>
+          o
+            .setName("thread")
+            .setDescription("Thread id of a leftover record whose thread is gone (see /sessions)")
+            .setRequired(false)
+        )
         .toJSON(),
       new SlashCommandBuilder()
         .setName("sessions")
@@ -783,7 +794,7 @@ export class DiscordCopilotApp {
       // created is clean by construction, so nothing can be lost.
       const dropWorktree = async (): Promise<void> => {
         if (!worktreeCreated) return;
-        await removeWorktreeIfClean(this.repoPath, workDir).catch(() => "failed" as const);
+        await removeWorktreeIfClean(this.repoPath, workDir, branch).catch(() => "failed" as const);
       };
       const abort = async (msg: string): Promise<void> => {
         await dropWorktree();
@@ -936,6 +947,22 @@ export class DiscordCopilotApp {
       await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
       return;
     }
+    const explicit = interaction.options.getString("thread")?.trim();
+    // A record whose thread was DELETED is the commonest leftover, and it is
+    // exactly the one you cannot type `/end` inside. `thread:` makes it
+    // reachable from the parent channel; without it those worktrees were
+    // unreclaimable no matter what /sessions claimed.
+    if (explicit) {
+      if (this.sessions.has(explicit)) {
+        await interaction.reply({
+          content: `<#${explicit}> 仍有進行中的 session，請到該討論串內執行 \`/end\`。`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      await this.endStaleRecord(interaction, explicit);
+      return;
+    }
     const threadId = interaction.channelId;
     const session = this.sessions.get(threadId);
     if (!session) {
@@ -979,13 +1006,8 @@ export class DiscordCopilotApp {
 
     let tail = "";
     if (session.branch && session.workDir !== this.repoPath) {
-      const r = await removeWorktreeIfClean(this.repoPath, session.workDir);
-      tail =
-        r === "removed"
-          ? `\n🌿 worktree 已清除（分支 \`${session.branch}\` 保留）。`
-          : r === "kept-dirty"
-            ? `\n🌿 worktree **保留**：\`${session.workDir}\` 還有未提交的變更（分支 \`${session.branch}\`）。確認後可自行 \`git worktree remove\`。`
-            : `\n⚠️ 無法移除 worktree \`${session.workDir}\`，請自行檢查。`;
+      const r = await removeWorktreeIfClean(this.repoPath, session.workDir, session.branch);
+      tail = this.worktreeOutcomeText(r, session.workDir, session.branch);
     }
     const left = this.sessions.size;
     await interaction.editReply(
@@ -993,9 +1015,28 @@ export class DiscordCopilotApp {
     );
   }
 
-  /** `/end` in a thread with no live session: reap the durable record and its
-   *  worktree, if it has one. Same rule as the live path — the worktree goes
-   *  only when git reports it clean. */
+  /** One honest sentence per worktree-cleanup outcome. */
+  private worktreeOutcomeText(
+    r: "removed" | "kept-dirty" | "kept-detached" | "failed",
+    dir: string,
+    branch: string
+  ): string {
+    switch (r) {
+      case "removed":
+        return `\n🌿 worktree 已清除（分支 \`${branch}\` 保留）。`;
+      case "kept-dirty":
+        return `\n🌿 worktree **保留**：\`${dir}\` 還有未提交／未追蹤／被忽略的內容（分支 \`${branch}\`）。確認後可自行 \`git worktree remove\`。`;
+      case "kept-detached":
+        return `\n🌿 worktree **保留**：\`${dir}\` 的 HEAD 不是 \`${branch}\`（detached 或換了分支），裡面可能有沒有任何分支指向的 commit。請自行確認後再移除。`;
+      default:
+        return `\n⚠️ 無法移除 worktree \`${dir}\`，請自行檢查。`;
+    }
+  }
+
+  /** `/end` where no live session exists: reap a genuinely terminal record and
+   *  its worktree. Deliberately narrow — "not in the live map" is not the same
+   *  as "dead", and the two states that differ are exactly the ones whose
+   *  deletion loses work. */
   private async endStaleRecord(
     interaction: ChatInputCommandInteraction,
     threadId: string
@@ -1005,16 +1046,38 @@ export class DiscordCopilotApp {
       await interaction.reply({ content: "這個討論串沒有進行中的 session。", flags: MessageFlags.Ephemeral });
       return;
     }
+    const disposition = classifyRecordDisposition(rec.state, this.sessions.has(threadId), this.creating);
+    if (disposition === "in-flight") {
+      await interaction.reply({
+        content: "⏳ 這個討論串的 `/new` 還在建立中，現在清除會把它的 worktree 抽掉。請等它完成後再試。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (disposition === "retry-pending") {
+      // reconcile kept this record ON PURPOSE after a transient failure. Its
+      // sessionId is the only pointer to the Copilot conversation.
+      await interaction.reply({
+        content:
+          "ℹ️ 這個記錄仍是 `active`：復原時只是暫時失敗，**重新啟動 bot 會再試一次**。\n" +
+          "現在清除會永久丟掉這段對話紀錄，所以不做。若確定不要了，重啟後它會變成 `orphaned`／`blocked`，屆時再 `/end`。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     let tail = "";
     if (rec.branch && rec.workDir !== this.repoPath) {
-      const r = await removeWorktreeIfClean(this.repoPath, rec.workDir);
-      tail =
-        r === "removed"
-          ? `\n🌿 worktree 已清除（分支 \`${rec.branch}\` 保留）。`
-          : r === "kept-dirty"
-            ? `\n🌿 worktree **保留**：\`${rec.workDir}\` 還有本地內容（分支 \`${rec.branch}\`）。`
-            : `\n⚠️ 無法移除 worktree \`${rec.workDir}\`，請自行檢查。`;
+      const r = await removeWorktreeIfClean(this.repoPath, rec.workDir, rec.branch);
+      tail = this.worktreeOutcomeText(r, rec.workDir, rec.branch);
+      if (r !== "removed") {
+        // Keeping the tree but dropping the record would make the tree
+        // invisible again — the exact defect this path exists to fix.
+        await interaction.editReply(
+          `記錄**保留**，這樣 \`/sessions\` 才看得到還有東西在磁碟上。${tail}`
+        );
+        return;
+      }
     }
     if (!this.store.remove(threadId)) {
       await interaction.editReply(`⚠️ 無法寫入磁碟移除記錄（狀態：${rec.state}）。請檢查磁碟／權限。${tail}`);
@@ -1035,18 +1098,28 @@ export class DiscordCopilotApp {
       const where = s.branch ? ` · \`${s.branch}\`` : " · 共用工作目錄";
       return `• <#${id}> — ${state}${q}${where}`;
     });
-    // Records with no live actor (reconcile marked them blocked/orphaned) still
-    // own a worktree and a branch. Surface them, or the disk they hold is
-    // invisible and nobody knows `/end` can reclaim it.
-    const stale = this.store
-      .all()
-      .filter((r) => !this.sessions.has(r.threadId))
-      .map((r) => `• <#${r.threadId}> — ${r.state}${r.reason ? `（${r.reason}）` : ""}${r.branch ? ` · \`${r.branch}\`` : ""}`);
+    // Records with no live actor still own a worktree and a branch. Surface
+    // them, or the disk they hold is invisible. Split by what may actually be
+    // done with each: telling someone to `/end` a record that /end will refuse
+    // is worse than not listing it.
+    const reapable: string[] = [];
+    const pending: string[] = [];
+    for (const r of this.store.all()) {
+      const d = classifyRecordDisposition(r.state, this.sessions.has(r.threadId), this.creating);
+      if (d === "live") continue;
+      const line = `• <#${r.threadId}> — ${r.state}${r.reason ? `（${r.reason}）` : ""}${r.branch ? ` · \`${r.branch}\`` : ""}`;
+      if (d === "reapable") reapable.push(`${line} · id \`${r.threadId}\``);
+      else pending.push(line);
+    }
     const header = `目前 ${rows.length}/${MAX_LIVE_SESSIONS} 個 session（隔離模式：\`${this.isolation}\`）`;
     const body = rows.length ? `${header}\n${rows.join("\n")}` : `${header}\n（沒有進行中的 session）`;
-    const tail = stale.length
-      ? `\n\n殘留記錄（沒有執行中的 session，可在該討論串用 \`/end\` 清除）：\n${stale.join("\n")}`
-      : "";
+    // The commonest leftover is a DELETED thread, which you cannot type inside —
+    // hence `/end thread:<id>`, usable from this channel.
+    const tail =
+      (reapable.length
+        ? `\n\n可清除的殘留記錄（在該討論串用 \`/end\`；討論串已刪除時用 \`/end thread:<id>\`）：\n${reapable.join("\n")}`
+        : "") +
+      (pending.length ? `\n\n暫時無法復原、**重啟後會再試**的記錄（不會被清除）：\n${pending.join("\n")}` : "");
     await interaction.reply({
       content: (body + tail).slice(0, 1900),
       flags: MessageFlags.Ephemeral,
@@ -1220,6 +1293,41 @@ export class DiscordCopilotApp {
         );
       }
     }
+    await this.announceUnreachableRecords();
+  }
+
+  /**
+   * Report leftovers whose own thread can no longer receive a notice.
+   *
+   * Every other reconcile message is posted into `rec.threadId` — which is
+   * precisely what is unusable when the thread was deleted, made inaccessible,
+   * or archived beyond unarchiving. Those records hold a full checkout each and
+   * would otherwise accumulate in total silence, discoverable only by someone
+   * who happened to run `/sessions`. Posted to the parent channel, once per
+   * startup, and only when there is something to say.
+   */
+  private async announceUnreachableRecords(): Promise<void> {
+    const unreachable = new Set(["thread-gone", "thread-inaccessible", "thread-archived"]);
+    const lines = this.store
+      .all()
+      .filter(
+        (r) =>
+          classifyRecordDisposition(r.state, this.sessions.has(r.threadId), this.creating) === "reapable" &&
+          !!r.reason &&
+          unreachable.has(r.reason)
+      )
+      .map((r) => `• \`${r.threadId}\`（${r.reason}）${r.branch ? ` · 分支 \`${r.branch}\`` : ""} — \`${r.workDir}\``);
+    if (!lines.length) return;
+    await this.transport
+      .notice(
+        this.config.DISCORD_PARENT_CHANNEL_ID,
+        `🧹 有 ${lines.length} 個 session 記錄的討論串已無法使用，各自仍佔著一個 worktree：\n` +
+          `${lines.join("\n")}\n` +
+          "無法在那些討論串裡下指令，請在本頻道用 `/end thread:<id>` 清除（有未提交內容的 worktree 會保留）。"
+      )
+      .catch(() => {
+        /* discoverability aid — never fail startup for it */
+      });
   }
 
   private async reconcileRecord(

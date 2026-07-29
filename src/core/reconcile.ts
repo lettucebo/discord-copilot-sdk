@@ -43,6 +43,38 @@ export function classifyResumeError(message: string): "session-lost" | "transien
   return "transient"; // default: retryable — never lose history on an ambiguous error
 }
 
+/**
+ * What may be done with a durable record that has no live session right now.
+ *
+ * "Not in the live map" is NOT the same as "dead leftover", and conflating them
+ * destroys data in two distinct ways:
+ *
+ * - `in-flight` — `/new` persists its record BEFORE the multi-second
+ *   `SessionActor.create()` and only registers the live session afterwards.
+ *   Reaping inside that window pulls the worktree and record out from under it.
+ * - `retry-pending` — reconcile deliberately KEEPS an `active` record when a
+ *   resume fails transiently, so the next restart retries. Deleting it discards
+ *   the only pointer to a Copilot conversation that would have come back.
+ *
+ * Only the terminal states (`orphaned`, `blocked`) are leftovers, and even then
+ * the worktree is removed only if git says it is safe.
+ */
+export type RecordDisposition = "live" | "in-flight" | "retry-pending" | "reapable";
+
+export function classifyRecordDisposition(
+  state: SessionState,
+  isLive: boolean,
+  newInFlight: boolean
+): RecordDisposition {
+  if (isLive) return "live";
+  // `newInFlight` is a single global flag, so it may belong to a DIFFERENT
+  // thread's /new. Erring towards "in-flight" only ever refuses a cleanup — the
+  // safe direction.
+  if (state === "creating") return newInFlight ? "in-flight" : "reapable";
+  if (state === "active") return "retry-pending";
+  return "reapable";
+}
+
 export function planReconcile(input: {
   corrupt: boolean;
   state?: SessionState;

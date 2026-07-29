@@ -276,6 +276,49 @@ describe("DiscordTransport ask_user / plan cards", () => {
     expect(ch.sent).toHaveLength(0);
   });
 
+  it("dispose() landing INSIDE renderChunks stops the remaining chunks and deletes the one in flight", async () => {
+    // The fetch-window guard is not enough: every actual write happens later,
+    // inside renderChunks, whose liveness predicate used to be epoch-only. Since
+    // dispose() never mutates the state object, a teardown landing mid-`send`
+    // was invisible and the rest of the render went into the ended thread. This
+    // window is WIDER than the fetch one and /end lands in it: cmdEnd awaits
+    // actor.disconnect() before calling dispose, and a 1s debounce flush of a
+    // streaming turn is far more likely to be mid-send than mid-fetch.
+    const ch = new FakeChannel();
+    let t!: DiscordTransport;
+    const realSend = ch.send.bind(ch);
+    let sends = 0;
+    ch.send = async (o: Record<string, unknown>) => {
+      const m = await realSend(o);
+      if (++sends === 1) t.dispose("thread"); // torn down between chunk 0 and 1
+      return m;
+    };
+    t = new DiscordTransport({ channels: { fetch: async () => ch } } as unknown as Client);
+    await t.render("thread", st("C".repeat(4000))); // >1900 → at least two chunks
+    await t.flush("thread");
+    expect(sends).toBe(1); // chunk 1 must never be attempted
+    expect(ch.sent[0]!.deleted).toBe(true); // and chunk 0 must be cleaned up
+  });
+
+  it("dispose() during an anchor re-fetch does not edit the old message", async () => {
+    // Same hole on the edit path: a second flush re-fetches the existing anchor,
+    // and a dispose during THAT await used to be followed by m.edit().
+    const ch = new FakeChannel();
+    let t!: DiscordTransport;
+    t = new DiscordTransport({ channels: { fetch: async () => ch } } as unknown as Client);
+    await t.render("thread", st("first"));
+    await t.flush("thread");
+    expect(ch.sent).toHaveLength(1);
+    const realFetch = ch.messages.fetch;
+    ch.messages.fetch = async (id: string) => {
+      t.dispose("thread"); // torn down while re-fetching the anchor
+      return realFetch(id);
+    };
+    await t.render("thread", st("SECOND WRITE AFTER DISPOSE"));
+    await t.flush("thread");
+    expect(ch.sent[0]!.content).toBe("first"); // never overwritten
+  });
+
   it("showPlan publishes the FULL summary in chunks before the card (no truncation)", async () => {
     const ch = new FakeChannel();
     const t = new DiscordTransport(fakeClient(ch));

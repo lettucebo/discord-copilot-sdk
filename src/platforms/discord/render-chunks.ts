@@ -81,6 +81,10 @@ export async function renderChunks(
     if (existing) {
       try {
         const m = await channel.messages.fetch(existing);
+        // Re-check: the fetch is a round trip, and a turn reset or dispose
+        // landing inside it would otherwise be followed by an edit that
+        // overwrites a message belonging to a turn that no longer exists.
+        if (!stillCurrent()) return;
         await m.edit(sendOpts(content));
         continue; // edited in place
       } catch (err) {

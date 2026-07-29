@@ -154,11 +154,18 @@ while the controlled repo stayed untouched.
 > (e.g. by prompt injection from repo content) can still reach another session's
 > worktree by path. Everything in the security model above still applies.
 
-- `/sessions` — what's live, with each one's state and branch (max 8), plus any
-  stale records that still hold a worktree
+- `/sessions` — what's live, with each one's state and branch (max 8). Leftover
+  records are listed too, split by what can actually be done with them:
+  *clearable*, or *will retry on restart* (never deleted — the record is the only
+  pointer to that Copilot conversation).
 - `/end` — end **this** thread's session; the others keep running. In a thread
-  whose session is gone but whose record survived (reconcile blocked it), the
-  same command reaps that record and its worktree — otherwise nothing could.
+  whose session is gone but whose record survived, the same command reaps that
+  record and its worktree.
+- `/end thread:<id>` — the commonest leftover is a **deleted** thread, which you
+  cannot type inside. Run this from the parent channel instead; the bot also
+  posts the ids there at startup. A worktree is removed only when git proves it
+  safe — any local content, a detached HEAD, or a HEAD on a different branch
+  keeps it (and keeps the record, so `/sessions` still shows it).
 
 `/end` removes the worktree **only when git reports it clean**. A dirty one is
 kept and its path reported: uncommitted work is not ours to discard. To land a
