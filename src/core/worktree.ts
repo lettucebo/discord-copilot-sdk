@@ -99,16 +99,21 @@ export async function addWorktree(repo: string, dir: string, branch: string): Pr
 /**
  * Remove a session's worktree — but ONLY when git reports it clean.
  *
- * Uncommitted work is the operator's, not ours to discard: a dirty worktree is
- * left in place (and reported) so `/end` can never silently delete something
- * that was never committed anywhere.
+ * Uncommitted work is the operator's, not ours to discard: a worktree with any
+ * local content — modified, untracked OR ignored — is left in place (and
+ * reported) so `/end` can never silently delete something that exists only
+ * there.
  */
 export async function removeWorktreeIfClean(
   repo: string,
   dir: string
 ): Promise<"removed" | "kept-dirty" | "failed"> {
   try {
-    const { stdout } = await run("git", ["status", "--porcelain"], { cwd: dir });
+    // `--ignored=matching` matters: plain `git status --porcelain` hides
+    // .gitignore'd paths, so a worktree whose only local content is ignored
+    // (a .env, generated data, build output) would read as clean and
+    // `git worktree remove` would delete it recursively.
+    const { stdout } = await run("git", ["status", "--porcelain", "--ignored=matching"], { cwd: dir });
     if (stdout.trim().length > 0) return "kept-dirty";
   } catch {
     return "failed"; // can't prove it's clean → keep it

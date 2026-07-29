@@ -575,6 +575,32 @@ describe("SessionActor abort + teardown", () => {
     await expect(s.actor.steer("hi")).rejects.toThrow(/closed|faulted/);
   });
 
+  it("keys repo approvals on `approvalKey`, so a grant is shared across worktrees", async () => {
+    // Each concurrent session works in its OWN git worktree, so keying repo
+    // approvals on the working directory would silently re-prompt for a command
+    // the operator already trusted in this repository — and, worse, scatter the
+    // persisted grants across per-session paths.
+    const s = await setup({ workingDirectory: "C:\\wt\\thread-1", approvalKey: "C:\\repo" });
+    s.actor.setYolo(false);
+    void perm(s)({ kind: "shell", fullCommandText: "git status", commands: [{ identifier: "git" }] });
+    await tick();
+    const nonce = s.transport.permissions.at(-1)!.nonce;
+    s.transport.deliverDecision(nonce, "always", "u1");
+    await tick();
+    // Stored under the REPO, not the worktree.
+    expect(s.policy.repoApprovals("C:\\repo")).toContain("git");
+    expect(s.policy.repoApprovals("C:\\wt\\thread-1")).toEqual([]);
+  });
+
+  it("falls back to the working directory when no approvalKey is given", async () => {
+    const s = await setup({ workingDirectory: "C:\\repo" });
+    void perm(s)({ kind: "shell", fullCommandText: "git status", commands: [{ identifier: "git" }] });
+    await tick();
+    s.transport.deliverDecision(s.transport.permissions.at(-1)!.nonce, "always", "u1");
+    await tick();
+    expect(s.policy.repoApprovals("C:\\repo")).toContain("git");
+  });
+
   it("disconnect() unsubscribes the decision handler and disconnects", async () => {
     const s = await setup();
     expect(s.transport.decision).toBeTypeOf("function");

@@ -25,6 +25,8 @@ import { stateDir } from "./paths.js";
 export class ApprovalPolicy {
   private readonly session = new Map<string, Set<string>>();
   private repo: Record<string, string[]> = {};
+  /** Bumped by every revocation — see `revocationEpoch`. */
+  private epoch = 0;
   private readonly file: string;
 
   constructor(file: string = path.join(stateDir(), "approvals.json")) {
@@ -75,7 +77,7 @@ export class ApprovalPolicy {
 
   /** Drop a session's in-memory approvals (on session teardown). */
   clearSession(sessionKey: string): void {
-    this.session.delete(sessionKey);
+    if (this.session.delete(sessionKey)) this.epoch++;
   }
 
   /** Executables approved in-memory for a session (for /approvals display). */
@@ -96,7 +98,19 @@ export class ApprovalPolicy {
    *  cleared first, so THIS process is fail-closed regardless of the disk write. */
   clearRepo(repoPath: string): boolean {
     if (this.repo[repoPath]) delete this.repo[repoPath];
+    this.epoch++;
     return this.persist();
+  }
+
+  /**
+   * Counter bumped by every revocation. A grant that was decided BEFORE a
+   * revocation must not be allowed to land after it: the click's Discord
+   * acknowledgement is a network round trip, and `/approvals clear` can complete
+   * (and report success) during it, so without this a revoked rule could quietly
+   * come back. Callers snapshot this before an await and re-check after.
+   */
+  revocationEpoch(): number {
+    return this.epoch;
   }
 
   private load(): void {

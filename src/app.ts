@@ -38,6 +38,7 @@ import {
   type Isolation,
 } from "./core/worktree.js";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import { sendUnlessAborted } from "./core/turn-gate.js";
@@ -103,10 +104,17 @@ class FatalReconcileError extends Error {}
  *  lab machine is a resource leak, not a feature. */
 const MAX_LIVE_SESSIONS = 8;
 
-/** Where per-session worktrees live. Kept out of the controlled repo so the
- *  agent can never see (or commit) another session's checkout. */
+/** Where per-session worktrees live.
+ *
+ * Deliberately NOT under `stateDir()`: that directory holds `approvals.json`,
+ * the session store and the instance lock, and every agent's cwd would then sit
+ * two levels below the bot's own trust store. In a threat model where the
+ * controlled repo is untrusted and tools run unsandboxed as the OS user, one
+ * approved relative-path write would be enough to grant durable auto-approval
+ * for arbitrary executables. Keeping worktrees in a sibling directory means no
+ * agent's working directory has the trust store as an ancestor. */
 function worktreeRoot(): string {
-  return join(stateDir(), "worktrees");
+  return `${stateDir()}-worktrees`;
 }
 
 /** Milliseconds a single session teardown may take during /new before we give
@@ -636,11 +644,31 @@ export class DiscordCopilotApp {
       return;
     }
     if (perm) {
-      // Ack Discord BEFORE settling, so an Allow can never run while the user
-      // sees "interaction failed"; ack failure delivers the safe default (deny).
+      // Snapshot the approval policy's revocation epoch BEFORE the ack. The ack
+      // is a network round trip, and `/approvals clear:true` can land during it:
+      // the operator would be told "Future commands will prompt again" and then
+      // this in-flight click would re-add the very rule they just revoked. A
+      // scope-widening decision (session/always) is downgraded to a one-shot
+      // approval in that case — the click still does what the operator saw on
+      // the card, but it cannot resurrect a revoked grant.
+      const epochAtClick = this.approvals.revocationEpoch();
       await resolveButtonAck(
         () => interaction.update({ components: [] }),
-        (d) => this.transport.deliverDecision(perm.nonce, d, uid),
+        (d) => {
+          const widens = d === "session" || d === "always";
+          const revoked = this.approvals.revocationEpoch() !== epochAtClick;
+          if (widens && revoked) {
+            void this.transport
+              .notice(
+                interaction.channelId,
+                "ℹ️ 這次核准只套用於本次請求：在你點擊的同時，核准規則被 `/approvals clear` 清除了，因此沒有記住。"
+              )
+              .catch(() => {});
+            this.transport.deliverDecision(perm.nonce, "once", uid);
+            return;
+          }
+          this.transport.deliverDecision(perm.nonce, d, uid);
+        },
         perm.action
       );
       return;
@@ -721,7 +749,6 @@ export class DiscordCopilotApp {
       const dropThread = async (): Promise<void> => {
         await (thread as unknown as { delete?: () => Promise<unknown> }).delete?.().catch(() => {});
       };
-
       // Reserve-before-create (P2): durably record a `creating` row with a
       // caller-assigned session id BEFORE calling createSession, so a crash
       // between the two leaves an identifiable id on disk rather than a live
@@ -733,11 +760,13 @@ export class DiscordCopilotApp {
       // concurrent agents share one checkout and silently overwrite each other.
       let workDir = this.repoPath;
       let branch: string | undefined;
+      let worktreeCreated = false;
       if (this.isolation === "worktree") {
         branch = worktreeBranch(thread.id);
         workDir = worktreePath(worktreeRoot(), thread.id);
         try {
           await addWorktree(this.repoPath, workDir, branch);
+          worktreeCreated = true;
         } catch (err) {
           await dropThread();
           await interaction.editReply(
@@ -747,6 +776,20 @@ export class DiscordCopilotApp {
           return;
         }
       }
+      // Every abort path from here on must undo the worktree too, or the
+      // operator is told "未建立 session" while a full checkout (and a branch)
+      // is left on disk with no command able to reach it — /end only works on a
+      // LIVE session. Safe to call unconditionally: a worktree that was just
+      // created is clean by construction, so nothing can be lost.
+      const dropWorktree = async (): Promise<void> => {
+        if (!worktreeCreated) return;
+        await removeWorktreeIfClean(this.repoPath, workDir).catch(() => "failed" as const);
+      };
+      const abort = async (msg: string): Promise<void> => {
+        await dropWorktree();
+        await dropThread();
+        await interaction.editReply(msg);
+      };
 
       const reserved = this.store.reserve({
         threadId: thread.id,
@@ -759,10 +802,7 @@ export class DiscordCopilotApp {
         ...(branch ? { branch } : {}),
       });
       if (!reserved) {
-        await dropThread();
-        await interaction.editReply(
-          "⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未建立新的 session。請檢查磁碟／權限後重試。"
-        );
+        await abort("⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未建立新的 session。請檢查磁碟／權限後重試。");
         return;
       }
 
@@ -773,8 +813,7 @@ export class DiscordCopilotApp {
         const ended = await this.endAllSessions("A new session was started; this one has ended.");
         if (!ended) {
           this.store.remove(thread.id);
-          await dropThread();
-          await interaction.editReply(
+          await abort(
             "無法結束前一個 session（可能已失效），未建立新的。前一個 session 已保留——請重試；若持續發生請重啟 bot。"
           );
           return;
@@ -809,6 +848,9 @@ export class DiscordCopilotApp {
           ) ?? Promise.resolve()) as Promise<unknown>,
           TEARDOWN_TIMEOUT_MS
         ).catch(() => {});
+        // The record stays `creating` (→ orphaned on restart, fail-closed), so
+        // keep the worktree: an orphaned row is the operator's to inspect, and
+        // deleting the tree would remove the only evidence of what happened.
         await dropThread();
         await interaction.editReply(
           `⚠️ 建立 session 失敗（${err instanceof Error ? err.message : String(err)}）。請重試 /new。`
@@ -828,10 +870,7 @@ export class DiscordCopilotApp {
           disconnected = false;
         }
         if (disconnected) {
-          await dropThread();
-          await interaction.editReply(
-            "⚠️ 無法持久化 session 狀態（commit 失敗），已取消啟動。請檢查磁碟／權限後重試。"
-          );
+          await abort("⚠️ 無法持久化 session 狀態（commit 失敗），已取消啟動。請檢查磁碟／權限後重試。");
         } else {
           // Fence: keep the (maybe-live) actor registered so it is still tracked.
           this.sessions.set(thread.id, {
@@ -921,7 +960,17 @@ export class DiscordCopilotApp {
     this.sessions.delete(threadId);
     this.approvals.clearSession(threadId);
     this.transport.dispose(threadId);
-    this.store.remove(threadId);
+    // A failed write is not cosmetic here: the row would stay `active` while we
+    // go on to delete its worktree, and the next boot would retry resuming a
+    // session whose directory is gone — forever, because a missing tree is
+    // classified transient. Keep the worktree and say so instead.
+    if (!this.store.remove(threadId)) {
+      await interaction.editReply(
+        "⚠️ session 已停止，但**無法寫入磁碟**移除記錄，worktree 也保留未動。" +
+          "請檢查磁碟／權限後重啟 bot（否則下次啟動會嘗試復原這個 session）。"
+      );
+      return;
+    }
 
     let tail = "";
     if (session.branch && session.workDir !== this.repoPath) {
@@ -1179,6 +1228,29 @@ export class DiscordCopilotApp {
    *  orphaned, terminal) vs transient (record LEFT ACTIVE so a later restart
    *  retries — never dropping recoverable history). */
   private async resumeRecord(rec: SessionRecord): Promise<void> {
+    // The worktree may be gone (hand-deleted, disk cleaned). Recreate it from
+    // the branch, which git still has. Without this the resume fails, gets
+    // classified `transient`, and the record is retried on EVERY boot forever —
+    // unrecoverable without hand-editing the store, since /end refuses a thread
+    // with no live session.
+    if (rec.branch && rec.workDir !== this.repoPath && !existsSync(rec.workDir)) {
+      try {
+        await addWorktree(this.repoPath, rec.workDir, rec.branch);
+        console.warn(`reconcile: recreated missing worktree for ${rec.threadId} at ${rec.workDir}`);
+      } catch (err) {
+        // Terminal, not transient: retrying every boot cannot fix a tree we
+        // just failed to rebuild.
+        this.store.setState(rec.threadId, "blocked", "worktree-missing");
+        await this.transport
+          .notice(
+            rec.threadId,
+            `⚠️ 無法復原：這個 session 的工作目錄不存在，且重建失敗（${err instanceof Error ? err.message : String(err)}）。` +
+              `分支 \`${rec.branch}\` 仍在，請用 /new 開新的。`
+          )
+          .catch(() => {});
+        return;
+      }
+    }
     const broker = new PendingInteractionBroker();
     let actor: SessionActor;
     try {
@@ -1250,8 +1322,15 @@ export class DiscordCopilotApp {
    *  must NOT resume — it would run one repo's conversation against another. */
   private bindingOk(rec: SessionRecord): boolean {
     const norm = (p: string): string => p.replace(/[\\/]+$/, "").toLowerCase();
+    // `workDir` must be somewhere WE would have put it — the controlled repo
+    // itself, or under the worktree root. The store file is plain JSON in the
+    // user's home; a record whose workDir was edited to point elsewhere would
+    // otherwise resume an agent into an arbitrary directory.
+    const wd = norm(rec.workDir);
+    const workDirOk = wd === norm(this.repoPath) || wd.startsWith(norm(worktreeRoot()) + "\\") || wd.startsWith(norm(worktreeRoot()) + "/");
     return (
       norm(rec.repoPath) === norm(this.repoPath) &&
+      workDirOk &&
       rec.guildId === this.config.DISCORD_GUILD_ID &&
       rec.parentChannelId === this.config.DISCORD_PARENT_CHANNEL_ID
     );
@@ -1508,9 +1587,16 @@ export class DiscordCopilotApp {
     }
     const staged = interaction.options.getBoolean("staged") ?? false;
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    // Diff the tree THIS session actually works in. With worktree isolation the
+    // controlled repo's own checkout is never modified — diffing it would report
+    // "no changes" for a session that has changed plenty, which is the one
+    // answer this command must never give.
+    const session = this.sessions.get(interaction.channelId);
+    const dir = session?.workDir ?? this.repoPath;
+    const where = session?.branch ? `（分支 \`${session.branch}\`）` : "";
     try {
-      const summary = await gitDiffSummary(this.repoPath, staged);
-      await interaction.editReply({ content: summary });
+      const summary = await gitDiffSummary(dir, staged);
+      await interaction.editReply({ content: (where ? where + "\n" : "") + summary });
     } catch (err) {
       await interaction.editReply({
         content: `⚠️ 無法取得 git diff：${err instanceof Error ? err.message : String(err)}`,
@@ -1699,8 +1785,8 @@ export class DiscordCopilotApp {
       await this.transport
         .notice(
           message.channelId,
-          "💤 這個討論串的 session 已經結束（v1 一次只跑一個 session，後來的 `/new` 會接手），訊息不會送出。" +
-            "請到最新的討論串繼續，或在父頻道用 `/new` 開一個新的。"
+          "💤 這個討論串的 session 已經結束（可能是你用了 `/end`，或在共用工作目錄模式下被後來的 `/new` 接手），訊息不會送出。" +
+            "用 `/sessions` 看還有哪些在跑，或在父頻道用 `/new` 開一個新的。"
         )
         .catch(() => {});
     } catch {
@@ -1859,7 +1945,11 @@ export class DiscordCopilotApp {
     if (!session || session.running || session.queue.length === 0) return;
     const next = session.queue.shift()!;
     const left = session.queue.length;
-    await this.transport
+    // NOTHING may await between the guard above and `runTurn` claiming the turn,
+    // or two callers (a finishing turn and a `/queue` on an idle session) both
+    // pass the guard, both shift, and the second lands as a steer into the turn
+    // the first just started. So the notice is fire-and-forget.
+    void this.transport
       .notice(threadId, `▶️ 開始執行佇列中的訊息${left ? `（還有 ${left} 則）` : ""}：\n> ${next.slice(0, 300)}`)
       .catch(() => {});
     await this.runTurn(threadId, next);
@@ -1885,6 +1975,12 @@ export class DiscordCopilotApp {
         await withTimeout(session.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
         this.sessions.delete(threadId);
         this.transport.dispose(threadId);
+        // Drop the durable record too. v1 got this for free because `reserve()`
+        // OVERWROTE the single record; with a per-thread store the ended row
+        // would survive as `active` and be resumed on the next boot — putting a
+        // second live agent back into the shared checkout that ending it was
+        // meant to prevent, in a thread the operator was told had ended.
+        this.store.remove(threadId);
       } catch {
         ok = false; // keep it — a later /new retries the (idempotent) disconnect
       }

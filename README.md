@@ -144,11 +144,15 @@ consume sidebar width.
 ## Concurrent sessions
 
 Every `/new` thread is an independent session and they run **in parallel**. Each
-gets its own **git worktree** (branch `copilot/t-<threadId>` under
-`~/.discord-copilot-sdk/worktrees/`), so two agents working at the same time
-cannot overwrite each other's files — verified by running two threads at once
-and confirming each wrote only into its own tree while the controlled repo
-stayed untouched.
+gets its own **git worktree** (branch `copilot/t-<threadId>`), so two agents
+working at the same time do not overwrite each other's files — verified by
+running two threads at once and confirming each wrote only into its own tree
+while the controlled repo stayed untouched.
+
+> The isolation is against *accidental* clobbering, not a sandbox. Lab mode runs
+> tools unsandboxed as your OS user, so a session that is deliberately steered
+> (e.g. by prompt injection from repo content) can still reach another session's
+> worktree by path. Everything in the security model above still applies.
 
 - `/sessions` — what's live, with each one's state and branch (max 8)
 - `/end` — end **this** thread's session; the others keep running

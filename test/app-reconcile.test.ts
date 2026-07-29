@@ -4,8 +4,9 @@ import { SessionStore, type SessionBinding } from "../src/core/session-store.js"
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Transport } from "../src/core/transport.js";
 import { tmpdir } from "node:os";
+import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
-import { rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync, mkdirSync } from "node:fs";
 
 const REPO = "C:\\repo";
 const tmpFile = (): string => join(tmpdir(), `dp-reconcile-${Math.random()}.json`);
@@ -68,11 +69,19 @@ const fakeSession = {
   rpc: { plan: { readSqlTodosWithDependencies: async () => ({ rows: [], dependencies: [] }) } },
 };
 
-function fakeCopilot(opts: { resumeError?: string } = {}): CopilotClient {
+/** Captures the config each resume was called with, so a test can assert the
+ *  session came back into the RIGHT working directory. */
+const resumeCalls: Array<{ id: string; cfg: Record<string, unknown> }> = [];
+
+function fakeCopilot(
+  opts: { resumeError?: string | ((id: string) => string | undefined) } = {}
+): CopilotClient {
   return {
     createSession: async () => fakeSession,
-    resumeSession: async (_id: string, _cfg: unknown) => {
-      if (opts.resumeError) throw new Error(opts.resumeError);
+    resumeSession: async (id: string, cfg: Record<string, unknown>) => {
+      resumeCalls.push({ id, cfg });
+      const e = typeof opts.resumeError === "function" ? opts.resumeError(id) : opts.resumeError;
+      if (e) throw new Error(e);
       return fakeSession;
     },
   } as unknown as CopilotClient;
@@ -233,6 +242,89 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       expect(store.isCorrupt()).toBe(true);
       const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
       await expect(reconcile(app, async () => "valid")).rejects.toThrow(/corrupt/i);
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+});
+
+describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
+  it("resumes EVERY active record, not just the first", async () => {
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      for (const id of ["t1", "t2", "t3"]) {
+        store.reserve(bind({ threadId: id, sessionId: `s-${id}`, generation: 1 }));
+        store.commit(id);
+      }
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      await reconcile(app, async () => "valid");
+      expect([...sessionsOf(app).keys()].sort()).toEqual(["t1", "t2", "t3"]);
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
+  it("one unusable record does NOT stop the others from coming back", async () => {
+    // Before this, a single bad row aborted the whole loop and every other
+    // thread stayed dead until someone noticed.
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      for (const id of ["t1", "bad", "t3"]) {
+        store.reserve(bind({ threadId: id, sessionId: `s-${id}`, generation: 1 }));
+        store.commit(id);
+      }
+      const copilot = fakeCopilot({ resumeError: (id) => (id === "s-bad" ? "boom" : undefined) });
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, copilot, new FakeTransport(), store);
+      await reconcile(app, async () => "valid");
+      expect(sessionsOf(app).has("t1")).toBe(true);
+      expect(sessionsOf(app).has("t3")).toBe(true);
+      expect(sessionsOf(app).has("bad")).toBe(false);
+      expect(store.get("bad")?.state).toBe("active"); // transient → retried later
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
+  it("resumes each session into ITS OWN recorded workDir", async () => {
+    // Resuming a worktree session into another session's directory would run
+    // one thread's conversation against another thread's files. The workDir must
+    // be one `bindingOk` accepts, i.e. under the real worktree root.
+    const f = tmpFile();
+    const wt = join(`${stateDir()}-worktrees`, `test-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(wt, { recursive: true });
+    try {
+      resumeCalls.length = 0;
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t1", sessionId: "s-1", workDir: wt, branch: "copilot/t-1" }));
+      store.commit("t1");
+      store.reserve(bind({ threadId: "t2", sessionId: "s-2", workDir: REPO }));
+      store.commit("t2");
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      await reconcile(app, async () => "valid");
+      const byId = Object.fromEntries(resumeCalls.map((c) => [c.id, c.cfg["workingDirectory"]]));
+      expect(byId["s-1"]).toBe(wt);
+      expect(byId["s-2"]).toBe(REPO);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(wt, { recursive: true, force: true });
+    }
+  });
+
+  it("REFUSES to resume a record whose workDir was tampered with", async () => {
+    // The store is plain JSON in the user's home. A record edited to point
+    // somewhere else must not resume an agent into an arbitrary directory.
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t1", sessionId: "s-1", workDir: "C:\\somewhere\\else" }));
+      store.commit("t1");
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      await reconcile(app, async () => "valid");
+      expect(sessionsOf(app).has("t1")).toBe(false);
+      expect(store.get("t1")?.state).toBe("blocked");
+      expect(store.get("t1")?.reason).toBe("config-mismatch");
     } finally {
       rmSync(f, { force: true });
     }

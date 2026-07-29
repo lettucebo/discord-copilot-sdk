@@ -166,8 +166,11 @@ The bot's single-instance guard is a **local** PID lock and cannot see other hos
 
 ## 9. 多個 session 同時進行 / Concurrent sessions
 
-**可以並行。** 每個 `/new` 開的討論串都是獨立 session，預設每個都有**自己的 git worktree**（分支 `copilot/t-<threadId>`，放在 `~/.discord-copilot-sdk/worktrees/`），所以兩個 agent 同時改檔案不會互相覆蓋。
-**Yes, they run in parallel.** Each `/new` thread is its own session, and by default each gets its **own git worktree** (branch `copilot/t-<threadId>`, under `~/.discord-copilot-sdk/worktrees/`), so two agents editing files at the same time cannot clobber each other.
+**可以並行。** 每個 `/new` 開的討論串都是獨立 session，預設每個都有**自己的 git worktree**（分支 `copilot/t-<threadId>`，放在 `~/.discord-copilot-sdk-worktrees/`），所以兩個 agent 同時改檔案不會互相覆蓋。
+**Yes, they run in parallel.** Each `/new` thread is its own session, and by default each gets its **own git worktree** (branch `copilot/t-<threadId>`, under `~/.discord-copilot-sdk-worktrees/`), so two agents editing files at the same time do not clobber each other.
+
+> 這是防止**意外**互相覆蓋，不是沙箱。lab 模式下工具以你的 OS 使用者身分執行且沒有隔離，被刻意操控的 agent 仍可用路徑存取別的 worktree。
+> This prevents *accidental* clobbering; it is not a sandbox. Tools run unsandboxed as your OS user, so a deliberately steered agent can still reach another worktree by path.
 
 | 指令 / Command | 用途 / Purpose |
 | --- | --- |
@@ -177,8 +180,8 @@ The bot's single-instance guard is a **local** PID lock and cannot see other hos
 
 上限同時 8 個 session。/ Up to 8 at once.
 
-`/end` 只有在 git 回報**乾淨**時才會移除 worktree；有未提交的變更就保留並告訴你路徑 —— 沒提交的工作不該被順手刪掉。
-`/end` removes the worktree **only when git reports it clean**; a dirty one is kept and its path reported — uncommitted work is not ours to discard.
+`/end` 只有在 git 回報**乾淨**時才會移除 worktree（含被 `.gitignore` 忽略的檔案也算「有東西」）；有任何本地內容就保留並告訴你路徑 —— 沒提交的工作不該被順手刪掉。`/diff` 顯示的是**這個討論串自己的** worktree。
+`/end` removes the worktree **only when git reports it clean** (ignored files count as content too); anything local is kept and its path reported. `/diff` shows **this thread's own** worktree.
 
 ### `SESSION_ISOLATION`
 
