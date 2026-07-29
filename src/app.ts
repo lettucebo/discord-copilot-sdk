@@ -1024,7 +1024,7 @@ export class DiscordCopilotApp {
       const r = await removeWorktreeIfClean(this.repoPath, workDir, branch);
       tail = this.worktreeOutcomeText(r, workDir, branch);
       if (r !== "removed" && r !== "already-absent") {
-        if (!this.store.setState(threadId, "blocked", "worktree-kept")) {
+        if (!this.retire(threadId)) {
           return {
             ok: false,
             tail: `${tail}\n⚠️ 且**無法寫入磁碟**更新記錄，請檢查磁碟／權限後重啟 bot。`,
@@ -1034,16 +1034,36 @@ export class DiscordCopilotApp {
       }
     }
     if (!this.store.remove(threadId)) {
+      // Only an `active` record would be resumed next boot; a terminal one is
+      // retained untouched, so promising a resume attempt there would be false.
+      const willResume = this.store.get(threadId)?.state === "active";
       return {
         ok: false,
         tail:
-          `${tail}\n⚠️ 但**無法寫入磁碟**移除記錄。` +
-          "請檢查磁碟／權限後重啟 bot（否則下次啟動會嘗試復原這個 session）。",
+          `${tail}\n⚠️ 但**無法寫入磁碟**移除記錄。請檢查磁碟／權限後重啟 bot` +
+          (willResume ? "（否則下次啟動會嘗試復原這個 session）。" : "，記錄仍會留著。"),
       };
     }
     return { ok: true, tail };
   }
 
+  /**
+   * Retire a record whose worktree we refused to remove: terminal, so the next
+   * boot does not try to resume a session we already stopped, but still listed
+   * and still reapable.
+   *
+   * The existing `reason` is preserved when it already says why the thread is
+   * unreachable. `setState` overwrites `reason`, and the startup announcement
+   * keys on those `thread-*` values — overwriting one would drop the record out
+   * of the announcement AND out of the stray-directory list (which skips any
+   * directory a record mentions), i.e. the single leftover you cannot reach from
+   * its own thread would go silent for ever. It also destroys the diagnosis.
+   */
+  private retire(threadId: string): boolean {
+    const cur = this.store.get(threadId)?.reason;
+    const keep = cur && cur.startsWith("thread-") ? cur : "worktree-kept";
+    return this.store.setState(threadId, "blocked", keep);
+  }
   /** One honest sentence per worktree-cleanup outcome. */
   private worktreeOutcomeText(
     r: "removed" | "already-absent" | "kept-dirty" | "kept-detached" | "failed",
@@ -1108,10 +1128,13 @@ export class DiscordCopilotApp {
     }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const outcome = await this.reclaim(threadId, rec.workDir, rec.branch);
+    // Re-read: reclaim may have retired the record, so the captured `rec.state`
+    // would be stale in the failure message.
+    const now = this.store.get(threadId)?.state ?? rec.state;
     await interaction.editReply(
       outcome.ok
-        ? `✅ 已清除這個討論串的殘留記錄（狀態：${rec.state}）。${outcome.tail}`
-        : `記錄**保留**（狀態：${rec.state}）。${outcome.tail}`
+        ? `✅ 已清除這個討論串的殘留記錄（原狀態：${rec.state}）。${outcome.tail}`
+        : `記錄**保留**（狀態：${now}）。${outcome.tail}`
     );
   }
 
@@ -1336,7 +1359,7 @@ export class DiscordCopilotApp {
    * startup, and only when there is something to say.
    */
   private async announceUnreachableRecords(): Promise<void> {
-    const unreachable = new Set(["thread-gone", "thread-inaccessible", "thread-archived"]);
+    const unreachable = new Set(["thread-gone", "thread-inaccessible", "thread-archived", "worktree-kept"]);
     const records = this.store.all();
     const lines = records
       .filter(
@@ -1361,22 +1384,31 @@ export class DiscordCopilotApp {
       /* no worktree root yet — nothing to report */
     }
     if (!lines.length && !stray.length) return;
-    // Cap explicitly: notice() truncates at 1900 chars, and silently losing the
-    // tail of a list whose whole purpose is to name ids would be worse than
-    // saying how many were left out.
-    const MAX = 15;
-    const shown = [...lines, ...stray].slice(0, MAX);
-    const omitted = lines.length + stray.length - shown.length;
+    // Budget by LENGTH, not by count: `notice()` slices at 1900, and a fixed cap
+    // does not bound the message — 15 realistic entries (19-digit snowflakes plus
+    // absolute paths) measure ~2250 chars, which silently drops the last ids AND
+    // the instruction line, in a message whose whole purpose is to name ids.
+    const all = [...lines, ...stray];
+    const head = `🧹 有 ${all.length} 項殘留仍佔著磁碟：\n`;
+    const foot =
+      (lines.length ? "\n討論串已無法使用，請在本頻道用 `/end thread:<id>` 清除（有未提交內容的 worktree 會保留）。" : "") +
+      (stray.length ? "\n沒有記錄的目錄請自行確認後 `git worktree remove`。" : "");
+    const BUDGET = 1850 - head.length - foot.length - 40; // 40 = room for the "omitted" line
+    const shown: string[] = [];
+    let used = 0;
+    for (const l of all) {
+      if (used + l.length + 1 > BUDGET) break;
+      shown.push(l);
+      used += l.length + 1;
+    }
+    const omitted = all.length - shown.length;
     await this.transport
       .notice(
         this.config.DISCORD_PARENT_CHANNEL_ID,
-        `🧹 有 ${lines.length + stray.length} 項殘留仍佔著磁碟：\n` +
-          `${shown.join("\n")}` +
+        head +
+          shown.join("\n") +
           (omitted > 0 ? `\n…另有 ${omitted} 項未列出（用 \`/sessions\` 查看）。` : "") +
-          (lines.length
-            ? "\n討論串已無法使用，請在本頻道用 `/end thread:<id>` 清除（有未提交內容的 worktree 會保留）。"
-            : "") +
-          (stray.length ? "\n沒有記錄的目錄請自行確認後 `git worktree remove`。" : "")
+          foot
       )
       .catch(() => {
         /* discoverability aid — never fail startup for it */

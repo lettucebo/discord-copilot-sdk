@@ -377,3 +377,102 @@ describe("startup announcement for records whose thread is gone", () => {
     }
   });
 });
+
+describe("a record retired by reclaim stays announceable", () => {
+  // reclaim() retires a kept-worktree record via setState(..., "blocked", reason),
+  // and setState OVERWRITES reason. If that erases `thread-gone`, the record drops
+  // out of the startup announcement (which keys on the thread-* reasons) AND out
+  // of the stray-directory list (which excludes any dir a record mentions) — so
+  // the one leftover whose thread you cannot type into goes silent for ever.
+  class KeyedTransport2 extends FakeTransport {
+    sent: Array<{ key: string; text: string }> = [];
+    override async notice(k: string, t: string): Promise<void> {
+      this.sent.push({ key: k, text: t });
+    }
+  }
+
+  it("keeps the thread-* diagnosis when the worktree is kept", async () => {
+    const f = tmpFile();
+    const wt = join(`${stateDir()}-worktrees`, "kept");
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "kept", workDir: wt, branch: "copilot/t-kept" }));
+      store.commit("kept");
+      const transport = new KeyedTransport2();
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      await reconcile(app, async () => "gone");
+      expect(store.get("kept")?.reason).toBe("thread-gone");
+
+      // The worktree does not exist here, so reclaim takes the already-absent
+      // path; force the "kept" branch by retiring the record the same way.
+      (app as unknown as { retire(id: string): boolean }).retire("kept");
+      const rec = store.get("kept");
+      expect(rec?.state).toBe("blocked");
+      expect(rec?.reason).toBe("thread-gone"); // diagnosis survives
+
+      transport.sent.length = 0;
+      await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
+      const parent = transport.sent.filter((m) => m.key === "c1");
+      expect(parent).toHaveLength(1);
+      expect(parent[0]!.text).toContain("kept"); // still discoverable at boot
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
+  it("announces a record retired from a live session too (it still holds disk)", async () => {
+    const f = tmpFile();
+    const wt = join(`${stateDir()}-worktrees`, "live-end");
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "live-end", workDir: wt, branch: "copilot/t-live-end" }));
+      store.commit("live-end"); // active, no reason
+      const transport = new KeyedTransport2();
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      (app as unknown as { retire(id: string): boolean }).retire("live-end");
+      expect(store.get("live-end")?.reason).toBe("worktree-kept");
+
+      await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
+      expect(transport.sent.filter((m) => m.key === "c1")).toHaveLength(1);
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+});
+
+describe("startup announcement length budget", () => {
+  class Cap extends FakeTransport {
+    sent: string[] = [];
+    override async notice(_k: string, t: string): Promise<void> {
+      this.sent.push(t);
+    }
+  }
+  it("never composes past notice()'s 1900-char slice, and says how many it left out", async () => {
+    // A fixed count cap does not bound a message built from 19-digit snowflakes
+    // and absolute paths: 15 realistic entries measure ~2250 chars, so the last
+    // ids AND the instruction line were silently dropped — in a message whose
+    // entire job is to name ids.
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      for (let i = 0; i < 40; i++) {
+        const id = `153200000000000${String(i).padStart(4, "0")}`;
+        store.reserve(
+          bind({ threadId: id, workDir: join(`${stateDir()}-worktrees`, id), branch: `copilot/t-${id}` })
+        );
+        store.commit(id);
+        store.setState(id, "blocked", "thread-gone");
+      }
+      const transport = new Cap();
+      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
+      expect(transport.sent).toHaveLength(1);
+      const msg = transport.sent[0]!;
+      expect(msg.length).toBeLessThanOrEqual(1900);
+      expect(msg).toContain("另有"); // admits what it omitted
+      expect(msg).toContain("/end thread:"); // the instruction survives the cut
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+});
