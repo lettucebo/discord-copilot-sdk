@@ -10,7 +10,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTANCE="${DISCORD_COPILOT_SDK_INSTANCE_ID:-default}"
+# Same rule as the app (src/core/paths.ts): an id the app rejects would make this
+# script read a different lock than the app writes, so it would start a second
+# process that then dies on the app's own lock.
+RAW_ID="$(printf '%s' "${DISCORD_COPILOT_SDK_INSTANCE_ID:-}" | tr -d '[:space:]')"
+if printf '%s' "$RAW_ID" | grep -Eq '^[A-Za-z0-9._-]{1,64}$'; then
+  INSTANCE="$RAW_ID"
+else
+  INSTANCE="default"
+fi
 STATE_DIR="$HOME/.discord-copilot-sdk"
 LOCK="$STATE_DIR/$INSTANCE.lock"
 FOREGROUND=0

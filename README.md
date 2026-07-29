@@ -120,7 +120,7 @@ wizard. **This repo is private**, so these use `gh` (your existing GitHub login)
 `raw.githubusercontent.com` would 404.
 
 ```powershell
-& ([scriptblock]::Create((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String)))
+& ([scriptblock]::Create(((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String).TrimStart([char]0xFEFF))))
 ```
 
 ```bash

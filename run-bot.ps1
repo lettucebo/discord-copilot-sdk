@@ -16,7 +16,11 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 $root = $PSScriptRoot
-$instance = if ($env:DISCORD_COPILOT_SDK_INSTANCE_ID) { $env:DISCORD_COPILOT_SDK_INSTANCE_ID } else { 'default' }
+# Same rule as the app (src/core/paths.ts): an id the app rejects would make this
+# script read a different lock than the app writes, so it would start a second
+# process that then dies on the app's own lock.
+$rawId = if ($env:DISCORD_COPILOT_SDK_INSTANCE_ID) { $env:DISCORD_COPILOT_SDK_INSTANCE_ID.Trim() } else { '' }
+$instance = if ($rawId -match '^[A-Za-z0-9._-]{1,64}$') { $rawId } else { 'default' }
 $stateDir = Join-Path $env:USERPROFILE '.discord-copilot-sdk'
 $lock = Join-Path $stateDir "$instance.lock"
 

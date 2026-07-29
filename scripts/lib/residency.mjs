@@ -167,7 +167,14 @@ function setupWindows(lang, opts = {}) {
     `Set-Location -LiteralPath '${q(REPO_ROOT)}'`,
     `& '${q(node)}' dist/index.js *>> '${q(logFile)}'`,
   ].join("\r\n");
-  fs.writeFileSync(wrapper, wrapperBody + "\r\n", "utf8");
+  // BOM, for the same reason the shipped .ps1 files carry one: Windows
+  // PowerShell 5.1 reads a BOM-less .ps1 as ANSI, and this wrapper interpolates
+  // REPO_ROOT, the copilot/git dirs and a log path built from os.homedir(). A
+  // non-ASCII Windows username — entirely ordinary for this project's audience —
+  // then breaks the file's quoting and it fails to PARSE. Silently: the parse
+  // error happens before the `*>>` redirect on the last line, so nothing reaches
+  // the bot log and the task merely appears to run and stop.
+  fs.writeFileSync(wrapper, "\ufeff" + wrapperBody + "\r\n", "utf8");
 
   const psExe = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const wrapperLeaf = path.basename(wrapper);
@@ -182,15 +189,37 @@ function setupWindows(lang, opts = {}) {
     pwEnvVar: PW_ENV,
   });
 
-  // The script goes over STDIN and the password over the child ENVIRONMENT, so
-  // neither ever lands in a command line that other processes can read.
+  // Run the registration as a FILE, not over `-Command -`.
+  //
+  // `powershell -Command -` is REPL-over-stdin: every line is an independent
+  // command, a terminating error aborts only that line, and the process still
+  // exits 0. Under it BOTH safety guards in this script were inert — the
+  // "refusing to replace a task that isn't ours" throw did not stop the next
+  // line's `Register-ScheduledTask -Force`, and `if(-not $pw){throw}` did not
+  // stop registration with an EMPTY password — and a genuinely failed
+  // registration was reported to the operator as success.
+  //
+  // The password stays in the environment, so the file holds no secret.
+  const scriptPath = path.join(os.tmpdir(), `dcs-residency-${process.pid}-${Date.now()}.ps1`);
+  fs.writeFileSync(scriptPath, "\ufeff" + register.replace(/\n/g, "\r\n") + "\r\n", "utf8");
   const childEnv = { ...process.env };
   if (mode === "always") childEnv[PW_ENV] = opts.password ?? "";
-  execFileSync(psExe, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"], {
-    input: register,
-    env: childEnv,
-    stdio: ["pipe", "inherit", "inherit"],
-  });
+  let out = "";
+  try {
+    out = execFileSync(psExe, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath], {
+      env: childEnv,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+  } finally {
+    fs.rmSync(scriptPath, { force: true });
+  }
+  // Belt and braces: require the sentinel the script prints only after both
+  // Register-ScheduledTask and Start-ScheduledTask succeeded, so a future change
+  // to how PowerShell reports failure cannot turn this back into a silent lie.
+  if (!/(^|\s)registered(\s|$)/.test(out)) {
+    throw new Error(`residency registration did not confirm success (task ${name})`);
+  }
   console.log((mode === "always" ? t("residencyWin247", lang) : t("residencyWin", lang)) + name);
   console.log(
     lang === "zh"

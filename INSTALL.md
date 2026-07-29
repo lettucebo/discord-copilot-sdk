@@ -35,13 +35,16 @@ No clone needed — this ensures git, fetches the source, and drops you into the
 ### Windows (PowerShell)
 
 ```powershell
-& ([scriptblock]::Create((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String)))
+& ([scriptblock]::Create(((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String).TrimStart([char]0xFEFF))))
 ```
+
+> `.TrimStart([char]0xFEFF)` 是必要的：`get.ps1` 帶有 UTF-8 BOM（從磁碟執行時 PowerShell 5.1 需要它），而 **PowerShell 7 不會**從原生命令輸出中去除 BOM，第一個語句會被當成叫做 `﻿#Requires` 的指令。
+> The `.TrimStart([char]0xFEFF)` is required: `get.ps1` carries a UTF-8 BOM (PowerShell 5.1 needs it when the file is run from disk), and **PowerShell 7 does not strip a BOM** from native-command output, so the first statement would parse as a command named `﻿#Requires`.
 
 要帶旗標時接在後面 / Append flags directly:
 
 ```powershell
-& ([scriptblock]::Create((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String))) -Residency24x7
+& ([scriptblock]::Create(((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String).TrimStart([char]0xFEFF)))) -Residency24x7
 ```
 
 ### macOS / Linux (bash)
@@ -60,12 +63,15 @@ gh repo clone lettucebo/discord-copilot-sdk && cd discord-copilot-sdk && ./insta
 ### 若這個 repo 改為 public / If this repo is made public
 
 ```powershell
-irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1 | iex
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1)))
 ```
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.sh | bash
 ```
+
+> 這裡刻意**不用** `irm ... | iex`：`Invoke-Expression` 在**呼叫者的作用域**中求值，頂層的 `param()` 會退化成變數宣告，任何參數屬性都會在腳本主體執行前就丟出例外。`[scriptblock]::Create` 會取得真正的作用域，才是可行的形式。
+> Deliberately **not** `irm ... | iex`: `Invoke-Expression` evaluates in the **caller's scope**, where a top-level `param()` degenerates into variable declarations and any parameter attribute throws before the body runs. `[scriptblock]::Create` gets a real scope, and is the form that works.
 
 可用環境變數 / Env overrides：`DISCORD_COPILOT_SDK_DIR`（安裝位置，預設 `~/discord-copilot-sdk`）、`DISCORD_COPILOT_SDK_REF`（分支或標籤，預設 `main`）。
 

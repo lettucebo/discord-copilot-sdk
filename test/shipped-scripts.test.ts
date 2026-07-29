@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -32,6 +33,15 @@ describe("shipped scripts", () => {
     // bash fail with `$'\r': command not found` on the user's machine.
     const text = fs.readFileSync(path.join(ROOT, name), "utf8");
     expect(text.startsWith("#!")).toBe(true);
+  });
+
+  it("every .sh is committed executable, because the docs say ./run-bot.sh", () => {
+    // A 100644 mode means a fresh macOS/Linux clone gets `permission denied` on
+    // every command the new docs tell people to run.
+    const out = execFileSync("git", ["ls-files", "-s", ...SHELL], { cwd: ROOT, encoding: "utf8" });
+    for (const line of out.trim().split(/\r?\n/)) {
+      expect(line.startsWith("100755")).toBe(true);
+    }
   });
 
   it("documents the one-line install in both README and INSTALL", () => {
