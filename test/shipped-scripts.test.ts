@@ -41,4 +41,16 @@ describe("shipped scripts", () => {
       expect(text).toContain("get.sh");
     }
   });
+
+  it("does not present a raw.githubusercontent one-liner as THE way while the repo is private", () => {
+    // The repo is private, so `irm https://raw.githubusercontent.com/...` 404s
+    // for everyone — including its owner. Documenting it unconditionally is a
+    // command that cannot work. Both docs must show the `gh` form, which uses
+    // the reader's existing GitHub login, and say why.
+    for (const doc of ["README.md", "INSTALL.md"]) {
+      const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
+      expect(text).toMatch(/gh api repos\/lettucebo\/discord-copilot-sdk\/contents\/get\.ps1/);
+      expect(text).toMatch(/private/i);
+    }
+  });
 });

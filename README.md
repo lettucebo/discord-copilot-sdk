@@ -116,25 +116,27 @@ Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-
 ## Quick start
 
 One line, no clone needed — ensures git, fetches the source, runs the bilingual
-wizard:
+wizard. **This repo is private**, so these use `gh` (your existing GitHub login);
+`raw.githubusercontent.com` would 404.
 
 ```powershell
-irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1 | iex
+& ([scriptblock]::Create((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String)))
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.sh | bash
+gh api repos/lettucebo/discord-copilot-sdk/contents/get.sh -H "Accept: application/vnd.github.raw" | bash
 ```
 
-Add `-Residency24x7` / `--residency-24x7` to also install **true 24/7** residency
-(starts at boot, no login required). See the residency section of
+Append `-Residency24x7` / `--residency-24x7` to also install **true 24/7**
+residency (starts at boot, no login required). See the residency section of
 [`INSTALL.md`](INSTALL.md) for what that costs — on Windows it means the task has
 to hold your account password, because the Copilot CLI's login lives in your user
 profile and a service account would be unauthenticated.
 
-Full instructions are in [`INSTALL.md`](INSTALL.md). Setting up the Discord bot
-itself — application, the required Message Content intent, invite permissions,
-and the four IDs — is in [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md).
+Full instructions, including the plain `irm`/`curl` one-liners for when this repo
+is public, are in [`INSTALL.md`](INSTALL.md). Setting up the Discord bot itself —
+application, the required Message Content intent, invite permissions, and the
+four IDs — is in [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md).
 
 From an existing clone:
 

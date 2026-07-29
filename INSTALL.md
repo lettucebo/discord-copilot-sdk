@@ -29,24 +29,42 @@ The installer is **bilingual** (Traditional Chinese + English): it defaults to y
 不需要先 clone，這行會裝好 git、抓下原始碼，然後直接進入設定精靈。
 No clone needed — this ensures git, fetches the source, and drops you into the wizard.
 
+> ⚠️ **這個 repo 目前是 private**，所以 `raw.githubusercontent.com` 會回 404。請用下面的 `gh` 版本（會用你已登入的 GitHub 認證）。
+> ⚠️ **This repo is currently private**, so `raw.githubusercontent.com` returns 404. Use the `gh` form below — it uses your existing GitHub login.
+
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1 | iex
+& ([scriptblock]::Create((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String)))
 ```
 
-要帶旗標時用 scriptblock 形式（管線無法傳參數）：
-To pass flags, use the scriptblock form (a pipe cannot carry arguments):
+要帶旗標時接在後面 / Append flags directly:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1))) -Residency24x7
+& ([scriptblock]::Create((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String))) -Residency24x7
 ```
 
 ### macOS / Linux (bash)
 
 ```bash
+gh api repos/lettucebo/discord-copilot-sdk/contents/get.sh -H "Accept: application/vnd.github.raw" | bash
+gh api repos/lettucebo/discord-copilot-sdk/contents/get.sh -H "Accept: application/vnd.github.raw" | bash -s -- --residency-24x7
+```
+
+### 更簡單的等效做法 / Simpler equivalent
+
+```bash
+gh repo clone lettucebo/discord-copilot-sdk && cd discord-copilot-sdk && ./install.ps1   # or ./install.sh
+```
+
+### 若這個 repo 改為 public / If this repo is made public
+
+```powershell
+irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1 | iex
+```
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.sh | bash
-curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.sh | bash -s -- --residency-24x7
 ```
 
 可用環境變數 / Env overrides：`DISCORD_COPILOT_SDK_DIR`（安裝位置，預設 `~/discord-copilot-sdk`）、`DISCORD_COPILOT_SDK_REF`（分支或標籤，預設 `main`）。
