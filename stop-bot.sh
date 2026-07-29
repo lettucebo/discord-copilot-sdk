@@ -59,7 +59,7 @@ fi
 #    node processes. Match the full command line.
 ARGS="$(ps -p "$PID" -o args= 2>/dev/null || true)"
 case "$ARGS" in
-  *index.js*) ;;
+  *dist/index.js*) ;;
   *) echo "PID $PID does not look like this bot — refusing to stop it."; echo "  $ARGS"; exit 0 ;;
 esac
 

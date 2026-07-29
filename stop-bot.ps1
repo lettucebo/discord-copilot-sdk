@@ -66,7 +66,7 @@ if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) {
 #    reused, and "it is called node" is not identity — this machine can easily
 #    have a dozen unrelated node processes. Match the command line.
 $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue).CommandLine
-if (-not $cmdLine -or $cmdLine -notmatch 'index\.js') {
+if (-not $cmdLine -or $cmdLine -notmatch 'dist[\\/]index\.js') {
   Write-Host "PID $procId 的指令列不像這個 bot — 不動它。/ PID $procId does not look like this bot — refusing."
   Write-Host "  $cmdLine"
   return
