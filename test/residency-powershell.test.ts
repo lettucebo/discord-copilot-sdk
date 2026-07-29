@@ -52,39 +52,30 @@ describe.runIf(isWindows)("how PowerShell is invoked decides whether the guards 
     expect(out).not.toContain("REACHED-THE-THING-WE-GUARDED"); // the guard held
   });
 
-  it("a BOM-less .ps1 with a non-ASCII path fails to PARSE under Windows PowerShell 5.1", () => {
+  it("a BOM makes a non-ASCII .ps1 parse under Windows PowerShell 5.1, on any machine", () => {
     // The generated residency wrapper interpolates REPO_ROOT and a log path built
-    // from os.homedir(). A Chinese Windows username is ordinary for this
-    // project's audience, and without a BOM 5.1 reads the file as ANSI, mangling
-    // the quotes. It fails silently, because the parse error precedes the `*>>`
-    // redirect that would have logged it.
-    const body = "Set-Location -LiteralPath 'C:\\Users\\使用者測試'\r\nWrite-Output 'RAN'\r\n";
-    const noBom = path.join(os.tmpdir(), `dcs-nobom-${process.pid}.ps1`);
+    // from os.homedir(). Without a BOM, 5.1 reads the file as ANSI: the UTF-8
+    // bytes of a Chinese Windows username are re-decoded as (say) Big5, which
+    // changes both the characters AND their count, shifting the quotes so the
+    // file fails to PARSE — silently, because the error precedes the `*>>`
+    // redirect that would have logged it. That is exactly how the shipped
+    // install.ps1 was broken:
+    //     haveNode = 'Node version'  ->  The hash literal was incomplete.
+    //
+    // WHETHER a given machine breaks depends on its ANSI codepage, so asserting
+    // the failure is not portable (an English CI runner at 1252 mangles the
+    // bytes differently and can still parse). What IS portable, and what we
+    // actually ship, is that the BOM version parses everywhere.
+    const body = "Set-Location -LiteralPath 'C:\\Users\\使用者測試' -ErrorAction SilentlyContinue\r\nWrite-Output 'RAN'\r\n";
     const withBom = path.join(os.tmpdir(), `dcs-bom-${process.pid}.ps1`);
-    fs.writeFileSync(noBom, body, "utf8");
     fs.writeFileSync(withBom, "\ufeff" + body, "utf8");
-    const run = (f: string): { code: number; out: string } => {
-      try {
-        return {
-          code: 0,
-          out: execFileSync(psExe, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", f], {
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "pipe"],
-          }),
-        };
-      } catch (e) {
-        return { code: (e as { status?: number }).status ?? 1, out: String((e as { stdout?: string }).stdout ?? "") };
-      }
-    };
     try {
-      // Set-Location to a path that doesn't exist fails either way; what differs
-      // is WHETHER THE FILE PARSED, which the marker after it proves.
-      const bom = run(withBom);
-      const bare = run(noBom);
-      expect(bom.out + bare.out).toContain("RAN"); // the BOM version got that far
-      expect(bare.out).not.toContain("RAN"); // the BOM-less one never parsed
+      const out = execFileSync(psExe, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", withBom], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      expect(out).toContain("RAN");
     } finally {
-      fs.rmSync(noBom, { force: true });
       fs.rmSync(withBom, { force: true });
     }
   });
