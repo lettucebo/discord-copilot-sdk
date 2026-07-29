@@ -22,8 +22,7 @@ describe("chooseIsolation", () => {
   });
 });
 
-describe("worktreeBranch / worktreePath", () => {
-  it("derives a stable, namespaced branch from the thread id", () => {
+describe("worktreeBranch / worktreePath", () => {  it("derives a stable, namespaced branch from the thread id", () => {
     expect(worktreeBranch("123456")).toBe("copilot/t-123456");
   });
 

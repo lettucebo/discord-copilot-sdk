@@ -138,6 +138,11 @@ export class DiscordTransport implements Transport {
     const chunks = text.length ? chunkText(text, 1900) : [];
     const channel = await this.fetchThread(sessionKey);
     if (!channel) return;
+    // Re-check AFTER the fetch: `dispose()` only deletes the map entry, and we
+    // are still holding `s`, so a session torn down during that round trip would
+    // otherwise get one more render posted into a thread the operator was just
+    // told had ended. The epoch guard can't catch this — the object is untouched.
+    if (this.sessions.get(sessionKey) !== s) return;
     // Delegates edit/re-anchor/trim to the unit-tested reconciler. The epoch
     // guard aborts cleanly if a new turn starts mid-write; a deleted anchor is
     // re-posted (never silently dropped).

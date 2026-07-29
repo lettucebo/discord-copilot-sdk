@@ -175,8 +175,8 @@ The bot's single-instance guard is a **local** PID lock and cannot see other hos
 | 指令 / Command | 用途 / Purpose |
 | --- | --- |
 | `/new` | 開一個新的並行 session（不會結束其他的）/ start another concurrent session (ends nothing) |
-| `/sessions` | 列出目前有哪些、各自的狀態與分支 / list what's live, with state and branch |
-| `/end` | 只結束**這個**討論串的 session / end **this** thread's session only |
+| `/sessions` | 列出進行中的 session，以及**殘留記錄**（無法復原、仍佔著 worktree 的）/ list live sessions **and stale records** still holding a worktree |
+| `/end` | 只結束**這個**討論串的 session；沒有進行中的 session 時，清除該討論串的殘留記錄與 worktree / end **this** thread's session — or reap its stale record and worktree when none is live |
 
 上限同時 8 個 session。/ Up to 8 at once.
 

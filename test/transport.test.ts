@@ -253,6 +253,29 @@ describe("DiscordTransport ask_user / plan cards", () => {
     ).rejects.toThrow();
   });
 
+  it("a flush racing dispose() posts NOTHING into the ended thread", async () => {
+    // doFlush captures its own state object and THEN awaits fetchThread. dispose()
+    // only deletes the map entry, so without a re-check after that await the
+    // session torn down mid-round-trip still gets one more render posted into a
+    // thread the operator was just told had ended. Disposing from inside the
+    // fetch is what puts the teardown in that exact window — disposing before
+    // the flush only exercises doFlush's first early return.
+    const ch = new FakeChannel();
+    let t!: DiscordTransport;
+    const client = {
+      channels: {
+        fetch: async () => {
+          t.dispose("thread"); // torn down while the flush is mid-fetch
+          return ch;
+        },
+      },
+    } as unknown as Client;
+    t = new DiscordTransport(client);
+    await t.render("thread", st("hello"));
+    await t.flush("thread");
+    expect(ch.sent).toHaveLength(0);
+  });
+
   it("showPlan publishes the FULL summary in chunks before the card (no truncation)", async () => {
     const ch = new FakeChannel();
     const t = new DiscordTransport(fakeClient(ch));

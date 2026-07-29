@@ -154,8 +154,11 @@ while the controlled repo stayed untouched.
 > (e.g. by prompt injection from repo content) can still reach another session's
 > worktree by path. Everything in the security model above still applies.
 
-- `/sessions` — what's live, with each one's state and branch (max 8)
-- `/end` — end **this** thread's session; the others keep running
+- `/sessions` — what's live, with each one's state and branch (max 8), plus any
+  stale records that still hold a worktree
+- `/end` — end **this** thread's session; the others keep running. In a thread
+  whose session is gone but whose record survived (reconcile blocked it), the
+  same command reaps that record and its worktree — otherwise nothing could.
 
 `/end` removes the worktree **only when git reports it clean**. A dirty one is
 kept and its path reported: uncommitted work is not ours to discard. To land a

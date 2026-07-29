@@ -939,7 +939,12 @@ export class DiscordCopilotApp {
     const threadId = interaction.channelId;
     const session = this.sessions.get(threadId);
     if (!session) {
-      await interaction.reply({ content: "這個討論串沒有進行中的 session。", flags: MessageFlags.Ephemeral });
+      // No LIVE session — but the thread may still own a durable record that
+      // reconcile marked `blocked`/`orphaned`. Those keep a full worktree and a
+      // branch that no other command can reach: /sessions only lists live ones
+      // and /new never touches them. Without this the only way to reclaim the
+      // disk was to edit the store by hand.
+      await this.endStaleRecord(interaction, threadId);
       return;
     }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -988,6 +993,36 @@ export class DiscordCopilotApp {
     );
   }
 
+  /** `/end` in a thread with no live session: reap the durable record and its
+   *  worktree, if it has one. Same rule as the live path — the worktree goes
+   *  only when git reports it clean. */
+  private async endStaleRecord(
+    interaction: ChatInputCommandInteraction,
+    threadId: string
+  ): Promise<void> {
+    const rec = this.store.get(threadId);
+    if (!rec) {
+      await interaction.reply({ content: "這個討論串沒有進行中的 session。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    let tail = "";
+    if (rec.branch && rec.workDir !== this.repoPath) {
+      const r = await removeWorktreeIfClean(this.repoPath, rec.workDir);
+      tail =
+        r === "removed"
+          ? `\n🌿 worktree 已清除（分支 \`${rec.branch}\` 保留）。`
+          : r === "kept-dirty"
+            ? `\n🌿 worktree **保留**：\`${rec.workDir}\` 還有本地內容（分支 \`${rec.branch}\`）。`
+            : `\n⚠️ 無法移除 worktree \`${rec.workDir}\`，請自行檢查。`;
+    }
+    if (!this.store.remove(threadId)) {
+      await interaction.editReply(`⚠️ 無法寫入磁碟移除記錄（狀態：${rec.state}）。請檢查磁碟／權限。${tail}`);
+      return;
+    }
+    await interaction.editReply(`✅ 已清除這個討論串的殘留記錄（狀態：${rec.state}）。${tail}`);
+  }
+
   /** `/sessions` — what is live right now, and where each one is working. */
   private async cmdSessions(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!isAuthorized(ctxOf(interaction), this.policy)) {
@@ -1000,9 +1035,20 @@ export class DiscordCopilotApp {
       const where = s.branch ? ` · \`${s.branch}\`` : " · 共用工作目錄";
       return `• <#${id}> — ${state}${q}${where}`;
     });
+    // Records with no live actor (reconcile marked them blocked/orphaned) still
+    // own a worktree and a branch. Surface them, or the disk they hold is
+    // invisible and nobody knows `/end` can reclaim it.
+    const stale = this.store
+      .all()
+      .filter((r) => !this.sessions.has(r.threadId))
+      .map((r) => `• <#${r.threadId}> — ${r.state}${r.reason ? `（${r.reason}）` : ""}${r.branch ? ` · \`${r.branch}\`` : ""}`);
     const header = `目前 ${rows.length}/${MAX_LIVE_SESSIONS} 個 session（隔離模式：\`${this.isolation}\`）`;
+    const body = rows.length ? `${header}\n${rows.join("\n")}` : `${header}\n（沒有進行中的 session）`;
+    const tail = stale.length
+      ? `\n\n殘留記錄（沒有執行中的 session，可在該討論串用 \`/end\` 清除）：\n${stale.join("\n")}`
+      : "";
     await interaction.reply({
-      content: (rows.length ? `${header}\n${rows.join("\n")}` : `${header}\n（沒有進行中的 session）`).slice(0, 1900),
+      content: (body + tail).slice(0, 1900),
       flags: MessageFlags.Ephemeral,
     });
   }
