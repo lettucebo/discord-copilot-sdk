@@ -43,7 +43,7 @@ import {
   type Isolation,
 } from "./core/worktree.js";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { sendUnlessAborted } from "./core/turn-gate.js";
@@ -992,40 +992,71 @@ export class DiscordCopilotApp {
     this.sessions.delete(threadId);
     this.approvals.clearSession(threadId);
     this.transport.dispose(threadId);
-    // A failed write is not cosmetic here: the row would stay `active` while we
-    // go on to delete its worktree, and the next boot would retry resuming a
-    // session whose directory is gone — forever, because a missing tree is
-    // classified transient. Keep the worktree and say so instead.
-    if (!this.store.remove(threadId)) {
-      await interaction.editReply(
-        "⚠️ session 已停止，但**無法寫入磁碟**移除記錄，worktree 也保留未動。" +
-          "請檢查磁碟／權限後重啟 bot（否則下次啟動會嘗試復原這個 session）。"
-      );
-      return;
-    }
-
-    let tail = "";
-    if (session.branch && session.workDir !== this.repoPath) {
-      const r = await removeWorktreeIfClean(this.repoPath, session.workDir, session.branch);
-      tail = this.worktreeOutcomeText(r, session.workDir, session.branch);
-    }
+    const outcome = await this.reclaim(threadId, session.workDir, session.branch);
     const left = this.sessions.size;
     await interaction.editReply(
-      `✅ 這個 session 已結束。${left ? `其他 ${left} 個 session 仍在執行。` : "目前沒有其他 session。"}${tail}`
+      `${outcome.ok ? "✅" : "⚠️"} 這個 session 已結束。${left ? `其他 ${left} 個 session 仍在執行。` : "目前沒有其他 session。"}${outcome.tail}`
     );
+  }
+
+  /**
+   * Retire a stopped session's durable record and worktree **together**.
+   *
+   * The two must move as one, and each ordering strands the other half:
+   * dropping the record first leaves a kept worktree that nothing lists and no
+   * command can reach; dropping the worktree first leaves, on a failed write, a
+   * record pointing at a directory that is gone. So the worktree's fate is
+   * decided FIRST, and the record follows it:
+   *
+   * - gone (removed, or already absent) → drop the record
+   * - kept  → keep the record, but retire it to `blocked` so the next boot does
+   *   not try to resume a session we just stopped, `/sessions` still shows the
+   *   disk it holds, and `/end thread:<id>` can retry once the operator has
+   *   dealt with whatever we refused to touch.
+   */
+  private async reclaim(
+    threadId: string,
+    workDir: string,
+    branch: string | undefined
+  ): Promise<{ ok: boolean; tail: string }> {
+    let tail = "";
+    if (branch && workDir !== this.repoPath) {
+      const r = await removeWorktreeIfClean(this.repoPath, workDir, branch);
+      tail = this.worktreeOutcomeText(r, workDir, branch);
+      if (r !== "removed" && r !== "already-absent") {
+        if (!this.store.setState(threadId, "blocked", "worktree-kept")) {
+          return {
+            ok: false,
+            tail: `${tail}\n⚠️ 且**無法寫入磁碟**更新記錄，請檢查磁碟／權限後重啟 bot。`,
+          };
+        }
+        return { ok: false, tail: `${tail}\n記錄保留，\`/sessions\` 才看得到還有東西在磁碟上。` };
+      }
+    }
+    if (!this.store.remove(threadId)) {
+      return {
+        ok: false,
+        tail:
+          `${tail}\n⚠️ 但**無法寫入磁碟**移除記錄。` +
+          "請檢查磁碟／權限後重啟 bot（否則下次啟動會嘗試復原這個 session）。",
+      };
+    }
+    return { ok: true, tail };
   }
 
   /** One honest sentence per worktree-cleanup outcome. */
   private worktreeOutcomeText(
-    r: "removed" | "kept-dirty" | "kept-detached" | "failed",
+    r: "removed" | "already-absent" | "kept-dirty" | "kept-detached" | "failed",
     dir: string,
     branch: string
   ): string {
     switch (r) {
       case "removed":
         return `\n🌿 worktree 已清除（分支 \`${branch}\` 保留）。`;
+      case "already-absent":
+        return `\n🌿 worktree \`${dir}\` 已經不存在了（分支 \`${branch}\` 保留）。`;
       case "kept-dirty":
-        return `\n🌿 worktree **保留**：\`${dir}\` 還有未提交／未追蹤／被忽略的內容（分支 \`${branch}\`）。確認後可自行 \`git worktree remove\`。`;
+        return `\n🌿 worktree **保留**：\`${dir}\` 還有未提交／未追蹤／被忽略的內容（分支 \`${branch}\`）。確認後可自行 \`git worktree remove\`，再用 \`/end thread:<id>\` 重試清除記錄。`;
       case "kept-detached":
         return `\n🌿 worktree **保留**：\`${dir}\` 的 HEAD 不是 \`${branch}\`（detached 或換了分支），裡面可能有沒有任何分支指向的 commit。請自行確認後再移除。`;
       default:
@@ -1047,6 +1078,16 @@ export class DiscordCopilotApp {
       return;
     }
     const disposition = classifyRecordDisposition(rec.state, this.sessions.has(threadId), this.creating);
+    if (disposition === "live") {
+      // Defensive: the callers check this synchronously first, but falling
+      // through to the destructive path if that ever changes would tear down a
+      // running session's worktree.
+      await interaction.reply({
+        content: "這個討論串仍有進行中的 session，請直接用 `/end`（不加參數）。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     if (disposition === "in-flight") {
       await interaction.reply({
         content: "⏳ 這個討論串的 `/new` 還在建立中，現在清除會把它的 worktree 抽掉。請等它完成後再試。",
@@ -1066,24 +1107,12 @@ export class DiscordCopilotApp {
       return;
     }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    let tail = "";
-    if (rec.branch && rec.workDir !== this.repoPath) {
-      const r = await removeWorktreeIfClean(this.repoPath, rec.workDir, rec.branch);
-      tail = this.worktreeOutcomeText(r, rec.workDir, rec.branch);
-      if (r !== "removed") {
-        // Keeping the tree but dropping the record would make the tree
-        // invisible again — the exact defect this path exists to fix.
-        await interaction.editReply(
-          `記錄**保留**，這樣 \`/sessions\` 才看得到還有東西在磁碟上。${tail}`
-        );
-        return;
-      }
-    }
-    if (!this.store.remove(threadId)) {
-      await interaction.editReply(`⚠️ 無法寫入磁碟移除記錄（狀態：${rec.state}）。請檢查磁碟／權限。${tail}`);
-      return;
-    }
-    await interaction.editReply(`✅ 已清除這個討論串的殘留記錄（狀態：${rec.state}）。${tail}`);
+    const outcome = await this.reclaim(threadId, rec.workDir, rec.branch);
+    await interaction.editReply(
+      outcome.ok
+        ? `✅ 已清除這個討論串的殘留記錄（狀態：${rec.state}）。${outcome.tail}`
+        : `記錄**保留**（狀態：${rec.state}）。${outcome.tail}`
+    );
   }
 
   /** `/sessions` — what is live right now, and where each one is working. */
@@ -1308,8 +1337,8 @@ export class DiscordCopilotApp {
    */
   private async announceUnreachableRecords(): Promise<void> {
     const unreachable = new Set(["thread-gone", "thread-inaccessible", "thread-archived"]);
-    const lines = this.store
-      .all()
+    const records = this.store.all();
+    const lines = records
       .filter(
         (r) =>
           classifyRecordDisposition(r.state, this.sessions.has(r.threadId), this.creating) === "reapable" &&
@@ -1317,13 +1346,37 @@ export class DiscordCopilotApp {
           unreachable.has(r.reason)
       )
       .map((r) => `• \`${r.threadId}\`（${r.reason}）${r.branch ? ` · 分支 \`${r.branch}\`` : ""} — \`${r.workDir}\``);
-    if (!lines.length) return;
+    // The other direction: /new creates the worktree BEFORE it persists the
+    // record, so a crash in between leaves a checkout that no record mentions —
+    // invisible to /sessions and to /end alike. Same for a store file replaced
+    // by hand. Listing both directions is what makes "nothing is silently
+    // holding disk" actually true.
+    const known = new Set(records.map((r) => r.workDir.toLowerCase()));
+    let stray: string[] = [];
+    try {
+      stray = readdirSync(worktreeRoot(), { withFileTypes: true })
+        .filter((d) => d.isDirectory() && !known.has(join(worktreeRoot(), d.name).toLowerCase()))
+        .map((d) => `• \`${join(worktreeRoot(), d.name)}\`（沒有對應的 session 記錄）`);
+    } catch {
+      /* no worktree root yet — nothing to report */
+    }
+    if (!lines.length && !stray.length) return;
+    // Cap explicitly: notice() truncates at 1900 chars, and silently losing the
+    // tail of a list whose whole purpose is to name ids would be worse than
+    // saying how many were left out.
+    const MAX = 15;
+    const shown = [...lines, ...stray].slice(0, MAX);
+    const omitted = lines.length + stray.length - shown.length;
     await this.transport
       .notice(
         this.config.DISCORD_PARENT_CHANNEL_ID,
-        `🧹 有 ${lines.length} 個 session 記錄的討論串已無法使用，各自仍佔著一個 worktree：\n` +
-          `${lines.join("\n")}\n` +
-          "無法在那些討論串裡下指令，請在本頻道用 `/end thread:<id>` 清除（有未提交內容的 worktree 會保留）。"
+        `🧹 有 ${lines.length + stray.length} 項殘留仍佔著磁碟：\n` +
+          `${shown.join("\n")}` +
+          (omitted > 0 ? `\n…另有 ${omitted} 項未列出（用 \`/sessions\` 查看）。` : "") +
+          (lines.length
+            ? "\n討論串已無法使用，請在本頻道用 `/end thread:<id>` 清除（有未提交內容的 worktree 會保留）。"
+            : "") +
+          (stray.length ? "\n沒有記錄的目錄請自行確認後 `git worktree remove`。" : "")
       )
       .catch(() => {
         /* discoverability aid — never fail startup for it */

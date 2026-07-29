@@ -163,9 +163,11 @@ while the controlled repo stayed untouched.
   record and its worktree.
 - `/end thread:<id>` — the commonest leftover is a **deleted** thread, which you
   cannot type inside. Run this from the parent channel instead; the bot also
-  posts the ids there at startup. A worktree is removed only when git proves it
-  safe — any local content, a detached HEAD, or a HEAD on a different branch
-  keeps it (and keeps the record, so `/sessions` still shows it).
+  posts the ids there at startup, along with any worktree directory that has no
+  record at all. A worktree is removed only when git proves it safe — any local
+  content, a detached HEAD, or a HEAD on a different branch keeps it, **and the
+  record is kept with it** so `/sessions` still shows the disk. Deal with the
+  tree (`git worktree remove`) and run the same command again to finish.
 
 `/end` removes the worktree **only when git reports it clean**. A dirty one is
 kept and its path reported: uncommitted work is not ours to discard. To land a

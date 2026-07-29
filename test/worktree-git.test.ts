@@ -56,6 +56,17 @@ describe("removeWorktreeIfClean", () => {
     await git(repo, "worktree", "remove", "--force", dir);
   });
 
+  it("reports an ALREADY-ABSENT directory instead of failing forever", async () => {
+    // A crash between removing the tree and removing the record, or an operator
+    // who ran `git worktree remove` by hand, leaves a record pointing at nothing.
+    // Reporting that as "failed" makes callers keep the record for ever, since
+    // every later attempt fails the same way — a leak with no way out.
+    const { dir, branch } = await makeWorktree("absent");
+    await git(repo, "worktree", "remove", "--force", dir);
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(await removeWorktreeIfClean(repo, dir, branch)).toBe("already-absent");
+  });
+
   it("REFUSES a detached HEAD carrying commits no branch points at", async () => {
     // git status is clean, but HEAD lives only in the worktree's own HEAD file.
     // Removing the tree drops that ref and the commits become unreachable and

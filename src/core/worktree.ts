@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import fs from "node:fs";
 import path from "node:path";
 
 const run = promisify(execFile);
@@ -116,7 +117,17 @@ export async function removeWorktreeIfClean(
   repo: string,
   dir: string,
   expectBranch?: string
-): Promise<"removed" | "kept-dirty" | "kept-detached" | "failed"> {
+): Promise<"removed" | "already-absent" | "kept-dirty" | "kept-detached" | "failed"> {
+  // "The directory is gone" is not a failure, and conflating the two strands
+  // records for ever: a caller that keeps the record whenever cleanup != removed
+  // can never let go of one whose tree is already absent, because every retry
+  // fails identically. This happens by following our own advice — we tell the
+  // operator to `git worktree remove` a tree we declined to touch — and after a
+  // crash between removing the tree and removing the record.
+  if (!fs.existsSync(dir)) {
+    await pruneWorktrees(repo); // drop git's now-dangling bookkeeping too
+    return "already-absent";
+  }
   try {
     // `--ignored=matching` matters: plain `git status --porcelain` hides
     // .gitignore'd paths, so a worktree whose only local content is ignored
