@@ -1,3 +1,6 @@
 *.sh text eol=lf
 *.mjs text eol=lf
 install.ps1 text eol=crlf
+get.ps1 text eol=crlf
+run-bot.ps1 text eol=crlf
+stop-bot.ps1 text eol=crlf

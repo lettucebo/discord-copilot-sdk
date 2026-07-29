@@ -15,7 +15,7 @@ import { secureWrite, secureBackup, hardenExisting } from "./lib/secure-file.mjs
 import { nodeVersionOk } from "./lib/setup-core.mjs";
 import { t, detectLang, normalizeLang } from "./lib/i18n.mjs";
 import { MANAGED_KEYS, validateConfig } from "./lib/validate.mjs";
-import { setupResidency, residencyName } from "./lib/residency.mjs";
+import { setupResidency, residencyName, chooseResidencyMode } from "./lib/residency.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
@@ -35,6 +35,10 @@ const FLAGS = {
   dryRun: has("--dry-run"),
   skipAuth: has("--skip-auth"),
   residency: has("--residency") ? true : has("--no-residency") ? false : undefined,
+  // Separate from --residency on purpose: asking for 24/7 implies wanting
+  // residency, but wanting residency must never imply consenting to a stored
+  // password.
+  residency247: has("--residency-24x7") ? true : undefined,
   lang: normalizeLang(flagVal("--lang")),
 };
 const interactive = process.stdin.isTTY && process.stdout.isTTY && !FLAGS.yes;
@@ -234,6 +238,43 @@ function sanitizedChildEnv() {
 }
 
 // ---- main ----------------------------------------------------------------
+/**
+ * Decide login-keepalive vs true 24/7, and collect the credentials 24/7 needs.
+ *
+ * Two rules this must never break:
+ *  - **Non-interactive never escalates.** A password cannot be asked for safely
+ *    without a TTY (`askHidden` refuses to fall back), so `--yes` gets
+ *    login-keepalive even if 24/7 was requested — never a silent prompt, never a
+ *    password from a flag or the environment where it would land in shell
+ *    history or a process listing.
+ *  - **macOS never claims 24/7.** A LaunchAgent is login-bound and a LaunchDaemon
+ *    runs as root, which leaves Copilot unauthenticated.
+ */
+async function residencyMode(lang, interactive) {
+  const requested = FLAGS.residency247 ?? (interactive ? /^y/i.test(await ask(t("residency247Prompt", lang) + " ", "")) : false);
+  const decided = chooseResidencyMode({
+    requested,
+    platform: process.platform,
+    interactive,
+    hasTty: !!process.stdin.isTTY,
+  });
+  if (decided === "logon") {
+    // Say WHY, when 24/7 was asked for and refused.
+    if (requested && process.platform === "darwin") warn(t("residency247Mac", lang));
+    else if (requested) warn(t("residency247NoTty", lang));
+    return { mode: "logon" };
+  }
+  if (decided === "always-free") return { mode: "always" }; // Linux: linger, no password
+  const me = `${process.env.USERDOMAIN ?? ""}\\${process.env.USERNAME ?? ""}`.replace(/^\\/, "");
+  const user = (await ask(`${t("residency247User", lang)}${me}): `, me)) || me;
+  const password = await askHidden(t("residency247Pw", lang));
+  if (!password) {
+    warn(t("residency247NoPw", lang));
+    return { mode: "logon" };
+  }
+  return { mode: "always", user, password };
+}
+
 async function main() {
   const lang = await resolveLanguage();
   if (interactive) ok(t("langChosen", lang));
@@ -339,10 +380,12 @@ async function main() {
     ok(t("wroteEnv", lang));
   }
 
-  // 10) Residency (opt-in; honest login-keepalive labeling).
-  const wantResidency = FLAGS.residency ?? (interactive ? /^y/i.test(await ask(t("residencyPrompt", lang) + " ", "")) : false);
+  // 10) Residency (opt-in). Two distinct things, labelled honestly:
+  //     login-keepalive (default) vs true 24/7 (needs a stored password).
+  const wantResidency =
+    FLAGS.residency ?? FLAGS.residency247 ?? (interactive ? /^y/i.test(await ask(t("residencyPrompt", lang) + " ", "")) : false);
   if (wantResidency) {
-    await setupResidency(lang);
+    await setupResidency(lang, await residencyMode(lang, interactive));
   } else {
     info(t("residencySkip", lang));
   }

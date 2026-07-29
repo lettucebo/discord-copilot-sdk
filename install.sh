@@ -18,6 +18,7 @@ for a in "$@"; do
     --yes|-y) FWD+=("--yes") ;;
     --dry-run) DRY=1; FWD+=("--dry-run") ;;
     --residency) FWD+=("--residency") ;;
+    --residency-24x7) FWD+=("--residency-24x7") ;;
     --no-residency) FWD+=("--no-residency") ;;
     --skip-auth) FWD+=("--skip-auth") ;;
   esac

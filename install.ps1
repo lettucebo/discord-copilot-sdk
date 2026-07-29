@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   discord-copilot-sdk Windows installer (bootstrap). Ensures prerequisites (Node, git,
   GitHub Copilot CLI) then hands off to the shared bilingual config engine
@@ -6,7 +6,7 @@
   with -Lang; setup.mjs shows the interactive chooser.
 
   Usage:
-    ./install.ps1 [-Lang zh|en] [-Yes] [-DryRun] [-Residency] [-NoResidency] [-SkipAuth]
+    ./install.ps1 [-Lang zh|en] [-Yes] [-DryRun] [-Residency] [-Residency24x7] [-NoResidency] [-SkipAuth]
 #>
 [CmdletBinding()]
 param(
@@ -14,6 +14,7 @@ param(
   [switch]$Yes,
   [switch]$DryRun,
   [switch]$Residency,
+  [switch]$Residency24x7,
   [switch]$NoResidency,
   [switch]$SkipAuth
 )
@@ -122,6 +123,7 @@ if ($PSBoundParameters.ContainsKey('Lang') -or $Yes) { $fwd += @('--lang', $L) }
 if ($Yes)         { $fwd += '--yes' }
 if ($DryRun)      { $fwd += '--dry-run' }
 if ($Residency)   { $fwd += '--residency' }
+if ($Residency24x7) { $fwd += '--residency-24x7' }
 if ($NoResidency) { $fwd += '--no-residency' }
 if ($SkipAuth)    { $fwd += '--skip-auth' }
 

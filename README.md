@@ -115,17 +115,37 @@ Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-
 
 ## Quick start
 
-Full instructions (including the guided installer) are in [`INSTALL.md`](INSTALL.md).
-Setting up the Discord bot itself — application, the required Message Content
-intent, invite permissions, and the four IDs — is in
-[`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md).
-From a clone:
+One line, no clone needed — ensures git, fetches the source, runs the bilingual
+wizard:
+
+```powershell
+irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1 | iex
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.sh | bash
+```
+
+Add `-Residency24x7` / `--residency-24x7` to also install **true 24/7** residency
+(starts at boot, no login required). See the residency section of
+[`INSTALL.md`](INSTALL.md) for what that costs — on Windows it means the task has
+to hold your account password, because the Copilot CLI's login lives in your user
+profile and a service account would be unauthenticated.
+
+Full instructions are in [`INSTALL.md`](INSTALL.md). Setting up the Discord bot
+itself — application, the required Message Content intent, invite permissions,
+and the four IDs — is in [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md).
+
+From an existing clone:
 
 ```bash
 cp .env.example .env   # fill in DISCORD_BOT_TOKEN + DISCORD_ALLOWED_USER_IDS
 npm install
 npm run dev
 ```
+
+Or, once configured, `./run-bot.ps1` / `./run-bot.sh` to start it detached and
+`./stop-bot.ps1` / `./stop-bot.sh` to stop it.
 
 ## Threads
 

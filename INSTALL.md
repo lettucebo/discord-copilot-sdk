@@ -24,7 +24,39 @@ The installer is **bilingual** (Traditional Chinese + English): it defaults to y
 
 ---
 
-## 2. 取得原始碼 / Get the code
+## 2. 最快：一行安裝 / Fastest: one-line install
+
+不需要先 clone，這行會裝好 git、抓下原始碼，然後直接進入設定精靈。
+No clone needed — this ensures git, fetches the source, and drops you into the wizard.
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1 | iex
+```
+
+要帶旗標時用 scriptblock 形式（管線無法傳參數）：
+To pass flags, use the scriptblock form (a pipe cannot carry arguments):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1))) -Residency24x7
+```
+
+### macOS / Linux (bash)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.sh | bash -s -- --residency-24x7
+```
+
+可用環境變數 / Env overrides：`DISCORD_COPILOT_SDK_DIR`（安裝位置，預設 `~/discord-copilot-sdk`）、`DISCORD_COPILOT_SDK_REF`（分支或標籤，預設 `main`）。
+
+> 目錄已存在且是本專案 → 自動更新；已存在但**不是**本專案且非空 → 拒絕覆蓋。
+> Existing checkout → updated in place; a non-empty directory that isn't ours → refused, never overwritten.
+
+---
+
+## 2b. 或手動取得原始碼 / Or get the code manually
 
 ```bash
 git clone https://github.com/lettucebo/discord-copilot-sdk.git
@@ -48,7 +80,8 @@ cd discord-copilot-sdk
 ./install.ps1 -Lang en        # force English
 ./install.ps1 -Yes            # 非互動（用既有 .env／預設）/ non-interactive (uses existing .env/defaults)
 ./install.ps1 -DryRun         # 只預覽，不變更任何東西 / preview only, no changes
-./install.ps1 -Residency      # 一併設定登入自動啟動 / also set up login auto-start
+./install.ps1 -Residency      # 一併設定常駐（登入後保活）/ residency (login-keepalive)
+./install.ps1 -Residency24x7  # 真 24/7（開機即啟動，需存 Windows 密碼）/ true 24/7 (stores a Windows password)
 ./install.ps1 -NoResidency    # 略過常駐 / skip residency
 ./install.ps1 -SkipAuth       # 略過 Copilot 登入檢查（標為未驗證）/ skip auth check (marked unverified)
 ```
@@ -73,19 +106,55 @@ The installer will: detect prerequisites → collect + **validate** config → `
 
 ---
 
-## 4. 24/7 常駐（可選）/ 24/7 residency (optional)
+## 4. 常駐 — 兩種，差很多 / Residency — two different things
 
-> **誠實說明 / Honest scope**：目前的常駐是「**登入後自動啟動並保持存活**」（Windows 排程工作 at-logon／macOS LaunchAgent／Linux systemd `--user`）。真正的「登入前無人值守」需要額外步驟（Linux 的 `loginctl enable-linger`）。macOS／Linux 的常駐**尚未在真機驗證，屬實驗性**。
-> The current residency is **auto-start + keepalive while you are logged in** (Windows Scheduled Task at-logon / macOS LaunchAgent / Linux systemd `--user`). True pre-login unattended startup needs extra steps (`loginctl enable-linger` on Linux). macOS/Linux residency is **experimental and not verified on real hardware**.
+安裝器會分開問。**預設是登入後保活**，只有你明確選擇才會用到密碼。
+The installer asks separately. **Login-keepalive is the default**; a password is only involved if you explicitly choose 24/7.
 
-- **Windows**：註冊排程工作 `discord-copilot-sdk-<instance>`（**登入後**啟動並保持存活、失敗自動重啟、無執行時間上限）。
+| | 登入後保活（預設）<br>login-keepalive | **真 24/7**<br>`-Residency24x7` / `--residency-24x7` |
+|---|---|---|
+| 何時啟動 / starts | 你登入時 / at your logon | **開機時，不需登入** / at boot, no login |
+| 登出後 / after logout | **停止** / stops | 繼續執行 / keeps running |
+| 需要密碼 / password | 否 / no | Windows：**是** / yes |
+| 平台 / platforms | Windows / macOS / Linux | Windows、Linux（macOS 不行 / not macOS） |
+
+### 為什麼 24/7 需要密碼？/ Why does 24/7 need a password?
+
+Copilot CLI 的登入狀態存在**你的使用者設定檔**裡（`%USERPROFILE%\.copilot`），而 SDK **沒有任何 token 環境變數**可用。所以常駐程序必須**以你本人的身分**執行 —— 用 SYSTEM 或服務帳號會變成未登入狀態。Windows 要在無人登入時以某個使用者身分執行，就必須讓排程工作持有該帳號的密碼。
+
+The Copilot CLI's login lives in **your user profile** (`%USERPROFILE%\.copilot`), and the SDK exposes **no token environment variable**. So the resident process must run **as you** — SYSTEM or a service account would be unauthenticated. Running as a user with nobody logged in is exactly what Windows requires a stored password for.
+
+> 密碼交給 **Windows 認證管理員**（作用域僅限該工作），**不會**寫進任何檔案、`.env` 或指令列。安裝器用隱藏輸入詢問，並透過子行程環境變數傳給 PowerShell —— 因為 `schtasks /RP` 和 `powershell -Command "…$pw…"` 都會把密碼留在指令列，機器上任何程序都能讀到。
+> The password goes to **Windows Credential Manager**, scoped to the task. It is **never** written to a file, `.env`, or a command line: the installer reads it with hidden input and hands it to PowerShell through the child process environment, because `schtasks /RP` and `powershell -Command "…$pw…"` both leave secrets in argv where any process can read them via `Win32_Process`.
+
+> **非互動絕不升級 / Non-interactive never escalates**：`--yes`／CI／管線輸入下無法安全詢問密碼，因此即使加了 `--residency-24x7` 也會退回登入後保活並明講原因。
+> With `--yes`, in CI, or through a pipe there is no safe way to ask, so `--residency-24x7` falls back to login-keepalive and says so.
+
+- **Windows**：排程工作 `discord-copilot-sdk-<instance>`（失敗自動重啟、無執行時間上限、不會重複啟動）。
   - 停止 / Stop：`schtasks /End /TN discord-copilot-sdk-default`
   - 移除 / Remove：`schtasks /Delete /TN discord-copilot-sdk-default /F`
   - 記錄 / Log：`~/.discord-copilot-sdk/logs/discord-copilot-sdk-default.log`
-- **macOS**：`~/Library/LaunchAgents/com.discord-copilot-sdk.<instance>.plist`
-- **Linux**：`~/.config/systemd/user/discord-copilot-sdk-<instance>.service`（登入前常駐：`loginctl enable-linger $USER`）
+- **Linux**：`~/.config/systemd/user/discord-copilot-sdk-<instance>.service`；24/7 會自動執行 `loginctl enable-linger`（不需密碼）。
+- **macOS**：僅登入後保活。LaunchAgent 綁定登入，LaunchDaemon 以 root 執行會讓 Copilot 變成未登入 —— 兩者都無法在登入前以你的身分執行，所以這裡不會謊稱 24/7。
+  `~/Library/LaunchAgents/com.discord-copilot-sdk.<instance>.plist`
+
+> macOS／Linux 常駐**尚未在真機驗證，屬實驗性**。/ macOS/Linux residency is **experimental, not verified on real hardware**.
 
 多重部署 / Multiple deployments：設定 `DISCORD_COPILOT_SDK_INSTANCE_ID`（預設 `default`），常駐資源名稱會隨之改變。
+
+### 手動啟動／停止 / Start and stop by hand
+
+```powershell
+./run-bot.ps1      # 背景啟動（已在跑就拒絕）/ start detached (refuses if already running)
+./run-bot.ps1 -Foreground
+./stop-bot.ps1     # 讀 app 自己寫的 lock / reads the app's own lock
+```
+
+```bash
+./run-bot.sh
+./run-bot.sh --foreground
+./stop-bot.sh
+```
 
 ---
 

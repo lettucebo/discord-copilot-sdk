@@ -44,15 +44,100 @@ function gitDir() {
   }
 }
 
-export async function setupResidency(lang) {
-  if (process.platform === "win32") return setupWindows(lang);
-  if (process.platform === "darwin") return setupMac(lang);
-  if (process.platform === "linux") return setupLinux(lang);
+/**
+ * Decide which residency to install. Pure, because this is a security decision
+ * and "did we accidentally escalate to storing a password?" must be answerable
+ * by a test rather than by reading the installer.
+ *
+ * Returns:
+ *  - `"logon"`       — auto-start + keepalive while logged in
+ *  - `"always"`      — true 24/7, needs the user's password (Windows only)
+ *  - `"always-free"` — true 24/7 with no password (Linux linger)
+ *
+ * Rules that must never break:
+ *  - a password can only be asked for on a real interactive TTY, so anything
+ *    non-interactive falls back to `logon` instead of prompting, or reading a
+ *    secret from a flag/env where it would land in shell history
+ *  - macOS can never be `always`: a LaunchAgent is login-bound and a LaunchDaemon
+ *    runs as root, leaving Copilot unauthenticated
+ */
+export function chooseResidencyMode({ requested, platform, interactive, hasTty }) {
+  if (!requested) return "logon";
+  if (platform === "darwin") return "logon";
+  if (platform !== "win32") return "always-free"; // Linux: linger needs no password
+  if (!interactive || !hasTty) return "logon";
+  return "always";
+}
+
+/**
+ * `opts.mode`:
+ *  - `"logon"`  (default) — auto-start + keepalive WHILE LOGGED IN. Stops at logout.
+ *  - `"always"` — true 24/7: starts at boot, before and without any login.
+ *
+ * 24/7 is Windows- and Linux-only, and for an honest reason: the Copilot CLI's
+ * login lives in the user's own profile, so the resident process MUST run as
+ * that user. On macOS a LaunchAgent is login-bound and a LaunchDaemon runs as
+ * root — neither can be that user before login — so macOS is reported as
+ * login-keepalive rather than quietly sold as 24/7.
+ */
+export async function setupResidency(lang, opts = {}) {
+  if (process.platform === "win32") return setupWindows(lang, opts);
+  if (process.platform === "darwin") return setupMac(lang, opts);
+  if (process.platform === "linux") return setupLinux(lang, opts);
   return;
 }
 
 // ---- Windows: Scheduled Task (at-logon keepalive, no admin) ----------------
-function setupWindows(lang) {
+/**
+ * Build the PowerShell that registers the Windows Scheduled Task. Pure: options
+ * in, script text out, so tests can assert the things an integration test would
+ * not catch cheaply — above all that the password never appears in it.
+ *
+ * `mode`:
+ *  - `"logon"`  — starts at logon, keepalive WHILE LOGGED IN. Stops at logout.
+ *  - `"always"` — starts at boot, before and without any login. Requires the
+ *    task to carry the user's credentials, because the Copilot CLI's login lives
+ *    in that user's profile and a SYSTEM/service account would be unauthenticated.
+ *
+ * The password is NEVER passed to this function — it is read at runtime from the
+ * CHILD PROCESS ENVIRONMENT (`pwEnvVar`). That is the point: `schtasks /RP` and
+ * `powershell -Command "...$pw..."` both place the secret in argv, which any
+ * process on the machine can read through `Win32_Process.CommandLine`. A builder
+ * that cannot see the password cannot leak it into the script.
+ */
+export function buildWindowsRegisterScript({ name, psExe, wrapper, wrapperLeaf, mode, user = "", pwEnvVar }) {
+  const q = (s) => String(s).replace(/'/g, "''");
+  const always = mode === "always";
+  const lines = [
+    "$ErrorActionPreference='Stop'",
+    `$name='${q(name)}'`,
+    `$action=New-ScheduledTaskAction -Execute '${q(psExe)}' -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "${q(wrapper)}"'`,
+    always
+      ? "$trigger=@((New-ScheduledTaskTrigger -AtStartup),(New-ScheduledTaskTrigger -AtLogOn))"
+      : "$trigger=New-ScheduledTaskTrigger -AtLogOn",
+    "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew",
+    // Verify an existing task, if any, belongs to THIS discord-copilot-sdk instance before replacing it.
+    "$existing=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue",
+    `if($existing -and ($existing.Actions.Arguments -notlike '*${q(wrapperLeaf)}*')){ throw "A Scheduled Task named $name exists but is not discord-copilot-sdk's; refusing to replace it." }`,
+  ];
+  if (always) {
+    lines.push(
+      `$pw=$env:${pwEnvVar}`,
+      "if(-not $pw){ throw 'no password supplied for 24/7 residency' }",
+      `Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -User '${q(user)}' -Password $pw -RunLevel Limited -Force | Out-Null`,
+      // Do not leave it in this process's environment any longer than needed.
+      `Remove-Item Env:\\${pwEnvVar} -ErrorAction SilentlyContinue`,
+      "$pw=$null"
+    );
+  } else {
+    lines.push("Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null");
+  }
+  lines.push("Start-ScheduledTask -TaskName $name", "Write-Output 'registered'");
+  return lines.join("\n");
+}
+
+function setupWindows(lang, opts = {}) {
+  const mode = opts.mode === "always" ? "always" : "logon";
   const name = residencyName();
   const node = process.execPath;
   const cop = copilotDir();
@@ -84,26 +169,27 @@ function setupWindows(lang) {
 
   const psExe = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const wrapperLeaf = path.basename(wrapper);
-  // Register with hardening: run at logon, restart on failure, no time limit,
-  // start when available, and never spawn a second instance.
-  const register = [
-    "$ErrorActionPreference='Stop'",
-    `$name='${q(name)}'`,
-    `$action=New-ScheduledTaskAction -Execute '${q(psExe)}' -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "${q(wrapper)}"'`,
-    "$trigger=New-ScheduledTaskTrigger -AtLogOn",
-    "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew",
-    // Verify an existing task, if any, belongs to THIS discord-copilot-sdk instance before replacing it.
-    "$existing=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue",
-    `if($existing -and ($existing.Actions.Arguments -notlike '*${q(wrapperLeaf)}*')){ throw "A Scheduled Task named $name exists but is not discord-copilot-sdk's; refusing to replace it." }`,
-    "Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null",
-    "Start-ScheduledTask -TaskName $name",
-    "Write-Output 'registered'",
-  ].join("; ");
-
-  execFileSync(psExe, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", register], {
-    stdio: "inherit",
+  const PW_ENV = "DCS_RESIDENCY_PW";
+  const register = buildWindowsRegisterScript({
+    name,
+    psExe,
+    wrapper,
+    wrapperLeaf,
+    mode,
+    user: opts.user ?? "",
+    pwEnvVar: PW_ENV,
   });
-  console.log(t("residencyWin", lang) + name);
+
+  // The script goes over STDIN and the password over the child ENVIRONMENT, so
+  // neither ever lands in a command line that other processes can read.
+  const childEnv = { ...process.env };
+  if (mode === "always") childEnv[PW_ENV] = opts.password ?? "";
+  execFileSync(psExe, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"], {
+    input: register,
+    env: childEnv,
+    stdio: ["pipe", "inherit", "inherit"],
+  });
+  console.log((mode === "always" ? t("residencyWin247", lang) : t("residencyWin", lang)) + name);
   console.log(
     lang === "zh"
       ? `  停止：schtasks /End /TN ${name}  ；移除：schtasks /Delete /TN ${name} /F  ；記錄：${logFile}`
@@ -113,6 +199,9 @@ function setupWindows(lang) {
 
 // ---- macOS: LaunchAgent (login-only; experimental, unverified on real HW) ----
 function setupMac(lang) {
+  // `opts.mode` is deliberately ignored: see setupResidency's note. A LaunchAgent
+  // is login-bound and a LaunchDaemon runs as root, so neither can hold the
+  // user's Copilot login before login. The caller reports login-keepalive.
   const name = residencyName();
   const label = `com.discord-copilot-sdk.${instanceId()}`;
   const node = process.execPath;
@@ -165,7 +254,7 @@ function setupMac(lang) {
 }
 
 // ---- Linux: systemd --user (login keepalive; pre-login needs linger) --------
-function setupLinux(lang) {
+function setupLinux(lang, opts = {}) {
   const name = residencyName();
   const node = process.execPath;
   const cop = copilotDir();
@@ -199,6 +288,33 @@ WantedBy=default.target
     console.log((lang === "zh" ? "⚠️ systemd 啟用未完成（實驗性）。已產生 unit：" : "⚠️ systemd enable incomplete (experimental). unit generated: ") + unitPath + " — " + (e && e.message));
   }
   if (enabled) console.log(t("residencyLinux", lang) + unitPath); // only on success
+  if (opts.mode === "always") {
+    // systemd --user stops at logout unless the account lingers. This is the one
+    // non-Windows platform where real pre-login residency is reachable without
+    // breaking Copilot auth, because the unit still runs as this user.
+    let lingering = false;
+    try {
+      execFileSync("loginctl", ["enable-linger", os.userInfo().username], { stdio: "inherit" });
+      lingering = true;
+    } catch (e) {
+      console.log(
+        (lang === "zh" ? "⚠️ 無法啟用 linger（24/7 需要它），請手動執行：" : "⚠️ Could not enable linger (24/7 needs it); run manually: ") +
+          `loginctl enable-linger ${os.userInfo().username}` +
+          " — " +
+          (e && e.message)
+      );
+    }
+    console.log(
+      lingering
+        ? lang === "zh"
+          ? "  ✅ 已啟用 linger：登出後仍會執行，開機即啟動。"
+          : "  ✅ Linger enabled: keeps running after logout and starts at boot."
+        : lang === "zh"
+          ? "  ⚠️ 目前仍只是「登入後保活」。"
+          : "  ⚠️ Still login-keepalive only for now."
+    );
+    return;
+  }
   console.log(
     lang === "zh"
       ? "  提示：登入前也要常駐請執行 `loginctl enable-linger $USER`（可能需權限）。"
