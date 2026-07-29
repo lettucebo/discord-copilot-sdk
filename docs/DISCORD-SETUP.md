@@ -164,15 +164,38 @@ The bot's single-instance guard is a **local** PID lock and cannot see other hos
 
 ---
 
-## 9. 一次只有一個 session / One session at a time
+## 9. 多個 session 同時進行 / Concurrent sessions
 
-v1 **一次只跑一個 session**：所有 session 共用同一個 `CONTROLLED_REPO_PATH`，兩個 agent 同時動同一份工作目錄會互相覆蓋（`src/app.ts`）。
-v1 runs **one live session at a time**: all sessions share the single `CONTROLLED_REPO_PATH`, and two concurrent agents would clobber each other's checkout (`src/app.ts`).
+**可以並行。** 每個 `/new` 開的討論串都是獨立 session，預設每個都有**自己的 git worktree**（分支 `copilot/t-<threadId>`，放在 `~/.discord-copilot-sdk/worktrees/`），所以兩個 agent 同時改檔案不會互相覆蓋。
+**Yes, they run in parallel.** Each `/new` thread is its own session, and by default each gets its **own git worktree** (branch `copilot/t-<threadId>`, under `~/.discord-copilot-sdk/worktrees/`), so two agents editing files at the same time cannot clobber each other.
 
-所以：**多個討論串不會平行執行**。`/new` 會結束前一個 session，舊討論串收到 `A new session was started; this one has ended.`，之後在裡面打字會得到一句提醒，訊息**不會**送給 agent。
-So **threads do not run in parallel**. `/new` ends the previous session, the old thread gets `A new session was started; this one has ended.`, and typing there afterwards returns a notice — the message is **not** sent to the agent.
+| 指令 / Command | 用途 / Purpose |
+| --- | --- |
+| `/new` | 開一個新的並行 session（不會結束其他的）/ start another concurrent session (ends nothing) |
+| `/sessions` | 列出目前有哪些、各自的狀態與分支 / list what's live, with state and branch |
+| `/end` | 只結束**這個**討論串的 session / end **this** thread's session only |
 
-同一個 session 內要平行處理，請用討論串裡的功能 / For concurrency inside one session, use:
+上限同時 8 個 session。/ Up to 8 at once.
+
+`/end` 只有在 git 回報**乾淨**時才會移除 worktree；有未提交的變更就保留並告訴你路徑 —— 沒提交的工作不該被順手刪掉。
+`/end` removes the worktree **only when git reports it clean**; a dirty one is kept and its path reported — uncommitted work is not ours to discard.
+
+### `SESSION_ISOLATION`
+
+| 值 / Value | 行為 / Behaviour |
+| --- | --- |
+| （留空）/ unset | 自動：controlled repo 是 git repo → `worktree`，否則 `shared` / auto |
+| `worktree` | 強制隔離。若不是 git repo 則**拒絕啟動**（而不是默默降級）/ force isolation; **refuses to start** if impossible |
+| `shared` | 所有 session 共用同一個工作目錄 → **一次只有一個安全**，`/new` 會結束前一個（v1 行為）/ one shared checkout → only one is safe, `/new` ends the previous |
+
+> agent 在 worktree 裡看到的是 repo 的完整內容（共用 git 物件），但只有自己的工作檔案。要把成果帶回主分支，就在該討論串裡請 agent commit，之後在主 repo `git merge copilot/t-<threadId>`。
+> Inside a worktree the agent sees the whole repo (shared git objects) but only its own working files. To land the work, ask the agent to commit in that thread, then `git merge copilot/t-<threadId>` in the main repo.
+
+同一個 session 內的並行（steer / `/queue`）見第 10 節。/ For concurrency *inside* one session see §10.
+
+---
+
+## 10. 一個 session 內的插隊與排隊 / Steering and queueing inside one session
 
 - 回合進行中**直接送訊息** → 插入目前回合（steer）/ send a message **while a turn is running** → steers it
 - `/queue message:…` → 排在目前回合之後執行 / queue a prompt to run after the current turn

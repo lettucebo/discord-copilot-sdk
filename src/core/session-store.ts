@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 
-/** Lifecycle state of the single persisted session record (one-session model).
+/** Lifecycle state of a persisted session record.
  *  Absent record = tombstone (nothing to resume). */
 export type SessionState = "creating" | "active" | "orphaned" | "blocked";
 
-const SCHEMA_VERSION = 1;
+/** v1 stored ONE bare record at the top level. v2 stores many, plus a
+ *  generation high-water mark. v1 files are migrated on read. */
+const SCHEMA_VERSION = 2;
 
 export interface SessionRecord {
   schemaVersion: number;
@@ -15,6 +17,12 @@ export interface SessionRecord {
   repoPath: string;
   guildId: string;
   parentChannelId: string;
+  /** Directory the agent actually works in. Equals `repoPath` for a shared-tree
+   *  session; a per-session git worktree otherwise. Absent in v1 records, which
+   *  predate isolation — migrated to `repoPath`. */
+  workDir: string;
+  /** Git branch checked out in `workDir`, when it is a worktree we created. */
+  branch?: string;
   state: SessionState;
   reason?: string;
   updatedAt: number;
@@ -29,15 +37,23 @@ export interface SessionBinding {
   repoPath: string;
   guildId: string;
   parentChannelId: string;
+  workDir: string;
+  branch?: string;
+}
+
+interface StoreFile {
+  schemaVersion: number;
+  generationHighWater: number;
+  sessions: SessionRecord[];
 }
 
 /**
- * Durable store for discord-copilot-sdk's single current thread↔session mapping, so a bot
- * restart can resume the active Discord thread instead of orphaning it.
+ * Durable store for the thread↔session mappings, so a bot restart can resume
+ * live Discord threads instead of orphaning them.
  *
  * Persisted as JSON at a per-instance path under `~/.discord-copilot-sdk`.
  *
- * Safety properties (P2):
+ * Safety properties (P2), all preserved from the single-session version:
  * - **Atomic**: writes go to a temp file then rename over the target, so a crash
  *   mid-write can't leave a torn file.
  * - **Persist-first**: in-memory state is updated ONLY after the disk write
@@ -46,58 +62,99 @@ export interface SessionBinding {
  * - **Corrupt != absent**: a present-but-unparseable file sets `isCorrupt()` so
  *   startup can fail closed rather than silently start fresh (which could drop a
  *   recoverable session).
+ *
+ * Multi-session note: `generationHighWater` is persisted rather than derived
+ * from the live records, because deleting records would otherwise let a
+ * generation be REUSED — and generations are what fence a stale actor's
+ * decisions from a newer incarnation of the same thread.
  */
 export class SessionStore {
-  private record?: SessionRecord;
+  private sessions = new Map<string, SessionRecord>();
+  private highWater = 0;
   private corrupt = false;
 
   constructor(private readonly file: string) {
     this.load();
   }
 
-  /** The current record, or undefined when none/tombstoned. */
-  get(): SessionRecord | undefined {
-    return this.record ? { ...this.record } : undefined;
+  /** Every persisted record, in insertion order. */
+  all(): SessionRecord[] {
+    return [...this.sessions.values()].map((r) => ({ ...r }));
+  }
+
+  /** One record by thread id, or undefined. */
+  get(threadId: string): SessionRecord | undefined {
+    const r = this.sessions.get(threadId);
+    return r ? { ...r } : undefined;
   }
 
   /** True when the on-disk file existed but could not be parsed/validated.
-   *  Startup should treat this as fatal, not as "no session". */
+   *  Startup should treat this as fatal, not as "no sessions". */
   isCorrupt(): boolean {
     return this.corrupt;
   }
 
-  /** Reserve a session as `creating` BEFORE createSession, using a caller-assigned
-   *  session id. Overwrites any prior record, so a crash after this can never
-   *  resurrect the superseded session. Returns durability. */
-  reserve(b: SessionBinding): boolean {
-    return this.write({ ...this.toRecord(b), state: "creating" });
-  }
-
-  /** Mark a freshly created/resumed session as active. When `b` is omitted, the
-   *  current record is promoted creating→active (used right after createSession
-   *  succeeds for a reserved id). Returns durability. */
-  commit(b?: SessionBinding): boolean {
-    if (b) return this.write({ ...this.toRecord(b), state: "active" });
-    if (!this.record) return false;
-    return this.write({ ...this.record, state: "active", updatedAt: Date.now() });
-  }
-
-  /** Transition the current record's state (e.g. active→orphaned/blocked). No-op
-   *  (false) when there is no record. */
-  setState(state: SessionState, reason?: string): boolean {
-    if (!this.record) return false;
-    return this.write({ ...this.record, state, reason, updatedAt: Date.now() });
-  }
-
-  /** Tombstone: forget the current record. Returns durability of the removal. */
-  clear(): boolean {
-    return this.write(undefined);
-  }
-
-  /** The generation to assign to the next incarnation: current + 1, or 1 when
-   *  there is no record. Monotonic bookkeeping (NOT a security fence — see design). */
+  /** The generation to assign to the next incarnation. Monotonic across the
+   *  whole store and never reused, even after records are removed. */
   nextGeneration(): number {
-    return (this.record?.generation ?? 0) + 1;
+    return this.highWater + 1;
+  }
+
+  /** Reserve a session as `creating` BEFORE createSession, using a caller-assigned
+   *  session id. Returns durability. */
+  reserve(b: SessionBinding): boolean {
+    return this.mutate((m, hw) => {
+      m.set(b.threadId, { ...this.toRecord(b), state: "creating" });
+      return Math.max(hw, b.generation);
+    });
+  }
+
+  /** Promote a reserved record creating→active (or refresh `updatedAt` for an
+   *  already-active one). No-op (false) when the thread has no record. */
+  commit(threadId: string): boolean {
+    if (!this.sessions.has(threadId)) return false;
+    return this.mutate((m, hw) => {
+      const cur = m.get(threadId)!;
+      m.set(threadId, { ...cur, state: "active", updatedAt: Date.now() });
+      return hw;
+    });
+  }
+
+  /** Transition a record's state (e.g. active→orphaned/blocked). No-op (false)
+   *  when the thread has no record. */
+  setState(threadId: string, state: SessionState, reason?: string): boolean {
+    if (!this.sessions.has(threadId)) return false;
+    return this.mutate((m, hw) => {
+      const cur = m.get(threadId)!;
+      m.set(threadId, { ...cur, state, reason, updatedAt: Date.now() });
+      return hw;
+    });
+  }
+
+  /** Tombstone one session. Returns durability of the removal. */
+  remove(threadId: string): boolean {
+    return this.mutate((m, hw) => {
+      m.delete(threadId);
+      return hw;
+    });
+  }
+
+  /** Forget every session. The file is KEPT (holding only the generation
+   *  high-water mark) so generations still never repeat — see `mutate`. */
+  clear(): boolean {
+    return this.mutate((m, hw) => {
+      m.clear();
+      return hw;
+    });
+  }
+
+  /** Write a prior record back verbatim (used to roll back a reserve when a
+   *  later step fails, restoring the still-live previous session). */
+  restore(rec: SessionRecord): boolean {
+    return this.mutate((m, hw) => {
+      m.set(rec.threadId, { ...rec, updatedAt: Date.now() });
+      return Math.max(hw, rec.generation);
+    });
   }
 
   private toRecord(b: SessionBinding): SessionRecord {
@@ -109,6 +166,8 @@ export class SessionStore {
       repoPath: b.repoPath,
       guildId: b.guildId,
       parentChannelId: b.parentChannelId,
+      workDir: b.workDir,
+      ...(b.branch ? { branch: b.branch } : {}),
       state: "active",
       updatedAt: Date.now(),
     };
@@ -119,48 +178,66 @@ export class SessionStore {
     try {
       raw = fs.readFileSync(this.file, "utf8");
     } catch (err) {
-      // Only a genuinely-absent file is "no session". Any OTHER read error
+      // Only a genuinely-absent file is "no sessions". Any OTHER read error
       // (permissions, a directory in the way, sharing violation) is treated as
       // corrupt so startup fails closed rather than silently starting fresh and
-      // dropping a recoverable session.
+      // dropping recoverable sessions.
       if ((err as { code?: string })?.code === "ENOENT") return;
       this.corrupt = true;
       return;
     }
     try {
       const parsed = JSON.parse(raw) as unknown;
-      if (isRecord(parsed)) this.record = parsed;
-      else this.corrupt = true; // present but invalid → fail closed at startup
+      const records = readRecords(parsed);
+      if (!records) {
+        this.corrupt = true; // present but invalid → fail closed at startup
+        return;
+      }
+      for (const r of records.sessions) this.sessions.set(r.threadId, r);
+      this.highWater = records.highWater;
     } catch {
       this.corrupt = true;
     }
   }
 
-  /** Write back a full prior record verbatim (used to roll back a reserve when a
-   *  subsequent step fails, restoring the still-live previous session). */
-  restore(rec: SessionRecord): boolean {
-    return this.write({ ...rec, updatedAt: Date.now() });
+  /**
+   * Apply `f` to a COPY of the state, persist it, and only then adopt it
+   * (persist-first). Returns false — never throws — when the write fails, in
+   * which case nothing changed in memory either.
+   *
+   * The file is written even when it holds ZERO sessions: it still carries the
+   * generation high-water mark, and deleting it would let a generation be
+   * reused after the last session ends — which is exactly what generations
+   * exist to prevent.
+   */
+  private mutate(f: (m: Map<string, SessionRecord>, highWater: number) => number): boolean {
+    const next = new Map(this.sessions);
+    const nextHw = f(next, this.highWater);
+    const candidate: StoreFile = {
+      schemaVersion: SCHEMA_VERSION,
+      generationHighWater: nextHw,
+      sessions: [...next.values()],
+    };
+    if (!this.write(candidate)) return false;
+    this.sessions = next;
+    this.highWater = nextHw;
+    this.corrupt = false;
+    return true;
   }
 
-  /** Atomically write (or remove) the record, updating in-memory state ONLY on a
-   *  successful write (persist-first). Returns false (and logs) on any I/O error. */
-  private write(candidate: SessionRecord | undefined): boolean {
+  /** Atomically write the file. Returns false (and logs) on any I/O error —
+   *  callers' fail-closed handling depends on it never throwing. */
+  private write(candidate: StoreFile): boolean {
     const tmp = `${this.file}.tmp`;
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      if (!candidate) {
-        fs.rmSync(this.file, { force: true });
-      } else {
-        fs.writeFileSync(tmp, JSON.stringify(candidate, null, 2), "utf8");
-        fs.renameSync(tmp, this.file); // atomic replace
-      }
-      this.record = candidate; // only reached when the write succeeded
-      this.corrupt = false;
+      fs.writeFileSync(tmp, JSON.stringify(candidate, null, 2), "utf8");
+      fs.renameSync(tmp, this.file); // atomic replace
       return true;
     } catch (err) {
       // Best-effort temp cleanup — must NOT itself throw, or write() would throw
-      // instead of returning false and callers' fail-closed handling (commit-fail
-      // fence, rollback) would be skipped.
+      // instead of returning false and callers' fail-closed handling would be
+      // skipped.
       try {
         fs.rmSync(tmp, { force: true });
       } catch {
@@ -174,10 +251,30 @@ export class SessionStore {
   }
 }
 
-function isRecord(v: unknown): v is SessionRecord {
-  if (!v || typeof v !== "object") return false;
+/** Parse either a v2 store file or a bare v1 record, or undefined if neither. */
+function readRecords(v: unknown): { sessions: SessionRecord[]; highWater: number } | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const o = v as Record<string, unknown>;
+  if (Array.isArray(o["sessions"])) {
+    const out: SessionRecord[] = [];
+    for (const item of o["sessions"]) {
+      const r = asRecord(item);
+      if (!r) return undefined; // one bad row invalidates the file — fail closed
+      out.push(r);
+    }
+    const hw = typeof o["generationHighWater"] === "number" ? o["generationHighWater"] : 0;
+    return { sessions: out, highWater: Math.max(hw, ...out.map((r) => r.generation), 0) };
+  }
+  // v1: a single bare record at the top level.
+  const single = asRecord(o);
+  if (!single) return undefined;
+  return { sessions: [single], highWater: single.generation };
+}
+
+function asRecord(v: unknown): SessionRecord | undefined {
+  if (!v || typeof v !== "object") return undefined;
   const r = v as Record<string, unknown>;
-  return (
+  const ok =
     typeof r["schemaVersion"] === "number" &&
     typeof r["threadId"] === "string" &&
     typeof r["sessionId"] === "string" &&
@@ -186,6 +283,11 @@ function isRecord(v: unknown): v is SessionRecord {
     typeof r["guildId"] === "string" &&
     typeof r["parentChannelId"] === "string" &&
     (r["state"] === "creating" || r["state"] === "active" || r["state"] === "orphaned" || r["state"] === "blocked") &&
-    typeof r["updatedAt"] === "number"
-  );
+    typeof r["updatedAt"] === "number";
+  if (!ok) return undefined;
+  // `workDir` is absent in v1 records, which predate per-session isolation: those
+  // sessions ran directly in the controlled repo, so that is their work dir.
+  const workDir = typeof r["workDir"] === "string" ? r["workDir"] : (r["repoPath"] as string);
+  const branch = typeof r["branch"] === "string" ? r["branch"] : undefined;
+  return { ...(r as unknown as SessionRecord), workDir, ...(branch ? { branch } : {}) };
 }

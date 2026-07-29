@@ -141,6 +141,27 @@ threads by creation (verified on the desktop client — posting the newest messa
 into an older thread does not move it above a newer one), so a number would only
 consume sidebar width.
 
+## Concurrent sessions
+
+Every `/new` thread is an independent session and they run **in parallel**. Each
+gets its own **git worktree** (branch `copilot/t-<threadId>` under
+`~/.discord-copilot-sdk/worktrees/`), so two agents working at the same time
+cannot overwrite each other's files — verified by running two threads at once
+and confirming each wrote only into its own tree while the controlled repo
+stayed untouched.
+
+- `/sessions` — what's live, with each one's state and branch (max 8)
+- `/end` — end **this** thread's session; the others keep running
+
+`/end` removes the worktree **only when git reports it clean**. A dirty one is
+kept and its path reported: uncommitted work is not ours to discard. To land a
+session's work, ask it to commit, then `git merge copilot/t-<threadId>`.
+
+`SESSION_ISOLATION` overrides the default: `worktree` forces isolation (and
+**refuses to start** where it is impossible, rather than silently downgrading),
+`shared` puts every session in the one checkout — which is only safe one at a
+time, so `/new` then ends the previous session.
+
 ## Steering and queueing
 
 A plain message sent **while a turn is running** *steers* that turn rather than

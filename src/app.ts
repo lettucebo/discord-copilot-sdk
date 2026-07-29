@@ -18,7 +18,7 @@ import {
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Config } from "./config.js";
 import { acquireSingleInstanceLock, type InstanceLock } from "./core/single-instance.js";
-import { lockPath, sessionStorePath } from "./core/paths.js";
+import { lockPath, sessionStorePath, stateDir } from "./core/paths.js";
 import { resolveControlledRepo } from "./core/repo.js";
 import { gitDiffSummary } from "./core/git.js";
 import { downloadBounded } from "./core/download.js";
@@ -26,7 +26,19 @@ import { SessionStore, type SessionRecord } from "./core/session-store.js";
 import { planReconcile, classifyResumeError, type ThreadStatus } from "./core/reconcile.js";
 import { deriveThreadTitle, THREAD_NAME_MAX } from "./core/thread-name.js";
 import { pickTitleModel, buildTitlePrompt, cleanModelTitle } from "./core/title.js";
+import {
+  chooseIsolation,
+  isGitRepo,
+  repoRoot,
+  addWorktree,
+  removeWorktreeIfClean,
+  pruneWorktrees,
+  worktreeBranch,
+  worktreePath,
+  type Isolation,
+} from "./core/worktree.js";
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 
 import { sendUnlessAborted } from "./core/turn-gate.js";
 import { shouldResetEffort, validateEffort, EFFORT_LEVELS } from "./core/effort.js";
@@ -62,6 +74,11 @@ export interface Session {
    *  NOT drain the runtime queue (verified — a queued message still ran after an
    *  abort), so `/stop` could not honestly stop anything we had pushed there. */
   queue: string[];
+  /** Directory this session's agent works in — its own git worktree, or the
+   *  controlled repo under `shared` isolation. */
+  workDir: string;
+  /** Branch checked out in `workDir` when it is a worktree we created. */
+  branch?: string;
 }
 
 /** The subset of an SDK session the throwaway titler uses. */
@@ -76,6 +93,21 @@ interface TitlerSession {
  *  an unbounded one just defers a pile of work the operator has forgotten
  *  about onto an unattended machine. */
 const QUEUE_MAX = 10;
+
+/** A reconcile failure that must stop startup (a required state transition
+ *  could not be persisted), as opposed to one bad record we can skip past. */
+class FatalReconcileError extends Error {}
+
+/** Most sessions that may be live at once. Each holds a runtime session, a
+ *  worktree and a Discord thread; an unbounded number of them on an unattended
+ *  lab machine is a resource leak, not a feature. */
+const MAX_LIVE_SESSIONS = 8;
+
+/** Where per-session worktrees live. Kept out of the controlled repo so the
+ *  agent can never see (or commit) another session's checkout. */
+function worktreeRoot(): string {
+  return join(stateDir(), "worktrees");
+}
 
 /** Milliseconds a single session teardown may take during /new before we give
  *  up on it (and keep it for a later retry) rather than stalling. */
@@ -250,6 +282,13 @@ export class DiscordCopilotApp {
   /** Startup phase gate (P2): input is rejected until reconciliation completes,
    *  so a /new can't race startup resume and create a second live actor. */
   private phase: "booting" | "reconciling" | "ready" | "shuttingDown" = "booting";
+  /** How each session gets its working directory. Resolved once at startup from
+   *  the controlled repo + `SESSION_ISOLATION`; see `chooseIsolation`. */
+  private isolation: Isolation = "shared";
+  /** Repository root that "always allow for this repo" rules are keyed by. With
+   *  worktrees every session has a different `workDir`, so keying on that would
+   *  silently re-prompt for a command the operator already trusted here. */
+  private approvalRepoKey = "";
 
   private constructor(
     private readonly config: Config,
@@ -326,6 +365,30 @@ export class DiscordCopilotApp {
     }
   }
 
+  /** Decide how concurrent sessions are isolated, and pick the key that repo-wide
+   *  approvals are stored under. Fails startup when the operator explicitly asked
+   *  for worktrees somewhere they cannot exist — running unprotected while they
+   *  believe otherwise is the one outcome worth refusing to boot over. */
+  private async resolveIsolation(): Promise<void> {
+    const git = await isGitRepo(this.repoPath);
+    const chosen = chooseIsolation({ isGitRepo: git, configured: this.config.SESSION_ISOLATION });
+    if (chosen === "impossible") {
+      throw new Error(
+        `SESSION_ISOLATION=worktree was requested but ${this.repoPath} is not a git repository. ` +
+          `Point CONTROLLED_REPO_PATH at a git repo, or set SESSION_ISOLATION=shared (only ONE session is safe at a time).`
+      );
+    }
+    this.isolation = chosen;
+    // Approvals follow the REPOSITORY, not the per-session checkout.
+    this.approvalRepoKey = git ? await repoRoot(this.repoPath) : this.repoPath;
+    if (chosen === "worktree") await pruneWorktrees(this.repoPath);
+    else {
+      console.warn(
+        "⚠️  SESSION_ISOLATION=shared — every session works in the SAME directory, so only one is safe at a time. /new will end the previous session."
+      );
+    }
+  }
+
   /** Log in and resolve only once the gateway is ready AND slash commands are
    *  registered — so a registration failure fails startup (with cleanup) rather
    *  than leaving a logged-in bot with no usable commands. */
@@ -343,9 +406,10 @@ export class DiscordCopilotApp {
 
   private async onReady(clientId: string): Promise<void> {
     await this.loadModels();
+    await this.resolveIsolation();
     await this.registerCommands(clientId);
-    // Reconcile the persisted session BEFORE accepting input (phase gate), so a
-    // /new can't race startup resume and leave two live actors on the shared tree.
+    // Reconcile persisted sessions BEFORE accepting input (phase gate), so a
+    // /new can't race startup resume and double-register a thread.
     this.phase = "reconciling";
     await this.reconcileOnStartup();
     this.phase = "ready";
@@ -353,6 +417,7 @@ export class DiscordCopilotApp {
       `✅ discord-copilot-sdk ready — controlling ${this.repoPath}\n` +
         `   guild=${this.config.DISCORD_GUILD_ID} channel=${this.config.DISCORD_PARENT_CHANNEL_ID}\n` +
         `   model=${this.config.DEFAULT_MODEL} contextTier=${this.config.DEFAULT_CONTEXT_TIER} (${this.modelIds.length} models)\n` +
+        `   isolation=${this.isolation} (concurrent sessions: up to ${MAX_LIVE_SESSIONS})\n` +
         `   ⚠️  lab mode: tools run as this OS user with no sandbox. The bot uses your\n` +
         `      logged-in Copilot, so any saved "always allow" rules bypass the Discord prompt.`
     );
@@ -476,6 +541,14 @@ export class DiscordCopilotApp {
           o.setName("clear").setDescription("Discard everything currently queued").setRequired(false)
         )
         .toJSON(),
+      new SlashCommandBuilder()
+        .setName("end")
+        .setDescription("End THIS thread's session (other sessions keep running)")
+        .toJSON(),
+      new SlashCommandBuilder()
+        .setName("sessions")
+        .setDescription("List the sessions running right now")
+        .toJSON(),
     ];
     // Register in the AUTHORIZED guild so command availability matches the auth
     // policy (DEV_GUILD_ID is intentionally not used here to avoid registering
@@ -516,6 +589,8 @@ export class DiscordCopilotApp {
         else if (c === "yolo") await this.cmdYolo(interaction);
         else if (c === "rename") await this.cmdRename(interaction);
         else if (c === "queue") await this.cmdQueue(interaction);
+        else if (c === "end") await this.cmdEnd(interaction);
+        else if (c === "sessions") await this.cmdSessions(interaction);
       }
     } catch (err) {
       console.error("interaction error:", err);
@@ -615,6 +690,12 @@ export class DiscordCopilotApp {
       await interaction.editReply("A session is already being created — please retry in a moment.");
       return;
     }
+    if (this.isolation === "worktree" && this.sessions.size >= MAX_LIVE_SESSIONS) {
+      await interaction.editReply(
+        `⚠️ 已達同時進行的 session 上限（${MAX_LIVE_SESSIONS}）。請先在某個討論串用 \`/end\` 結束，再開新的。用 \`/sessions\` 看目前有哪些。`
+      );
+      return;
+    }
     this.creating = true;
     try {
       const parent = await this.discord.channels.fetch(this.config.DISCORD_PARENT_CHANNEL_ID);
@@ -642,15 +723,31 @@ export class DiscordCopilotApp {
       };
 
       // Reserve-before-create (P2): durably record a `creating` row with a
-      // caller-assigned session id BEFORE tearing down the old session or calling
-      // createSession. This OVERWRITES any prior record, so a crash anywhere after
-      // this point can never resurrect the superseded session (startup sees
-      // `creating(newId)`, not the old `active` row). Capture the prior record so
-      // a FAILED (non-crash) teardown can be rolled back, keeping the live old
-      // session fully intact.
-      const prevRecord = this.store.get();
+      // caller-assigned session id BEFORE calling createSession, so a crash
+      // between the two leaves an identifiable id on disk rather than a live
+      // runtime session nobody knows about.
       const sessionId = randomUUID();
       const generation = this.store.nextGeneration();
+
+      // Isolate this session's files from the other live ones. Without it,
+      // concurrent agents share one checkout and silently overwrite each other.
+      let workDir = this.repoPath;
+      let branch: string | undefined;
+      if (this.isolation === "worktree") {
+        branch = worktreeBranch(thread.id);
+        workDir = worktreePath(worktreeRoot(), thread.id);
+        try {
+          await addWorktree(this.repoPath, workDir, branch);
+        } catch (err) {
+          await dropThread();
+          await interaction.editReply(
+            `⚠️ 無法為這個 session 建立 git worktree（${err instanceof Error ? err.message : String(err)}）。` +
+              "未建立 session。可設定 `SESSION_ISOLATION=shared` 改用共用工作目錄（**同時只能有一個 session 安全執行**）。"
+          );
+          return;
+        }
+      }
+
       const reserved = this.store.reserve({
         threadId: thread.id,
         sessionId,
@@ -658,6 +755,8 @@ export class DiscordCopilotApp {
         repoPath: this.repoPath,
         guildId: this.config.DISCORD_GUILD_ID,
         parentChannelId: this.config.DISCORD_PARENT_CHANNEL_ID,
+        workDir,
+        ...(branch ? { branch } : {}),
       });
       if (!reserved) {
         await dropThread();
@@ -667,22 +766,19 @@ export class DiscordCopilotApp {
         return;
       }
 
-      // v1 runs ONE live session at a time: all sessions share the single
-      // controlled working tree, so two concurrent agents could clobber each
-      // other's checkout/edits. Refuse to start if the previous one won't end.
-      const ended = await this.endAllSessions("A new session was started; this one has ended.");
-      if (!ended) {
-        // Teardown failed and the old actor is still live in-memory (endAllSessions
-        // retains it → it also FENCES the next /new). Roll the record back to the
-        // still-live old session so disk and memory agree and it stays resumable.
-        const rolledBack = prevRecord ? this.store.restore(prevRecord) : this.store.clear();
-        await dropThread();
-        await interaction.editReply(
-          rolledBack
-            ? "無法結束前一個 session（可能已失效），未建立新的。前一個 session 已保留——請重試；若持續發生請重啟 bot。"
-            : "⚠️ 無法結束前一個 session，且回滾記錄也失敗（磁碟問題）。前一個 session 仍在執行中，但其記錄可能不一致——請重啟 bot。"
-        );
-        return;
+      // Sessions run CONCURRENTLY. Under `shared` isolation they all point at
+      // the same checkout, which is only safe one at a time — so that mode ends
+      // the previous session, exactly as v1 did.
+      if (this.isolation !== "worktree" && this.sessions.size > 0) {
+        const ended = await this.endAllSessions("A new session was started; this one has ended.");
+        if (!ended) {
+          this.store.remove(thread.id);
+          await dropThread();
+          await interaction.editReply(
+            "無法結束前一個 session（可能已失效），未建立新的。前一個 session 已保留——請重試；若持續發生請重啟 bot。"
+          );
+          return;
+        }
       }
 
       const broker = new PendingInteractionBroker();
@@ -690,7 +786,8 @@ export class DiscordCopilotApp {
       try {
         actor = await SessionActor.create(this.copilot, {
           sessionKey: thread.id,
-          workingDirectory: this.repoPath,
+          workingDirectory: workDir,
+          approvalKey: this.approvalRepoKey,
           model: this.config.DEFAULT_MODEL,
           contextTier: this.config.DEFAULT_CONTEXT_TIER,
           broker,
@@ -721,9 +818,8 @@ export class DiscordCopilotApp {
       // Promote creating→active. A failed commit means the record isn't durable,
       // so we must NOT run as active. Try a bounded disconnect of the just-created
       // actor; if that fails the runtime may still be live, so RETAIN the actor as
-      // a fence (registered) — endAllSessions will then refuse the next /new until
-      // a restart, rather than letting a second live actor onto the shared tree.
-      if (!this.store.commit()) {
+      // a fence (registered) rather than losing track of a live runtime session.
+      if (!this.store.commit(thread.id)) {
         let disconnected = false;
         try {
           await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS);
@@ -737,17 +833,44 @@ export class DiscordCopilotApp {
             "⚠️ 無法持久化 session 狀態（commit 失敗），已取消啟動。請檢查磁碟／權限後重試。"
           );
         } else {
-          // Fence: keep the (maybe-live) actor registered so /new stays blocked.
-          this.sessions.set(thread.id, { actor, broker, running: false, titled: true, titleEpoch: 0, queue: [] });
+          // Fence: keep the (maybe-live) actor registered so it is still tracked.
+          this.sessions.set(thread.id, {
+            actor,
+            broker,
+            running: false,
+            titled: true,
+            titleEpoch: 0,
+            queue: [],
+            workDir,
+            ...(branch ? { branch } : {}),
+          });
           await interaction.editReply(
-            "⚠️ 無法持久化 session 狀態，且無法確認前述 runtime 已關閉。已將其設為屏障以避免雙重 session——請重啟 bot。"
+            "⚠️ 無法持久化 session 狀態，且無法確認前述 runtime 已關閉。已保留為屏障——請重啟 bot。"
           );
         }
         return;
       }
-      const session: Session = { actor, broker, running: false, titled: false, titleEpoch: 0, queue: [] };
+      const session: Session = {
+        actor,
+        broker,
+        running: false,
+        titled: false,
+        titleEpoch: 0,
+        queue: [],
+        workDir,
+        ...(branch ? { branch } : {}),
+      };
       this.sessions.set(thread.id, session);
-      await interaction.editReply(`Started a session in <#${thread.id}>. Send prompts there.`);
+      const live = this.sessions.size;
+      const where =
+        this.isolation === "worktree"
+          ? `\n🌿 這個 session 有自己的 git worktree（分支 \`${branch}\`），與其他 session 的檔案互相隔離。`
+          : "\n⚠️ 共用工作目錄模式：一次只有一個 session 是安全的。";
+      await interaction.editReply(
+        `Started a session in <#${thread.id}>. Send prompts there.` +
+          (live > 1 ? `（目前有 ${live} 個 session 同時進行）` : "") +
+          where
+      );
 
       if (promptOption) {
         // Title this the same way a first thread message is titled — the thread
@@ -759,6 +882,80 @@ export class DiscordCopilotApp {
     } finally {
       this.creating = false;
     }
+  }
+
+  /**
+   * `/end` — close THIS thread's session and leave every other one running.
+   *
+   * With concurrent sessions, `/new` no longer ends anything, so without this
+   * sessions would only ever accumulate. The worktree is removed **only when git
+   * reports it clean**: uncommitted work belongs to the operator, and deleting
+   * it to tidy up would be the worst possible trade.
+   */
+  private async cmdEnd(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isAuthorized(ctxOf(interaction), this.policy)) {
+      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const threadId = interaction.channelId;
+    const session = this.sessions.get(threadId);
+    if (!session) {
+      await interaction.reply({ content: "這個討論串沒有進行中的 session。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    session.currentAbort?.abort();
+    session.queue = [];
+    let closed = true;
+    try {
+      await withTimeout(session.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
+    } catch {
+      closed = false; // runtime may still be live — keep the record, say so
+    }
+    if (!closed) {
+      await interaction.editReply(
+        "⚠️ 無法確認 runtime 已關閉，這個 session 保留為屏障（不會再接受訊息）。請重啟 bot。"
+      );
+      return;
+    }
+    this.sessions.delete(threadId);
+    this.approvals.clearSession(threadId);
+    this.transport.dispose(threadId);
+    this.store.remove(threadId);
+
+    let tail = "";
+    if (session.branch && session.workDir !== this.repoPath) {
+      const r = await removeWorktreeIfClean(this.repoPath, session.workDir);
+      tail =
+        r === "removed"
+          ? `\n🌿 worktree 已清除（分支 \`${session.branch}\` 保留）。`
+          : r === "kept-dirty"
+            ? `\n🌿 worktree **保留**：\`${session.workDir}\` 還有未提交的變更（分支 \`${session.branch}\`）。確認後可自行 \`git worktree remove\`。`
+            : `\n⚠️ 無法移除 worktree \`${session.workDir}\`，請自行檢查。`;
+    }
+    const left = this.sessions.size;
+    await interaction.editReply(
+      `✅ 這個 session 已結束。${left ? `其他 ${left} 個 session 仍在執行。` : "目前沒有其他 session。"}${tail}`
+    );
+  }
+
+  /** `/sessions` — what is live right now, and where each one is working. */
+  private async cmdSessions(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isAuthorized(ctxOf(interaction), this.policy)) {
+      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const rows = [...this.sessions.entries()].map(([id, s]) => {
+      const state = s.running ? "執行中" : "閒置";
+      const q = s.queue.length ? ` · 佇列 ${s.queue.length}` : "";
+      const where = s.branch ? ` · \`${s.branch}\`` : " · 共用工作目錄";
+      return `• <#${id}> — ${state}${q}${where}`;
+    });
+    const header = `目前 ${rows.length}/${MAX_LIVE_SESSIONS} 個 session（隔離模式：\`${this.isolation}\`）`;
+    await interaction.reply({
+      content: (rows.length ? `${header}\n${rows.join("\n")}` : `${header}\n（沒有進行中的 session）`).slice(0, 1900),
+      flags: MessageFlags.Ephemeral,
+    });
   }
 
   /** Fire the one-shot thread titler for `text`, fenced so it can never run
@@ -899,63 +1096,80 @@ export class DiscordCopilotApp {
     ).catch(() => {});
   }
 
-  /** Reconcile the persisted session on startup (P2). Runs while `phase` is
-   *  "reconciling" (input rejected), so it can register a resumed session before
+  /** Reconcile every persisted session on startup (P2). Runs while `phase` is
+   *  "reconciling" (input rejected), so resumed sessions are registered before
    *  any /new. `deps.classifyThread` is injectable for tests. Throws on a corrupt
    *  store so startup fails closed rather than silently starting fresh. */
   private async reconcileOnStartup(deps?: {
     classifyThread?: (threadId: string) => Promise<ThreadStatus>;
   }): Promise<void> {
     const classify = deps?.classifyThread ?? ((id: string) => this.classifyThread(id));
-    const rec = this.store.get();
-    const corrupt = this.store.isCorrupt();
+    if (this.store.isCorrupt()) {
+      // Checked once, for the whole file: a corrupt store says nothing reliable
+      // about ANY session, so per-record handling would be guesswork.
+      planReconcile({ corrupt: true });
+      throw new Error(
+        `session store at ${sessionStorePath()} is corrupt; refusing to start. Inspect/remove it and restart.`
+      );
+    }
+    // Resume sequentially: each resume is a runtime RPC, and a burst of them on
+    // startup competes with the reconnect the runtime is already doing.
+    for (const rec of this.store.all()) {
+      try {
+        await this.reconcileRecord(rec, classify);
+      } catch (err) {
+        // One unusable record must not stop the others from coming back.
+        if (err instanceof FatalReconcileError) throw err;
+        console.warn(
+          `reconcile: ${rec.threadId} failed (${err instanceof Error ? err.message : String(err)}); continuing.`
+        );
+      }
+    }
+  }
 
+  private async reconcileRecord(
+    rec: SessionRecord,
+    classify: (threadId: string) => Promise<ThreadStatus>
+  ): Promise<void> {
     let bindingOk: boolean | undefined;
     let threadStatus: ThreadStatus | undefined;
-    if (!corrupt && rec?.state === "active") {
+    if (rec.state === "active") {
       bindingOk = this.bindingOk(rec);
       if (bindingOk) threadStatus = await classify(rec.threadId);
     }
 
-    const action = planReconcile({ corrupt, state: rec?.state, bindingOk, threadStatus });
+    const action = planReconcile({ corrupt: false, state: rec.state, bindingOk, threadStatus });
     switch (action.kind) {
       case "fail-corrupt":
-        throw new Error(
-          `session store at ${sessionStorePath()} is corrupt; refusing to start. Inspect/remove it and restart.`
-        );
       case "fresh":
       case "retain":
         return;
       case "orphan-interrupted":
         // A required terminal transition: if it can't be persisted, that's a disk
         // problem — fail startup rather than run with a non-durable state.
-        if (!this.store.setState("orphaned", "interrupted-create")) {
-          throw new Error(`reconcile: could not persist orphaned state at ${sessionStorePath()}`);
+        if (!this.store.setState(rec.threadId, "orphaned", "interrupted-create")) {
+          throw new FatalReconcileError(`reconcile: could not persist orphaned state at ${sessionStorePath()}`);
         }
         return;
       case "skip":
-        console.warn(`reconcile: not resuming this boot (${action.reason}); record left unchanged.`);
-        if (rec) {
-          await this.transport
-            .notice(
-              rec.threadId,
-              "⚠️ 啟動時暫時無法確認此執行緒狀態，本次未復原。session 記錄已保留——重新啟動 bot 可再嘗試。"
-            )
-            .catch(() => {});
-        }
+        console.warn(`reconcile: not resuming ${rec.threadId} this boot (${action.reason}); record left unchanged.`);
+        await this.transport
+          .notice(
+            rec.threadId,
+            "⚠️ 啟動時暫時無法確認此執行緒狀態，本次未復原。session 記錄已保留——重新啟動 bot 可再嘗試。"
+          )
+          .catch(() => {});
         return;
       case "block":
-        if (!this.store.setState("blocked", action.reason)) {
-          throw new Error(`reconcile: could not persist blocked state at ${sessionStorePath()}`);
+        if (!this.store.setState(rec.threadId, "blocked", action.reason)) {
+          throw new FatalReconcileError(`reconcile: could not persist blocked state at ${sessionStorePath()}`);
         }
-        if (rec) {
-          await this.transport
-            .notice(rec.threadId, `⚠️ 無法復原此 session（${action.reason}）。請用 /new 開新的。`)
-            .catch(() => {});
-        }
+        await this.transport
+          .notice(rec.threadId, `⚠️ 無法復原此 session（${action.reason}）。請用 /new 開新的。`)
+          .catch(() => {});
         return;
       case "resume":
-        if (rec) await this.resumeRecord(rec);
+        await this.resumeRecord(rec);
         return;
     }
   }
@@ -970,7 +1184,11 @@ export class DiscordCopilotApp {
     try {
       actor = await SessionActor.create(this.copilot, {
         sessionKey: rec.threadId,
-        workingDirectory: this.repoPath,
+        // Back into the SAME directory this session was created in — resuming a
+        // worktree session into the shared repo would run one thread's
+        // conversation against another thread's files.
+        workingDirectory: rec.workDir,
+        approvalKey: this.approvalRepoKey,
         model: this.config.DEFAULT_MODEL,
         contextTier: this.config.DEFAULT_CONTEXT_TIER,
         broker,
@@ -984,8 +1202,8 @@ export class DiscordCopilotApp {
       if (classifyResumeError(msg) === "session-lost") {
         // Definitive: the session id is gone. Mark terminal; a failed persist of
         // that transition is a disk problem we must surface (fail startup).
-        if (!this.store.setState("orphaned", "session-lost")) {
-          throw new Error(`reconcile: could not persist orphaned state for ${rec.threadId}`);
+        if (!this.store.setState(rec.threadId, "orphaned", "session-lost")) {
+          throw new FatalReconcileError(`reconcile: could not persist orphaned state for ${rec.threadId}`);
         }
         await this.transport
           .notice(rec.threadId, "⚠️ 無法復原（session 已遺失）。請用 /new 開新的。")
@@ -1006,8 +1224,17 @@ export class DiscordCopilotApp {
     }
     // A resumed thread was already named by the run that created it — never
     // re-title it from whatever the user happens to type first after a restart.
-    this.sessions.set(rec.threadId, { actor, broker, running: false, titled: true, titleEpoch: 0, queue: [] });
-    this.store.commit(); // keep active, refresh updatedAt
+    this.sessions.set(rec.threadId, {
+      actor,
+      broker,
+      running: false,
+      titled: true,
+      titleEpoch: 0,
+      queue: [],
+      workDir: rec.workDir,
+      ...(rec.branch ? { branch: rec.branch } : {}),
+    });
+    this.store.commit(rec.threadId); // keep active, refresh updatedAt
     await this.transport
       .notice(
         rec.threadId,
@@ -1254,10 +1481,10 @@ export class DiscordCopilotApp {
     // in-memory rules while still claiming they were revoked.
     const scope = approvalScopeKeys(this.sessions.keys());
     const sessionRules = [...new Set(scope.flatMap((k) => this.approvals.sessionApprovals(k)))];
-    const repoRules = this.approvals.repoApprovals(this.repoPath);
+    const repoRules = this.approvals.repoApprovals(this.approvalRepoKey);
     if (clear) {
       for (const key of scope) this.approvals.clearSession(key);
-      const durable = this.approvals.clearRepo(this.repoPath);
+      const durable = this.approvals.clearRepo(this.approvalRepoKey);
       const tail = durable
         ? "Future commands will prompt again."
         : "⚠️ 已在記憶體中清除（本次執行不會再自動核准），但寫入磁碟失敗 — 重啟後 repo 規則可能重現，請檢查檔案權限。";

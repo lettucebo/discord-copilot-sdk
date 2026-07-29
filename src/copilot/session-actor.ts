@@ -43,6 +43,11 @@ interface PendingPermMeta {
 export interface SessionActorOpts {
   sessionKey: string;
   workingDirectory: string;
+  /** Identity that "always allow for this repo" rules are stored under. With
+   *  per-session worktrees the working directory differs for every session, so
+   *  keying approvals on it would silently re-prompt for a command the operator
+   *  already trusted in this repository. Defaults to `workingDirectory`. */
+  approvalKey?: string;
   model?: string;
   contextTier?: "default" | "long_context";
   broker: PendingInteractionBroker;
@@ -84,6 +89,10 @@ export class SessionActor {
   private session!: CopilotSession;
   private renderer = new TurnRenderer();
   private readonly generation: number;
+  /** See `SessionActorOpts.approvalKey`. */
+  private get approvalKey(): string {
+    return this.opts.approvalKey ?? this.opts.workingDirectory;
+  }
   private idleWaiters: Array<() => void> = [];
   /** Actor lifecycle. `faulted`/`closed` are terminal; `closing` means a
    *  disconnect RPC is in flight (not yet confirmed). The actor refuses new
@@ -457,7 +466,7 @@ export class SessionActor {
     // from trusting the runtime's command parse blindly.
     const simple = isSimpleCommand(fullCommandText);
     const allSafe = executables.length > 0 && executables.every(isSafeExecutable);
-    if (simple && allSafe && this.opts.policy.isApproved(this.opts.sessionKey, this.opts.workingDirectory, executables)) {
+    if (simple && allSafe && this.opts.policy.isApproved(this.opts.sessionKey, this.approvalKey, executables)) {
       await this.opts.transport.notice(
         this.opts.sessionKey,
         `✓ Auto-approved (existing rule): ${executables.map((e) => `\`${e}\``).join(", ")}`
@@ -535,7 +544,7 @@ export class SessionActor {
       return APPROVE_ONCE;
     }
     // decision === "always"
-    const durable = this.opts.policy.approveForRepo(this.opts.workingDirectory, meta.executable);
+    const durable = this.opts.policy.approveForRepo(this.approvalKey, meta.executable);
     if (!durable) {
       // The rule is live for THIS process but did not reach disk. Say so:
       // "Always (this repo)" promises it survives a restart.

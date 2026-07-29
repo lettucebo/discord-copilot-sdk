@@ -1,246 +1,284 @@
 import { describe, it, expect } from "vitest";
-import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { rmSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 
+function tmpFile(): string {
+  return join(mkdtempSync(join(tmpdir(), "dcs-store-")), "s.json");
+}
 
-const tmpFile = (): string => join(tmpdir(), `dp-session-${Math.random()}.json`);
-
-const bind = (over: Partial<SessionBinding> = {}): SessionBinding => ({
-  threadId: "t1",
-  sessionId: "sess-1",
+const bind = (threadId: string, over: Partial<SessionBinding> = {}): SessionBinding => ({
+  threadId,
+  sessionId: `sess-${threadId}`,
   generation: 1,
   repoPath: "C:\\repo",
   guildId: "g1",
-  parentChannelId: "c1",
+  parentChannelId: "p1",
+  workDir: "C:\\repo",
   ...over,
 });
 
-describe("SessionStore", () => {
-  it("returns undefined and not-corrupt when no file exists", () => {
+describe("SessionStore — basics", () => {
+  it("returns nothing and not-corrupt when no file exists", () => {
     const s = new SessionStore(tmpFile());
-    expect(s.get()).toBeUndefined();
+    expect(s.all()).toEqual([]);
+    expect(s.get("t1")).toBeUndefined();
     expect(s.isCorrupt()).toBe(false);
   });
 
-  it("commit → get roundtrips and persists across instances", () => {
+  it("reserve writes a creating record; commit promotes it to active", () => {
     const f = tmpFile();
-    try {
-      const s1 = new SessionStore(f);
-      expect(s1.commit(bind())).toBe(true);
-      expect(s1.get()).toMatchObject({
-        threadId: "t1",
-        sessionId: "sess-1",
-        generation: 1,
+    const s = new SessionStore(f);
+    expect(s.reserve(bind("t1"))).toBe(true);
+    expect(s.get("t1")?.state).toBe("creating");
+    expect(s.commit("t1")).toBe(true);
+    expect(s.get("t1")?.state).toBe("active");
+    expect(new SessionStore(f).get("t1")?.state).toBe("active"); // persisted
+  });
+
+  it("commit/setState for an unknown thread return false", () => {
+    const s = new SessionStore(tmpFile());
+    expect(s.commit("nope")).toBe(false);
+    expect(s.setState("nope", "blocked", "x")).toBe(false);
+  });
+
+  it("setState updates state + reason", () => {
+    const s = new SessionStore(tmpFile());
+    s.reserve(bind("t1"));
+    expect(s.setState("t1", "blocked", "thread-gone")).toBe(true);
+    expect(s.get("t1")).toMatchObject({ state: "blocked", reason: "thread-gone" });
+  });
+
+  it("restore() writes a prior record back verbatim", () => {
+    const s = new SessionStore(tmpFile());
+    s.reserve(bind("t1"));
+    s.commit("t1");
+    const prior = s.get("t1")!;
+    s.remove("t1");
+    expect(s.get("t1")).toBeUndefined();
+    expect(s.restore(prior)).toBe(true);
+    expect(s.get("t1")).toMatchObject({ sessionId: prior.sessionId, state: prior.state });
+  });
+
+  it("carries workDir and branch so a resumed session lands in the SAME tree", () => {
+    // Resuming a worktree-isolated session into the wrong directory would run
+    // one thread's conversation against another thread's files.
+    const f = tmpFile();
+    const s = new SessionStore(f);
+    s.reserve(bind("t1", { workDir: "C:\\wt\\t1", branch: "copilot/t1" }));
+    s.commit("t1");
+    expect(new SessionStore(f).get("t1")).toMatchObject({
+      workDir: "C:\\wt\\t1",
+      branch: "copilot/t1",
+    });
+  });
+});
+
+describe("SessionStore — many concurrent sessions", () => {
+  it("holds several records at once and removes them individually", () => {
+    const f = tmpFile();
+    const s = new SessionStore(f);
+    s.reserve(bind("t1", { generation: 1 }));
+    s.reserve(bind("t2", { generation: 2 }));
+    s.reserve(bind("t3", { generation: 3 }));
+    expect(s.all().map((r) => r.threadId)).toEqual(["t1", "t2", "t3"]);
+    expect(s.remove("t2")).toBe(true);
+    expect(s.all().map((r) => r.threadId)).toEqual(["t1", "t3"]);
+    expect(new SessionStore(f).all().map((r) => r.threadId)).toEqual(["t1", "t3"]);
+  });
+
+  it("ending one session leaves the others untouched", () => {
+    const s = new SessionStore(tmpFile());
+    s.reserve(bind("t1"));
+    s.commit("t1");
+    s.reserve(bind("t2", { generation: 2 }));
+    s.commit("t2");
+    s.setState("t1", "orphaned", "ended");
+    expect(s.get("t1")?.state).toBe("orphaned");
+    expect(s.get("t2")?.state).toBe("active"); // unaffected
+  });
+
+  it("NEVER reuses a generation, even after every record is removed", () => {
+    // Generations fence a stale actor's decisions from a newer incarnation. If
+    // removing records let a generation repeat, a late callback from the old
+    // actor could be accepted by the new one.
+    const f = tmpFile();
+    const s = new SessionStore(f);
+    expect(s.nextGeneration()).toBe(1);
+    s.reserve(bind("t1", { generation: s.nextGeneration() }));
+    s.reserve(bind("t2", { generation: s.nextGeneration() }));
+    expect(s.nextGeneration()).toBe(3);
+    s.remove("t1");
+    s.remove("t2");
+    expect(s.all()).toEqual([]);
+    expect(s.nextGeneration()).toBe(3); // not back to 1
+    expect(new SessionStore(f).nextGeneration()).toBe(3); // survives a restart
+  });
+
+  it("clear() empties the store but KEEPS the generation counter", () => {
+    // Deleting the file would restart generations at 1 and let a stale actor's
+    // decisions be accepted by a new incarnation.
+    const f = tmpFile();
+    const s = new SessionStore(f);
+    s.reserve(bind("t1", { generation: 7 }));
+    expect(s.clear()).toBe(true);
+    expect(s.all()).toEqual([]);
+    expect(new SessionStore(f).all()).toEqual([]);
+    expect(new SessionStore(f).nextGeneration()).toBe(8);
+  });
+});
+
+describe("SessionStore — v1 migration", () => {
+  it("reads a pre-multi-session file (one bare record) and keeps it resumable", () => {
+    const f = tmpFile();
+    writeFileSync(
+      f,
+      JSON.stringify({
+        schemaVersion: 1,
+        threadId: "old-thread",
+        sessionId: "old-sess",
+        generation: 9,
         repoPath: "C:\\repo",
         guildId: "g1",
-        parentChannelId: "c1",
+        parentChannelId: "p1",
         state: "active",
+        updatedAt: 123,
+      }),
+      "utf8"
+    );
+    const s = new SessionStore(f);
+    expect(s.isCorrupt()).toBe(false);
+    expect(s.all()).toHaveLength(1);
+    expect(s.get("old-thread")).toMatchObject({ sessionId: "old-sess", state: "active" });
+    // v1 predates isolation: that session ran directly in the controlled repo.
+    expect(s.get("old-thread")?.workDir).toBe("C:\\repo");
+    // and its generation must not be handed out again
+    expect(s.nextGeneration()).toBe(10);
+  });
+
+  it("upgrades the file to v2 on the next write, without losing the old session", () => {
+    const f = tmpFile();
+    writeFileSync(
+      f,
+      JSON.stringify({
         schemaVersion: 1,
-      });
-      expect(new SessionStore(f).get()).toMatchObject({ sessionId: "sess-1", state: "active" });
-    } finally {
-      rmSync(f, { force: true });
-    }
+        threadId: "old-thread",
+        sessionId: "old-sess",
+        generation: 2,
+        repoPath: "C:\\repo",
+        guildId: "g1",
+        parentChannelId: "p1",
+        state: "active",
+        updatedAt: 1,
+      }),
+      "utf8"
+    );
+    const s = new SessionStore(f);
+    s.reserve(bind("new-thread", { generation: s.nextGeneration() }));
+    const onDisk = JSON.parse(readFileSync(f, "utf8")) as { schemaVersion: number; sessions: unknown[] };
+    expect(onDisk.schemaVersion).toBe(2);
+    expect(onDisk.sessions).toHaveLength(2);
+    expect(new SessionStore(f).get("old-thread")?.sessionId).toBe("old-sess");
   });
+});
 
-  it("reserve writes a creating record; commit() promotes it to active", () => {
-    const f = tmpFile();
-    try {
-      const s = new SessionStore(f);
-      expect(s.reserve(bind())).toBe(true);
-      expect(s.get()?.state).toBe("creating");
-      expect(s.commit()).toBe(true); // promote in place
-      expect(s.get()?.state).toBe("active");
-      expect(new SessionStore(f).get()?.state).toBe("active");
-    } finally {
-      rmSync(f, { force: true });
-    }
-  });
-
-  it("commit() with no record returns false", () => {
-    expect(new SessionStore(tmpFile()).commit()).toBe(false);
-  });
-
-  it("setState updates state + reason; no-op (false) without a record", () => {
-    const f = tmpFile();
-    try {
-      const s = new SessionStore(f);
-      expect(s.setState("blocked", "x")).toBe(false); // no record yet
-      s.commit(bind());
-      expect(s.setState("orphaned", "session-lost")).toBe(true);
-      expect(s.get()).toMatchObject({ state: "orphaned", reason: "session-lost" });
-      expect(new SessionStore(f).get()?.state).toBe("orphaned");
-    } finally {
-      rmSync(f, { force: true });
-    }
-  });
-
-  it("clear tombstones the record durably (file removed)", () => {
-    const f = tmpFile();
-    try {
-      const s = new SessionStore(f);
-      s.commit(bind());
-      expect(s.clear()).toBe(true);
-      expect(s.get()).toBeUndefined();
-      expect(existsSync(f)).toBe(false);
-      expect(new SessionStore(f).get()).toBeUndefined();
-    } finally {
-      rmSync(f, { force: true });
-    }
-  });
-
-  it("nextGeneration = current+1, or 1 when empty", () => {
-    const f = tmpFile();
-    try {
-      const s = new SessionStore(f);
-      expect(s.nextGeneration()).toBe(1);
-      s.commit(bind({ generation: 7 }));
-      expect(s.nextGeneration()).toBe(8);
-    } finally {
-      rmSync(f, { force: true });
-    }
-  });
-
+describe("SessionStore — durability (unchanged safety properties)", () => {
   it("writes atomically (target parses as valid JSON, temp removed)", () => {
     const f = tmpFile();
+    const s = new SessionStore(f);
+    s.reserve(bind("t1"));
+    expect(() => JSON.parse(readFileSync(f, "utf8"))).not.toThrow();
+    expect(existsSync(`${f}.tmp`)).toBe(false);
+  });
+
+  it("PERSIST-FIRST: a failed write returns false AND leaves memory unchanged", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dcs-store-ro-"));
+    const f = join(dir, "s.json");
+    const s = new SessionStore(f);
+    s.reserve(bind("t1"));
+    s.commit("t1");
+    // Make the target path unwritable by turning it into a directory.
+    rmSync(f, { force: true });
+    mkdirSync(f);
     try {
-      const s = new SessionStore(f);
-      s.commit(bind());
-      expect(JSON.parse(readFileSync(f, "utf8")).sessionId).toBe("sess-1");
-      expect(existsSync(`${f}.tmp`)).toBe(false);
+      expect(s.reserve(bind("t2", { generation: 2 }))).toBe(false);
+      expect(s.get("t2")).toBeUndefined(); // nothing adopted
+      expect(s.get("t1")?.state).toBe("active"); // prior state intact
+      expect(s.setState("t1", "blocked", "x")).toBe(false);
+      expect(s.get("t1")?.state).toBe("active"); // still the last DURABLE state
     } finally {
-      rmSync(f, { force: true });
-      rmSync(`${f}.tmp`, { force: true });
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("PERSIST-FIRST: a failed write returns false AND leaves in-memory unchanged", () => {
-    const f = tmpFile();
+  it("write failures NEVER throw — every mutation returns false instead", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dcs-store-throw-"));
+    const f = join(dir, "s.json");
+    const s = new SessionStore(f);
+    s.reserve(bind("t1"));
+    rmSync(f, { force: true });
+    mkdirSync(f);
     try {
-      const s = new SessionStore(f);
-      expect(s.commit(bind({ sessionId: "old" }))).toBe(true); // durable baseline
-      // Make the target path unwritable by turning it into a directory's child that
-      // can't be created: point a second store at an existing DIRECTORY.
-      const dir = mkdtempSync(join(tmpdir(), "dp-session-dir-"));
-      try {
-        const s2 = new SessionStore(join(dir)); // file path IS a directory → writes throw
-        // seed s2 in-memory via a successful-looking call? No: first write fails.
-        expect(s2.commit(bind({ sessionId: "new" }))).toBe(false);
-        expect(s2.get()).toBeUndefined(); // never adopted the undurable state
-      } finally {
-        rmSync(dir, { force: true, recursive: true });
-      }
-      // original store's durable record is intact
-      expect(new SessionStore(f).get()?.sessionId).toBe("old");
+      expect(() => s.commit("t1")).not.toThrow();
+      expect(() => s.remove("t1")).not.toThrow();
+      expect(() => s.clear()).not.toThrow();
+      expect(s.commit("t1")).toBe(false);
     } finally {
-      rmSync(f, { force: true });
-    }
-  });
-
-  it("PERSIST-FIRST: failed setState keeps the prior durable state", () => {
-    // Use a directory as the file so the write fails, but seed the in-memory
-    // record by loading from a good file first is not possible here; instead we
-    // assert setState on an unwritable store with a preloaded record is false.
-    const good = tmpFile();
-    const dir = mkdtempSync(join(tmpdir(), "dp-session-dir2-"));
-    try {
-      // Prepare a valid record file, then copy its path into a store whose writes fail.
-      const seed = new SessionStore(good);
-      seed.commit(bind({ sessionId: "keep" }));
-      // A store pointed at a directory can't load (readFileSync on a dir throws →
-      // treated as absent), so simulate: it has no record, setState is false.
-      const s = new SessionStore(dir);
-      expect(s.setState("blocked")).toBe(false);
-    } finally {
-      rmSync(good, { force: true });
-      rmSync(dir, { force: true, recursive: true });
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it("CORRUPT != absent: an unparseable file sets isCorrupt()", () => {
     const f = tmpFile();
-    try {
-      writeFileSync(f, "{ this is not json", "utf8");
-      const s = new SessionStore(f);
-      expect(s.isCorrupt()).toBe(true);
-      expect(s.get()).toBeUndefined();
-    } finally {
-      rmSync(f, { force: true });
-    }
+    writeFileSync(f, "{ not json", "utf8");
+    expect(new SessionStore(f).isCorrupt()).toBe(true);
   });
 
-  it("a structurally-invalid JSON object is also corrupt", () => {
+  it("a structurally-invalid record is corrupt, not 'absent'", () => {
     const f = tmpFile();
-    try {
-      writeFileSync(f, JSON.stringify({ threadId: "t1" }), "utf8"); // missing fields
-      expect(new SessionStore(f).isCorrupt()).toBe(true);
-    } finally {
-      rmSync(f, { force: true });
-    }
+    writeFileSync(f, JSON.stringify({ hello: "world" }), "utf8");
+    expect(new SessionStore(f).isCorrupt()).toBe(true);
+  });
+
+  it("ONE bad row invalidates the whole file (fail closed, never partial)", () => {
+    // Silently dropping the unreadable row would orphan a live thread without
+    // saying so.
+    const f = tmpFile();
+    writeFileSync(
+      f,
+      JSON.stringify({
+        schemaVersion: 2,
+        generationHighWater: 2,
+        sessions: [
+          {
+            schemaVersion: 2,
+            threadId: "good",
+            sessionId: "s",
+            generation: 1,
+            repoPath: "r",
+            guildId: "g",
+            parentChannelId: "p",
+            workDir: "r",
+            state: "active",
+            updatedAt: 1,
+          },
+          { threadId: "bad" },
+        ],
+      }),
+      "utf8"
+    );
+    const s = new SessionStore(f);
+    expect(s.isCorrupt()).toBe(true);
+    expect(s.all()).toEqual([]);
   });
 
   it("a NON-ENOENT read error (path is a directory) is corrupt, not 'absent'", () => {
-    const dir = mkdtempSync(join(tmpdir(), "dp-session-isdir-"));
+    const dir = mkdtempSync(join(tmpdir(), "dcs-store-dir-"));
     try {
-      const s = new SessionStore(dir); // readFileSync(dir) → EISDIR
-      expect(s.isCorrupt()).toBe(true);
-      expect(s.get()).toBeUndefined();
+      expect(new SessionStore(dir).isCorrupt()).toBe(true);
     } finally {
-      rmSync(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("restore() writes a prior record back verbatim", () => {
-    const f = tmpFile();
-    try {
-      const s = new SessionStore(f);
-      s.commit(bind({ sessionId: "orig" }));
-      const prev = s.get()!;
-      s.reserve(bind({ sessionId: "new", generation: 2 })); // overwrite
-      expect(s.get()?.sessionId).toBe("new");
-      expect(s.restore(prev)).toBe(true); // roll back
-      expect(s.get()).toMatchObject({ sessionId: "orig", state: "active", generation: 1 });
-      expect(new SessionStore(f).get()?.sessionId).toBe("orig"); // durable
-    } finally {
-      rmSync(f, { force: true });
-    }
-  });
-
-  it("write failures NEVER throw — commit AND clear return false on an unwritable path", () => {
-    // A directory as the file makes every write throw; the store must still
-    // return false (not throw), so callers' fail-closed handling isn't skipped.
-    const dir = mkdtempSync(join(tmpdir(), "dp-session-nothrow-"));
-    try {
-      const s = new SessionStore(dir);
-      expect(() => {
-        expect(s.commit(bind())).toBe(false);
-        expect(s.clear()).toBe(false);
-      }).not.toThrow();
-    } finally {
-      rmSync(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("write() returns false (never throws) even when the temp CLEANUP itself throws", () => {
-    // Fault injection WITHOUT mocking: pre-create a DIRECTORY at the temp path, so
-    // both the main writeFileSync(tmp) AND the catch-block rmSync(tmp) throw
-    // (EISDIR). write() must still return false — a throw here would bypass the
-    // commit-fail fence / rollback in cmdNew. (The plain-directory test above
-    // would pass even against the previous unguarded-cleanup code; this one won't.)
-    const f = tmpFile();
-    mkdirSync(`${f}.tmp`);
-    try {
-      const s = new SessionStore(f);
-      let result: boolean | undefined;
-      expect(() => {
-        result = s.commit(bind());
-      }).not.toThrow();
-      expect(result).toBe(false);
-    } finally {
-      rmSync(`${f}.tmp`, { force: true, recursive: true });
-      rmSync(f, { force: true });
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

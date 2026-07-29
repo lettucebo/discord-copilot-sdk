@@ -119,6 +119,7 @@ function buildAppWithSession(): { app: DiscordCopilotApp; actor: FakeActor; tran
     titled: true,
     titleEpoch: 0,
     queue: [],
+    workDir: "C:\\repo",
   };
   (app as unknown as { sessions: Map<string, unknown> }).sessions.set("thread-1", session);
   return { app, actor, transport, session };

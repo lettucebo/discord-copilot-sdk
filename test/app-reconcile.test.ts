@@ -17,6 +17,7 @@ const bind = (over: Partial<SessionBinding> = {}): SessionBinding => ({
   repoPath: REPO,
   guildId: "g1",
   parentChannelId: "c1",
+  workDir: REPO,
   ...over,
 });
 
@@ -91,12 +92,12 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
-      store.commit(bind());
+      store.reserve(bind()); store.commit("t1");
       const transport = new FakeTransport();
       const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(true);
-      expect(store.get()?.state).toBe("active");
+      expect(store.get("t1")?.state).toBe("active");
       expect(transport.notices.some((n) => n.includes("復原"))).toBe(true);
     } finally {
       rmSync(f, { force: true });
@@ -107,13 +108,13 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
-      store.commit(bind());
+      store.reserve(bind()); store.commit("t1");
       const transport = new FakeTransport();
       const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot({ resumeError: "session not found" }), transport, store);
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(false);
-      expect(store.get()?.state).toBe("orphaned");
-      expect(store.get()?.reason).toBe("session-lost");
+      expect(store.get("t1")?.state).toBe("orphaned");
+      expect(store.get("t1")?.reason).toBe("session-lost");
     } finally {
       rmSync(f, { force: true });
     }
@@ -123,7 +124,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
-      store.commit(bind());
+      store.reserve(bind()); store.commit("t1");
       const transport = new FakeTransport();
       const app = DiscordCopilotApp.createForTest(
         cfg,
@@ -134,7 +135,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       );
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(false); // not resumed this boot
-      expect(store.get()?.state).toBe("active"); // preserved so a restart retries
+      expect(store.get("t1")?.state).toBe("active"); // preserved so a restart retries
       expect(transport.notices.some((n) => n.includes("暫時無法復原"))).toBe(true);
     } finally {
       rmSync(f, { force: true });
@@ -145,7 +146,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
-      store.commit(bind());
+      store.reserve(bind()); store.commit("t1");
       let resumeTried = false;
       const client = {
         resumeSession: async () => {
@@ -155,8 +156,8 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       } as unknown as CopilotClient;
       const app = DiscordCopilotApp.createForTest(cfg, REPO, client, new FakeTransport(), store);
       await reconcile(app, async () => "gone");
-      expect(store.get()?.state).toBe("blocked");
-      expect(store.get()?.reason).toBe("thread-gone");
+      expect(store.get("t1")?.state).toBe("blocked");
+      expect(store.get("t1")?.reason).toBe("thread-gone");
       expect(sessionsOf(app).has("t1")).toBe(false);
       expect(resumeTried).toBe(false);
     } finally {
@@ -168,15 +169,15 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
-      store.commit(bind({ repoPath: "C:\\different-repo" }));
+      store.reserve(bind({ repoPath: "C:\\different-repo" })); store.commit("t1");
       const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
       let classifyCalls = 0;
       await reconcile(app, async () => {
         classifyCalls++;
         return "valid";
       });
-      expect(store.get()?.state).toBe("blocked");
-      expect(store.get()?.reason).toBe("config-mismatch");
+      expect(store.get("t1")?.state).toBe("blocked");
+      expect(store.get("t1")?.reason).toBe("config-mismatch");
       expect(classifyCalls).toBe(0); // never even fetched the thread
       expect(sessionsOf(app).has("t1")).toBe(false);
     } finally {
@@ -188,10 +189,10 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
-      store.commit(bind());
+      store.reserve(bind()); store.commit("t1");
       const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "transient");
-      expect(store.get()?.state).toBe("active"); // preserved for a later retry
+      expect(store.get("t1")?.state).toBe("active"); // preserved for a later retry
       expect(sessionsOf(app).has("t1")).toBe(false);
     } finally {
       rmSync(f, { force: true });
@@ -205,7 +206,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       store.reserve(bind()); // creating
       const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "valid");
-      expect(store.get()?.state).toBe("orphaned");
+      expect(store.get("t1")?.state).toBe("orphaned");
       expect(sessionsOf(app).has("t1")).toBe(false);
     } finally {
       rmSync(f, { force: true });
