@@ -4,6 +4,9 @@ import {
   orderSteps,
   classifyWorktree,
   irreversible,
+  isOurBotCommandLine,
+  isOurTaskDefinition,
+  isSignalablePid,
   NEVER_TOUCHED,
   STEPS,
 } from "../scripts/lib/uninstall-core.mjs";
@@ -85,6 +88,68 @@ describe("classifyWorktree", () => {
 
   it("removes a clean tree when no branch was recorded (v1 records)", () => {
     expect(classifyWorktree("", "refs/heads/whatever", undefined)).toBe("removable");
+  });
+});
+
+describe("isOurBotCommandLine", () => {
+  it("accepts the bot however it was started", () => {
+    // run-bot, the residency wrapper and `npm start` all land on dist/index.js.
+    expect(isOurBotCommandLine(`"C:\\nvm4w\\nodejs\\node.exe" C:\\repo\\dist\\index.js`)).toBe(true);
+    expect(isOurBotCommandLine("node /home/me/discord-copilot-sdk/dist/index.js")).toBe(true);
+  });
+
+  it("REFUSES an unrelated node process on a recycled PID", () => {
+    // The lock holds only a PID and survives a crash — it is released solely on
+    // a clean shutdown — so an operator who hard-killed the bot and is now
+    // uninstalling has a stale PID sitting there. This is the exact check
+    // stop-bot makes, and the uninstaller was the one tool skipping it.
+    expect(isOurBotCommandLine(`"C:\\nvm4w\\nodejs\\node.exe" -e setTimeout(()=>{},25000)`)).toBe(false);
+    expect(isOurBotCommandLine("node .../chrome-devtools-mcp/build/src/telemetry/watchdog/main.js")).toBe(false);
+    expect(isOurBotCommandLine("node /some/other/index.js")).toBe(false); // not under dist/
+  });
+
+  it("fails closed on anything it could not read", () => {
+    expect(isOurBotCommandLine(null)).toBe(false);
+    expect(isOurBotCommandLine("")).toBe(false);
+    expect(isOurBotCommandLine(undefined)).toBe(false);
+  });
+});
+
+describe("isSignalablePid", () => {
+  it("REFUSES pid 0 — on POSIX that signals the whole process group", () => {
+    // A truncated or corrupt lock file reading as "0" would otherwise make the
+    // uninstaller take out the caller's entire session.
+    expect(isSignalablePid(0)).toBe(false);
+  });
+
+  it("refuses pid 1 (init) and anything negative", () => {
+    expect(isSignalablePid(1)).toBe(false);
+    expect(isSignalablePid(-1)).toBe(false); // kill(-1) = every process we may signal
+  });
+
+  it("refuses non-integers", () => {
+    expect(isSignalablePid(NaN)).toBe(false);
+    expect(isSignalablePid(1.5)).toBe(false);
+  });
+
+  it("accepts a normal pid", () => {
+    expect(isSignalablePid(4321)).toBe(true);
+  });
+});
+
+describe("isOurTaskDefinition", () => {
+  it("accepts a task whose action runs one of our wrappers", () => {
+    expect(isOurTaskDefinition("<Exec><Arguments>-File \"C:\\r\\scripts\\run-bot.default.ps1\"</Arguments></Exec>")).toBe(
+      true
+    );
+  });
+
+  it("REFUSES a same-named task that is not ours", () => {
+    // The installer explicitly declines to REPLACE such a task; an uninstaller
+    // that deletes on a name match alone would destroy what the installer
+    // deliberately left alone.
+    expect(isOurTaskDefinition("<Exec><Command>C:\\other\\thing.exe</Command></Exec>")).toBe(false);
+    expect(isOurTaskDefinition(null)).toBe(false);
   });
 });
 

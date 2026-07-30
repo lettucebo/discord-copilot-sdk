@@ -290,9 +290,15 @@ describe("SessionStore — transient Windows write failures", () => {
     // for a moment. A single attempt turns that into commit() === false, and
     // cmdNew then tells the operator the DISK is broken and DELETES the thread
     // it just created — for a condition that succeeds milliseconds later.
+    //
+    // The failure is exercised on commit() REPLACING AN EXISTING FILE, which is
+    // the shape the production failure actually takes: replacing an existing
+    // target is what Windows contends on, not creating a new one.
     const fs = await import("node:fs");
     const dir = mkdtempSync(join(tmpdir(), "dcs-store-retry-"));
     const f = join(dir, "s.json");
+    const s = new SessionStore(f);
+    expect(s.reserve(bind("t1"))).toBe(true); // file now exists
     const real = fs.default.renameSync;
     let calls = 0;
     const spy = vi.spyOn(fs.default, "renameSync").mockImplementation(((a: string, b: string) => {
@@ -305,10 +311,10 @@ describe("SessionStore — transient Windows write failures", () => {
       return real(a, b);
     }) as typeof fs.default.renameSync);
     try {
-      const s = new SessionStore(f);
-      expect(s.reserve(bind("t1"))).toBe(true); // survived the transient failure
+      expect(s.commit("t1")).toBe(true); // survived the transient failure
       expect(calls).toBeGreaterThan(1); // and it really did retry
-      expect(JSON.parse(readFileSync(f, "utf8")).sessions).toHaveLength(1); // durable
+      expect(s.get("t1")?.state).toBe("active");
+      expect(JSON.parse(readFileSync(f, "utf8")).sessions[0].state).toBe("active"); // durable
     } finally {
       spy.mockRestore();
       rmSync(dir, { recursive: true, force: true });

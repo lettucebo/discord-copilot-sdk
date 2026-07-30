@@ -14,7 +14,15 @@ import os from "node:os";
 import readline from "node:readline";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { planUninstall, classifyWorktree, irreversible, NEVER_TOUCHED } from "./lib/uninstall-core.mjs";
+import {
+  planUninstall,
+  classifyWorktree,
+  irreversible,
+  isOurBotCommandLine,
+  isOurTaskDefinition,
+  isSignalablePid,
+  NEVER_TOUCHED,
+} from "./lib/uninstall-core.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
@@ -127,7 +135,33 @@ function findWrappers() {
     .map((f) => path.join(dir, f));
 }
 
-/** Every instance's running bot, not just this one — see findResidency. */
+/** This process's command line, or null when it cannot be read. */
+function commandLineOf(pid) {
+  if (process.platform === "win32") {
+    // wmic first (fast, still present on most Windows builds), PowerShell as the
+    // fallback for machines where it has been removed.
+    const w = tryRun("wmic", ["process", "where", `processid=${pid}`, "get", "commandline", "/format:list"], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (w && /CommandLine=/.test(w)) return w.split("CommandLine=")[1] ?? "";
+    const ps = tryRun(
+      path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+      ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`],
+      { stdio: ["ignore", "pipe", "ignore"] }
+    );
+    return ps === null ? null : ps.trim();
+  }
+  const out = tryRun("ps", ["-p", String(pid), "-o", "args="]);
+  return out === null ? null : out.trim();
+}
+
+/**
+ * Every instance's running bot, not just this one — see findResidency.
+ *
+ * A PID alone is not identity: the lock is released only on a CLEAN shutdown, so
+ * a hard kill or a reboot leaves a stale PID, and PIDs get reused. Anything whose
+ * command line is not our bot is reported rather than signalled.
+ */
 function findProcess() {
   if (!fs.existsSync(STATE_DIR)) return [];
   const out = [];
@@ -136,12 +170,14 @@ function findProcess() {
     const raw = fs.readFileSync(path.join(STATE_DIR, f), "utf8").trim();
     if (!/^\d+$/.test(raw)) continue;
     const pid = Number(raw);
+    if (!isSignalablePid(pid)) continue; // 0 = whole process group, 1 = init
     try {
       process.kill(pid, 0); // signal 0 = existence check only
     } catch {
-      continue; // stale lock
+      continue; // stale lock, dead PID
     }
-    out.push({ pid, instance: f.replace(/\.lock$/, "") });
+    const cmd = commandLineOf(pid);
+    out.push({ pid, instance: f.replace(/\.lock$/, ""), ours: isOurBotCommandLine(cmd), cmd });
   }
   return out;
 }
@@ -170,14 +206,35 @@ function findBranches(repoPath) {
 // ------------------------------------------------------------------- steps --
 
 async function stepResidency(found, wrappers) {
-  if (!found.length) say("  （沒有安裝常駐）", "  (no residency installed)");
+  if (!found.length && !wrappers.length) {
+    say("  （沒有安裝常駐）", "  (no residency installed)");
+    return true;
+  }
+  let allGood = true;
   for (const r of found) {
     if (r.kind === "task") {
+      // The installer refuses to REPLACE a same-named task that is not its own;
+      // deleting on a name match alone would destroy what it deliberately left.
+      const xml = tryRun("schtasks", ["/Query", "/TN", r.id, "/XML"], { stdio: ["ignore", "pipe", "ignore"] });
+      if (!isOurTaskDefinition(xml)) {
+        warn(
+          ZH
+            ? `排程工作 ${r.id} 不是這個工具建立的（動作不是我們的包裝腳本），不動它。`
+            : `scheduled task ${r.id} was not created by this tool (its action is not our wrapper) — refusing.`
+        );
+        continue;
+      }
       tryRun("schtasks", ["/End", "/TN", r.id]);
       const del = tryRun("schtasks", ["/Delete", "/TN", r.id, "/F"]);
-      if (del === null) warn(ZH ? `無法刪除排程工作 ${r.id}` : `could not delete scheduled task ${r.id}`);
-      else ok(ZH ? `已刪除排程工作：${r.id}` : `deleted scheduled task: ${r.id}`);
+      if (del === null) {
+        warn(ZH ? `無法刪除排程工作 ${r.id}` : `could not delete scheduled task ${r.id}`);
+        allGood = false;
+      } else ok(ZH ? `已刪除排程工作：${r.id}` : `deleted scheduled task: ${r.id}`);
     } else if (r.kind === "launchd") {
+      if (!isOurTaskDefinition(readTextOr(r.id))) {
+        warn(ZH ? `${r.id} 不像是這個工具產生的，不動它。` : `${r.id} does not look like ours — refusing.`);
+        continue;
+      }
       const uid = tryRun("id", ["-u"])?.trim();
       if (uid) tryRun("launchctl", ["bootout", `gui/${uid}`, r.id]);
       fs.rmSync(r.id, { force: true });
@@ -188,6 +245,17 @@ async function stepResidency(found, wrappers) {
       fs.rmSync(r.id, { force: true });
       tryRun("systemctl", ["--user", "daemon-reload"]);
       ok(ZH ? `已移除 systemd unit：${r.id}` : `removed systemd unit: ${r.id}`);
+      // `enable-linger` is what --residency-24x7 turned on, and nothing else
+      // reverts it. Report rather than revert: the account may linger for
+      // reasons that have nothing to do with this tool.
+      const who = tryRun("id", ["-un"])?.trim();
+      if (who) {
+        console.log(
+          ZH
+            ? `  ℹ️ 若當初開了 24/7，linger 仍是開的：loginctl disable-linger ${who}`
+            : `  ℹ️ if you enabled 24/7, linger is still on: loginctl disable-linger ${who}`
+        );
+      }
     }
   }
   // Outside the loop on purpose: a wrapper outlives the task that referenced it
@@ -197,29 +265,92 @@ async function stepResidency(found, wrappers) {
     fs.rmSync(w, { force: true });
     ok(ZH ? `已移除啟動包裝腳本：${w}` : `removed wrapper: ${w}`);
   }
+  return allGood;
 }
 
+function readTextOr(p) {
+  try {
+    return fs.readFileSync(p, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stop the bots, and WAIT for them to actually be gone.
+ *
+ * Signalling is not stopping. Shutdown disconnects every live session and can
+ * take seconds, during which the bot is still writing to its worktrees and its
+ * state file — both of which the very next steps delete. Removing a directory
+ * out from under a running agent is how an uninstall corrupts the work it was
+ * supposed to leave alone.
+ *
+ * Returns false if anything is still alive afterwards, so the caller can refuse
+ * to go on to the destructive steps.
+ */
 function stepProcess(found) {
-  if (!found.length) return say("  （bot 沒有在執行）", "  (bot is not running)");
+  if (!found.length) {
+    say("  （bot 沒有在執行）", "  (bot is not running)");
+    return true;
+  }
+  const signalled = [];
+  let allGood = true;
   for (const p of found) {
+    if (!p.ours) {
+      // Liveness is not identity. Refuse, and show what it actually is so the
+      // operator can decide — rather than force-killing a stranger's process.
+      warn(
+        ZH
+          ? `PID ${p.pid}（${p.instance}.lock）不是這個 bot，不動它：${p.cmd ?? "無法讀取指令列"}`
+          : `PID ${p.pid} (${p.instance}.lock) is not this bot — refusing: ${p.cmd ?? "command line unreadable"}`
+      );
+      continue;
+    }
     try {
       process.kill(p.pid, "SIGTERM");
-      ok(ZH ? `已停止 bot（${p.instance}，PID ${p.pid}）` : `stopped bot (${p.instance}, PID ${p.pid})`);
+      signalled.push(p);
     } catch (e) {
       warn(ZH ? `無法停止 PID ${p.pid}：${e.message}` : `could not stop PID ${p.pid}: ${e.message}`);
+      allGood = false;
     }
   }
+  // Up to ~15s, which comfortably covers the app's own teardown timeout.
+  const deadline = Date.now() + 15_000;
+  for (const p of signalled) {
+    let alive = true;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(p.pid, 0);
+      } catch {
+        alive = false;
+        break;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    }
+    if (alive) {
+      warn(
+        ZH
+          ? `PID ${p.pid} 在 15 秒後仍在執行，不繼續刪除它的資料。`
+          : `PID ${p.pid} is still running after 15s; refusing to delete its data.`
+      );
+      allGood = false;
+    } else {
+      ok(ZH ? `已停止 bot（${p.instance}，PID ${p.pid}）` : `stopped bot (${p.instance}, PID ${p.pid})`);
+    }
+  }
+  return allGood;
 }
 
 async function stepCommands(env) {
   const token = env.DISCORD_BOT_TOKEN;
   const guild = env.DISCORD_GUILD_ID;
   if (!token || !guild) {
-    return warn(
+    warn(
       ZH
         ? "  找不到 token/guild，略過解除註冊 slash commands（Discord 上仍會留著）。"
         : "  No token/guild found; skipped deregistering slash commands (they remain in Discord)."
     );
+    return true; // nothing we could have done — not a failure to retry
   }
   // Discord/Cloudflare answers 403 to a request with no User-Agent. Verified.
   const headers = {
@@ -227,26 +358,46 @@ async function stepCommands(env) {
     "User-Agent": "DiscordBot (https://github.com/lettucebo/discord-copilot-sdk, 1.0)",
     "Content-Type": "application/json",
   };
+  // Guild-command overwrite is a rate-limited bucket, and 429 is the one error
+  // that WOULD have worked on a second attempt — the difference between a clean
+  // uninstall and commands stranded in Discord for good.
+  const send = async (url, init) => {
+    for (let i = 0; ; i++) {
+      const res = await fetch(url, { ...init, headers });
+      if (res.status !== 429 || i >= 3) return res;
+      const retry = Number(res.headers.get("retry-after") ?? "1");
+      const ms = Math.min(Number.isFinite(retry) ? retry * 1000 : 1000, 10_000);
+      say(`  （被限流，${Math.round(ms / 1000)} 秒後重試）`, `  (rate limited, retrying in ${Math.round(ms / 1000)}s)`);
+      await new Promise((r) => setTimeout(r, ms));
+    }
+  };
   try {
-    const me = await fetch("https://discord.com/api/v10/applications/@me", { headers });
+    const me = await send("https://discord.com/api/v10/applications/@me", {});
     if (!me.ok) throw new Error(`applications/@me -> ${me.status}`);
-    const appId = (await me.json()).id;
-    const url = `https://discord.com/api/v10/applications/${appId}/guilds/${guild}/commands`;
-    const before = await fetch(url, { headers });
+    const app = await me.json();
+    const url = `https://discord.com/api/v10/applications/${app.id}/guilds/${guild}/commands`;
+    const before = await send(url, {});
     const count = before.ok ? (await before.json()).length : "?";
-    const res = await fetch(url, { method: "PUT", headers, body: "[]" });
+    const res = await send(url, { method: "PUT", body: "[]" });
     if (!res.ok) throw new Error(`PUT commands -> ${res.status}`);
     ok(ZH ? `已解除註冊 ${count} 個 slash commands` : `deregistered ${count} slash commands`);
+    // Print the exact app URL while we still have the id — far more useful than
+    // a generic link once .env is gone.
+    APP_URL = `https://discord.com/developers/applications/${app.id}`;
+    return true;
   } catch (e) {
-    warn(
-      (ZH ? "無法解除註冊 slash commands（可在 Discord 開發者後台刪除應用程式）：" : "Could not deregister slash commands (deleting the app in the Discord developer portal also removes them): ") +
-        e.message
-    );
+    warn((ZH ? "無法解除註冊 slash commands：" : "Could not deregister slash commands: ") + e.message);
+    return false;
   }
 }
+let APP_URL = "";
 
 function stepWorktrees(worktrees) {
-  if (!worktrees.length) return say("  （沒有 worktree）", "  (no worktrees)");
+  if (!worktrees.length) {
+    say("  （沒有 worktree）", "  (no worktrees)");
+    return true;
+  }
+  let allGood = true;
   for (const w of worktrees) {
     if (w.verdict !== "removable") {
       warn(
@@ -259,6 +410,7 @@ function stepWorktrees(worktrees) {
     const removed = tryRun("git", ["worktree", "remove", w.dir], { cwd: w.repoPath });
     if (removed === null) {
       warn(ZH ? `無法移除：${w.dir}` : `could not remove: ${w.dir}`);
+      allGood = false;
     } else {
       ok(ZH ? `已移除 worktree：${w.dir}（分支保留）` : `removed worktree: ${w.dir} (branch kept)`);
     }
@@ -267,30 +419,41 @@ function stepWorktrees(worktrees) {
     fs.rmSync(WORKTREE_ROOT, { recursive: true, force: true });
     ok(ZH ? `已移除空的 worktree 根目錄：${WORKTREE_ROOT}` : `removed empty worktree root: ${WORKTREE_ROOT}`);
   }
+  return allGood;
 }
 
 function stepBranches(repoPath, branches) {
-  if (!branches.length) return say("  （沒有 copilot/t-* 分支）", "  (no copilot/t-* branches)");
+  if (!branches.length) {
+    say("  （沒有 copilot/t-* 分支）", "  (no copilot/t-* branches)");
+    return true;
+  }
   for (const b of branches) {
     // `-d`, never `-D`: git refuses to delete a branch holding unmerged commits,
-    // and that refusal is the whole safety net here.
+    // and that refusal is the whole safety net here. Report git's own words
+    // rather than assuming "unmerged" — it may be a lock or a checked-out branch.
     const out = tryRun("git", ["-C", repoPath, "branch", "-d", b]);
     if (out === null) {
-      warn(
-        ZH
-          ? `保留分支 ${b} — 有尚未合併的 commit`
-          : `kept branch ${b} — it holds unmerged commits`
-      );
+      warn(ZH ? `保留分支 ${b}（git 拒絕刪除：可能有未合併的 commit，或正被 worktree 使用）` : `kept branch ${b} (git refused: unmerged commits, or checked out in a worktree)`);
     } else {
       ok(ZH ? `已刪除分支：${b}` : `deleted branch: ${b}`);
     }
   }
+  return true; // a refusal to delete is a safety feature, not a failure
 }
 
 function rmDir(dir, label) {
-  if (!fs.existsSync(dir)) return say(`  （沒有 ${label}）`, `  (no ${label})`);
-  fs.rmSync(dir, { recursive: true, force: true });
-  ok(ZH ? `已移除 ${label}：${dir}` : `removed ${label}: ${dir}`);
+  if (!fs.existsSync(dir)) {
+    say(`  （沒有 ${label}）`, `  (no ${label})`);
+    return true;
+  }
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    ok(ZH ? `已移除 ${label}：${dir}` : `removed ${label}: ${dir}`);
+    return true;
+  } catch (e) {
+    warn(ZH ? `無法移除 ${label}：${e.message}` : `could not remove ${label}: ${e.message}`);
+    return false;
+  }
 }
 
 function stepEnv() {
@@ -415,24 +578,62 @@ async function main() {
 
   // --- act, in the order the planner fixed ---
   console.log("");
+  // Track every step. Reporting "complete" over a swallowed failure is the exact
+  // half-truth this whole design keeps refusing to ship — and one failure in
+  // particular is load-bearing: if deregistering the commands failed, deleting
+  // .env destroys the only credential that could retry it.
+  const failed = new Set();
+  let commandsOk = true;
   for (const s of steps) {
-    if (s === "residency") await stepResidency(residency, wrappers);
-    else if (s === "process") stepProcess(proc);
-    else if (s === "commands") await stepCommands(env);
-    else if (s === "worktrees") stepWorktrees(worktrees);
-    else if (s === "branches") stepBranches(repoPath, branches);
-    else if (s === "state") rmDir(STATE_DIR, ZH ? "狀態目錄" : "state dir");
-    else if (s === "legacy") rmDir(LEGACY_DIR, ZH ? "改名前的目錄" : "legacy dir");
-    else if (s === "env") stepEnv();
+    if (s === "residency") {
+      if (!(await stepResidency(residency, wrappers))) failed.add("residency");
+    } else if (s === "process") {
+      if (!stepProcess(proc)) failed.add("process");
+    } else if (s === "commands") {
+      commandsOk = await stepCommands(env);
+      if (!commandsOk) failed.add("commands");
+    } else if (s === "worktrees") {
+      // Never delete a running bot's working directory.
+      if (failed.has("process")) {
+        warn(ZH ? "有 bot 仍在執行，略過 worktree 清理。" : "a bot is still running; skipped worktree cleanup.");
+        failed.add("worktrees");
+      } else if (!stepWorktrees(worktrees)) failed.add("worktrees");
+    } else if (s === "branches") {
+      if (!stepBranches(repoPath, branches)) failed.add("branches");
+    } else if (s === "state") {
+      if (failed.has("process")) {
+        warn(ZH ? "有 bot 仍在執行，略過刪除狀態目錄。" : "a bot is still running; skipped deleting the state dir.");
+        failed.add("state");
+      } else if (!rmDir(STATE_DIR, ZH ? "狀態目錄" : "state dir")) failed.add("state");
+    } else if (s === "legacy") {
+      if (!rmDir(LEGACY_DIR, ZH ? "改名前的目錄" : "legacy dir")) failed.add("legacy");
+    } else if (s === "env") {
+      if (!commandsOk) {
+        // Keep the token: it is the only way to retry the deregistration.
+        warn(
+          ZH
+            ? "slash commands 解除註冊失敗，因此**保留 .env**（那是唯一能重試的憑證）。修好網路後重跑即可。"
+            : "deregistering the slash commands failed, so .env is KEPT — it is the only credential that could retry. Re-run once the network is back."
+        );
+        failed.add("env");
+      } else stepEnv();
+    }
   }
 
   console.log("");
-  say("解除安裝完成。", "Uninstall complete.");
+  if (failed.size) {
+    warn(
+      ZH
+        ? `解除安裝**未完成**：${[...failed].join("、")} 這幾步沒有成功。`
+        : `Uninstall INCOMPLETE — these steps did not succeed: ${[...failed].join(", ")}.`
+    );
+  } else {
+    say("本機解除安裝完成。", "Local uninstall complete.");
+  }
   console.log("");
   say("還需要你自己做的：", "Still yours to do:");
   // Repeat the security-relevant leftovers HERE, not only in the plan. After a
-  // long run the last thing on screen is what people act on, and "complete"
-  // sitting above a still-present bot token is the wrong last word.
+  // long run the last thing on screen is what people act on.
   if (!steps.includes("env") && fs.existsSync(ENV_PATH)) {
     console.log(
       ZH
@@ -443,8 +644,15 @@ async function main() {
   if (!steps.includes("state") && fs.existsSync(STATE_DIR)) {
     console.log(
       ZH
-        ? `  • ⚠️ ${STATE_DIR} 仍在，含核准紀錄與 .env 備份（--keep-state）`
-        : `  • ⚠️ ${STATE_DIR} is still there, with approval grants and .env backups (--keep-state)`
+        ? `  • ⚠️ ${STATE_DIR} 仍在，含核准紀錄，且 env-backups/ 內的**舊 .env 備份也含 token**（--keep-state）`
+        : `  • ⚠️ ${STATE_DIR} is still there with approval grants, and env-backups/ holds **old .env copies that also contain tokens** (--keep-state)`
+    );
+  }
+  if (failed.has("commands")) {
+    console.log(
+      ZH
+        ? `  • ⚠️ slash commands **仍註冊在該伺服器**（解除註冊失敗）。網路恢復後重跑本腳本即可。`
+        : `  • ⚠️ the slash commands are STILL registered in that guild (deregistration failed). Re-run this script once the network is back.`
     );
   }
   for (const w of worktrees.filter((x) => x.verdict !== "removable")) {
@@ -452,14 +660,30 @@ async function main() {
   }
   console.log(
     ZH
-      ? "  • 到 https://discord.com/developers/applications 刪除這個 bot 應用程式（或至少重設 token）"
-      : "  • Delete the bot application at https://discord.com/developers/applications (or at least reset its token)"
+      ? `  • 刪除 Discord 應用程式（或至少重設 token —— 刪掉 .env 不會讓已外流的 token 失效）：\n    ${APP_URL || "https://discord.com/developers/applications"}`
+      : `  • Delete the bot application, or at least RESET its token — deleting .env does not revoke a token that leaked:\n    ${APP_URL || "https://discord.com/developers/applications"}`
   );
   console.log(
     ZH
-      ? `  • 這份原始碼還在：${REPO_ROOT}\n    不自動刪除，因為腳本正在裡面執行；確認後可自行移除。`
-      : `  • This checkout is still at: ${REPO_ROOT}\n    Not deleted automatically — the script is running from inside it. Remove it yourself when you are happy.`
+      ? "  • bot 仍是該 Discord 伺服器的成員，先前的討論串與訊息也還在 —— 這個腳本不會動 Discord 上的內容。"
+      : "  • The bot is still a member of that Discord server, and its old threads and messages remain — this script does not touch content in Discord."
   );
+  console.log(
+    ZH
+      ? "  • Copilot 自己的 session 資料仍在 ~/.copilot/session-state/（屬於 Copilot CLI，本工具不碰）。"
+      : "  • Copilot's own session data remains under ~/.copilot/session-state/ (it belongs to the Copilot CLI; this tool does not touch it)."
+  );
+  console.log(
+    ZH
+      ? `  • 這份原始碼還在（含 node_modules 與 dist，通常是最大的殘留）：${REPO_ROOT}\n    不自動刪除，因為腳本正在裡面執行；確認後可自行移除。`
+      : `  • This checkout is still at (node_modules and dist included — usually the largest residue): ${REPO_ROOT}\n    Not deleted automatically — the script is running from inside it.`
+  );
+  console.log(
+    ZH
+      ? "  • 若你還有**另一份 clone**：本次已刪除所有 instance 共用的狀態，但那份的 .env（含 token）仍在，請自行處理。"
+      : "  • If you have ANOTHER checkout: this removed the state shared by all instances, but that checkout's .env (and its token) is untouched — handle it yourself."
+  );
+  if (failed.size) process.exitCode = 1;
 }
 
 main().catch((e) => {

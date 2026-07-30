@@ -77,6 +77,48 @@ export function classifyWorktree(status, head, branch) {
 }
 
 /**
+ * Is this process command line our bot?
+ *
+ * A lock file holds a PID and nothing else, and it survives a crash: the lock is
+ * released only on a clean shutdown, so an operator who hard-killed the bot — or
+ * rebooted — and is now uninstalling has a stale PID sitting there. PIDs get
+ * reused. Liveness is therefore NOT identity, and killing on liveness alone is
+ * how an unrelated process gets terminated with no chance to save anything.
+ *
+ * `stop-bot` already refuses on exactly this rule; the uninstaller had been the
+ * one tool ignoring it, while being the one most likely to run long after the
+ * bot last exited.
+ */
+export function isOurBotCommandLine(cmdline) {
+  if (typeof cmdline !== "string" || !cmdline) return false;
+  return /dist[\\/]index\.js/.test(cmdline);
+}
+
+/**
+ * Is this PID safe to signal at all?
+ *
+ * On POSIX, `kill(0, sig)` signals the ENTIRE PROCESS GROUP and `kill(-1, sig)`
+ * signals every process the user may signal. A corrupt or truncated lock file
+ * reading as "0" would therefore take out the caller's whole session. PID 1 is
+ * init. None of these can ever be our bot.
+ */
+export function isSignalablePid(pid) {
+  return Number.isInteger(pid) && pid > 1;
+}
+
+/**
+ * Is this scheduled task ours?
+ *
+ * The installer refuses to REPLACE a same-named task whose action does not point
+ * at its own wrapper (`residency.mjs`). An uninstaller that deletes purely on a
+ * name match would destroy what the installer deliberately declined to touch.
+ */
+export function isOurTaskDefinition(xml) {
+  if (typeof xml !== "string" || !xml) return false;
+  return /run-bot\.[A-Za-z0-9._-]+\.ps1/.test(xml);
+}
+
+/**
  * Things an uninstall must never touch, with the reason. Surfaced in the plan so
  * the operator can see the boundary rather than trust it.
  */

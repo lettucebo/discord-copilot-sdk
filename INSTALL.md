@@ -273,6 +273,28 @@ In your Discord channel, run `/new` to start a session, or send a message to tes
 > 沒有互動終端機（CI、管線）又沒有 `--yes` 時，**什麼都不會做**並說明原因。
 > With no interactive terminal and no `--yes`, it changes nothing and says why.
 
+### 誠實的邊界 / What "complete" does NOT mean
+
+這個腳本做的是**本機**解除安裝。以下是它做不到、會在結尾明確告訴你的：
+This is a **local** uninstall. These are the things it cannot do, and says so at the end:
+
+- **刪 `.env` 不等於註銷 token**。已外流的 token 依然有效 —— 請到 Discord 開發者後台**重設或刪除應用程式**（結尾會印出你這個 app 的確切網址）。
+  Deleting `.env` does not revoke the token; a leaked copy still works. Reset it or delete the application (the exact URL for your app is printed at the end).
+- **bot 仍是該伺服器的成員**，先前的討論串與訊息也還在。
+  The bot remains a guild member, and its threads and messages remain.
+- **`~/.copilot/session-state/` 內的 Copilot session 資料不會被刪** —— 那屬於 Copilot CLI。
+  Copilot's own session data under `~/.copilot/session-state/` is not deleted — it belongs to the CLI.
+- **原始碼（含 `node_modules`、`dist`）不會自刪**，因為腳本正在裡面執行；結尾會印出路徑。
+  The checkout (with `node_modules` and `dist`, usually the largest residue) is not self-deleted.
+- **agent 曾在你 repo 內做過的任何事**都不會被回復 —— 它本來就是以你的身分執行無沙箱指令。
+  Nothing the unsandboxed agent did inside your repo is undone.
+
+> ⚠️ **有兩份 clone 時要注意**：狀態目錄是所有 instance 共用的，所以在 A 執行會刪掉 B 也在用的狀態、並停掉 B 的 bot，但 **B 的 `.env`（含 token）不會被碰**。結尾會提醒你這件事。
+> ⚠️ **Two checkouts:** the state dir is shared, so running this in A removes state B also uses and stops B's bot — but **B's `.env`, and its token, is untouched**. The closing report says so.
+
+> 任何一步失敗（例如解除註冊 slash commands 時斷網），腳本會印出 **`Uninstall INCOMPLETE`**、**保留 `.env`**（那是唯一能重試的憑證）並以 **exit code 1** 結束。修好後重跑即可。
+> If any step fails — say the network drops while deregistering — it prints **`Uninstall INCOMPLETE`**, **keeps `.env`** (the only credential that could retry), and exits **1**. Re-run when fixed.
+
 ---
 
 ## 7. 安全提醒 / Safety

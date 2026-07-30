@@ -262,9 +262,10 @@ export class SessionStore {
    *
    * Only those codes are retried, and only briefly (~90ms worst case) — a
    * genuinely permanent failure must still fail, promptly and honestly. The
-   * sleep is a synchronous spin because `write()` is called from synchronous
-   * persist-first paths that cannot become async without changing every caller's
-   * contract.
+   * sleep must be SYNCHRONOUS because `write()` is called from synchronous
+   * persist-first paths that cannot become async without changing every
+   * caller's contract; `Atomics.wait` blocks without spinning the CPU, which a
+   * busy loop would do while also stalling the Discord event loop.
    */
   private renameWithRetry(from: string, to: string): void {
     const TRANSIENT = new Set(["EPERM", "EACCES", "EBUSY"]);
@@ -276,10 +277,7 @@ export class SessionStore {
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code ?? "";
         if (i >= delays.length || !TRANSIENT.has(code)) throw err;
-        const until = Date.now() + delays[i]!;
-        while (Date.now() < until) {
-          /* brief synchronous backoff */
-        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delays[i]!);
       }
     }
   }

@@ -41,9 +41,9 @@ if [ "$LANG_SEL" = "zh" ]; then DISCORD_COPILOT_SDK_LOCALE=zh-TW; else DISCORD_C
 if ! command -v node >/dev/null 2>&1; then
   echo "node not found. The uninstaller needs Node.js. If you removed it, delete these by hand:" >&2
   echo "  $HOME/.discord-copilot-sdk" >&2
-  echo "  $HOME/.discord-copilot-sdk-worktrees" >&2
   echo "  $ROOT/.env" >&2
   echo "  systemctl --user disable --now discord-copilot-sdk-default.service" >&2
+  echo "  $HOME/.discord-copilot-sdk-worktrees — check each one first; they may hold uncommitted work" >&2
   exit 1
 fi
 

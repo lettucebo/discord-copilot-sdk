@@ -41,9 +41,14 @@ if (-not $node) {
     Write-Host 'node not found. The uninstaller needs Node.js. If you removed it, delete these by hand:'
   }
   Write-Host "  $env:USERPROFILE\.discord-copilot-sdk"
-  Write-Host "  $env:USERPROFILE\.discord-copilot-sdk-worktrees"
   Write-Host "  $PSScriptRoot\.env"
   Write-Host '  schtasks /Delete /TN discord-copilot-sdk-default /F'
+  if ($Lang -eq 'zh') {
+    Write-Host "  $env:USERPROFILE\.discord-copilot-sdk-worktrees —— 逐一確認，裡面可能有未提交的工作"
+  }
+  else {
+    Write-Host "  $env:USERPROFILE\.discord-copilot-sdk-worktrees — check each one first; they may hold uncommitted work"
+  }
   throw 'node is required'
 }
 
