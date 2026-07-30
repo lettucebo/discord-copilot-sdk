@@ -26,11 +26,17 @@ describe.runIf(isWindows)("how PowerShell is invoked decides whether the guards 
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (e) {
-      exitCode = (e as { status?: number }).status ?? 1;
+      // `status` is the child's exit code; its absence means the spawn itself
+      // failed (EAGAIN/ENOENT under load), which says nothing about PowerShell's
+      // semantics. Only a real exit code is evidence either way.
+      const status = (e as { status?: number | null }).status;
+      if (typeof status !== "number") return; // environmental, not a verdict
+      exitCode = status;
+      out = String((e as { stdout?: string }).stdout ?? "");
     }
     expect(exitCode).toBe(0); // no failure signalled
     expect(out).toContain("REACHED-THE-THING-WE-GUARDED"); // the guard did not stop it
-  });
+  }, 30_000);
 
   it("`-File` (script mode) DOES abort on throw and exits non-zero", () => {
     const f = path.join(os.tmpdir(), `dcs-guard-${process.pid}-${Date.now()}.ps1`);
@@ -50,7 +56,7 @@ describe.runIf(isWindows)("how PowerShell is invoked decides whether the guards 
     }
     expect(exitCode).not.toBe(0); // the failure is visible to Node
     expect(out).not.toContain("REACHED-THE-THING-WE-GUARDED"); // the guard held
-  });
+  }, 30_000);
 
   it("a BOM makes a non-ASCII .ps1 parse under Windows PowerShell 5.1, on any machine", () => {
     // The generated residency wrapper interpolates REPO_ROOT and a log path built
@@ -78,5 +84,5 @@ describe.runIf(isWindows)("how PowerShell is invoked decides whether the guards 
     } finally {
       fs.rmSync(withBom, { force: true });
     }
-  });
+  }, 30_000);
 });

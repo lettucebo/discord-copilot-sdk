@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 /** Every .ps1 an end user is told to run. */
-const USER_FACING_PS1 = ["install.ps1", "get.ps1", "run-bot.ps1", "stop-bot.ps1"];
+const USER_FACING_PS1 = ["install.ps1", "get.ps1", "run-bot.ps1", "stop-bot.ps1", "uninstall.ps1"];
 
 describe("shipped scripts", () => {
   it.each(USER_FACING_PS1)("%s starts with a UTF-8 BOM", (name) => {
@@ -26,7 +26,7 @@ describe("shipped scripts", () => {
     expect(buf.subarray(3, 4).toString()).not.toMatch(/\s/);
   });
 
-  const SHELL = ["install.sh", "get.sh", "run-bot.sh", "stop-bot.sh"];
+  const SHELL = ["install.sh", "get.sh", "run-bot.sh", "stop-bot.sh", "uninstall.sh"];
 
   it.each(SHELL)("%s has a shebang and no CRLF in the committed form", (name) => {
     // `.gitattributes` normalises *.sh to LF, but a stray CR would still make
@@ -49,6 +49,16 @@ describe("shipped scripts", () => {
       const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
       expect(text).toContain("get.ps1");
       expect(text).toContain("get.sh");
+    }
+  });
+
+  it("documents the uninstaller in both README and INSTALL", () => {
+    // A tool that installs residency, stores approval grants and holds a bot
+    // token needs its removal documented where its installation is.
+    for (const doc of ["README.md", "INSTALL.md"]) {
+      const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
+      expect(text).toContain("uninstall.ps1");
+      expect(text).toContain("uninstall.sh");
     }
   });
 

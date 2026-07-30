@@ -153,6 +153,28 @@ npm run dev
 Or, once configured, `./run-bot.ps1` / `./run-bot.sh` to start it detached and
 `./stop-bot.ps1` / `./stop-bot.sh` to stop it.
 
+## Uninstall
+
+```powershell
+./uninstall.ps1 -DryRun   # see exactly what would go, change nothing
+./uninstall.ps1           # show the plan, ask, then remove everything
+```
+
+```bash
+./uninstall.sh --dry-run
+./uninstall.sh
+```
+
+It removes the residency registration, the running bot, the guild's slash
+commands, the per-session worktrees, `~/.discord-copilot-sdk` (approval grants,
+session records, logs, `.env` backups) and `.env` **including your bot token**.
+
+It never deletes your controlled repo, never touches `~/.copilot` (your Copilot
+CLI login), never removes a worktree git cannot prove is clean, and keeps
+`copilot/t-*` branches unless you pass `--branches` — and even then only the
+merged ones. `--keep-config` keeps `.env`, and says plainly that your token is
+still on disk. Details in [`INSTALL.md`](INSTALL.md).
+
 ## Threads
 
 Each `/new` opens a thread. Its name is generated from your first message by a

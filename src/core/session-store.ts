@@ -232,7 +232,7 @@ export class SessionStore {
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
       fs.writeFileSync(tmp, JSON.stringify(candidate, null, 2), "utf8");
-      fs.renameSync(tmp, this.file); // atomic replace
+      this.renameWithRetry(tmp, this.file);
       return true;
     } catch (err) {
       // Best-effort temp cleanup — must NOT itself throw, or write() would throw
@@ -247,6 +247,40 @@ export class SessionStore {
         `⚠️  could not persist session store to ${this.file}: ${err instanceof Error ? err.message : String(err)}`
       );
       return false;
+    }
+  }
+
+  /**
+   * The atomic replace, retried through a transient Windows failure.
+   *
+   * `rename` over an existing file fails with EPERM/EACCES/EBUSY whenever
+   * anything holds the target for an instant — an antivirus scanner, the search
+   * indexer, a backup agent. Treating that first attempt as final is not merely
+   * a flaky test: `commit()` returns false, and `/new` then tells the operator
+   * their DISK is broken and deletes the thread it just created, for a condition
+   * that succeeds a few milliseconds later.
+   *
+   * Only those codes are retried, and only briefly (~90ms worst case) — a
+   * genuinely permanent failure must still fail, promptly and honestly. The
+   * sleep is a synchronous spin because `write()` is called from synchronous
+   * persist-first paths that cannot become async without changing every caller's
+   * contract.
+   */
+  private renameWithRetry(from: string, to: string): void {
+    const TRANSIENT = new Set(["EPERM", "EACCES", "EBUSY"]);
+    const delays = [5, 15, 30, 40];
+    for (let i = 0; ; i++) {
+      try {
+        fs.renameSync(from, to);
+        return;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code ?? "";
+        if (i >= delays.length || !TRANSIENT.has(code)) throw err;
+        const until = Date.now() + delays[i]!;
+        while (Date.now() < until) {
+          /* brief synchronous backoff */
+        }
+      }
     }
   }
 }

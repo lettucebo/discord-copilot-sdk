@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -278,6 +278,59 @@ describe("SessionStore — durability (unchanged safety properties)", () => {
     try {
       expect(new SessionStore(dir).isCorrupt()).toBe(true);
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("SessionStore — transient Windows write failures", () => {
+  it("RETRIES a rename that fails once, instead of reporting a false failure", async () => {
+    // On Windows `rename` can fail with a transient EPERM/EACCES/EBUSY when an
+    // antivirus scanner, the search indexer, or a backup agent holds the target
+    // for a moment. A single attempt turns that into commit() === false, and
+    // cmdNew then tells the operator the DISK is broken and DELETES the thread
+    // it just created — for a condition that succeeds milliseconds later.
+    const fs = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "dcs-store-retry-"));
+    const f = join(dir, "s.json");
+    const real = fs.default.renameSync;
+    let calls = 0;
+    const spy = vi.spyOn(fs.default, "renameSync").mockImplementation(((a: string, b: string) => {
+      calls++;
+      if (calls === 1) {
+        const e = new Error("EPERM: operation not permitted, rename") as NodeJS.ErrnoException;
+        e.code = "EPERM";
+        throw e;
+      }
+      return real(a, b);
+    }) as typeof fs.default.renameSync);
+    try {
+      const s = new SessionStore(f);
+      expect(s.reserve(bind("t1"))).toBe(true); // survived the transient failure
+      expect(calls).toBeGreaterThan(1); // and it really did retry
+      expect(JSON.parse(readFileSync(f, "utf8")).sessions).toHaveLength(1); // durable
+    } finally {
+      spy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still gives up — and reports false — when the failure is permanent", async () => {
+    // Retrying must not turn a real, persistent failure into a hang or a lie.
+    const fs = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "dcs-store-perm-"));
+    const f = join(dir, "s.json");
+    const spy = vi.spyOn(fs.default, "renameSync").mockImplementation((() => {
+      const e = new Error("EPERM: operation not permitted, rename") as NodeJS.ErrnoException;
+      e.code = "EPERM";
+      throw e;
+    }) as typeof fs.default.renameSync);
+    try {
+      const s = new SessionStore(f);
+      expect(s.reserve(bind("t1"))).toBe(false);
+      expect(s.get("t1")).toBeUndefined(); // persist-first still holds
+    } finally {
+      spy.mockRestore();
       rmSync(dir, { recursive: true, force: true });
     }
   });

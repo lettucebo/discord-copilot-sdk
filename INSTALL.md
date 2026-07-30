@@ -220,7 +220,62 @@ In your Discord channel, run `/new` to start a session, or send a message to tes
 
 ---
 
-## 6. 安全提醒 / Safety
+## 6. 完整解除安裝 / Complete uninstall
+
+```powershell
+./uninstall.ps1 -DryRun      # 只看計畫，什麼都不動 / plan only, changes nothing
+./uninstall.ps1              # 顯示計畫 → 詢問 → 執行 / plan, confirm, then remove
+```
+
+```bash
+./uninstall.sh --dry-run
+./uninstall.sh
+```
+
+| 旗標 / Flag | 作用 / Effect |
+| --- | --- |
+| `-DryRun` / `--dry-run` | 只印計畫 / print the plan only |
+| `-Yes` / `--yes` | 不詢問 / skip the confirmation |
+| `-KeepConfig` / `--keep-config` | 保留 `.env`（**你的 bot token 會留在磁碟上**）/ keep `.env` (**your bot token stays on disk**) |
+| `-KeepState` / `--keep-state` | 保留 `~/.discord-copilot-sdk` |
+| `-Branches` / `--branches` | 一併刪除 `copilot/t-*` 分支（**只刪已合併的**）/ also delete `copilot/t-*` branches (**merged only**) |
+
+### 會移除 / Removed
+
+1. 常駐設定（**所有 instance** 的排程工作／launchd／systemd）＋ 產生的啟動包裝腳本
+2. 執行中的 bot（所有 instance；過期的 lock 會被忽略）
+3. 該 Discord 伺服器的 slash commands
+4. per-session 的 git worktree —— **只移除 git 能證明乾淨的**
+5. `~/.discord-copilot-sdk`：核准紀錄（「永遠允許」）、session 記錄、日誌、`.env` 備份
+6. 改名前的 `~/.discopilot`
+7. `.env` —— **含你的 bot token**
+
+### 絕不會碰 / Never touched
+
+| 項目 | 原因 |
+| --- | --- |
+| 你的 `CONTROLLED_REPO_PATH` repo | 那是你的程式碼；這個工具只曾在裡面加 worktree 和分支 |
+| `~/.copilot` | Copilot CLI 的登入狀態屬於 CLI，不屬於這個工具 |
+| node / git / Copilot CLI | 只是前置需求，整台機器共用 |
+| Discord 應用程式本身 | 只有你能刪：<https://discord.com/developers/applications> |
+
+### 設計上的取捨 / Deliberate trade-offs
+
+- **預設會刪掉 `.env`**。你要的是「完整」解除安裝，而 bot token 是整包東西裡最敏感的一項；留著它再宣稱「已解除安裝」是假話。要重裝方便就加 `-KeepConfig`，屆時會明確告訴你 token 還在。
+  **`.env` goes by default**: the token is the most sensitive artifact here, and calling it "uninstalled" while the token sits on disk would be a half-truth. `-KeepConfig` is the escape hatch, and it says so at the end.
+- **分支預設保留**。分支上可能有只存在於那裡的 commit。`--branches` 也只用 `git branch -d`（不是 `-D`），所以 git 會自己擋下未合併的分支。
+  Branches are kept by default because they can hold commits that exist nowhere else; `--branches` uses `git branch -d`, never `-D`, so git itself refuses the unmerged ones.
+- **解除註冊 slash commands 一定排在刪 `.env` 之前**，因為那需要 token，而 token 的唯一一份就在 `.env` 裡。
+  Deregistering the slash commands is ordered before deleting `.env`, because it needs the token and `.env` is its only copy.
+- **不會自動刪掉這份原始碼**：腳本正在裡面執行。結尾會告訴你路徑，由你自己移除。
+  The checkout is not deleted automatically — the script is running from inside it. The path is printed at the end.
+
+> 沒有互動終端機（CI、管線）又沒有 `--yes` 時，**什麼都不會做**並說明原因。
+> With no interactive terminal and no `--yes`, it changes nothing and says why.
+
+---
+
+## 7. 安全提醒 / Safety
 
 - 使用**私人** Discord 伺服器、開啟 **2FA**。/ Use a **private** Discord server, enable **2FA**.
 - **絕不**把 `.env` 或 token 提交到版控（已在 `.gitignore`；安裝器也會拒絕寫入被追蹤的 `.env`）。
@@ -229,7 +284,7 @@ In your Discord channel, run `/new` to start a session, or send a message to tes
 
 ---
 
-## 7. 疑難排解 / Troubleshooting
+## 8. 疑難排解 / Troubleshooting
 
 - **裝完 Node 但終端機找不到** / Node installed but shell can't find it → 關閉並重新開啟終端機再執行一次 / close and reopen the terminal, then re-run.
 - **Copilot 未登入** / Copilot not signed in → 執行 `copilot`，然後 `/login`。/ run `copilot`, then `/login`.
