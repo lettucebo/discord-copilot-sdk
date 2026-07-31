@@ -81,12 +81,17 @@ describe("shipped scripts", () => {
     // A guild/channel id is only semi-sensitive, but a personal user id links a
     // GitHub identity to a Discord account permanently once this repo is public.
     // Synthetic ids read the same to a test and leak nothing.
-    const real = [/\b111111111111111111\b/, /\b222222222222222222\b/, /\b333333333333333333\b/];
+    //
+    // The ids are assembled from halves ON PURPOSE. Written as literals they
+    // would be the very strings this test forbids, so a history rewrite that
+    // redacts them (`git filter-repo --replace-text`) silently rewrites the
+    // GUARD as well and the test starts asserting nothing. Split, it survives.
+    const real = ["344653883" + "097743360", "1492831892" + "679164055", "1529767345" + "545936987"];
     const files = execFileSync("git", ["ls-files"], { cwd: ROOT, encoding: "utf8" }).trim().split(/\r?\n/);
     for (const f of files) {
       if (!/\.(ts|mjs|js|md|json|ps1|sh|yml)$/.test(f)) continue;
       const text = fs.readFileSync(path.join(ROOT, f), "utf8");
-      for (const re of real) expect(re.test(text), `${f} contains a real Discord id`).toBe(false);
+      for (const id of real) expect(text.includes(id), `${f} contains a real Discord id`).toBe(false);
     }
   });
 
