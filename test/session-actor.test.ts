@@ -374,6 +374,46 @@ describe("SessionActor permission handling", () => {
     }
   });
 
+  it("never auto-approves an argument that turns a TRUSTED binary into a launcher", async () => {
+    // The repo grant is keyed on the EXECUTABLE, so one "Always allow git" click
+    // used to authorise every future `git …` — including argument shapes where
+    // the agent itself names the program to run. None of these contain a shell
+    // metacharacter, so `isSimpleCommand` passes, `git` is not a wrapper so
+    // `isSafeExecutable` passes, and the grant covers `git`: the payload ran with
+    // NO card and nothing on screen. Prompt injection reaches this directly.
+    const s = await setup();
+    s.policy.approveForSession("t", "git");
+    for (const cmd of [
+      "git -c core.pager=/tmp/payload log",
+      "git -c core.sshCommand=/tmp/payload fetch origin",
+      "git -c alias.x=!/tmp/payload x",
+      "git --exec-path=/tmp/evil status",
+      "git config --global core.pager /tmp/payload",
+      "git fetch --upload-pack=/tmp/payload origin",
+      "git push --receive-pack=/tmp/payload origin",
+    ]) {
+      const before = s.transport.permissions.length;
+      const r = perm(s)({ kind: "shell", fullCommandText: cmd, commands: [{ identifier: cmd }] });
+      await tick();
+      expect(s.transport.permissions.length, `should have carded: ${cmd}`).toBe(before + 1);
+      // …and it must not be offerable for an even wider scope either.
+      expect(s.transport.permissions.at(-1)!.canOfferSession, cmd).toBe(false);
+      s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u");
+      await r;
+    }
+  });
+
+  it("still auto-approves ordinary granted commands (the fix must not gut the feature)", async () => {
+    const s = await setup();
+    s.policy.approveForSession("t", "git");
+    for (const cmd of ["git status", "git --no-pager log --oneline -5", "git diff HEAD~1", "git branch -a"]) {
+      const before = s.transport.permissions.length;
+      const r = await perm(s)({ kind: "shell", fullCommandText: cmd, commands: [{ identifier: cmd }] });
+      expect(r, cmd).toEqual({ kind: "approve-once" });
+      expect(s.transport.permissions.length, `should NOT have carded: ${cmd}`).toBe(before);
+    }
+  });
+
   it("does not auto-approve when fullCommandText disagrees with commands[] (SDK mislabel defense)", async () => {
     const s = await setup();
     s.policy.approveForSession("t", "git");

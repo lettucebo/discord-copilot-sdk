@@ -461,10 +461,12 @@ export class SessionActor {
     );
     // A command is eligible for auto-approve / a wider scope only when it is a
     // SIMPLE command (no shell metacharacters that could chain/pipe/redirect/
-    // substitute a different command) AND every executable is a safe, specific
-    // name (not a shell/runtime/wrapper/exec-launcher). This keeps discord-copilot-sdk
-    // from trusting the runtime's command parse blindly.
-    const simple = isSimpleCommand(fullCommandText);
+    // substitute a different command), every executable is a safe, specific name
+    // (not a shell/runtime/wrapper/exec-launcher), AND it does not name another
+    // program for that trusted binary to run (`git -c core.pager=…`). This keeps
+    // discord-copilot-sdk from trusting the runtime's command parse blindly, and
+    // keeps an executable-keyed grant from covering arbitrary code.
+    const simple = isSimpleCommand(fullCommandText) && !namesAnotherProgram(fullCommandText);
     const allSafe = executables.length > 0 && executables.every(isSafeExecutable);
     if (simple && allSafe && this.opts.policy.isApproved(this.opts.sessionKey, this.approvalKey, executables)) {
       await this.opts.transport.notice(
@@ -1065,6 +1067,44 @@ function isSafeExecutable(exe: string): boolean {
  *  any of these appear, the request always shows a per-request card instead. */
 function isSimpleCommand(fullCommandText: string): boolean {
   return fullCommandText.length > 0 && !/[;&|<>`$()\r\n]/.test(fullCommandText);
+}
+
+/**
+ * Does this command name ANOTHER program for a trusted binary to execute?
+ *
+ * A grant is keyed on the EXECUTABLE, which silently assumes the executable is
+ * the unit of trust. For a whole class of ordinary, non-shell tools that is
+ * false: `git` will happily run whatever you point `core.pager` at, and none of
+ * these carry a shell metacharacter, so `isSimpleCommand` waves them through.
+ * One "Always allow git" click therefore used to authorise
+ *
+ *     git -c core.pager=<payload> log
+ *
+ * with no card and nothing on screen — reachable directly by prompt injection,
+ * since the AGENT chooses the payload path. That is qualitatively different from
+ * `npm test` running repo-controlled scripts: there the payload is already in
+ * the repo, here the command itself introduces it.
+ *
+ * This is a blocklist, and blocklists leak. It closes the known shapes; the real
+ * containment is still not granting standing scope to launcher-capable binaries,
+ * which the approval card says in as many words.
+ */
+function namesAnotherProgram(fullCommandText: string): boolean {
+  return (
+    // `git -c key=value` / `--config-env` — the generic config injection vector.
+    /(^|\s)(-c|--config-env)(\s|=)/.test(fullCommandText) ||
+    // Config keys whose VALUE is a program, however they are set (`-c`, `git
+    // config core.pager X`, an env-style assignment).
+    /\b(core\.(pager|sshCommand|editor|askpass|hooksPath|fsmonitor)|sequence\.editor|diff\.external|credential\.helper|uploadpack\.packObjects|filter\.[^\s=]+\.(clean|smudge|process))\b/i.test(
+      fullCommandText
+    ) ||
+    // A git alias whose body starts with `!` is a shell escape.
+    /\balias\.[A-Za-z0-9_.-]+=\s*!/.test(fullCommandText) ||
+    // Options that take a program path directly.
+    /(^|\s)--(exec|exec-path|upload-pack|receive-pack|to-command|pager|editor)(\s|=)/.test(fullCommandText) ||
+    // Env-style prefixes that redirect execution without needing a shell.
+    /\b(GIT_(SSH|SSH_COMMAND|EDITOR|PAGER|ASKPASS|EXTERNAL_DIFF)|LESSOPEN|PAGER|EDITOR|VISUAL)=/.test(fullCommandText)
+  );
 }
 
 function dedupe(items: string[]): string[] {

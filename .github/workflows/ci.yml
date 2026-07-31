@@ -37,15 +37,12 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
-      # The committed package-lock.json resolves against an internal Microsoft
-      # mirror (generated behind a corp proxy) that public runners can't reach, so
-      # `npm ci` would fail. Resolve fresh from the default public registry
-      # instead. (To restore `npm ci` reproducibility, regenerate the lockfile off
-      # the corp network against registry.npmjs.org and commit it.)
-      - name: Install deps (public npm)
-        run: |
-          rm -f package-lock.json
-          npm install --no-audit --no-fund
+      # No lockfile is committed (see .gitignore): this project is developed
+      # behind a corporate npm proxy, so a lockfile generated there pins internal
+      # hosts and carries that proxy's integrity hashes. Resolve fresh from the
+      # public registry instead.
+      - name: Install deps
+        run: npm install --no-audit --no-fund
       - run: npm run typecheck
       - run: npm test
 

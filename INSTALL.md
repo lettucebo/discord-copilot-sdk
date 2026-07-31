@@ -29,49 +29,47 @@ The installer is **bilingual** (Traditional Chinese + English): it defaults to y
 不需要先 clone，這行會裝好 git、抓下原始碼，然後直接進入設定精靈。
 No clone needed — this ensures git, fetches the source, and drops you into the wizard.
 
-> ⚠️ **這個 repo 目前是 private**，所以 `raw.githubusercontent.com` 會回 404。請用下面的 `gh` 版本（會用你已登入的 GitHub 認證）。
-> ⚠️ **This repo is currently private**, so `raw.githubusercontent.com` returns 404. Use the `gh` form below — it uses your existing GitHub login.
-
 ### Windows (PowerShell)
 
 ```powershell
-& ([scriptblock]::Create(((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String).TrimStart([char]0xFEFF))))
+irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1 | iex
 ```
 
-> `.TrimStart([char]0xFEFF)` 是必要的：`get.ps1` 帶有 UTF-8 BOM（從磁碟執行時 PowerShell 5.1 需要它），而 **PowerShell 7 不會**從原生命令輸出中去除 BOM，第一個語句會被當成叫做 `﻿#Requires` 的指令。
-> The `.TrimStart([char]0xFEFF)` is required: `get.ps1` carries a UTF-8 BOM (PowerShell 5.1 needs it when the file is run from disk), and **PowerShell 7 does not strip a BOM** from native-command output, so the first statement would parse as a command named `﻿#Requires`.
-
-要帶旗標時接在後面 / Append flags directly:
+> ⚠️ 上面的 `| iex` 形式**無法帶旗標**（`Invoke-Expression` 在呼叫者的作用域求值，頂層 `param()` 會退化成變數宣告）。要帶旗標請用 scriptblock 形式：
+> ⚠️ The `| iex` form **cannot take flags** (`Invoke-Expression` evaluates in the caller's scope, where a top-level `param()` degenerates into variable declarations). For flags, use the scriptblock form:
 
 ```powershell
-& ([scriptblock]::Create(((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String).TrimStart([char]0xFEFF)))) -Residency24x7
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1))) -Residency24x7
 ```
 
 ### macOS / Linux (bash)
 
 ```bash
-gh api repos/lettucebo/discord-copilot-sdk/contents/get.sh -H "Accept: application/vnd.github.raw" | bash
-gh api repos/lettucebo/discord-copilot-sdk/contents/get.sh -H "Accept: application/vnd.github.raw" | bash -s -- --residency-24x7
+curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.sh | bash -s -- --residency-24x7
 ```
 
 ### 更簡單的等效做法 / Simpler equivalent
 
 ```bash
-gh repo clone lettucebo/discord-copilot-sdk && cd discord-copilot-sdk && ./install.ps1   # or ./install.sh
+git clone https://github.com/lettucebo/discord-copilot-sdk.git && cd discord-copilot-sdk && ./install.sh   # 或 ./install.ps1
 ```
 
-### 若這個 repo 改為 public / If this repo is made public
+### 私有 fork / For a private fork
+
+若你 fork 成 private，`raw.githubusercontent.com` 會回 404，改用 `gh`（會用你已登入的 GitHub 認證）：
+If you fork this privately, `raw.githubusercontent.com` returns 404 — use `gh`, which uses your existing GitHub login:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1)))
+& ([scriptblock]::Create(((gh api repos/<owner>/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String).TrimStart([char]0xFEFF))))
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.sh | bash
+gh api repos/<owner>/discord-copilot-sdk/contents/get.sh -H "Accept: application/vnd.github.raw" | bash
 ```
 
-> 這裡刻意**不用** `irm ... | iex`：`Invoke-Expression` 在**呼叫者的作用域**中求值，頂層的 `param()` 會退化成變數宣告，任何參數屬性都會在腳本主體執行前就丟出例外。`[scriptblock]::Create` 會取得真正的作用域，才是可行的形式。
-> Deliberately **not** `irm ... | iex`: `Invoke-Expression` evaluates in the **caller's scope**, where a top-level `param()` degenerates into variable declarations and any parameter attribute throws before the body runs. `[scriptblock]::Create` gets a real scope, and is the form that works.
+> PowerShell 7 不會從原生命令輸出中去除 BOM，所以 `gh` 形式需要 `.TrimStart([char]0xFEFF)`；`get.ps1` 帶 BOM 是因為從磁碟執行時 PowerShell 5.1 需要它。
+> PowerShell 7 does not strip a BOM from native-command output, hence the `.TrimStart([char]0xFEFF)`; `get.ps1` carries a BOM because PowerShell 5.1 needs one when the file is run from disk.
 
 可用環境變數 / Env overrides：`DISCORD_COPILOT_SDK_DIR`（安裝位置，預設 `~/discord-copilot-sdk`）、`DISCORD_COPILOT_SDK_REF`（分支或標籤，預設 `main`）。
 

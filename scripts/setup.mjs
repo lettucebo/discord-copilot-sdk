@@ -353,7 +353,13 @@ async function main() {
   //    machine, so this is acceptable for a single-owner lab.)
   ensureEnvNotTracked();
   info("\n" + c(1, t("buildHeader", lang)));
-  run("npm", ["ci"], sanitizedChildEnv());
+  // `npm ci` REQUIRES a lockfile and fails hard without one, and this project
+  // deliberately ships no lockfile (see .gitignore: one generated behind a
+  // corporate proxy pins internal hosts and carries integrity hashes public
+  // `npm ci` cannot verify). Use `ci` when the user has generated their own —
+  // it is faster and reproducible — and fall back to `install` otherwise.
+  const hasLock = fs.existsSync(path.join(REPO_ROOT, "package-lock.json"));
+  run("npm", hasLock ? ["ci"] : ["install", "--no-audit", "--no-fund"], sanitizedChildEnv());
   run("npm", ["run", "build"], sanitizedChildEnv());
 
   // 8) Validate the MERGED config through the REAL runtime schema (in memory —

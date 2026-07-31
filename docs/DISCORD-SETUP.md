@@ -53,6 +53,14 @@ If it's off: the bot shows online and slash commands work, but **it silently ign
 > 其他兩個特權 intent（Presence、Server Members）**不需要**開。
 > The other two privileged intents (Presence, Server Members) are **not** needed.
 
+### 順手關掉 Public Bot / While you are here: turn OFF "Public Bot"
+
+同一個 **Bot** 分頁往下找 **PUBLIC BOT**，把它**關掉**。開著的話（這是預設值），任何知道你 Application ID 的人都能把**你的 bot** 邀進**他們自己的**伺服器。
+Same **Bot** tab, scroll to **PUBLIC BOT** and turn it **off**. Left on (it is on by default), anyone who knows your application ID can invite **your bot** into **their own** server.
+
+這不是漏洞 —— `DISCORD_GUILD_ID` 是精確比對，別人的伺服器一律被拒，slash 指令也只註冊在你的伺服器。但沒有理由讓它被邀出去，而 Application ID 並不是秘密。
+This is not a hole: `DISCORD_GUILD_ID` is matched exactly so another guild is refused outright, and slash commands are registered per-guild. But there is no reason to let it be invited anywhere, and an application ID is not a secret.
+
 ---
 
 ## 3. 取得 Bot Token / Copy the bot token

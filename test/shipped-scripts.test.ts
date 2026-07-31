@@ -62,15 +62,41 @@ describe("shipped scripts", () => {
     }
   });
 
-  it("does not present a raw.githubusercontent one-liner as THE way while the repo is private", () => {
-    // The repo is private, so `irm https://raw.githubusercontent.com/...` 404s
-    // for everyone — including its owner. Documenting it unconditionally is a
-    // command that cannot work. Both docs must show the `gh` form, which uses
-    // the reader's existing GitHub login, and say why.
+  it("documents an install one-liner that matches the repo's actual visibility", () => {
+    // This used to assert the opposite: while the repo was private,
+    // `raw.githubusercontent.com` 404'd for everyone including its owner, so the
+    // docs had to lead with the `gh api` form. Now that it is public the plain
+    // form works and is what a reader should see first — a documented command
+    // that cannot run is worse than no command.
     for (const doc of ["README.md", "INSTALL.md"]) {
       const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
-      expect(text).toMatch(/gh api repos\/lettucebo\/discord-copilot-sdk\/contents\/get\.ps1/);
-      expect(text).toMatch(/private/i);
+      expect(text).toMatch(/raw\.githubusercontent\.com\/lettucebo\/discord-copilot-sdk\/main\/get\.(ps1|sh)/);
     }
+    // The private-fork fallback is still documented, but as a fallback.
+    const install = fs.readFileSync(path.join(ROOT, "INSTALL.md"), "utf8");
+    expect(install).toMatch(/gh api repos\/<owner>\/discord-copilot-sdk\/contents\/get\.ps1/);
+  });
+
+  it("keeps real Discord snowflakes out of the tracked tree", () => {
+    // A guild/channel id is only semi-sensitive, but a personal user id links a
+    // GitHub identity to a Discord account permanently once this repo is public.
+    // Synthetic ids read the same to a test and leak nothing.
+    const real = [/\b111111111111111111\b/, /\b222222222222222222\b/, /\b333333333333333333\b/];
+    const files = execFileSync("git", ["ls-files"], { cwd: ROOT, encoding: "utf8" }).trim().split(/\r?\n/);
+    for (const f of files) {
+      if (!/\.(ts|mjs|js|md|json|ps1|sh|yml)$/.test(f)) continue;
+      const text = fs.readFileSync(path.join(ROOT, f), "utf8");
+      for (const re of real) expect(re.test(text), `${f} contains a real Discord id`).toBe(false);
+    }
+  });
+
+  it("does not commit a lockfile pinned to a corporate proxy", () => {
+    // One generated behind the corp proxy pins internal hosts AND carries that
+    // proxy's integrity hashes (sha1, where public npm serves sha512), so
+    // `npm ci` could not verify them anywhere else. Shipping none is honest.
+    const tracked = execFileSync("git", ["ls-files", "package-lock.json"], { cwd: ROOT, encoding: "utf8" }).trim();
+    expect(tracked).toBe("");
+    const ignore = fs.readFileSync(path.join(ROOT, ".gitignore"), "utf8");
+    expect(ignore).toMatch(/^package-lock\.json$/m);
   });
 });

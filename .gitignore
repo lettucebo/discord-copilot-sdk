@@ -9,6 +9,16 @@ dist/
 .env.*
 !.env.example
 
+# Dependency lockfile.
+#
+# Deliberately NOT committed. This project is developed behind a corporate npm
+# proxy, so a lockfile generated here pins every package to an internal host AND
+# carries that proxy's integrity hashes (sha1, where public npm serves sha512) —
+# publishing it would both leak internal infrastructure and hand outside users a
+# lockfile whose `npm ci` integrity checks cannot pass. A lockfile that only
+# works for its author is worse than none.
+package-lock.json
+
 # data / local state
 data/
 *.db
