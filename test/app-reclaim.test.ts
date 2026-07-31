@@ -108,7 +108,11 @@ const reclaim = (
     }
   ).reclaim(id, wd, br);
 
-describe("reclaim — the record and its worktree retire together", () => {
+// Each test here creates a real git repo AND a real worktree, so it pays for
+// several git subprocesses. Locally that is ~1.4s; CI runs roughly 4-5x slower
+// (measured: a test at 1.4s locally timed out at 6707ms against vitest's 5s
+// default there), which would make this flake on timing rather than behaviour.
+describe("reclaim — the record and its worktree retire together", { timeout: 60_000 }, () => {
   it("clean worktree: both go, branch stays", async () => {
     const { app, store, dir, branch } = await seed();
     const out = await reclaim(app, "t1", dir, branch);

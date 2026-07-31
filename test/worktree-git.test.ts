@@ -34,7 +34,9 @@ async function makeWorktree(name: string): Promise<{ dir: string; branch: string
   return { dir, branch };
 }
 
-describe("removeWorktreeIfClean", () => {
+// Real git worktrees, so several subprocesses per test — see the note in
+// app-reclaim.test.ts about CI being several times slower than a local run.
+describe("removeWorktreeIfClean", { timeout: 60_000 }, () => {
   it("removes a clean worktree and keeps its branch", async () => {
     const { dir, branch } = await makeWorktree("clean");
     expect(await removeWorktreeIfClean(repo, dir, branch)).toBe("removed");

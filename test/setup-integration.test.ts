@@ -90,7 +90,14 @@ afterAll(() => {
   }
 });
 
-describe("setup.mjs --dry-run orchestration (integration)", () => {
+// Every test in here spawns a REAL `node scripts/setup.mjs` subprocess. Node
+// startup alone is ~1s, and on a loaded CI runner (Windows especially) the whole
+// round trip routinely exceeds vitest's 5s default — observed at 6707ms on a
+// commit that changed only documentation. A test that fails on timing rather
+// than behaviour is worse than no test, so the budget is stated explicitly here
+// instead of being raised globally, which would blunt the signal for genuinely
+// hanging unit tests.
+describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 }, () => {
   it("valid config, English: exits 0, masks the token, and mutates NOTHING", () => {
     const repo = makeFixture(true);
     try {
