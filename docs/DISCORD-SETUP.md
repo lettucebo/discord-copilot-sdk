@@ -28,6 +28,9 @@ Create a **text channel** in it (e.g. `#copilot`) to act as the parent. Every se
 > **為什麼要私人伺服器**：這個 bot 會以你的身分執行 shell 指令。任何看得到這個頻道的人都能看到 agent 的輸出（包含檔案內容）。輸入有 allow-list 保護，**輸出沒有**。
 > **Why private**: the bot runs shell commands as you. Anyone who can read the channel can read the agent's output, including file contents. Input is allow-listed; **output is not**.
 
+> 反過來也一樣值得管：預設情況下 **bot 讀得到你伺服器的每一個頻道**。§4b 有把它關進單一頻道的完整做法。
+> The reverse is worth controlling too: by default **the bot can read every channel in your server**. §4b confines it to one.
+
 ---
 
 ## 1. 建立 Application 與 Bot / Create the application and bot
@@ -58,8 +61,27 @@ If it's off: the bot shows online and slash commands work, but **it silently ign
 同一個 **Bot** 分頁往下找 **PUBLIC BOT**，把它**關掉**。開著的話（這是預設值），任何知道你 Application ID 的人都能把**你的 bot** 邀進**他們自己的**伺服器。
 Same **Bot** tab, scroll to **PUBLIC BOT** and turn it **off**. Left on (it is on by default), anyone who knows your application ID can invite **your bot** into **their own** server.
 
-這不是漏洞 —— `DISCORD_GUILD_ID` 是精確比對，別人的伺服器一律被拒，slash 指令也只註冊在你的伺服器。但沒有理由讓它被邀出去，而 Application ID 並不是秘密。
+這不是漏洞 —— `DISCORD_GUILD_ID` 是精確比對，別人的伺服器一律被拒，slash 指令也只註冊在你的伺服器。但沒有理由讓它被邀出去，而 Application ID 並不是秘密（尤其這個 repo 是公開的）。
 This is not a hole: `DISCORD_GUILD_ID` is matched exactly so another guild is refused outright, and slash commands are registered per-guild. But there is no reason to let it be invited anywhere, and an application ID is not a secret.
+
+#### 會被這個錯誤擋住 / You will hit this error first
+
+```
+Private application cannot have a default authorization link.
+Please check that the default authorization link is set to None in the installation tab.
+```
+
+Discord 不允許「私有 App」帶著公開安裝連結，所以**順序是反過來的**：
+Discord refuses to make an app private while it still advertises an install link, so the order is inverted:
+
+1. **Installation** 分頁 → **Install Link** → 選 `None` → **Save Changes**
+2. **Bot** 分頁 → **PUBLIC BOT** 關掉 → **再按一次 Save Changes**
+
+> 兩個分頁**各自**要存一次。下拉選單已經顯示 `None` 不代表存過了 —— Discord 的存檔是手動的，畫面上會浮出 **Save Changes** 提示條。
+> Each tab has its **own** save. Seeing `None` in the dropdown does not mean it is saved — a **Save Changes** bar appears and must be clicked.
+
+拿掉 Install Link **不會**影響已經在伺服器裡的 bot：slash 指令是 bot 啟動時自己用 API 註冊的（`app.ts` 的 `applicationGuildCommands`），跟安裝連結無關。日後若要重新邀請，用下面第 4 節的網址即可。
+Removing the install link does **not** affect a bot already in your server: slash commands are registered by the bot itself over the API at startup, not through the install flow. To re-invite later, use the URL in §4.
 
 ---
 
@@ -112,6 +134,84 @@ Both scopes are required: `bot` for the bot user, `applications.commands` so it 
 
 ---
 
+## 4b. 🔒 只讓 bot 看到一個頻道 / Confine the bot to ONE channel
+
+上面的邀請連結把權限給在**身分組**上，而身分組權限是**整個伺服器通用**的 —— 意思是 bot 看得到你**每一個**頻道，包括私人討論。對一個會把讀到的內容送進 Copilot 的工具來說，這值得收緊。
+The invite above grants permissions on the **role**, and role permissions apply **server-wide** — the bot can read **every** channel, including private ones. For a tool that feeds what it reads into Copilot, that is worth tightening.
+
+### 先理解為什麼「不給權限」沒有用 / Why removing role permissions is not enough
+
+大多數伺服器的 `@everyone` 身分組本身就帶著 **View Channels**，而 bot 也是成員，**一樣繼承它**。所以把 bot 身分組的權限清成 `0`，它照樣看得到所有沒有明確拒絕它的頻道。
+On most servers the `@everyone` role already grants **View Channels**, and a bot is a member like any other, so it **inherits that**. Clearing the bot role's permissions to `0` therefore changes nothing on its own.
+
+自己確認一下（在伺服器設定 → 身分組 → `@everyone` 看 View Channels 是否開著）：
+Check yours (Server Settings → Roles → `@everyone` → is View Channels on?):
+
+| 設定位置 / Where | 效果 / Effect |
+| --- | --- |
+| 身分組（伺服器層級）給 View Channels | 看得到**每一個**沒明確拒絕它的頻道 |
+| 頻道層級 **允許** View Channels | 只加開**那一個**頻道 |
+| 頻道層級 **拒絕** View Channels | **擋住**該頻道，優先於 `@everyone` 的伺服器層級允許 |
+
+Discord 的權限解析順序是：`@everyone` 伺服器層級 → 身分組伺服器層級 → `@everyone` 頻道覆寫 → **身分組頻道覆寫**。所以身分組的頻道層級「拒絕」會蓋過 `@everyone` 的「允許」—— 這是唯一有效的擋法。
+Resolution order is: `@everyone` server → role server → `@everyone` channel overwrite → **role channel overwrite**. A role-level channel DENY therefore overrides the `@everyone` server-level allow — that is the only thing that actually blocks it.
+
+### 正確的設定 / The setup that works
+
+| 放哪裡 / Where | 給什麼 / What |
+| --- | --- |
+| Bot 的身分組 | **完全清空（`0`）** —— 包括不要 Administrator |
+| 工作頻道 | **允許**下面那組工作權限 |
+| 其他**每一個**頻道與**分類** | **拒絕** View Channels |
+
+分類（Category）也要設，因為分類權限會往下繼承到底下的頻道。
+Categories matter too: their permissions cascade to the channels inside them.
+
+### ⚠️ 順序很重要 / Order matters
+
+**先做頻道設定，最後才拿掉 Administrator。** 反過來的話 bot 會先失去 `Manage Roles`，就沒有權限再去改頻道設定了。
+**Do the channel overwrites first, remove Administrator last.** Reversed, the bot loses `Manage Roles` and can no longer edit channel permissions at all.
+
+### 步驟 / Steps
+
+1. **工作頻道** → 編輯頻道 → 權限 → 加入你的 bot 身分組 → 打開下面這些：
+   View Channels · Send Messages · Send Messages in Threads · Create Public Threads ·
+   Create Private Threads · Manage Threads · Embed Links · Attach Files ·
+   Read Message History · Add Reactions · Use External Emoji
+   （這組的整數是 `395137371200`。範圍鎖在單一頻道，所以可以給得寬鬆一點。）
+2. **其他每一個頻道與分類** → 權限 → 加入 bot 身分組 → **拒絕** View Channels
+3. **最後**：伺服器設定 → 身分組 → 你的 bot 身分組 → **關掉 Administrator**，其餘留空
+   （該頁右上角的 **Clear permissions** 可以一次清空。）
+
+> **確認你改的是對的身分組。** 伺服器裡可能有多個整合身分組（例如另一個 `GitHubCopilot`）。編輯畫面的標題要顯示**你的 bot 名稱**。
+> **Make sure you are editing the right role.** A server can carry several integration roles; the edit pane's title must show **your bot's** name.
+
+> **這一步只能在網頁介面做。** bot 不能修改自己最高的身分組 —— Discord 的階層規則，`ADMINISTRATOR` 也繞不過（API 會回 `50013 Missing Permissions`）。
+> **This step is UI-only.** A bot cannot edit its own highest role: Discord's hierarchy rule is not bypassed by `ADMINISTRATOR` (the API returns `50013 Missing Permissions`).
+
+### 刻意不給的權限 / Deliberately withheld
+
+| 權限 | 為什麼不給 |
+| --- | --- |
+| `Administrator` | 繞過**所有**頻道設定，上面做的隔離會全部失效 |
+| `Manage Messages` | 程式只刪**自己發的**訊息，那不需要這個權限；給了等於能刪你的訊息 |
+| `Manage Channels` / `Manage Roles` | 完全用不到 |
+| `Mention Everyone` | 完全用不到 |
+
+### 驗收 / Verify
+
+不要只看設定畫面 —— 實際測一次：
+Do not trust the settings screen; test it:
+
+1. 在工作頻道 `/new`，送一則訊息 → 應該正常回覆
+2. 在**別的**頻道 tag 或提到 bot → 它應該**完全看不到**（連讀都讀不到）
+
+在 Discord 左側頻道列表用 bot 的視角是看不到的，但你可以從**成員清單**確認：bot 只會出現在工作頻道的成員清單裡。
+The bot will appear in the member list of the work channel only.
+
+
+---
+
 ## 5. 取得四個 ID / Collect the four IDs
 
 先開啟開發者模式：**User Settings → Advanced → Developer Mode**。
@@ -127,6 +227,15 @@ Turn on **User Settings → Advanced → Developer Mode** first.
 - 父頻道必須是**文字頻道**（不能是分類、論壇或語音）；bot 啟動時會檢查。/ The parent must be a **text channel** (not a category, forum, or voice channel); the bot checks this.
 - `DISCORD_ALLOWED_USER_IDS` 是逗號分隔，但 v1 建議**只放你自己**。清單外的人即使在同一個頻道也無法下指令。/ Comma-separated, but v1 should be **just you**. Anyone not listed cannot drive the bot even in the same channel.
 
+### 之後想換父頻道 / Moving to a different parent channel later
+
+1. 改 `.env` 的 `DISCORD_PARENT_CHANNEL_ID`
+2. **趁 bot 還有權限時**，照 §4b 把新頻道的允許、舊頻道的拒絕設好
+3. 重啟 bot（`./stop-bot.ps1` → `./run-bot.ps1`）
+
+舊父頻道底下的討論串**會全部失效** —— 授權是綁父頻道的（`auth.ts`），不在新父頻道底下的一律拒絕。這些記錄不會自己消失：bot 下次啟動會在新父頻道列出它們，用 `/end thread:<id>` 清掉，順便回收 worktree。
+Threads under the old parent **all stop working**: authorization is bound to the parent channel, so anything outside it is refused. Those records do not disappear on their own — the bot lists them in the new parent at startup, and `/end thread:<id>` clears each one along with its worktree.
+
 ---
 
 ## 6. 驗收 / Verify
@@ -138,6 +247,18 @@ After installing and starting per [`INSTALL.md`](../INSTALL.md):
 2. 在父頻道打 `/` → 看得到 `/new`、`/stop`、`/usage` 等指令 / typing `/` in the parent channel lists `/new`, `/stop`, `/usage`, …
 3. `/new` → 開出一個新討論串 / `/new` opens a new thread
 4. 在討論串打「hello」→ **有回應**（沒回應 = 步驟 2 的 intent 沒開）/ type "hello" in the thread → **you get a reply** (no reply = the step-2 intent is off)
+
+### 做過 §4b 收緊權限的話，額外驗這兩件事 / If you locked it down per §4b
+
+設定畫面看起來正確**不等於**真的生效 —— Discord 的權限是四層疊加運算出來的。實際驗證：
+A settings screen that looks right is **not** proof: effective permissions are computed across four layers. Test the real thing:
+
+1. **正向**：在工作頻道 `/new` → 開討論串 → 打字 → 有回應（證明允許那組有效）
+2. **反向**：到**別的**頻道提到 bot → 它應該**完全沒反應**（證明拒絕有效）
+
+反向那一條才是重點。只驗第一條的話，你證明的是「能用」，不是「被關住」。
+The second one is the point. Testing only the first proves it works, not that it is confined.
+
 
 ---
 
@@ -151,6 +272,8 @@ After installing and starting per [`INSTALL.md`](../INSTALL.md):
 | 討論串開了但 bot 不說話 / thread opens but the bot is mute in it | 少 `Send Messages in Threads`（`Send Messages` 對討論串無效）/ missing that permission |
 | 指令回「Not authorized」 | `DISCORD_ALLOWED_USER_IDS` 不是你的 user ID / not your user ID |
 | 指令只在某些伺服器出現 | 指令是註冊到 `DISCORD_GUILD_ID` 那個伺服器的 / commands are registered to that one guild |
+| 收緊權限後 bot 整個消失了 / the bot vanished after locking it down | 工作頻道的 View Channels 沒給到，或身分組的 Administrator 拿掉了但頻道覆寫沒設好 → 見 §4b。緊急還原：把 Administrator 打回去 / grant View Channels on the work channel, see §4b; to recover fast, re-enable Administrator |
+| 換了 `DISCORD_PARENT_CHANNEL_ID` 後舊討論串沒反應 / old threads stopped responding after changing the parent | 正常。授權是綁父頻道的，舊討論串不在新父頻道底下就一律拒絕。啟動時會在新父頻道列出這些殘留記錄，用 `/end thread:<id>` 清掉 / expected: authorization is bound to the parent channel. Startup lists the stranded records; clear them with `/end thread:<id>` |
 
 ---
 

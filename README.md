@@ -68,6 +68,8 @@ Mitigations that **are** in place:
 - **Access gate**: only allow-listed user id(s), in the configured guild + parent channel/threads,
   can drive a session. (This gates *input*; anyone who can read the channel can read *output* — use
   a private channel.) Secrets (`DISCORD_*`/`DISCORD_COPILOT_SDK_*`) are stripped from the agent's runtime env.
+  By default the bot can also *read* every channel in the server; confining it to one is a few clicks
+  and is written up in [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) §4b.
 
 **Known limitation — inherited approvals:** the bot uses your logged-in Copilot (`~/.copilot`), so
 any blanket "always allow" approval rules you've saved there apply and would bypass the per-command
