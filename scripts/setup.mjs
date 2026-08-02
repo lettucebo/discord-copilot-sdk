@@ -429,7 +429,14 @@ async function promptField(spec, cur, lang) {
       const entered = await askHidden(shown);
       val = entered === "" ? cur : entered;
     } else {
-      val = (await ask(label + " ", cur)).trim();
+      // NOT `label + " "` — that trailing-space trick (used deliberately below
+      // for the y/n and multi-choice prompts, to suppress ask()'s automatic
+      // ": ") was copy-pasted in here too, which silently ate the colon (and
+      // added a stray double space before "[default]") on every ordinary
+      // "label: value" field except the hidden-input one (askHidden always
+      // appends ": " unconditionally, which is why only the token prompt had
+      // a colon).
+      val = (await ask(label, cur)).trim();
     }
     if (spec.optional && val === "") return "";
     if (spec.required && val === "") {
