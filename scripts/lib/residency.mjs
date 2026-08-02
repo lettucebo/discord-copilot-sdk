@@ -204,28 +204,49 @@ function setupWindows(lang, opts = {}) {
   fs.writeFileSync(scriptPath, "\ufeff" + register.replace(/\n/g, "\r\n") + "\r\n", "utf8");
   const childEnv = { ...process.env };
   if (mode === "always") childEnv[PW_ENV] = opts.password ?? "";
-  let out = "";
+  // A registration failure here (e.g. "Access is denied" — Task Scheduler
+  // creation blocked by a corporate GPO, observed in the wild on an account
+  // that is a member of Administrators "for deny only") must NOT crash the
+  // whole installer: .env and the build already succeeded by this point, and
+  // residency is opt-in. macOS's and Linux's setup functions already fail soft
+  // (catch + warn + keep going); Windows was the odd one out, letting the
+  // exception propagate all the way through setup.mjs's main() uncaught,
+  // which took the entire install down — including the final instructions —
+  // over an optional feature nobody asked to be load-bearing.
   try {
-    out = execFileSync(psExe, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath], {
-      env: childEnv,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "inherit"],
-    });
-  } finally {
-    fs.rmSync(scriptPath, { force: true });
+    let out = "";
+    try {
+      out = execFileSync(psExe, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath], {
+        env: childEnv,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "inherit"],
+      });
+    } finally {
+      fs.rmSync(scriptPath, { force: true });
+    }
+    // Belt and braces: require the sentinel the script prints only after both
+    // Register-ScheduledTask and Start-ScheduledTask succeeded, so a future
+    // change to how PowerShell reports failure cannot turn this back into a
+    // silent lie.
+    if (!/(^|\s)registered(\s|$)/.test(out)) {
+      throw new Error(`residency registration did not confirm success (task ${name})`);
+    }
+    console.log((mode === "always" ? t("residencyWin247", lang) : t("residencyWin", lang)) + name);
+    console.log(
+      lang === "zh"
+        ? `  停止：schtasks /End /TN ${name}  ；移除：schtasks /Delete /TN ${name} /F  ；記錄：${logFile}`
+        : `  Stop: schtasks /End /TN ${name}  ; Remove: schtasks /Delete /TN ${name} /F  ; Log: ${logFile}`
+    );
+  } catch (e) {
+    console.log(
+      (lang === "zh"
+        ? "⚠️ Windows 排程工作註冊未完成（可能被公司原則封鎖，或本機帳號沒有建立排程工作的權限）。你仍可手動啟動："
+        : "⚠️ Windows Scheduled Task registration did not complete (may be blocked by a corporate policy, or this account lacks permission to create scheduled tasks). You can still start it manually: ") +
+        wrapper +
+        " — " +
+        (e && e.message)
+    );
   }
-  // Belt and braces: require the sentinel the script prints only after both
-  // Register-ScheduledTask and Start-ScheduledTask succeeded, so a future change
-  // to how PowerShell reports failure cannot turn this back into a silent lie.
-  if (!/(^|\s)registered(\s|$)/.test(out)) {
-    throw new Error(`residency registration did not confirm success (task ${name})`);
-  }
-  console.log((mode === "always" ? t("residencyWin247", lang) : t("residencyWin", lang)) + name);
-  console.log(
-    lang === "zh"
-      ? `  停止：schtasks /End /TN ${name}  ；移除：schtasks /Delete /TN ${name} /F  ；記錄：${logFile}`
-      : `  Stop: schtasks /End /TN ${name}  ; Remove: schtasks /Delete /TN ${name} /F  ; Log: ${logFile}`
-  );
 }
 
 // ---- macOS: LaunchAgent (login-only; experimental, unverified on real HW) ----

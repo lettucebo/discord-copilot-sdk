@@ -208,6 +208,9 @@ not survive is a reboot. Choose 24/7 only when unattended reboots matter.
 > **非互動絕不升級 / Non-interactive never escalates**：`--yes`／CI／管線輸入下無法安全詢問密碼，因此即使加了 `--residency-24x7` 也會退回登入後保活並明講原因。
 > With `--yes`, in CI, or through a pipe there is no safe way to ask, so `--residency-24x7` falls back to login-keepalive and says so.
 
+> **公司管理／受限帳號可能直接被拒絕**：部分企業管理的 Windows 機器（觀察到帳號雖列在 Administrators 但標示「for deny only」）會讓 `Register-ScheduledTask` 回傳「Access is denied」。安裝器會印出警告並**繼續完成其餘設定**（`.env`／build 已經完成，不會因為常駐這個選配步驟而整個失敗），你仍可用 `./run-bot.ps1` 手動啟動。
+> **A corporate-managed or restricted account may simply be denied**: on some enterprise-managed Windows machines (observed with an account listed in Administrators but marked "for deny only"), `Register-ScheduledTask` returns "Access is denied". The installer prints a warning and **still completes the rest of setup** (`.env`/build already succeeded, so this optional step failing does not fail the whole install) — you can still start it manually with `./run-bot.ps1`.
+
 - **Windows**：排程工作 `discord-copilot-sdk-<instance>`（失敗自動重啟、無執行時間上限、不會重複啟動）。
   - 停止 / Stop：`schtasks /End /TN discord-copilot-sdk-default`
   - 移除 / Remove：`schtasks /Delete /TN discord-copilot-sdk-default /F`

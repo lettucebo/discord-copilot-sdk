@@ -218,6 +218,22 @@ Copilot auth — so macOS is documented as login-keepalive only, not quietly sol
 as 24/7. Linux: `loginctl enable-linger` genuinely gives pre-login `systemd --user`,
 so 24/7 is offered there.
 
+> **⚠️ CORRECTION (2026-08-02, real-world failure).** `setupWindows` let a
+> `Register-ScheduledTask` failure propagate as an uncaught exception all the
+> way through `setup.mjs`'s `main()`, crashing the ENTIRE installer — even
+> though `.env` and the build had already succeeded by that point, and
+> residency is opt-in. Reproduced on a real corporate-managed machine:
+> `Register-ScheduledTask` returned "Access is denied" (`HRESULT 0x80070005`)
+> for an account that IS listed in `Administrators` but marked "for deny
+> only" (a locked-down/UAC-restricted account), regardless of whether 24/7 or
+> plain login-keepalive was requested — the failure had nothing to do with
+> the password prompt. `setupMac` and `setupLinux` already failed SOFT (catch
+> + print a warning + keep going) for the equivalent case; `setupWindows` was
+> the odd one out. Fixed by wrapping the registration + success-check in
+> `try/catch`, printing the same bilingual "may be blocked by policy, start
+> manually with `run-bot.ps1`" warning pattern, and letting the installer
+> finish and report success for everything that DID work.
+
 ### 4. Honesty fix
 
 The existing option is relabelled "auto-start + keepalive **while logged in**";
