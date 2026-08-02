@@ -192,17 +192,30 @@ param(
     # A directory being A git repo does not make it OUR git repo. Without this
     # check the update path would fetch from a STRANGER'S origin, detach their
     # HEAD onto it, and then hand off to whatever install.ps1 it found there.
-    # This branch is reached only for a bootstrap-MANAGED directory (the
-    # default, DISCORD_COPILOT_SDK_DIR, -Dir, or a menu-typed custom path) —
-    # never for the auto-detected "reuse as-is" choice above — so fetch +
-    # detach here is expected appliance-style behavior, not a surprise.
     $origin = (& git -C $target remote get-url origin 2>$null)
     if (-not $origin -or (& $norm $origin) -ne (& $norm $repoUrl)) {
       throw "$target is a git repo whose origin is '$origin', not $repoUrl. Set DISCORD_COPILOT_SDK_DIR to somewhere else."
     }
-    Say '已存在，改為更新…' 'Already present; updating…'
-    Invoke-Git @('-C', $target, 'fetch', '--depth', '1', 'origin', $ref)
-    Invoke-Git @('-C', $target, 'checkout', '-q', '--detach', 'FETCH_HEAD')
+    # A target reached via -Dir/DISCORD_COPILOT_SDK_DIR/a menu-typed custom
+    # path can ALSO be an existing dev clone the user pointed us at without
+    # standing inside it — $reuseAsIs only catches the case where they were
+    # cd'd into it. So the real signal for "is this ours to rewrite" is
+    # whether it's SITTING ON A NAMED BRANCH: every clone/update this script
+    # performs immediately detaches HEAD (see below), so an attached branch
+    # here means a human is developing on it, and fetch + detach would
+    # silently rip their HEAD off that branch — exactly the bug this whole
+    # detection feature exists to prevent, just reached through a path we
+    # hadn't covered (a REAL detach-out-from-under-a-dev-clone incident is
+    # what motivated this check).
+    $onBranch = (& git -C $target symbolic-ref -q --short HEAD 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $onBranch) {
+      Say "已存在且在分支 $onBranch 上；為避免打斷你的工作，不會更新（不會 fetch/checkout）…" "Already present and on branch $onBranch; not updating so as not to disturb your work (no fetch/checkout)…"
+    }
+    else {
+      Say '已存在，改為更新…' 'Already present; updating…'
+      Invoke-Git @('-C', $target, 'fetch', '--depth', '1', 'origin', $ref)
+      Invoke-Git @('-C', $target, 'checkout', '-q', '--detach', 'FETCH_HEAD')
+    }
   }
   elseif (Test-Path $target) {
     # Refuse to clone into a non-empty directory that is not our repo — that is
@@ -211,9 +224,15 @@ param(
       throw "$target exists and is not a discord-copilot-sdk checkout. Set DISCORD_COPILOT_SDK_DIR to somewhere else."
     }
     Invoke-Git @('clone', '--depth', '1', '--branch', $ref, $repoUrl, $target)
+    # Detach immediately so this managed clone is indistinguishable-by-git-state
+    # from one just fetched+detached above — that is what lets the NEXT run
+    # recognize it as bootstrap-managed (detached) rather than a dev clone
+    # (on a branch) and safely update it again.
+    Invoke-Git @('-C', $target, 'checkout', '-q', '--detach', 'HEAD')
   }
   else {
     Invoke-Git @('clone', '--depth', '1', '--branch', $ref, $repoUrl, $target)
+    Invoke-Git @('-C', $target, 'checkout', '-q', '--detach', 'HEAD')
   }
 
   # --- hand off to the repo's installer, in a CHILD process ---

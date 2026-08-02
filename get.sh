@@ -128,25 +128,41 @@ if [ "$REUSE_AS_IS" = "1" ]; then
   say "使用你現有的 checkout（未更新）…" "Using your existing checkout (not updated)…"
 elif [ -d "$TARGET/.git" ]; then
   # Being A git repo does not make it OUR git repo: without this the update path
-  # would fetch from a stranger's origin and hand off to their install.sh. This
-  # branch is reached only for a bootstrap-MANAGED directory (the default,
-  # DISCORD_COPILOT_SDK_DIR, --dir, or a menu-typed custom path) — never for the
-  # auto-detected "reuse as-is" choice above — so fetch + detach here is
-  # expected appliance-style behavior, not a surprise.
+  # would fetch from a stranger's origin and hand off to their install.sh.
   ORIGIN="$(git -C "$TARGET" remote get-url origin 2>/dev/null || true)"
   if [ -z "$ORIGIN" ] || [ "$(norm "$ORIGIN")" != "$(norm "$REPO_URL")" ]; then
     echo "$TARGET is a git repo whose origin is '$ORIGIN', not $REPO_URL. Set DISCORD_COPILOT_SDK_DIR elsewhere." >&2
     exit 1
   fi
-  say "已存在，改為更新…" "Already present; updating…"
-  git -C "$TARGET" fetch --depth 1 origin "$REF"
-  git -C "$TARGET" checkout -q --detach FETCH_HEAD
+  # A target reached via --dir/DISCORD_COPILOT_SDK_DIR/a menu-typed custom path
+  # can ALSO be an existing dev clone the user pointed us at without standing
+  # inside it — REUSE_AS_IS only catches the case where they were cd'd into
+  # it. So the real signal for "is this ours to rewrite" is whether it's
+  # SITTING ON A NAMED BRANCH: every clone/update this script performs
+  # immediately detaches HEAD (see below), so an attached branch here means a
+  # human is developing on it, and fetch + detach would silently rip their
+  # HEAD off that branch — exactly the bug this whole detection feature
+  # exists to prevent, just reached through a path we hadn't covered (a REAL
+  # detach-out-from-under-a-dev-clone incident is what motivated this check).
+  ON_BRANCH="$(git -C "$TARGET" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+  if [ -n "$ON_BRANCH" ]; then
+    say "已存在且在分支 $ON_BRANCH 上；為避免打斷你的工作，不會更新（不會 fetch/checkout）…" "Already present and on branch $ON_BRANCH; not updating so as not to disturb your work (no fetch/checkout)…"
+  else
+    say "已存在，改為更新…" "Already present; updating…"
+    git -C "$TARGET" fetch --depth 1 origin "$REF"
+    git -C "$TARGET" checkout -q --detach FETCH_HEAD
+  fi
 elif [ -d "$TARGET" ] && [ -n "$(ls -A "$TARGET" 2>/dev/null)" ]; then
   # Refuse to clone over someone else's data.
   echo "$TARGET exists and is not a discord-copilot-sdk checkout. Set DISCORD_COPILOT_SDK_DIR elsewhere." >&2
   exit 1
 else
   git clone --depth 1 --branch "$REF" "$REPO_URL" "$TARGET"
+  # Detach immediately so this managed clone is indistinguishable-by-git-state
+  # from one just fetched+detached above — that is what lets the NEXT run
+  # recognize it as bootstrap-managed (detached) rather than a dev clone (on
+  # a branch) and safely update it again.
+  git -C "$TARGET" checkout -q --detach HEAD
 fi
 
 # --- hand off to the repo's installer ---

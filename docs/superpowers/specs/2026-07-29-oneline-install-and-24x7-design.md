@@ -153,6 +153,40 @@ would silence a correctness bug as a convenience feature. `get.sh`'s menu
 reads from `/dev/tty` for the same reason the existing installer handoff
 already does: its own stdin is the `curl` pipe.
 
+> **⚠️ CORRECTION (2026-08-02, near-miss during real-world testing).** The
+> paragraph above is wrong in one place: "never for the auto-detected
+> 'you're standing in it' choice" implied every OTHER path (default,
+> env var, `-Dir`, menu-typed custom path) was safe to fetch + detach. It is
+> not. This got caught immediately because it happened to this very repo's
+> own working checkout: running the fixed one-liner from `~` (not cd'd into
+> the repo) and choosing menu option **[2] Custom path**, then typing this
+> checkout's own path, hit the "bootstrap-managed directory" branch — which
+> fetched and ran `checkout --detach FETCH_HEAD` on a real dev clone sitting
+> on `main`, silently detaching it. `$reuseAsIs` only catches "you were cd'd
+> into it when you ran the command"; it says nothing about a path you typed
+> or passed with `-Dir` that happens to be some OTHER existing clone of this
+> repo you weren't standing in.
+>
+> The real invariant was never "how did the user arrive at this path" — it
+> is **whether the directory is currently sitting on a named branch**.
+> `get.ps1`/`get.sh` now detach HEAD immediately after every clone they
+> perform (`git checkout --detach HEAD` right after `git clone`), so every
+> directory this script has ever fully managed is unambiguously in a
+> detached state. The "already present" branch then checks
+> `git symbolic-ref -q --short HEAD`: if it succeeds (attached to a branch),
+> that is a human's own checkout and the script prints a message and does
+> **nothing** to it (no fetch, no checkout) — regardless of whether the path
+> came from the default, the env var, `-Dir`, or a menu-typed custom path.
+> Only a directory already detached gets fetched and re-detached. This
+> closes the gap for every entry point at once, rather than special-casing
+> "custom path pointing at an existing clone" on top of `$reuseAsIs`.
+>
+> Recovery for this repo's own checkout (`main` was one commit ahead locally
+> and untouched on the remote, so this was a pure fast-forward, not a rebase
+> or history rewrite): `git merge-base --is-ancestor main HEAD` confirmed no
+> divergence, then `git checkout main && git merge --ff-only <detached-sha>`
+> reattached HEAD with zero data loss.
+
 ### 2. `run-bot.*` / `stop-bot.*`
 
 Start the bot detached with the PATH/HOME fixes residency already needs, logging
