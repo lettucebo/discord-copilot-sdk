@@ -148,6 +148,12 @@ bash install.sh --skip-auth
 > 請**不要**用 `sudo` 執行安裝器（只有套件安裝會在需要時提權）。
 > Do **not** run the installer with `sudo` (only package installs elevate when needed).
 
+> ⚠️ **`CONTROLLED_REPO_PATH` 必須是「一個 git repo 的根目錄」的絕對路徑** —— 也就是那個資料夾底下要有 `.git`。放了好幾個 repo 的**上層資料夾不算**（例如填 `C:\Source\Repos` 而不是 `C:\Source\Repos\my-repo`），repo 的**子目錄也不算**。安裝器現在會當場擋下來；在此之前它會照樣寫入並回報「安裝完成」，然後 bot 一啟動就掛掉。還沒有可拋棄的 repo 就先建一個：`mkdir ~/copilot-sandbox && cd ~/copilot-sandbox && git init`。
+> ⚠️ **`CONTROLLED_REPO_PATH` must be an absolute path to the ROOT of a git repo** — the folder itself must contain `.git`. A parent folder holding several repos does **not** count (e.g. `C:\Source\Repos` instead of `C:\Source\Repos\my-repo`), and neither does a subdirectory of a repo. The installer now rejects these outright; before it would accept one, report "installation complete", and the bot would die on its first launch. No disposable repo yet? `mkdir ~/copilot-sandbox && cd ~/copilot-sandbox && git init`.
+
+> 重跑安裝器前請先停掉 bot（`./stop-bot.ps1` / `./stop-bot.sh`）—— npm 需要覆寫執行中程序正在使用的檔案。安裝器會偵測到並直接告訴你，不會再丟出難懂的 `EPERM` 錯誤。
+> Stop the bot (`./stop-bot.ps1` / `./stop-bot.sh`) before re-running the installer — npm has to replace files a running process holds open. The installer detects this and says so, instead of failing with a cryptic `EPERM`.
+
 安裝器會：偵測前置需求 → 收集設定並**驗證** → `npm ci` + build → 用真實 schema 在記憶體驗證設定 → **最後**才安全寫入 `.env`（權限僅限本人、token 不顯示、原子寫入 + 備份）→（可選）設定常駐 → 完成報告。（先建置再寫入，`.env` 是最後一步；**全新安裝**時 npm 過程中磁碟上不會有 token。）
 The installer will: detect prerequisites → collect + **validate** config → `npm ci` + build → validate the config in memory against the real schema → **finally** write `.env` securely (owner-only, token never echoed, atomic write + backup) → (optional) residency → done report. (Build first, `.env` written last; on a **fresh install** npm never sees the token on disk.)
 

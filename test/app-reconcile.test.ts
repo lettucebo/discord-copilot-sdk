@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { DiscordCopilotApp } from "../src/app.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import type { CopilotClient } from "@github/copilot-sdk";
@@ -6,7 +6,7 @@ import type { Transport } from "../src/core/transport.js";
 import { tmpdir } from "node:os";
 import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
-import { rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { rmSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
 
 const REPO = "C:\\repo";
 const tmpFile = (): string => join(tmpdir(), `dp-reconcile-${Math.random()}.json`);
@@ -341,6 +341,32 @@ describe("startup announcement for records whose thread is gone", () => {
       this.sent.push({ key: k, text: t });
     }
   }
+
+  // announceUnreachableRecords() ALSO reports "stray" worktree directories by
+  // reading worktreeRoot() (= `${stateDir()}-worktrees`) off the real disk, and
+  // stateDir() resolves through os.homedir(). Without redirecting HOME these
+  // tests read the DEVELOPER'S OWN worktree root: run the bot once, leave a
+  // session's checkout behind, and "stays silent when nothing is unreachable"
+  // starts failing on that machine only — a test whose verdict depends on
+  // whether you have ever used the app. os.homedir() reads $HOME/%USERPROFILE%
+  // on every call, so pointing them at an empty temp dir is enough.
+  let realHome: string | undefined;
+  let realUserProfile: string | undefined;
+  let fakeHome: string;
+  beforeAll(() => {
+    realHome = process.env.HOME;
+    realUserProfile = process.env.USERPROFILE;
+    fakeHome = mkdtempSync(join(tmpdir(), "dp-reconcile-home-"));
+    process.env.HOME = fakeHome;
+    process.env.USERPROFILE = fakeHome;
+  });
+  afterAll(() => {
+    if (realHome === undefined) delete process.env.HOME;
+    else process.env.HOME = realHome;
+    if (realUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = realUserProfile;
+    rmSync(fakeHome, { recursive: true, force: true });
+  });
 
   it("posts ONE parent-channel line naming the thread id and its worktree", async () => {
     const f = tmpFile();

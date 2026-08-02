@@ -12,10 +12,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, execSync } from "node:child_process";
 import { mergeEnv } from "./lib/env-file.mjs";
 import { secureWrite, secureBackup, hardenExisting } from "./lib/secure-file.mjs";
-import { nodeVersionOk } from "./lib/setup-core.mjs";
+import { nodeVersionOk, controlledRepoProblem, livePidFromLock } from "./lib/setup-core.mjs";
 import { t, detectLang, normalizeLang } from "./lib/i18n.mjs";
 import { MANAGED_KEYS, validateConfig } from "./lib/validate.mjs";
-import { setupResidency, residencyName, chooseResidencyMode } from "./lib/residency.mjs";
+import { setupResidency, residencyName, chooseResidencyMode, instanceId } from "./lib/residency.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
@@ -334,23 +334,21 @@ async function main() {
     throw new SetupError(t("missingRequiredNonInteractive", lang) + missingRequired);
   }
 
-  // 4b) CONTROLLED_REPO_PATH must be a git working-tree root — checked
-  // UNCONDITIONALLY (interactive AND --yes), unlike the promptField check
-  // above. This is deliberately NOT folded into validateConfig()/MANAGED_KEYS:
-  // that function is the config CONTRACT with the runtime zod schema
-  // (test/config-contract.test.ts asserts they accept/reject identically),
-  // and parseConfig() intentionally does no filesystem I/O — the equivalent
-  // real check (src/core/repo.ts's resolveControlledRepo) is ALSO a separate
-  // runtime step, called only once DiscordCopilotApp.start() actually runs.
-  // Without this, a --yes install (or an interactive one that kept an
-  // already-bad EXISTING .env value, which skips promptField entirely under
-  // --yes) reports "installation complete" and the bot then crashes on the
-  // very first launch, deep inside start(), long after setup.mjs exited 0.
-  if (!fs.existsSync(values.CONTROLLED_REPO_PATH) || !fs.statSync(values.CONTROLLED_REPO_PATH).isDirectory()) {
-    throw new SetupError(t("errRepoMissing", lang) + values.CONTROLLED_REPO_PATH);
-  }
-  if (!fs.existsSync(path.join(values.CONTROLLED_REPO_PATH, ".git"))) {
-    throw new SetupError(t("errRepoNotGit", lang) + values.CONTROLLED_REPO_PATH);
+  // 4b) CONTROLLED_REPO_PATH shape check, run UNCONDITIONALLY (interactive AND
+  // --yes), unlike promptField's copy which only runs when a human is typing.
+  // A --yes install reuses the EXISTING .env value without prompting, so
+  // without this a long-broken path sails straight through to "complete".
+  //
+  // This is a FAST PRE-FLIGHT, not the source of truth: step 8b below calls the
+  // runtime's own resolveControlledRepo() once dist/ exists. Running here too
+  // means a bad path fails in seconds instead of after minutes of npm ci +
+  // build. Deliberately NOT folded into validateConfig()/MANAGED_KEYS: that is
+  // the config CONTRACT with the runtime zod schema (test/config-contract.test.ts
+  // asserts they accept/reject identically), and parseConfig() does no
+  // filesystem I/O by design.
+  {
+    const repoErr = checkControlledRepoShape(values.CONTROLLED_REPO_PATH, lang);
+    if (repoErr) throw new SetupError(repoErr);
   }
 
   // 5) Compute the merged .env in memory.
@@ -364,6 +362,22 @@ async function main() {
     info(c(90, t("residencyDry", lang) + residencyName()));
     info("\n" + c(32, t("doneHeader", lang)) + " (dry-run)");
     return;
+  }
+
+  // 6b) Refuse to reinstall over a RUNNING bot. npm replaces files inside
+  //     node_modules that the live process holds open — on Windows that is a
+  //     hard EPERM ("operation not permitted, unlink ...copilot-win32-x64/
+  //     prebuilds/win32-x64/runtime.node"), which reads like a permissions or
+  //     antivirus problem and says nothing about the actual cause. Re-running
+  //     the installer to FIX a bad config is exactly when the bot is most
+  //     likely to be running, so this is the common path, not an edge case.
+  //     Checked here, after all validation but before the first mutation, so a
+  //     refusal still changes nothing.
+  {
+    const running = runningInstancePid();
+    if (running !== undefined) {
+      throw new SetupError(t("errBotRunning", lang) + running);
+    }
   }
 
   // 7) Guard, then BUILD FIRST — on a FRESH install no .env exists yet, so npm
@@ -386,8 +400,25 @@ async function main() {
   //    same parser+schema the bot uses (parseEnv → parseConfig), so a config the
   //    runtime would reject fails the install BEFORE we write anything.
   const { parseConfig } = await import(pathToFileURL(path.join(REPO_ROOT, "dist", "config.js")).href);
+  let parsed;
   try {
-    parseConfig(parseEnv(merged));
+    parsed = parseConfig(parseEnv(merged));
+  } catch (e) {
+    throw new SetupError(t("healthFail", lang) + " " + (e instanceof Error ? e.message : String(e)));
+  }
+
+  // 8b) AUTHORITATIVE controlled-repo check: call the very function the bot
+  //     calls at startup (app.ts → resolveControlledRepo), not a copy of its
+  //     rules. parseConfig deliberately does no filesystem I/O, so the zod
+  //     schema alone cannot catch a path that exists but is not a git
+  //     working-tree root — which is exactly how an install once reported
+  //     success while the bot died on its first launch. checkControlledRepo()
+  //     above fails faster (before minutes of npm ci/build) but is a mirror of
+  //     these rules; THIS is the one that cannot drift, because it is the same
+  //     code. Run only after build, since it lives in dist/.
+  const { resolveControlledRepo } = await import(pathToFileURL(path.join(REPO_ROOT, "dist", "core", "repo.js")).href);
+  try {
+    resolveControlledRepo(parsed.CONTROLLED_REPO_PATH);
   } catch (e) {
     throw new SetupError(t("healthFail", lang) + " " + (e instanceof Error ? e.message : String(e)));
   }
@@ -467,26 +498,36 @@ async function promptField(spec, cur, lang) {
       continue;
     }
     if (spec.key === "CONTROLLED_REPO_PATH" && val !== "") {
-      if (!fs.existsSync(val) || !fs.statSync(val).isDirectory()) {
-        err(t("errRepoMissing", lang) + val);
-        continue;
-      }
-      // Mirrors src/core/repo.ts's resolveControlledRepo() EXACTLY (a git
-      // working-tree root has a `.git` entry — dir for a normal clone, file
-      // for a worktree). Without this, the installer accepted ANY existing
-      // directory (e.g. a folder that merely CONTAINS several repos, like
-      // the parent of a clone) and reported "installation complete" — the
-      // bot then crashed on the very first launch with this exact error,
-      // deep inside DiscordCopilotApp.start(), long after setup.mjs had
-      // already exited 0. The installer and the runtime must reject the
-      // same CONTROLLED_REPO_PATH, or "installed successfully" is a lie.
-      if (!fs.existsSync(path.join(val, ".git"))) {
-        err(t("errRepoNotGit", lang) + val);
+      const repoErr = checkControlledRepoShape(val, lang);
+      if (repoErr) {
+        err(repoErr);
         continue;
       }
     }
     return val;
   }
+}
+
+/**
+ * Localizing wrapper over controlledRepoProblem() (scripts/lib/setup-core.mjs,
+ * where the rules live and are unit-tested against the real
+ * resolveControlledRepo). Returns a localized error string, or null when the
+ * path is acceptable.
+ */
+function checkControlledRepoShape(val, lang) {
+  const problem = controlledRepoProblem(val, fs, path);
+  if (problem === "notAbsolute") return t("errRepoNotAbsolute", lang) + val;
+  if (problem === "missing") return t("errRepoMissing", lang) + val;
+  if (problem === "notGit") return t("errRepoNotGit", lang) + val;
+  return null;
+}
+
+/**
+ * Thin wrapper over livePidFromLock() (scripts/lib/setup-core.mjs, where the
+ * logic lives and is unit-tested) resolving this instance's lock path.
+ */
+function runningInstancePid() {
+  return livePidFromLock(path.join(STATE_DIR, `${instanceId()}.lock`), fs, process.kill.bind(process));
 }
 
 function previewMasked(values, lang) {

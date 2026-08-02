@@ -66,7 +66,10 @@ const MESSAGES = {
     errSnowflake: "必須是 Discord 雪花 ID（5–25 位數字）。",
     errUserIds: "必須是逗號分隔的雪花 ID，至少一個。",
     errRepoMissing: "路徑不存在或不是資料夾：",
+    errRepoNotAbsolute: "必須是絕對路徑（例如 C:\\Users\\你\\my-repo），不能用相對路徑：",
     errRepoNotGit: "這個路徑存在，但不是 git repo 的根目錄（沒有 .git；例如放了好幾個 repo 的上層資料夾就不算）：",
+    errBotRunning:
+      "bot 正在執行中，無法安裝（npm 會需要覆寫它正在使用的檔案）。請先執行 ./stop-bot.ps1（或 ./stop-bot.sh）再重跑安裝器。執行中的 PID：",
     errContextTier: "只能是 default 或 long_context。",
     repoLabWarn: "提醒：這個 repo 會被 agent 直接修改，請確定它是可拋棄的。",
     writingEnv: "寫入 .env…",
@@ -131,7 +134,10 @@ const MESSAGES = {
     errSnowflake: "Must be a Discord snowflake id (5–25 digits).",
     errUserIds: "Must be comma-separated snowflake ids, at least one.",
     errRepoMissing: "Path does not exist or is not a directory: ",
+    errRepoNotAbsolute: "Must be an absolute path (e.g. /home/you/my-repo or C:\\Users\\you\\my-repo), not a relative one: ",
     errRepoNotGit: "This path exists but is not the root of a git repo (no .git — e.g. a parent folder containing several repos does not count): ",
+    errBotRunning:
+      "The bot is running, so this install cannot proceed (npm would have to overwrite files it holds open). Run ./stop-bot.sh (or ./stop-bot.ps1) first, then re-run the installer. Running PID: ",
     errContextTier: "Must be 'default' or 'long_context'.",
     repoLabWarn: "Note: the agent edits this repo directly — make sure it's disposable.",
     writingEnv: "Writing .env…",

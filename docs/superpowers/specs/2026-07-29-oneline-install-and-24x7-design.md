@@ -239,6 +239,64 @@ so 24/7 is offered there.
 The existing option is relabelled "auto-start + keepalive **while logged in**";
 only the new one is called 24/7.
 
+### 4a. "Installed successfully" must mean the bot can actually start (2026-08-03)
+
+The installer reported `✅ 安裝完成` for a config the RUNTIME refuses, and the
+bot then died on its very first launch. Reported as "`/new` says *The
+application did not respond*" — misleading, because the slash command was still
+registered in Discord from an earlier successful run, so the UI looked healthy
+while no process was alive to answer it.
+
+**Root cause.** `CONTROLLED_REPO_PATH` was a folder that merely *contains*
+several repos (the parent of a clone). The installer only checked "exists and is
+a directory"; `src/core/repo.ts`'s `resolveControlledRepo()` additionally
+requires a `.git` entry (a git working-tree ROOT) and an ABSOLUTE path, and it
+runs inside `DiscordCopilotApp.start()` — long after `setup.mjs` exited 0.
+`parseConfig()`'s zod schema could not have caught it either: it deliberately
+does no filesystem I/O, which is exactly why `resolveControlledRepo` is a
+separate runtime step.
+
+**Fix, in three layers** (fast feedback without a second source of truth):
+1. `controlledRepoProblem()` in `scripts/lib/setup-core.mjs` — a pure mirror of
+   the filesystem rules, returning a reason CODE (`notAbsolute` / `missing` /
+   `notGit`) so it stays i18n-free. Used by the interactive prompt (re-ask
+   immediately) and unconditionally before npm (fail in seconds, not after a
+   multi-minute build). Runs for `--yes` too, where the prompt loop never
+   executes at all and a stale bad value in an existing `.env` would otherwise
+   sail straight through.
+2. **The authoritative check**: after the build, `setup.mjs` imports
+   `resolveControlledRepo` from `dist/` and calls it. Not a copy of the rules —
+   the same code the bot runs. It can only live here because `dist/` does not
+   exist until the build.
+3. `test/setup-core.test.ts` pins (1) to (2) with a contract test, the same way
+   `test/config-contract.test.ts` pins `validate.mjs` to the zod schema.
+
+That contract test immediately earned its place: the first version of the mirror
+omitted the absoluteness rule and accepted `.`, which the runtime rejects. Every
+case in the suite used an absolute `mkdtemp` path, so the corpus now pins
+relative paths explicitly. **A mirror nobody checks is how they drift.**
+
+Two adjacent defects the same investigation surfaced:
+
+- **`run-bot.ps1` hid the reason.** `Start-Process` splits stdout and stderr
+  into `run-bot.<instance>.log` and `<...>.log.err`, but only the
+  crash-within-2-seconds branch mentioned the `.err` file. This crash happened
+  *after* that window, so the operator saw `已啟動 (PID …)` — a success message
+  — while the actual error sat in a file nobody was told existed. The success
+  path now names it too. `run-bot.sh` needs no equivalent change: bash's
+  `>>"$LOG" 2>&1` already merges both streams into one file.
+- **Reinstalling over a running bot failed cryptically.** npm must replace files
+  in `node_modules` that the live process holds open; on Windows that is
+  `EPERM … unlink …copilot-win32-x64/prebuilds/win32-x64/runtime.node`, which
+  reads like an antivirus or permissions problem and names nothing useful. Since
+  re-running the installer to FIX a bad config is precisely when the bot is
+  most likely to be running, `setup.mjs` now refuses up front with the PID and
+  the exact command to run, reading the app's OWN lock
+  (`~/.discord-copilot-sdk/<instance>.lock`) rather than inventing a second
+  source of truth. It **fails open** on a missing/garbage/stale lock — a crashed
+  process must not block installs forever, which is the worse bug of the two.
+
+
 ### 5. Testability
 
 `buildWindowsRegisterScript(opts)` becomes pure (options in, script text out) so
