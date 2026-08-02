@@ -334,6 +334,25 @@ async function main() {
     throw new SetupError(t("missingRequiredNonInteractive", lang) + missingRequired);
   }
 
+  // 4b) CONTROLLED_REPO_PATH must be a git working-tree root — checked
+  // UNCONDITIONALLY (interactive AND --yes), unlike the promptField check
+  // above. This is deliberately NOT folded into validateConfig()/MANAGED_KEYS:
+  // that function is the config CONTRACT with the runtime zod schema
+  // (test/config-contract.test.ts asserts they accept/reject identically),
+  // and parseConfig() intentionally does no filesystem I/O — the equivalent
+  // real check (src/core/repo.ts's resolveControlledRepo) is ALSO a separate
+  // runtime step, called only once DiscordCopilotApp.start() actually runs.
+  // Without this, a --yes install (or an interactive one that kept an
+  // already-bad EXISTING .env value, which skips promptField entirely under
+  // --yes) reports "installation complete" and the bot then crashes on the
+  // very first launch, deep inside start(), long after setup.mjs exited 0.
+  if (!fs.existsSync(values.CONTROLLED_REPO_PATH) || !fs.statSync(values.CONTROLLED_REPO_PATH).isDirectory()) {
+    throw new SetupError(t("errRepoMissing", lang) + values.CONTROLLED_REPO_PATH);
+  }
+  if (!fs.existsSync(path.join(values.CONTROLLED_REPO_PATH, ".git"))) {
+    throw new SetupError(t("errRepoNotGit", lang) + values.CONTROLLED_REPO_PATH);
+  }
+
   // 5) Compute the merged .env in memory.
   const exampleText = fs.existsSync(EXAMPLE_PATH) ? fs.readFileSync(EXAMPLE_PATH, "utf8") : "";
   const baseText = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : exampleText;
@@ -450,6 +469,19 @@ async function promptField(spec, cur, lang) {
     if (spec.key === "CONTROLLED_REPO_PATH" && val !== "") {
       if (!fs.existsSync(val) || !fs.statSync(val).isDirectory()) {
         err(t("errRepoMissing", lang) + val);
+        continue;
+      }
+      // Mirrors src/core/repo.ts's resolveControlledRepo() EXACTLY (a git
+      // working-tree root has a `.git` entry — dir for a normal clone, file
+      // for a worktree). Without this, the installer accepted ANY existing
+      // directory (e.g. a folder that merely CONTAINS several repos, like
+      // the parent of a clone) and reported "installation complete" — the
+      // bot then crashed on the very first launch with this exact error,
+      // deep inside DiscordCopilotApp.start(), long after setup.mjs had
+      // already exited 0. The installer and the runtime must reject the
+      // same CONTROLLED_REPO_PATH, or "installed successfully" is a lie.
+      if (!fs.existsSync(path.join(val, ".git"))) {
+        err(t("errRepoNotGit", lang) + val);
         continue;
       }
     }

@@ -15,17 +15,24 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REAL_SCRIPTS = path.join(HERE, "..", "scripts");
 const isWin = process.platform === "win32";
 
-const VALID_ENV = [
-  "DISCORD_BOT_TOKEN=tok_UNIQUE_SENTINEL_do_not_leak_9f3c",
-  "DISCORD_ALLOWED_USER_IDS=123456789012345678",
-  "DISCORD_GUILD_ID=234567890123456789",
-  "DISCORD_PARENT_CHANNEL_ID=345678901234567890",
-  "CONTROLLED_REPO_PATH=/tmp/discord-copilot-sdk-fixture-repo",
-  "DEV_GUILD_ID=",
-  "DEFAULT_MODEL=claude-sonnet-5",
-  "DEFAULT_CONTEXT_TIER=default",
-  "",
-].join("\n");
+// CONTROLLED_REPO_PATH is filled in per-fixture (see makeFixture) — it must be a
+// REAL directory with a `.git` entry, because setup.mjs now enforces that
+// unconditionally (interactive AND --yes), mirroring src/core/repo.ts's
+// resolveControlledRepo(). A placeholder like `/tmp/does-not-exist` would fail
+// every one of these "valid config" cases.
+function validEnv(controlledRepoPath) {
+  return [
+    "DISCORD_BOT_TOKEN=tok_UNIQUE_SENTINEL_do_not_leak_9f3c",
+    "DISCORD_ALLOWED_USER_IDS=123456789012345678",
+    "DISCORD_GUILD_ID=234567890123456789",
+    "DISCORD_PARENT_CHANNEL_ID=345678901234567890",
+    `CONTROLLED_REPO_PATH=${controlledRepoPath}`,
+    "DEV_GUILD_ID=",
+    "DEFAULT_MODEL=claude-sonnet-5",
+    "DEFAULT_CONTEXT_TIER=default",
+    "",
+  ].join("\n");
+}
 
 let root; // temp fixture root
 let binDir; // stub-bin prepended to PATH
@@ -35,7 +42,18 @@ function makeFixture(withEnv) {
   fs.cpSync(REAL_SCRIPTS, path.join(repo, "scripts"), { recursive: true });
   fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version: "0.0.0" }));
   fs.writeFileSync(path.join(repo, ".env.example"), "DISCORD_BOT_TOKEN=\nDEV_GUILD_ID=\n");
-  if (withEnv) fs.writeFileSync(path.join(repo, ".env"), VALID_ENV);
+  if (withEnv) {
+    // A separate directory from the fixture root itself, so it can't be
+    // confused with the "is THIS a discord-copilot-sdk checkout" guard —
+    // just a disposable git working-tree root, exactly what CONTROLLED_REPO_PATH
+    // is supposed to point at. An empty `.git` marker is enough: setup.mjs's
+    // check (mirroring resolveControlledRepo) only tests for the entry's
+    // existence, not that it's a fully functional repository. Nested inside
+    // `repo` so the caller's single rmSync(repo) cleans it up too.
+    const controlledRepo = path.join(repo, "controlled-repo");
+    fs.mkdirSync(path.join(controlledRepo, ".git"), { recursive: true });
+    fs.writeFileSync(path.join(repo, ".env"), validEnv(controlledRepo));
+  }
   return repo;
 }
 
@@ -126,6 +144,33 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       expect(r.status).toBe(0);
       expect(out).toContain("token 已遮蔽"); // zh preview header
       expect(out).not.toContain("tok_UNIQUE_SENTINEL_do_not_leak_9f3c");
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("FAIL-CLOSED: CONTROLLED_REPO_PATH that exists but isn't a git repo root is rejected, even under --yes", () => {
+    // Regression test for a REAL production bug: an installer that only checked
+    // "exists and is a directory" (not ".git present") happily wrote this to
+    // .env and reported success, and the bot then crashed on its very first
+    // launch inside DiscordCopilotApp.start() -> resolveControlledRepo(). This
+    // must be caught even under --yes, where promptField() (the interactive
+    // prompt loop) never runs at all — a plain directory that merely CONTAINS
+    // several repos (exactly what happened in the wild) is the case that
+    // matters most, so that's what this asserts, not just "path missing".
+    const repo = makeFixture(true);
+    try {
+      const notARepo = path.join(repo, "just-a-plain-folder");
+      fs.mkdirSync(notARepo);
+      const env = fs.readFileSync(path.join(repo, ".env"), "utf8").replace(/CONTROLLED_REPO_PATH=.*/, `CONTROLLED_REPO_PATH=${notARepo}`);
+      fs.writeFileSync(path.join(repo, ".env"), env);
+      const r = runSetup(repo, ["--dry-run", "--yes", "--skip-auth", "--lang", "en"]);
+      expect(r.error).toBeUndefined();
+      expect(r.signal).toBeNull();
+      expect(r.status).toBe(1);
+      const out = (r.stdout || "") + (r.stderr || "");
+      expect(out).toMatch(/not the root of a git repo|not a git working-tree root/i);
+      expect(out).toContain(notARepo);
     } finally {
       fs.rmSync(repo, { recursive: true, force: true });
     }

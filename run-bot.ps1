@@ -64,6 +64,14 @@ try {
       throw 'bot exited immediately'
     }
     Write-Host "已啟動 (PID $($p.Id))。記錄 / Log: $log"
+    # Startup errors that surface AFTER this 2-second check (this project's own
+    # discord-copilot-sdk repo hit exactly this: a bad CONTROLLED_REPO_PATH
+    # crashed the process about a minute in, well past this check) land in
+    # $log.err, not $log — Start-Process keeps them in separate files. Without
+    # mentioning it here, "already started" looks like success forever while
+    # the actual reason a later crash happened sits in a file nobody thinks to
+    # open.
+    Write-Host "（如果稍後沒反應，請看錯誤記錄 / if it stops responding later, check the error log: $log.err）"
     Write-Host '停止 / Stop: ./stop-bot.ps1'
   }
 }
