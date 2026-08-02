@@ -54,12 +54,42 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "22.12"
-      # Bash syntax check for the POSIX installer/bootstraps.
-      - run: bash -n install.sh
+      # Bash syntax check for every shipped POSIX bootstrap/installer script.
+      - name: bash -n on every shipped .sh
+        run: |
+          for f in install.sh get.sh run-bot.sh stop-bot.sh uninstall.sh; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
       # Node syntax check for the installer engine + its pure libs.
       - run: |
           for f in scripts/setup.mjs scripts/lib/*.mjs; do
             echo "node --check $f"
             node --check "$f"
           done
+      # PowerShell parse check for every shipped .ps1, reproducing exactly how
+      # `irm | iex` / `[scriptblock]::Create()` see these files over the
+      # network: Invoke-RestMethod does NOT strip the UTF-8 BOM these files
+      # ship with (neither on PowerShell 5.1 nor 7), so decoding with the BOM
+      # preserved, trimming it, then parsing is what actually has to succeed.
+      # Before this step NOTHING here ever parsed a single .ps1 — which is
+      # exactly how get.ps1's leading BOM broke the documented one-liner
+      # (`#Requires`/`param` failed to parse) without failing any CI check.
+      - name: PowerShell parse check (simulates irm, BOM preserved then trimmed)
+        shell: pwsh
+        run: |
+          $files = 'install.ps1', 'get.ps1', 'run-bot.ps1', 'stop-bot.ps1', 'uninstall.ps1'
+          $failed = $false
+          foreach ($f in $files) {
+            $bytes = [System.IO.File]::ReadAllBytes($f)
+            $text = [System.Text.Encoding]::UTF8.GetString($bytes)  # keeps the BOM as U+FEFF, matching Invoke-RestMethod
+            try {
+              [scriptblock]::Create($text.TrimStart([char]0xFEFF)) | Out-Null
+              Write-Host "OK: $f"
+            } catch {
+              Write-Host "FAIL: $f -- $($_.Exception.Message)"
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
 

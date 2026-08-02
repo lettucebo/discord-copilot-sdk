@@ -32,14 +32,14 @@ No clone needed — this ensures git, fetches the source, and drops you into the
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1 | iex
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1).TrimStart([char]0xFEFF)))
 ```
 
-> ⚠️ 上面的 `| iex` 形式**無法帶旗標**（`Invoke-Expression` 在呼叫者的作用域求值，頂層 `param()` 會退化成變數宣告）。要帶旗標請用 scriptblock 形式：
-> ⚠️ The `| iex` form **cannot take flags** (`Invoke-Expression` evaluates in the caller's scope, where a top-level `param()` degenerates into variable declarations). For flags, use the scriptblock form:
+> ⚠️ **不要用 `irm ... | iex`** —— `get.ps1` 帶 UTF-8 BOM（PowerShell 5.1 從磁碟執行時需要它），而 `Invoke-RestMethod` 在 PowerShell 5.1 **與** 7 都不會從回應內容去除這個 BOM。`iex`／`[scriptblock]::Create()` 解析的是字串而非檔案，未去除的 BOM 會黏在 `#Requires` 上，直接讓腳本解析失敗（兩行紅字錯誤）。加上 `iex` 本身在呼叫者的作用域求值，頂層 `param()` 會退化成變數宣告，也完全無法帶旗標——所以上面這個「去 BOM 再用 scriptblock 呼叫」的形式是唯一支援的用法，帶旗標一樣可以：
+> ⚠️ **Do not use `irm ... | iex`.** `get.ps1` ships with a UTF-8 BOM (PowerShell 5.1 needs it to parse the file from disk), and `Invoke-RestMethod` does **not** strip that BOM from the response body on **either** PowerShell 5.1 or 7. `iex` / `[scriptblock]::Create()` parse a raw string, not a file, so the untrimmed BOM lands on the `#Requires` token and the script fails to parse outright (two red errors). `iex` also evaluates in the caller's scope, where a top-level `param()` degenerates into variable declarations, so it cannot take flags either way. The form above — strip the BOM, then invoke the scriptblock — is the only supported form, and it takes flags fine:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1))) -Residency24x7
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1).TrimStart([char]0xFEFF))) -Residency24x7
 ```
 
 ### macOS / Linux (bash)
@@ -68,10 +68,35 @@ If you fork this privately, `raw.githubusercontent.com` returns 404 — use `gh`
 gh api repos/<owner>/discord-copilot-sdk/contents/get.sh -H "Accept: application/vnd.github.raw" | bash
 ```
 
-> PowerShell 7 不會從原生命令輸出中去除 BOM，所以 `gh` 形式需要 `.TrimStart([char]0xFEFF)`；`get.ps1` 帶 BOM 是因為從磁碟執行時 PowerShell 5.1 需要它。
-> PowerShell 7 does not strip a BOM from native-command output, hence the `.TrimStart([char]0xFEFF)`; `get.ps1` carries a BOM because PowerShell 5.1 needs one when the file is run from disk.
+> PowerShell 5.1 與 7 都不會從原生命令輸出中去除 BOM，所以不管是 `irm` 還是 `gh` 形式都需要 `.TrimStart([char]0xFEFF)`；`get.ps1` 帶 BOM 是因為從磁碟執行時 PowerShell 5.1 需要它。
+> Neither PowerShell 5.1 nor 7 strips a BOM from native-command output, so both the `irm` and the `gh` form need `.TrimStart([char]0xFEFF)`; `get.ps1` carries a BOM because PowerShell 5.1 needs one when the file is run from disk.
 
-可用環境變數 / Env overrides：`DISCORD_COPILOT_SDK_DIR`（安裝位置，預設 `~/discord-copilot-sdk`）、`DISCORD_COPILOT_SDK_REF`（分支或標籤，預設 `main`）。
+可用環境變數 / Env overrides：`DISCORD_COPILOT_SDK_DIR`（安裝位置，預設 `~/discord-copilot-sdk`）、`DISCORD_COPILOT_SDK_REF`（分支或標籤，預設 `main`）。也可以用 `-Dir <path>` / `--dir <path>` 在指令上直接指定安裝位置。
+Env overrides: `DISCORD_COPILOT_SDK_DIR` (install location, default `~/discord-copilot-sdk`), `DISCORD_COPILOT_SDK_REF` (branch/tag, default `main`). You can also pass `-Dir <path>` / `--dir <path>` on the command line to set it directly.
+
+### 資料夾選擇 / Folder selection
+
+沒有指定 `-Dir`／`--dir`／環境變數時，且終端機是互動式的（沒有加 `-Yes`／`--yes`／`-y`），啟動器會偵測**目前目錄（或其上層）是否已經是本專案的 checkout**，並顯示選單：
+
+```
+[1] 使用現有的 <你目前的 checkout 路徑>（預設，不會更新）
+[2] 安裝到 <預設路徑>
+[3] 自訂路徑
+```
+
+Without `-Dir`/`--dir`/the env var, and in an interactive terminal (no `-Yes`/`--yes`/`-y`), the bootstrapper detects whether your **current directory (or an ancestor) is already a checkout of this repo** and shows a menu:
+
+```
+[1] Use existing <path to your current checkout> (default, not updated)
+[2] Install to <default path>
+[3] Custom path
+```
+
+> ⚠️ **選 [1] 絕對不會 fetch 或 checkout** —— 直接原封不動用你現有的 checkout 交給安裝器，避免把你正在開發用的分支（例如 `main`）意外變成 detached HEAD。只有預設路徑／自訂路徑（選項 [2]、[3]，或 `-Dir`／環境變數）才會用「已存在就 fetch + 切到最新」的方式更新 —— 這些是啟動器自己管理的安裝目錄，不是你的工作副本。
+> ⚠️ **Choosing [1] never fetches or checks out** — it hands your existing checkout to the installer exactly as it stands, so it can never accidentally detach HEAD off a branch you're actively developing on (e.g. `main`). Only the default/custom-path options ([2], [3], or `-Dir`/the env var) update via "fetch + checkout latest if already present" — those are directories the bootstrapper itself manages, not your working copy.
+
+非互動執行（`-Yes`／`--yes`／`-y`，或沒有終端機，例如 CI）**不會偵測、不會提示**，一律用預設路徑，行為不隨你執行時所在的目錄改變。
+A non-interactive run (`-Yes`/`--yes`/`-y`, or no tty — e.g. CI) **never detects or prompts** — it always uses the default path, so scripted invocations behave the same regardless of the caller's cwd.
 
 > 目錄已存在且是本專案 → 自動更新；已存在但**不是**本專案且非空 → 拒絕覆蓋。
 > Existing checkout → updated in place; a non-empty directory that isn't ours → refused, never overwritten.

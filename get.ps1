@@ -4,24 +4,46 @@
 
   Run WITHOUT cloning first (note: NOT `| iex` — Invoke-Expression evaluates in
   the caller's scope, where this file's top-level param() degenerates into
-  variable declarations):
-    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1)))
+  variable declarations, AND it cannot take flags at all). This file ships with
+  a UTF-8 BOM (required so PowerShell 5.1 parses the bilingual strings when run
+  from disk — see shipped-scripts.test.ts), but `Invoke-RestMethod` does NOT
+  strip that BOM from the response body on EITHER PowerShell 5.1 or 7, and
+  `[scriptblock]::Create()` parses a raw string (not a file), so an untrimmed
+  BOM sits on the `#Requires` token and the script fails to parse. The
+  TrimStart is therefore mandatory, not just a private-fork/pwsh nicety:
+    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1).TrimStart([char]0xFEFF)))
 
-  From a PRIVATE repo (this one), and from PowerShell 7, the BOM must be trimmed
-  because pwsh does not strip it from native-command output:
-    & ([scriptblock]::Create(((gh api repos/lettucebo/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String).TrimStart([char]0xFEFF))))
+  From a private fork, replace the `irm` with `gh api` (uses your existing
+  GitHub login instead of the anonymous raw endpoint, which 404s on a private
+  repo); the same TrimStart still applies:
+    & ([scriptblock]::Create(((gh api repos/<owner>/discord-copilot-sdk/contents/get.ps1 -H "Accept: application/vnd.github.raw" | Out-String).TrimStart([char]0xFEFF))))
 
   Env overrides:
     DISCORD_COPILOT_SDK_DIR   target directory (default %USERPROFILE%\discord-copilot-sdk)
     DISCORD_COPILOT_SDK_REF   branch/tag to check out (default main)
 
-  Ensures git, clones (or fast-forwards) the repo, then hands off to the repo's
-  install.ps1 in a CHILD process (isolated session + ExecutionPolicy Bypass).
+  Ensures git, then either reuses an already-checked-out copy of this repo
+  as-is (no fetch, no checkout — never touches YOUR working tree's HEAD) or
+  clones/fast-forwards into the resolved target directory, then hands off to
+  the repo's install.ps1 in a CHILD process (isolated session + ExecutionPolicy
+  Bypass). See "folder resolution" below for how the target is chosen.
 
-  NOTE: this runs inside YOUR PowerShell session (iex). The whole body runs in an
+  NOTE: this runs inside YOUR PowerShell session. The whole body runs in an
   isolated child scope (& { ... }) so it does NOT leak variables/functions into
   your session, and it NEVER calls `exit` — that would close your window. Errors
   propagate as terminating errors instead.
+
+  Folder resolution (highest priority first):
+    1. -Dir <path> / DISCORD_COPILOT_SDK_DIR env var
+    2. Interactive: if the current directory (or an ancestor) is already a
+       discord-copilot-sdk checkout, offer to reuse it, install to the default,
+       or a custom path
+    3. Non-interactive (-Yes, or no TTY): default %USERPROFILE%\discord-copilot-sdk,
+       no prompt — so scripted/CI invocations never depend on the caller's cwd
+  Reusing an existing checkout NEVER fetches or checks out — it hands off to
+  that directory's install.ps1 exactly as it stands, because detaching HEAD on
+  a clone you are actively developing in would be a correctness bug, not a
+  convenience.
 #>
 param(
   # NOTE: no [ValidateSet] here. When this file is run as `irm ... | iex`,
@@ -72,15 +94,11 @@ param(
 
   $repoUrl = 'https://github.com/lettucebo/discord-copilot-sdk.git'
   $ref = if ($Ref) { $Ref } elseif ($env:DISCORD_COPILOT_SDK_REF) { $env:DISCORD_COPILOT_SDK_REF } else { 'main' }
-  $target = if ($Dir) { $Dir }
-  elseif ($env:DISCORD_COPILOT_SDK_DIR) { $env:DISCORD_COPILOT_SDK_DIR }
-  else { Join-Path $env:USERPROFILE 'discord-copilot-sdk' }
+  $norm = { param($u) ($u -replace '\.git$', '' -replace '/$', '').ToLowerInvariant() }
 
   Say 'discord-copilot-sdk 一鍵安裝（網路啟動器）' 'discord-copilot-sdk one-line bootstrap'
-  Say "  目標目錄：$target" "  Target: $target"
-  Say "  分支/標籤：$ref" "  Ref: $ref"
 
-  # --- git ---
+  # --- git --- (must run before folder detection below, which shells out to git)
   if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Say '找不到 git，嘗試用 winget 安裝…' 'git not found; installing with winget…'
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -94,13 +112,91 @@ param(
     }
   }
 
+  # Is the CURRENT directory (or an ancestor) already a checkout of THIS repo?
+  # Returns $null rather than throwing for "not a repo at all" / "no origin" /
+  # "origin is something else" — those are all just "no, nothing to detect".
+  function Find-ExistingCheckout {
+    $top = $null
+    try { $top = (& git rev-parse --show-toplevel 2>$null) } catch { return $null }
+    if ($LASTEXITCODE -ne 0 -or -not $top) { return $null }
+    $origin = (& git -C $top remote get-url origin 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $origin) { return $null }
+    if ((& $norm $origin) -ne (& $norm $repoUrl)) { return $null }
+    # git prints forward slashes even on Windows; normalize for display/Test-Path.
+    return ($top -replace '/', '\')
+  }
+
+  # A non-interactive run (scripted, CI, -Yes, no console) must behave the same
+  # regardless of the caller's cwd — so it never prompts and never auto-reuses
+  # a directory it merely happens to be standing in.
+  function Test-Interactive {
+    if ($Yes) { return $false }
+    try { return ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) }
+    catch { return $false }
+  }
+
+  # --- resolve target directory ---
+  # Priority: -Dir / env var > interactive chooser > non-interactive default.
+  # Only the interactive "reuse the checkout I'm standing in" choice sets
+  # $reuseAsIs — that is the ONE path that must never fetch/checkout (see below).
+  $reuseAsIs = $false
+  if ($Dir) {
+    $target = $Dir
+  }
+  elseif ($env:DISCORD_COPILOT_SDK_DIR) {
+    $target = $env:DISCORD_COPILOT_SDK_DIR
+  }
+  else {
+    $defaultTarget = Join-Path $env:USERPROFILE 'discord-copilot-sdk'
+    if (Test-Interactive) {
+      $existing = Find-ExistingCheckout
+      if ($existing) {
+        Say "找到現有的 checkout：$existing" "Found an existing checkout: $existing"
+        Say '  [1] 使用現有的（預設，不會更新）' '  [1] Use it as-is (default, not updated)'
+        Say "  [2] 安裝到 $defaultTarget" "  [2] Install to $defaultTarget"
+        Say '  [3] 自訂路徑' '  [3] Custom path'
+        $choice = Read-Host $(if ($zh) { '請選擇' } else { 'Choose' })
+        switch ($choice) {
+          '2' { $target = $defaultTarget }
+          '3' { $target = Read-Host $(if ($zh) { '請輸入路徑' } else { 'Enter path' }) }
+          default { $target = $existing; $reuseAsIs = $true }
+        }
+      }
+      else {
+        Say "  [1] 安裝到 $defaultTarget（預設）" "  [1] Install to $defaultTarget (default)"
+        Say '  [2] 自訂路徑' '  [2] Custom path'
+        $choice = Read-Host $(if ($zh) { '請選擇' } else { 'Choose' })
+        switch ($choice) {
+          '2' { $target = Read-Host $(if ($zh) { '請輸入路徑' } else { 'Enter path' }) }
+          default { $target = $defaultTarget }
+        }
+      }
+      if (-not $target) { throw 'A target directory is required.' }
+    }
+    else {
+      $target = $defaultTarget
+    }
+  }
+
+  Say "  目標目錄：$target" "  Target: $target"
+  Say "  分支/標籤：$ref" "  Ref: $ref"
+
   # --- clone or update ---
-  if (Test-Path (Join-Path $target '.git')) {
+  if ($reuseAsIs) {
+    # Chosen from the menu above: the user was already standing inside this
+    # checkout. Never fetch/checkout here — that would detach HEAD out from
+    # under a clone someone might be actively developing in (e.g. on `main`).
+    Say '使用你現有的 checkout（未更新）…' 'Using your existing checkout (not updated)…'
+  }
+  elseif (Test-Path (Join-Path $target '.git')) {
     # A directory being A git repo does not make it OUR git repo. Without this
     # check the update path would fetch from a STRANGER'S origin, detach their
     # HEAD onto it, and then hand off to whatever install.ps1 it found there.
+    # This branch is reached only for a bootstrap-MANAGED directory (the
+    # default, DISCORD_COPILOT_SDK_DIR, -Dir, or a menu-typed custom path) —
+    # never for the auto-detected "reuse as-is" choice above — so fetch +
+    # detach here is expected appliance-style behavior, not a surprise.
     $origin = (& git -C $target remote get-url origin 2>$null)
-    $norm = { param($u) ($u -replace '\.git$', '' -replace '/$', '').ToLowerInvariant() }
     if (-not $origin -or (& $norm $origin) -ne (& $norm $repoUrl)) {
       throw "$target is a git repo whose origin is '$origin', not $repoUrl. Set DISCORD_COPILOT_SDK_DIR to somewhere else."
     }

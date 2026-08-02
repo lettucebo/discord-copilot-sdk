@@ -117,16 +117,24 @@ Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-
 
 ## Quick start
 
-One line, no clone needed — ensures git, fetches the source, runs the bilingual
-wizard.
+One line, no clone needed — ensures git, fetches the source (or reuses an
+existing checkout, if you're already in one), runs the bilingual wizard.
 
 ```powershell
-irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1 | iex
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.ps1).TrimStart([char]0xFEFF)))
 ```
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/get.sh | bash
 ```
+
+> ⚠️ Do not use `irm ... | iex` on Windows — see [`INSTALL.md`](INSTALL.md) for why it fails outright and cannot take flags either way.
+
+Already sitting in a checkout of this repo? Running it interactively offers to
+reuse that directory as-is (never fetches/checks it out — no risk of detaching
+your `main`). Pass `-Dir <path>` / `--dir <path>`, or run non-interactively
+(`-Yes`/`--yes`), to skip the prompt. See the folder-selection section of
+[`INSTALL.md`](INSTALL.md) for details.
 
 Append `-Residency24x7` / `--residency-24x7` to also install **true 24/7**
 residency (starts at boot, no login required). On Windows that means the

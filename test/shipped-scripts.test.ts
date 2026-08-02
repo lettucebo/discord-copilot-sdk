@@ -77,6 +77,62 @@ describe("shipped scripts", () => {
     expect(install).toMatch(/gh api repos\/<owner>\/discord-copilot-sdk\/contents\/get\.ps1/);
   });
 
+  it("every documented get.ps1 command strips the BOM before scriptblock::Create, and never bare-pipes into iex", () => {
+    // Invoke-RestMethod does NOT strip the UTF-8 BOM get.ps1 ships with (on
+    // EITHER PowerShell 5.1 or 7). [scriptblock]::Create() parses a raw string,
+    // not a file, so an untrimmed BOM lands on the `#Requires` token and the
+    // whole script fails to parse. `irm ... | iex` cannot be fixed by trimming
+    // either — Invoke-Expression evaluates in the caller's scope, where a
+    // top-level param() degenerates into variable declarations, and it cannot
+    // take flags — so a bare `| iex` invocation must never be the documented
+    // form again.
+    const fence = /```powershell\r?\n([\s\S]*?)```/g;
+    for (const doc of ["README.md", "INSTALL.md"]) {
+      const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
+      const blocks = [...text.matchAll(fence)].map((m) => m[1] ?? "");
+      const getBlocks = blocks.filter((b) => b.includes("get.ps1"));
+      expect(getBlocks.length, `${doc} should have a powershell code block invoking get.ps1`).toBeGreaterThan(0);
+      for (const block of getBlocks) {
+        expect(block).toContain("TrimStart([char]0xFEFF)");
+        expect(block).not.toMatch(/\|\s*iex\b/);
+      }
+    }
+  });
+
+  describe("PowerShell parse check (network-BOM simulation)", { timeout: 60_000 }, () => {
+    it.each(USER_FACING_PS1)("%s parses via [scriptblock]::Create the way irm/iex sees it over the network", (name) => {
+      // Reproduces exactly how a networked `irm` response is consumed: read the
+      // raw bytes, decode as UTF-8 (this keeps the BOM as a leading U+FEFF
+      // character — Invoke-RestMethod does not strip it), trim it, then parse.
+      // Before this test (and the matching CI step in ci.yml's lint-scripts job)
+      // NOTHING ever parsed a shipped .ps1 at all, which is how get.ps1's BOM
+      // broke the documented one-liner without failing any check. A raised
+      // timeout matches this repo's convention for subprocess-heavy suites
+      // (app-reclaim, setup-integration, worktree-git) — spawning a real pwsh
+      // process per file is slow, especially under load.
+      let pwshOk = true;
+      try {
+        execFileSync("pwsh", ["-NoProfile", "-Command", "1"], { stdio: "ignore" });
+      } catch {
+        pwshOk = false;
+      }
+      if (!pwshOk) return; // authoritative guard is CI's pwsh step; skip if pwsh isn't installed locally
+
+      // pwsh's -Command treats everything after it as the script text (it does
+      // NOT expose further argv entries as $args), so the path is embedded
+      // directly — single-quoted and doubled per PowerShell's escaping rule.
+      const psPath = path.join(ROOT, name).replace(/'/g, "''");
+      const script = [
+        `$bytes = [System.IO.File]::ReadAllBytes('${psPath}')`,
+        "$text = [System.Text.Encoding]::UTF8.GetString($bytes)",
+        "[scriptblock]::Create($text.TrimStart([char]0xFEFF))",
+        "'PARSE OK'",
+      ].join("\n");
+      const out = execFileSync("pwsh", ["-NoProfile", "-Command", script], { encoding: "utf8" });
+      expect(out).toContain("PARSE OK");
+    });
+  });
+
   it("keeps real Discord snowflakes out of the tracked tree", () => {
     // A guild/channel id is only semi-sensitive, but a personal user id links a
     // GitHub identity to a Discord account permanently once this repo is public.

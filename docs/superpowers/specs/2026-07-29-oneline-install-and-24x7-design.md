@@ -92,6 +92,67 @@ modes are already known there:
 
 Env overrides: `DISCORD_COPILOT_SDK_DIR`, `DISCORD_COPILOT_SDK_REF`.
 
+> **⚠️ CORRECTION (2026-08-01, post-shipping bug report).** The line above —
+> "flags cannot be passed through a pipe, so the scriptblock form is
+> documented" — implied the scriptblock form was otherwise fine. It was not:
+> `get.ps1` ships with a UTF-8 BOM (required so PowerShell 5.1 parses the
+> bilingual strings when run from disk; enforced by
+> `test/shipped-scripts.test.ts`), and `Invoke-RestMethod` does **not** strip
+> that BOM from the response body on **either** PowerShell 5.1 or 7 — this was
+> verified empirically, not assumed. `iex` and `[scriptblock]::Create()` both
+> parse a raw **string**, not a file, so the untrimmed BOM sat on the
+> `#Requires` token and the whole script failed to parse (`#Requires`/`param`
+> both reported as unrecognized commands) — a real user hit this running the
+> exact command this doc recommended. The fix, documented in `README.md` /
+> `INSTALL.md` and baked into `get.ps1`'s own header comment, is
+> `.TrimStart([char]0xFEFF)` on the fetched string before
+> `[scriptblock]::Create()`. The bare `irm ... | iex` form is no longer
+> documented at all — even with the BOM fixed it still cannot take flags,
+> and a documented command that sometimes works is worse than one that is
+> simply not offered.
+>
+> **Why CI didn't catch it:** `lint-scripts` ran `bash -n install.sh` only —
+> no `.ps1` was ever parsed by anything. Fixed by adding a `pwsh` step that
+> decodes each shipped `.ps1` as `Invoke-RestMethod` actually would (BOM
+> preserved as a leading `U+FEFF`), trims it, and feeds it to
+> `[scriptblock]::Create()`; mirrored in `test/shipped-scripts.test.ts` (skips
+> locally if `pwsh` is absent — the authoritative guard is CI, which runs on
+> `ubuntu-latest` with `pwsh` preinstalled).
+
+### 1a. Folder selection (2026-08-01 addition)
+
+A second bug surfaced together with the BOM one: a user already standing
+inside a clone of this repo still got a fresh, separate clone under
+`~/discord-copilot-sdk`, because target resolution never looked at the
+current directory — only `-Dir`/`DISCORD_COPILOT_SDK_DIR`/the hardcoded
+default. That the BOM bug also silently swallowed `-Dir` (any flag, on any
+documented form) is exactly why nobody could work around it by hand either.
+
+**Resolution order** (`-Dir`/`--dir` and the env var keep top priority — no
+behavior change for anyone already scripting this):
+1. `-Dir` / `--dir` / `DISCORD_COPILOT_SDK_DIR`
+2. Interactive (a real tty, and not `-Yes`/`--yes`/`-y`): detect whether the
+   current directory or an ancestor is already a checkout of this repo (`git
+   rev-parse --show-toplevel` + `git remote get-url origin`, normalized the
+   same way the existing origin-mismatch guard already does) and offer a
+   menu: reuse it as-is (default), install to the default path, or a custom
+   path
+3. Non-interactive (`-Yes`/no tty, e.g. CI): always the hardcoded default,
+   no prompt — a scripted invocation must behave identically regardless of
+   the caller's cwd, otherwise the same automation run in two different
+   directories silently does two different things
+
+**The one hard rule:** reusing a checkout detected this way **never** fetches
+or checks out — it hands the directory to `install.ps1`/`install.sh` exactly
+as it stands. The existing "already present → fetch + detach HEAD" update
+path stays, but only for directories the bootstrapper itself manages (the
+default path, the env var, `-Dir`, or a menu-typed custom path) — never for
+the auto-detected "you're standing in it" choice. Detaching HEAD on a clone
+someone is actively developing on (e.g. sitting on `main` with local commits)
+would silence a correctness bug as a convenience feature. `get.sh`'s menu
+reads from `/dev/tty` for the same reason the existing installer handoff
+already does: its own stdin is the `curl` pipe.
+
 ### 2. `run-bot.*` / `stop-bot.*`
 
 Start the bot detached with the PATH/HOME fixes residency already needs, logging
