@@ -35,13 +35,30 @@ export function canonicalPath(p: string): string {
   return realpathSync.native(p);
 }
 
-/** Canonical name if the path exists, otherwise the resolved input. For
- *  comparisons that must not throw on a path that has been deleted. */
+/**
+ * Canonical name for a path that MAY NOT EXIST YET.
+ *
+ * Canonicalising only what exists is not enough. `provision()` asks whether
+ * `<reposRoot>/<new-name>` is inside `<reposRoot>` *before* creating it: the
+ * parent canonicalises to the OS's long form while the not-yet-existing child
+ * stays as written, and the containment test then says a path is outside the
+ * directory it is literally under. So walk up to the nearest ancestor that DOES
+ * exist, canonicalise that, and re-attach the remainder.
+ */
 export function canonicalPathOr(p: string): string {
-  try {
-    return realpathSync.native(p);
-  } catch {
-    return path.resolve(p);
+  const resolved = path.resolve(p);
+  const tail: string[] = [];
+  let cur = resolved;
+  for (;;) {
+    try {
+      const real = realpathSync.native(cur);
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return resolved; // reached the root; nothing exists
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
   }
 }
 

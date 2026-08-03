@@ -240,6 +240,18 @@ describe("canonicalPath (8.3 short names)", () => {
     const viaRoot = resolveRepoWithinRoot(root, "canon-me");
     expect(viaRoot).toBe(canonicalPath(repo));
   });
+
+  it("keeps containment true for a path that DOES NOT EXIST YET", () => {
+    // `/repo new` asks whether <root>/<name> is inside <root> BEFORE creating
+    // it. Canonicalising only the existing parent left the child spelled as
+    // written, and on a short-name path the two forms differ — so the check said
+    // a path was outside the directory it is literally under, and every
+    // /repo new and /repo clone failed. Walk up to the nearest existing
+    // ancestor instead.
+    const future = path.join(root, "not-created-yet");
+    expect(isStrictlyInside(future, root)).toBe(true);
+    expect(pathRelation(path.join(future, "deeper"), root)).toBe("a-inside-b");
+  });
 });
 
 describe("listRepos", () => {

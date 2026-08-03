@@ -8,6 +8,7 @@ import { DiscordCopilotApp, type Session } from "../src/app.js";
 import { SessionStore } from "../src/core/session-store.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { addWorktree } from "../src/core/worktree.js";
+import { canonicalPathOr } from "../src/core/repo.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Transport } from "../src/core/transport.js";
 import type { DevMode } from "../src/core/binding.js";
@@ -152,11 +153,12 @@ const sessions = (app: DiscordCopilotApp): Map<string, Session> =>
   (app as unknown as { sessions: Map<string, Session> }).sessions;
 const leases = (app: DiscordCopilotApp): Map<string, string> =>
   (app as unknown as { localLeases: Map<string, string> }).localLeases;
-/** Mirrors `DiscordCopilotApp.leaseKey`: case-folded on Windows ONLY, because on
- *  Linux two paths differing in case are different directories. Writing
- *  `.toLowerCase()` here made the assertions pass on Windows and fail on CI. */
+/** Mirrors `DiscordCopilotApp.leaseKey`: the SAME canonicaliser, case-folded on
+ *  Windows ONLY. Using `path.resolve().toLowerCase()` here made the assertions
+ *  pass locally and fail on CI twice — once for the case rule on Linux, once
+ *  because a short-name tmpdir canonicalises to a different string. */
 const leaseKeyOf = (p: string): string =>
-  process.platform === "win32" ? path.resolve(p).toLowerCase() : path.resolve(p);
+  process.platform === "win32" ? canonicalPathOr(p).toLowerCase() : canonicalPathOr(p);
 const applyRebind = (app: DiscordCopilotApp, target: { repoPath: string; devMode: DevMode }): Promise<string> =>
   (
     app as unknown as {
