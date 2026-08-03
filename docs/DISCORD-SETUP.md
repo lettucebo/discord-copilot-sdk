@@ -281,8 +281,8 @@ The second one is the point. Testing only the first proves it works, not that it
 
 **不要**兩台同時用同一個 token 跑。/ Do **not** run the same token on two machines at once.
 
-Bot 靠一個**本機** PID 鎖來避免重複啟動，它看不到別台機器（`src/core/single-instance.ts`）。實測：兩個實例同時連線時，`/new` 會被**其中一個**接走 —— 而且不是固定的哪一個（測兩次分別由不同實例處理）。由於每台機器有自己的 `CONTROLLED_REPO_PATH` 和自己的核准規則，你會無法預期指令到底跑在哪台機器、動到哪個 repo。
-The bot's single-instance guard is a **local** PID lock and cannot see other hosts (`src/core/single-instance.ts`). Verified: with two instances connected, `/new` is picked up by **one** of them — and not consistently the same one (two runs, two different winners). Since each machine has its own `CONTROLLED_REPO_PATH` and its own approval rules, you cannot predict which machine ran your command or which repo it touched.
+Bot 靠一個**本機** PID 鎖來避免重複啟動，它看不到別台機器（`src/core/single-instance.ts`）。實測：兩個實例同時連線時，`/new` 會被**其中一個**接走 —— 而且不是固定的哪一個（測兩次分別由不同實例處理）。由於每台機器有自己的 `REPOS_ROOT` 和自己的核准規則，你會無法預期指令到底跑在哪台機器、動到哪個 repo。
+The bot's single-instance guard is a **local** PID lock and cannot see other hosts (`src/core/single-instance.ts`). Verified: with two instances connected, `/new` is picked up by **one** of them — and not consistently the same one (two runs, two different winners). Since each machine has its own `REPOS_ROOT` and its own approval rules, you cannot predict which machine ran your command or which repo it touched.
 
 搬到新電腦的做法 / To move:
 
@@ -315,13 +315,28 @@ The bot's single-instance guard is a **local** PID lock and cannot see other hos
 `/end` 只有在 git 回報**乾淨**時才會移除 worktree（含被 `.gitignore` 忽略的檔案也算「有東西」）；有任何本地內容就保留並告訴你路徑 —— 沒提交的工作不該被順手刪掉。`/diff` 顯示的是**這個討論串自己的** worktree。
 `/end` removes the worktree **only when git reports it clean** (ignored files count as content too); anything local is kept and its path reported. `/diff` shows **this thread's own** worktree.
 
-### `SESSION_ISOLATION`
+### `/repo` — 每個討論串綁哪個 repo、怎麼開發 / which repo a thread works in, and how
 
-| 值 / Value | 行為 / Behaviour |
+| 指令 / Command | 作用 / What it does |
 | --- | --- |
-| （留空）/ unset | 自動：controlled repo 是 git repo → `worktree`，否則 `shared` / auto |
-| `worktree` | 強制隔離。若不是 git repo 則**拒絕啟動**（而不是默默降級）/ force isolation; **refuses to start** if impossible |
-| `shared` | 所有 session 共用同一個工作目錄 → **一次只有一個安全**，`/new` 會結束前一個（v1 行為）/ one shared checkout → only one is safe, `/new` ends the previous |
+| `/repo show` | 這個討論串綁的 repo、模式、分支與**完整工作目錄** / repo, mode, branch and full working directory |
+| `/repo list` | `REPOS_ROOT` 底下可用的 repo，並標出被 local 模式佔用的 / bindable repos, marking any held in local mode |
+| `/repo set <name>` | 改綁（輸入即搜尋）/ rebind this thread (type to search) |
+| `/repo dev <worktree\|local>` | 換開發模式 / switch dev mode |
+| `/repo clone <source> [name]` | clone 進 `REPOS_ROOT` 再綁定 / clone into `REPOS_ROOT`, then bind |
+| `/repo new <name>` | 在 `REPOS_ROOT` 建空 repo 再綁定 / create an empty repo there, then bind |
+
+**每個新 session 都有自己的 worktree。** `local`（agent 直接改 repo 本體）只能在該討論串用 `/repo dev local` 明確開啟；**沒有**任何設定鍵能把它變成預設，因為那等於讓之後每個討論串都在沒人決定的情況下直接動你的工作區。
+**Every new session gets its own worktree.** `local` — the agent editing the repo checkout directly — is reachable only through a per-thread `/repo dev local`. There is deliberately no config key that makes it the default: that would opt every future thread into editing your working copy without anyone deciding to.
+
+同一個 repo 同時只能有一個 **local** session（限**同一個 bot 行程**內；刻意跑兩個共用 `REPOS_ROOT` 的實例時互相看不到）。兩個 agent 改同一份 checkout 會互相靜默覆蓋，其中一個 `git checkout` 就會毀掉另一個未提交的工作 —— 所以第二個討論串會被直接拒絕，並告訴你是誰佔用中。worktree 模式沒有這個限制。
+At most **one live `local` session per repo**, within a single bot process (two instances deliberately sharing one `REPOS_ROOT` cannot see each other's leases): two agents in one checkout silently overwrite each other, and a `git checkout` in one destroys the other's uncommitted work. A second thread asking for the same repo is refused and told which thread holds it. Worktree sessions have no such limit.
+
+改綁會建立**新的** Copilot session（SDK 只在建立時接受工作目錄），因此**對話歷史會消失**；已經跑過回合的討論串會先要求按鈕確認。回合進行中一律拒絕改綁；目前 worktree 有未提交／未追蹤／被忽略的內容時也拒絕 —— 改綁後就沒有任何記錄指向那棵樹了。
+Rebinding builds a **new** Copilot session (the SDK fixes the working directory at creation), so the conversation history is lost and a thread that has already run a turn must confirm first. A rebind is refused while a turn is running, and while the current worktree holds uncommitted, untracked or ignored content — after a rebind nothing points at that tree any more.
+
+`/repo clone` 只走 `https`/`ssh`，預設只允許 `github.com`（`REPO_CLONE_HOST_POLICY=allowlist` 可指定其他主機），且一律拒絕 internal／loopback／metadata 位址。git 以 argv 陣列啟動（永不經 shell），關閉 `ext::`／`file::`／credential helper，並忽略你的 global git 與 ssh 設定 —— `url.<base>.insteadOf` 會改寫網址，ssh 的 `ProxyCommand` 會執行程式。刻意不提供「任意公開主機」選項：主機名稱無法證明 DNS 會指向哪裡。
+`/repo clone` fetches only over `https`/`ssh`, only from `github.com` unless `REPO_CLONE_HOST_POLICY=allowlist`, and never from an internal, loopback or metadata address. git runs with an argv array (never a shell), with `ext::`, `file::` and credential helpers disabled, and with your global git and ssh config ignored — `url.<base>.insteadOf` rewrites URLs and an ssh `ProxyCommand` runs a program. There is deliberately no "any public host" option: a hostname cannot prove where DNS will point.
 
 > agent 在 worktree 裡看到的是 repo 的完整內容（共用 git 物件），但只有自己的工作檔案。要把成果帶回主分支，就在該討論串裡請 agent commit，之後在主 repo `git merge copilot/t-<threadId>`。
 > Inside a worktree the agent sees the whole repo (shared git objects) but only its own working files. To land the work, ask the agent to commit in that thread, then `git merge copilot/t-<threadId>` in the main repo.

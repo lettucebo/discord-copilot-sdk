@@ -148,8 +148,11 @@ bash install.sh --skip-auth
 > 請**不要**用 `sudo` 執行安裝器（只有套件安裝會在需要時提權）。
 > Do **not** run the installer with `sudo` (only package installs elevate when needed).
 
-> ⚠️ **`CONTROLLED_REPO_PATH` 必須是「一個 git repo 的根目錄」的絕對路徑** —— 也就是那個資料夾底下要有 `.git`。放了好幾個 repo 的**上層資料夾不算**（例如填 `C:\Source\Repos` 而不是 `C:\Source\Repos\my-repo`），repo 的**子目錄也不算**。安裝器現在會當場擋下來；在此之前它會照樣寫入並回報「安裝完成」，然後 bot 一啟動就掛掉。還沒有可拋棄的 repo 就先建一個：`mkdir ~/copilot-sandbox && cd ~/copilot-sandbox && git init`。
-> ⚠️ **`CONTROLLED_REPO_PATH` must be an absolute path to the ROOT of a git repo** — the folder itself must contain `.git`. A parent folder holding several repos does **not** count (e.g. `C:\Source\Repos` instead of `C:\Source\Repos\my-repo`), and neither does a subdirectory of a repo. The installer now rejects these outright; before it would accept one, report "installation complete", and the bot would die on its first launch. No disposable repo yet? `mkdir ~/copilot-sandbox && cd ~/copilot-sandbox && git init`.
+> ⚠️ **`REPOS_ROOT` 必須是「裝著你各個 repo 的上層資料夾」的絕對路徑** —— 例如 `C:\Source\Repos`，而**不是** `C:\Source\Repos\my-repo`。這條規則和舊版的 `CONTROLLED_REPO_PATH` **正好相反**：那個要求你指向一個 repo，這個要求你指向裝著 repo 的那層。安裝器會擋下「這個路徑本身就是 git repo」的情況，因為那正是升級時最容易犯的錯（直接把舊值貼過來）。`REPOS_ROOT` 也不能和 `~/.discord-copilot-sdk` 互為上下層 —— 那會讓 agent 的工作目錄以核准規則的儲存位置為祖先。還沒有可拋棄的 repo 就先建一個：`mkdir -p ~/copilot-sandbox/demo && cd ~/copilot-sandbox/demo && git init`，然後填 `REPOS_ROOT=~/copilot-sandbox`。
+> ⚠️ **`REPOS_ROOT` must be an absolute path to the folder that CONTAINS your repos** — e.g. `C:\Source\Repos`, **not** `C:\Source\Repos\my-repo`. This is the exact INVERSE of the old `CONTROLLED_REPO_PATH` rule, which required a path that *was* a repo. The installer rejects a `REPOS_ROOT` that is itself a git repo, because pasting the old value straight in is the commonest upgrade mistake. It must also not contain, or sit inside, `~/.discord-copilot-sdk` — that would put every agent's working directory below the store holding your approval rules. No disposable repo yet? `mkdir -p ~/copilot-sandbox/demo && cd ~/copilot-sandbox/demo && git init`, then set `REPOS_ROOT=~/copilot-sandbox`.
+
+> 🔄 **從單一 repo 版本升級**：安裝器會自動轉換舊設定 —— `CONTROLLED_REPO_PATH=C:\Source\Repos\my-repo` 會變成 `REPOS_ROOT=C:\Source\Repos` 加 `DEFAULT_REPO=my-repo`，並把舊的那行從 `.env` 刪掉。舊的鍵留著不刪的話 bot 會拒絕啟動（它們過去定義的是安全邊界，語意已經改變，不能含糊帶過）。
+> 🔄 **Upgrading from the single-repo version**: the installer migrates for you — `CONTROLLED_REPO_PATH=C:\Source\Repos\my-repo` becomes `REPOS_ROOT=C:\Source\Repos` plus `DEFAULT_REPO=my-repo`, and the old line is deleted from `.env`. The bot refuses to start while a removed key is still set: those keys used to DEFINE the repo boundary, and its meaning has changed, so leaving them ambiguous is not an option.
 
 > 重跑安裝器前請先停掉 bot（`./stop-bot.ps1` / `./stop-bot.sh`）—— npm 需要覆寫執行中程序正在使用的檔案。安裝器會偵測到並直接告訴你，不會再丟出難懂的 `EPERM` 錯誤。
 > Stop the bot (`./stop-bot.ps1` / `./stop-bot.sh`) before re-running the installer — npm has to replace files a running process holds open. The installer detects this and says so, instead of failing with a cryptic `EPERM`.
@@ -175,14 +178,14 @@ The installer asks separately. **Login-keepalive is the default**; a password is
 
 **不是**因為 Copilot 無法用 token 認證 —— SDK 其實有 `gitHubToken` 選項，是這個 app 自己寫死了 `useLoggedInUser: true`（`src/copilot/sdk.ts`）。
 
-真正的原因是**檔案身分**：agent 會在 `CONTROLLED_REPO_PATH` 執行指令、改檔案，並在你家目錄下建立 git worktree。換一個帳號執行會把這些檔案的擁有者搞亂；用 SYSTEM 執行則等於讓任意指令以 SYSTEM 身分跑 —— 對一個「agent 以你的身分執行 shell 指令」的工具來說更糟。
+真正的原因是**檔案身分**：agent 會在 `REPOS_ROOT` 底下的 repo 執行指令、改檔案，並在你家目錄下建立 git worktree。換一個帳號執行會把這些檔案的擁有者搞亂；用 SYSTEM 執行則等於讓任意指令以 SYSTEM 身分跑 —— 對一個「agent 以你的身分執行 shell 指令」的工具來說更糟。
 
 Windows 要在**無人登入**時以某個使用者身分執行，就必須讓排程工作持有該帳號的密碼。這是 Windows 的規則，不是 Copilot 的限制。
 
 It is **not** because Copilot cannot authenticate with a token — the SDK does
 expose `gitHubToken`; this app hardcodes `useLoggedInUser: true`
 (`src/copilot/sdk.ts`). The real reason is **file ownership**: the agent runs
-commands and edits files in `CONTROLLED_REPO_PATH` and creates git worktrees
+commands and edits files in the repos under `REPOS_ROOT` and creates git worktrees
 under your home directory. Another account would scramble ownership across all of
 it, and SYSTEM would run arbitrary commands as SYSTEM — worse for a tool whose
 security note is "the agent runs shell commands as you". Running as a user with
@@ -286,7 +289,7 @@ In your Discord channel, run `/new` to start a session, or send a message to tes
 
 | 項目 | 原因 |
 | --- | --- |
-| 你的 `CONTROLLED_REPO_PATH` repo | 那是你的程式碼；這個工具只曾在裡面加 worktree 和分支 |
+| `REPOS_ROOT` 底下的每個 repo | 那是你的程式碼；這個工具只曾在裡面加 worktree 和分支 |
 | `~/.copilot` | Copilot CLI 的登入狀態屬於 CLI，不屬於這個工具 |
 | node / git / Copilot CLI | 只是前置需求，整台機器共用 |
 | Discord 應用程式本身 | 只有你能刪：<https://discord.com/developers/applications> |

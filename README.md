@@ -229,10 +229,42 @@ while the controlled repo stayed untouched.
 kept and its path reported: uncommitted work is not ours to discard. To land a
 session's work, ask it to commit, then `git merge copilot/t-<threadId>`.
 
-`SESSION_ISOLATION` overrides the default: `worktree` forces isolation (and
-**refuses to start** where it is impossible, rather than silently downgrading),
-`shared` puts every session in the one checkout — which is only safe one at a
-time, so `/new` then ends the previous session.
+## Repos and dev mode
+
+`REPOS_ROOT` is the folder that **contains** your repos (e.g. `C:\Source\Repos`);
+`DEFAULT_REPO` names the one `/new` binds to when you don't pass `repo:`.
+
+- `/repo show` — the repo, mode, branch and **full working directory** of this thread.
+- `/repo list` — every bindable repo, marking any held in `local` mode.
+- `/repo set <name>` — rebind this thread (type-to-search).
+- `/repo dev <worktree|local>` — where this session works.
+- `/repo clone <source> [name]` — clone into `REPOS_ROOT`, then bind.
+- `/repo new <name>` — create an empty repo there, then bind.
+
+**Every new session gets its own worktree.** `local` — the agent editing the repo
+checkout directly — is reachable only through `/repo dev local`, per thread. There
+is no config key that makes it the default, because that would opt every future
+thread into editing your working copy without anyone deciding to.
+
+At most **one live `local` session per repo** (per bot process). Two agents in one checkout silently
+overwrite each other, and a `git checkout` in one destroys the other's uncommitted
+work, so a second thread asking for the same repo is refused and told which thread
+holds it. Worktree sessions have no such limit — that is what they are for.
+
+Rebinding builds a **new** Copilot session, because the SDK fixes a session's
+working directory when it is created. The conversation history is therefore lost,
+so a thread that has already run a turn asks for confirmation first. A rebind is
+refused outright while a turn is running, and while the current worktree has
+uncommitted, untracked or ignored content — after a rebind nothing points at that
+tree any more, so orphaning it would put it beyond every command's reach.
+
+`/repo clone` only fetches over `https`/`ssh`, only from `github.com` unless you
+set `REPO_CLONE_HOST_POLICY=allowlist`, and never from an internal, loopback or
+metadata address. It runs git with an argv array (never a shell), with `ext::`,
+`file::` and credential helpers disabled, and with your global git and ssh config
+ignored — `url.<base>.insteadOf` can rewrite an allowed URL, and an ssh
+`ProxyCommand` can run a program. There is deliberately no "any public host"
+option: a hostname cannot prove where DNS will point.
 
 ## Steering and queueing
 

@@ -171,6 +171,13 @@ sentence describing the real behaviour or defect rather than the diff, e.g.
 
 ## Security context
 
-v1 is **lab-only**: tools run unsandboxed as the OS user that starts the bot, against
-`CONTROLLED_REPO_PATH`, using the host's logged-in Copilot. Treat the controlled repo as
-untrusted input to the agent, and never point a dev run at a repository you care about.
+v1 is **lab-only**: tools run unsandboxed as the OS user that starts the bot, against the
+repos under `REPOS_ROOT`, using the host's logged-in Copilot. Treat every bindable repo as
+untrusted input to the agent, and never point a dev run at repositories you care about.
+
+Multi-repo moved the boundary from one path to "anything under `REPOS_ROOT` that is a git
+working-tree root", so two rules carry the weight the old single path used to:
+`resolveReposRoot` (the root must be disjoint from the trust store in BOTH directions —
+`REPOS_ROOT=~` would make `~/.discord-copilot-sdk` bindable, `REPOS_ROOT=~/.discord-copilot-sdk/x`
+would put every agent's cwd under it) and `validateBinding` (git must PROVE a worktree
+belongs to the repo a record claims; a path prefix cannot, and a git failure is a refusal).

@@ -143,3 +143,76 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 - rd-plan（R1）→ 納入：broker、安全、擁有權/復原、測試、render、adapter、範圍、移植。
 - rd-plan2（R2）→ 納入：P1/P2 順序修正（handler 從第一 session 全註冊+fail-closed）、containment invariant、10 權限變體 fail-closed + resolvedByHook 防繞過、broker 明確狀態機、resume 持久化 fencing + 對帳表 + 生命週期、single-instance→P0、v1 最小化垂直切片。
 - 殘留非阻塞強化（記錄不做）：per-session microVM、hash-chained 稽核、TOTP、DLP 掃描（皆 defense-in-depth）。
+
+## 12. 多 repo + per-thread 開發模式（取代 §1「單一受控 repo」）
+
+### 12.1 動機
+單一 `CONTROLLED_REPO_PATH` 讓每個 thread 只能在同一個 repo 的 worktree 裡工作。實測痛點：
+使用者要求 clone 一個新專案，agent 只能把它放進自己的 worktree
+（`~/.discord-copilot-sdk-worktrees/<threadId>/career-ops`），而使用者期望的是
+`C:\Source\Repos\career-ops`。agent 當時的回答「我目前工作環境的根目錄是固定在 …(worktree)…，
+並非我這邊設定的通用根目錄」完全正確——那正是規格。
+
+### 12.2 決策
+1. **`CONTROLLED_REPO_PATH` → `REPOS_ROOT` + `DEFAULT_REPO`**（取代，非並存）。舊鍵存在即**啟動失敗**。
+   - 並存被否決：兩條邊界會讓 `bindingOk` 的前綴檢查長出多個 OR 分支，那是最不該複雜化的地方。
+   - `z.object()` 會忽略未知鍵，所以刪掉欄位**不等於**拒絕；需在 parse 前加 legacy-key 檢查。
+2. **新 session 一律 `worktree`**；`local` 只能逐 thread 用 `/repo dev local` 開啟。
+   - `DEFAULT_DEV_MODE` 被否決：一個讓所有新 thread 預設進 local 的設定鍵，就是這條決策要避免的東西。
+3. **改綁 = 新的 SDK session**（`workingDirectory` 是建立時設定，`reconfigure()` 改不了），
+   因此**對話歷史必然消失**；已跑過回合的 thread 要按鈕二次確認，沿用 `PendingInteractionBroker`。
+
+### 12.3 安全不變式
+- **S1 綁定必須被證明**：`validateBinding()` 用 `git rev-parse --git-common-dir` 嚴格確認 worktree
+  屬於記錄宣稱的 repo，並用 `--show-toplevel` 確認 local 模式的 repo 是它自己的 working-tree root
+  （`.git` 只是一個「條目」，`.git` **檔案**會指向別的 repo）。git 失敗 = 拒絕，不得 fallback
+  （`repoRoot()` 的寬鬆版因此不能當驗證器）。兩側都經 `realpath`，且探測環境會清掉
+  `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`——繼承這些變數的 git 回答的是別的 repo。
+  **`/new`、rebind、resume 三條路徑都會呼叫。**
+- **S2 雙向不相交**：`REPOS_ROOT` 不得包含、也不得被包含於 `stateDir()` / `worktreeRoot()`。
+  大小寫折疊**只在 Windows** 做（Linux 上兩個大小寫不同的路徑是不同目錄，CI 有跑 Ubuntu）。
+- **S3 local 租約**：同一 repo 同時只有一個 live local session（**同一個行程內**——見 12.5）。reconcile
+  **在任何 resume 之前**先掃描並取得租約，且 transient resume 失敗（記錄刻意留 `active`）時**不釋放**——
+  否則另一個 thread 會綁走同一 repo，下次重啟就有兩個 durable 主張者。租約在記錄轉為終局狀態
+  （`block` / `session-lost`）與 `reclaim()` 時釋放；`local-conflict` 無法持久化時**啟動失敗**，不得 fall through。
+- **S4 改綁前置**：回合進行中拒絕；目前 worktree 髒或 HEAD 非預期分支拒絕。檢查用新的**非破壞性**
+  `inspectWorktree()`——`removeWorktreeIfClean()` 判定乾淨時會直接刪除，不能當前置檢查。
+- **S5 autocomplete 過授權閘**，且必須用 `interaction.respond([])`（autocomplete 不可 `reply()`）。
+- **S6 clone fail-closed**：僅 `https`/`ssh`；拒 `ext::`（**真 RCE**：git `protocol.ext.allow` 預設
+  `user`）、`file:`、`http:`、`-` 開頭、控制字元、內嵌憑證、internal/loopback/metadata host；
+  argv 陣列啟動；隔離 ambient git/ssh 設定（`url.*.insteadOf`、`ProxyCommand`）。
+
+### 12.4 否決的方案與理由
+| 方案 | 否決理由 |
+|---|---|
+| `REPOS_ROOT` 與 `CONTROLLED_REPO_PATH` 並存 | 兩條安全邊界；`bindingOk` 複雜化；鍵名長期說謊 |
+| `DEFAULT_DEV_MODE` / `/new dev:` | 抵觸「local 需明確 opt-in」，只是把同一個風險延後 |
+| 扁平 worktree 佈局 `<root>/<threadId>` | `addWorktree` 會重用既有目錄 → 改綁 A→B 後「記錄寫 B、實際在 A 工作」。改為 `<repoHash>/<threadId>`；舊記錄沿用其路徑，不遷移 |
+| 「`REPOS_ROOT` 不得位於任何 git worktree 內」 | 過嚴且多餘。實測：內層有自己 `.git` 的 repo，`--show-toplevel` 回自己，外層不會贏；真正的危害（無 `.git` 的候選解析到外層）已由 binding gate 擋下。這條會誤擋「家目錄是 dotfiles repo」這個很常見的配置 |
+| 「任意公開主機」clone policy | 主機名稱無法證明 DNS 指向何處；DNS rebinding／重導向擋不住 |
+| 擴充 `Transport` 介面來發確認卡 | 那個 seam 是 **agent 觸發**的 UI；加方法會逼每個測試 fake 長出沒有 agent 會用到的東西。改用 `session.broker` + app 直接發按鈕 |
+| 「未綁定 session」狀態（`DEFAULT_REPO` 留空時） | 會多一個生命週期狀態要 reconcile，且確認機制依賴 `session.broker`。改為 `/new` 在**建立 thread 之前**就拒絕 |
+
+### 12.5 已接受的殘留風險
+- **S3 租約是行程內的**。`instanceId()` 允許同機多實例，各有自己的鎖檔；兩個實例共用同一個
+  `REPOS_ROOT` 時租約互不可見。**刻意不做跨行程 lock file**：`single-instance.ts` 已有 PID 鎖原語，
+  但推廣成「每個 canonical repo 一個租約檔」需處理 stale 偵測、crash 回收與跨平台語意，而觸發條件是
+  操作者刻意跑兩個共用 `REPOS_ROOT` 的實例——與既有的多主機限制同層級。README／DISCORD-SETUP
+  必須明說「同一行程內」（已加註）。
+- **TOCTOU**：SDK 的 `workingDirectory` 是字串；`realpath` 只能擋**靜態**的 junction／短檔名別名，
+  擋不掉建立 session 前一刻的目錄替換。`validateBinding` 已在 `/new`、rebind、resume 建立 actor
+  之前執行，但那仍是「檢查後使用」，不是原子操作。
+- **`/repo clone` 走 `gh` 時使用操作者已登入的 GitHub 憑證**，因此能 clone 私有 repo。與本工具
+  「以 OS 使用者身分執行、用已登入的 Copilot」的既有姿態一致，屬刻意決定。
+- **`allowlist` 仍無法防 DNS 解析到內網**（見 12.4 最後一列）。預設 `github` 不受影響。
+
+### 12.6 新增的測試對照
+| 不變式 | 測試 |
+|---|---|
+| S1 | `binding.test.ts`（真 git worktree，含「repo A 的 worktree 冒充 repo B」） |
+| S2 | `repo.test.ts`（雙向、`Repos-evil`、junction、Linux 大小寫、`C:foo`） |
+| S3 | `app-reconcile.test.ts`（`local-conflict` 阻擋 + 兩個 worktree 可共用 repo）、`app-rebind.test.ts`（租約轉移、離開 local 時釋放） |
+| 改綁交易性 | `app-rebind.test.ts`（前置條件、建立失敗完整回滾、並行改綁被拒、teardown 未確認時保留舊 worktree） |
+| S6 | `repo-provision.test.ts`（`ext::`、`file:`、`http:`、`-` 開頭、`169.254.169.254`、`localhost.`、`::ffff:127.0.0.1`、Windows 保留字） |
+| schema v3 遷移 | `session-store.test.ts`（三條規則 + 不再展開未驗證欄位） |
+| 安裝器契約（極性反轉） | `setup-core.test.ts`、`setup-integration.test.ts`、`config-contract.test.ts` |
