@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { pathRelation } from "./repo.js";
+import { canonicalPathOr, pathRelation } from "./repo.js";
 
 const run = promisify(execFile);
 
@@ -126,16 +126,12 @@ export async function repoRootStrict(dir: string): Promise<string> {
     cwd: dir,
     env: GIT_PROBE_ENV,
   });
-  // git prints forward slashes even on Windows; realpath normalises them AND
-  // resolves junctions, so two names for one directory compare equal.
+  // git prints forward slashes even on Windows; canonicalising normalises them,
+  // resolves junctions, AND expands 8.3 short names, so two OS-level names for
+  // one directory compare equal.
   const common = stdout.trim();
   if (!common) throw new Error(`git could not report a common dir for ${dir}`);
-  const root = path.resolve(path.dirname(common));
-  try {
-    return fs.realpathSync(root);
-  } catch {
-    return root;
-  }
+  return canonicalPathOr(path.dirname(common));
 }
 
 /**
@@ -154,12 +150,7 @@ export async function topLevelStrict(dir: string): Promise<string> {
   });
   const top = stdout.trim();
   if (!top) throw new Error(`git could not report a top level for ${dir}`);
-  const resolved = path.resolve(top);
-  try {
-    return fs.realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
+  return canonicalPathOr(top);
 }
 
 /**

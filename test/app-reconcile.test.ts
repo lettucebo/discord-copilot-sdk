@@ -8,8 +8,8 @@ import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
 import { rmSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
 
-const REPOS_ROOT = "C:\\Repos";
-const REPO = "C:\\Repos\\repo";
+const REPOS_ROOT = join(tmpdir(), "dcs-fixture-repos");
+const REPO = join(REPOS_ROOT, "repo");
 /** Where `bindingOk` requires a worktree-mode workDir to live. */
 const WT_ROOT = `${stateDir()}-worktrees`;
 const tmpFile = (): string => join(tmpdir(), `dp-reconcile-${Math.random()}.json`);
@@ -218,7 +218,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
-      store.reserve(bind({ repoPath: "C:\\different-repo" })); store.commit("t1");
+      store.reserve(bind({ repoPath: join(tmpdir(), "dcs-fixture-OTHER-root", "repo") })); store.commit("t1");
       const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
       let classifyCalls = 0;
       await reconcile(app, async () => {
@@ -398,7 +398,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
-      store.reserve(bind({ threadId: "t1", sessionId: "s-1", workDir: "C:\\somewhere\\else" }));
+      store.reserve(bind({ threadId: "t1", sessionId: "s-1", workDir: join(tmpdir(), "dcs-fixture-somewhere-else") }));
       store.commit("t1");
       const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "valid");

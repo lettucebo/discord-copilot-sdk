@@ -142,7 +142,7 @@ function harness(over: { devMode?: DevMode; repo?: string; hasRunTurn?: boolean;
   });
   store.commit("t1");
   sessions(app).set("t1", session);
-  if (devMode === "local") leases(app).set(repo.toLowerCase(), "t1");
+  if (devMode === "local") leases(app).set(leaseKeyOf(repo), "t1");
   // Bypass the git proof — see the file header.
   (app as unknown as { bindingCheck: unknown }).bindingCheck = async () => ({ ok: true });
   return { app, store, transport, actor };
@@ -152,6 +152,11 @@ const sessions = (app: DiscordCopilotApp): Map<string, Session> =>
   (app as unknown as { sessions: Map<string, Session> }).sessions;
 const leases = (app: DiscordCopilotApp): Map<string, string> =>
   (app as unknown as { localLeases: Map<string, string> }).localLeases;
+/** Mirrors `DiscordCopilotApp.leaseKey`: case-folded on Windows ONLY, because on
+ *  Linux two paths differing in case are different directories. Writing
+ *  `.toLowerCase()` here made the assertions pass on Windows and fail on CI. */
+const leaseKeyOf = (p: string): string =>
+  process.platform === "win32" ? path.resolve(p).toLowerCase() : path.resolve(p);
 const applyRebind = (app: DiscordCopilotApp, target: { repoPath: string; devMode: DevMode }): Promise<string> =>
   (
     app as unknown as {
@@ -218,7 +223,7 @@ describe("rebindBlocker — the preconditions that protect work", { timeout: 60_
 
   it("refuses a local target another thread already holds, naming that thread", async () => {
     const { app } = harness();
-    leases(app).set(repoB.toLowerCase(), "other-thread");
+    leases(app).set(leaseKeyOf(repoB), "other-thread");
     const msg = await blocker(app, sessions(app).get("t1")!, { repoPath: repoB, devMode: "local" });
     expect(msg).toMatch(/other-thread/);
     expect(msg).toMatch(/local/);
@@ -228,7 +233,7 @@ describe("rebindBlocker — the preconditions that protect work", { timeout: 60_
     // The lease exists because two agents cannot share ONE checkout. A worktree
     // is a different checkout, so the restriction must not leak onto it.
     const { app } = harness();
-    leases(app).set(repoB.toLowerCase(), "other-thread");
+    leases(app).set(leaseKeyOf(repoB), "other-thread");
     expect(await blocker(app, sessions(app).get("t1")!, { repoPath: repoB, devMode: "worktree" })).toBeUndefined();
   });
 });
@@ -241,14 +246,14 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     const { app } = harness({ devMode: "local", repo: repoA });
     const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
     expect(out).toMatch(/已改綁/);
-    expect(leases(app).get(repoA.toLowerCase())).toBeUndefined();
-    expect(leases(app).get(repoB.toLowerCase())).toBe("t1");
+    expect(leases(app).get(leaseKeyOf(repoA))).toBeUndefined();
+    expect(leases(app).get(leaseKeyOf(repoB))).toBe("t1");
   });
 
   it("releases the lease when leaving local mode", async () => {
     const { app } = harness({ devMode: "local", repo: repoA });
     await applyRebind(app, { repoPath: repoA, devMode: "worktree" });
-    expect(leases(app).get(repoA.toLowerCase())).toBeUndefined();
+    expect(leases(app).get(leaseKeyOf(repoA))).toBeUndefined();
   });
 
   it("refuses a SECOND concurrent rebind on the same thread", async () => {
@@ -290,7 +295,7 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     });
     store.commit("t1");
     sessions(app).set("t1", session);
-    leases(app).set(repoA.toLowerCase(), "t1");
+    leases(app).set(leaseKeyOf(repoA), "t1");
     (app as unknown as { bindingCheck: unknown }).bindingCheck = async () => ({ ok: true });
 
     const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
@@ -301,8 +306,8 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     expect(actor.disconnectCalls).toBe(0); // old runtime untouched
     expect(store.get("t1")?.repoPath).toBe(repoA); // record rolled back
     expect(store.get("t1")?.sessionId).toBe("s1");
-    expect(leases(app).get(repoA.toLowerCase())).toBe("t1"); // lease restored
-    expect(leases(app).get(repoB.toLowerCase())).toBeUndefined();
+    expect(leases(app).get(leaseKeyOf(repoA))).toBe("t1"); // lease restored
+    expect(leases(app).get(leaseKeyOf(repoB))).toBeUndefined();
   });
 
   it("refuses when the binding cannot be proved, and touches nothing", async () => {

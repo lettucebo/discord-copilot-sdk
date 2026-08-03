@@ -16,6 +16,35 @@ import { stateDir, worktreeRoot } from "./paths.js";
  * split tracked separately.
  */
 
+/**
+ * The OS's canonical name for an existing path. Throws if it does not exist.
+ *
+ * `realpathSync.native`, NOT `realpathSync`: only the native one expands Windows
+ * 8.3 short names. Measured on Windows —
+ * `realpathSync('C:\\PROGRA~1')` → `C:\PROGRA~1`,
+ * `realpathSync.native('C:\\PROGRA~1')` → `C:\Program Files`.
+ *
+ * That is not a curiosity. `os.tmpdir()` on a GitHub Windows runner is
+ * `C:\Users\RUNNER~1\...` while git reports `C:\Users\runneradmin\...` for the
+ * same directory, so a binding proof built on the plain version compares two
+ * names for one directory, finds them different, and refuses EVERY session on
+ * such a machine. CI caught exactly that; a dev box whose paths are all short
+ * enough never will.
+ */
+export function canonicalPath(p: string): string {
+  return realpathSync.native(p);
+}
+
+/** Canonical name if the path exists, otherwise the resolved input. For
+ *  comparisons that must not throw on a path that has been deleted. */
+export function canonicalPathOr(p: string): string {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
 /** How two paths relate, computed on canonicalised, OS-case-folded paths. */
 export type PathRelation = "same" | "a-inside-b" | "b-inside-a" | "disjoint";
 
@@ -143,7 +172,7 @@ export function resolveReposRoot(input: string, deps?: Partial<ReposRootDeps>): 
   if (!existsSync(input)) {
     throw new Error(`REPOS_ROOT does not exist: ${input}`);
   }
-  const real = realpathSync(input);
+  const real = canonicalPath(input);
   if (!statSync(real).isDirectory()) {
     throw new Error(`REPOS_ROOT is not a directory: ${real}`);
   }
@@ -210,7 +239,7 @@ export function resolveRepoWithinRoot(root: string, name: string): string {
   if (problem) throw new Error(`Invalid repo name \`${name}\`: ${problem}.`);
   let realRoot: string;
   try {
-    realRoot = realpathSync(root);
+    realRoot = canonicalPath(root);
   } catch {
     throw new Error(`REPOS_ROOT is not accessible: ${root}`);
   }
@@ -220,7 +249,7 @@ export function resolveRepoWithinRoot(root: string, name: string): string {
   }
   let real: string;
   try {
-    real = realpathSync(candidate);
+    real = canonicalPath(candidate);
   } catch {
     throw new Error(`Could not resolve \`${name}\` under REPOS_ROOT.`);
   }
@@ -255,7 +284,7 @@ export function resolveRepoWithinRoot(root: string, name: string): string {
 export function listRepos(root: string): string[] {
   let realRoot: string;
   try {
-    realRoot = realpathSync(root);
+    realRoot = canonicalPath(root);
   } catch {
     return [];
   }

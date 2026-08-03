@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync, readFileSync, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -11,6 +11,7 @@ import {
   isGitWorkTreeRoot,
   enclosingRepo,
   repoNameProblem,
+  canonicalPath,
 } from "../src/core/repo.js";
 
 let tmp: string;
@@ -205,6 +206,39 @@ describe("resolveRepoWithinRoot (the binding gate)", () => {
       return; // no symlink privilege (unelevated Windows) — nothing to assert
     }
     expect(() => resolveRepoWithinRoot(root, "sneaky")).toThrow(/outside REPOS_ROOT/i);
+  });
+});
+
+describe("canonicalPath (8.3 short names)", () => {
+  it("uses realpathSync.NATIVE — the plain one does not expand short names", () => {
+    // Pinned at source level because the difference is invisible on a dev box
+    // whose paths are all short enough. CI caught it: `os.tmpdir()` on a GitHub
+    // Windows runner is `C:\Users\RUNNER~1\...` while git reports
+    // `C:\Users\runneradmin\...` for the same directory, so the plain version
+    // compared two names for one directory, found them different, and made
+    // `validateBinding` refuse EVERY session on that machine.
+    const src = readFileSync(new URL("../src/core/repo.ts", import.meta.url), "utf8");
+    const body = src.slice(src.indexOf("export function canonicalPath"));
+    expect(body.slice(0, body.indexOf("}"))).toContain("realpathSync.native");
+  });
+
+  it("expands a real 8.3 name on Windows", () => {
+    if (process.platform !== "win32" || !existsSync("C:\\PROGRA~1")) return;
+    expect(canonicalPath("C:\\PROGRA~1")).not.toBe("C:\\PROGRA~1");
+    expect(canonicalPath("C:\\PROGRA~1").toLowerCase()).toContain("program files");
+  });
+
+  it("is idempotent — canonicalising a canonical path changes nothing", () => {
+    const once = canonicalPath(tmp);
+    expect(canonicalPath(once)).toBe(once);
+  });
+
+  it("resolves a repo to the SAME string whichever name it is reached by", () => {
+    // The property that actually matters: `validateBinding` compares a recorded
+    // path against what git reports, and those two can be different names.
+    const repo = makeRepo(root, "canon-me");
+    const viaRoot = resolveRepoWithinRoot(root, "canon-me");
+    expect(viaRoot).toBe(canonicalPath(repo));
   });
 });
 

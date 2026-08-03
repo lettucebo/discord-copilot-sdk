@@ -24,48 +24,53 @@ describe("worktreeBranch / worktreePath", () => {
     // The repo segment is what stops a rebound thread from silently reusing the
     // checkout of the repo it was moved away from: `addWorktree` adopts an
     // existing directory, so one path per (repo, thread) is the invariant.
-    const root = "C:\\state\\worktrees";
-    const p = worktreePath(root, "C:\\Source\\Repos\\alpha", "123456");
+    const root = path.join(path.sep, "state", "worktrees");
+    const p = worktreePath(root, path.join(path.sep, "Source", "Repos", "alpha"), "123456");
     expect(p.startsWith(root)).toBe(true);
     expect(p.endsWith(`${path.sep}123456`)).toBe(true);
     expect(path.dirname(p)).not.toBe(root); // there IS a repo level in between
   });
 
   it("gives DIFFERENT directories to the same thread on different repos", () => {
-    const root = "C:\\state\\worktrees";
-    const a = worktreePath(root, "C:\\Source\\Repos\\alpha", "t1");
-    const b = worktreePath(root, "C:\\Source\\Repos\\beta", "t1");
+    const root = path.join(path.sep, "state", "worktrees");
+    const a = worktreePath(root, path.join(path.sep, "Source", "Repos", "alpha"), "t1");
+    const b = worktreePath(root, path.join(path.sep, "Source", "Repos", "beta"), "t1");
     expect(a).not.toBe(b);
   });
 
   it("gives the SAME directory for the same repo + thread (idempotent resume)", () => {
-    const root = "C:\\state\\worktrees";
-    expect(worktreePath(root, "C:\\Source\\Repos\\alpha", "t1")).toBe(
-      worktreePath(root, "C:\\Source\\Repos\\alpha", "t1")
-    );
+    const root = path.join(path.sep, "state", "worktrees");
+    const repo = path.join(path.sep, "Source", "Repos", "alpha");
+    expect(worktreePath(root, repo, "t1")).toBe(worktreePath(root, repo, "t1"));
   });
 
   it("cannot be escaped by a hostile thread id (no path traversal)", () => {
-    const p = worktreePath("C:\\state\\worktrees", "C:\\Source\\Repos\\alpha", "../../evil");
+    const root = path.join(path.sep, "state", "worktrees");
+    const p = worktreePath(root, path.join(path.sep, "Source", "Repos", "alpha"), "../../evil");
     expect(p.includes("..")).toBe(false);
-    expect(p.startsWith("C:\\state\\worktrees")).toBe(true);
+    expect(p.startsWith(root)).toBe(true);
   });
 });
 
 describe("repoSlug", () => {
+  // Paths are built with path.join, not written as literals: on Linux a
+  // backslash is an ordinary filename character, so "C:\\Source\\Repos\\x" is
+  // ONE segment and `path.basename` returns the whole string. CI caught that.
+  const under = (...segs: string[]): string => path.join(path.sep, "Source", "Repos", ...segs);
+
   it("keeps the repo name readable and appends a hash of the full path", () => {
     // Readability matters: the leftover-worktree report exists to tell a human
     // which project a stray checkout belongs to.
-    const slug = repoSlug("C:\\Source\\Repos\\career-ops");
+    const slug = repoSlug(under("career-ops"));
     expect(slug.startsWith("career-ops-")).toBe(true);
     expect(slug).toMatch(/^career-ops-[0-9a-f]{10}$/);
   });
 
   it("distinguishes same-named repos in different roots", () => {
-    expect(repoSlug("C:\\a\\proj")).not.toBe(repoSlug("C:\\b\\proj"));
+    expect(repoSlug(path.join(path.sep, "a", "proj"))).not.toBe(repoSlug(path.join(path.sep, "b", "proj")));
   });
 
   it("produces a filesystem-safe segment even for an awkward name", () => {
-    expect(repoSlug("C:\\Source\\Repos\\weird name!")).toMatch(/^[A-Za-z0-9._-]+$/);
+    expect(repoSlug(under("weird name!"))).toMatch(/^[A-Za-z0-9._-]+$/);
   });
 });

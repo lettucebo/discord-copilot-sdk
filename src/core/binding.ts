@@ -1,6 +1,5 @@
 import path from "node:path";
-import { realpathSync } from "node:fs";
-import { isGitWorkTreeRoot, isStrictlyInside, pathRelation } from "./repo.js";
+import { canonicalPathOr, isGitWorkTreeRoot, isStrictlyInside, pathRelation } from "./repo.js";
 import { repoRootStrict, topLevelStrict } from "./worktree.js";
 
 /**
@@ -81,15 +80,10 @@ export async function validateBinding(b: Binding, deps: BindingDeps): Promise<Bi
   const owner = deps.ownerOf ?? repoRootStrict;
   const topLevel = deps.topLevelOf ?? topLevelStrict;
   // Canonicalise BOTH sides. `path.resolve` alone leaves a junction as a second
-  // name for one directory, so a link under the worktree root pointing at the
-  // main checkout would compare unequal to the repo it actually is.
-  const canon = (p: string): string => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return path.resolve(p);
-    }
-  };
+  // name for one directory, and on Windows a short (8.3) name as a third — so a
+  // link under the worktree root, or a tmpdir like `C:\Users\RUNNER~1\...`,
+  // would compare unequal to the very directory it IS. See `canonicalPath`.
+  const canon = canonicalPathOr;
   const repo = canon(b.repoPath);
   const work = canon(b.workDir);
 
