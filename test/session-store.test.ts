@@ -16,6 +16,7 @@ const bind = (threadId: string, over: Partial<SessionBinding> = {}): SessionBind
   guildId: "g1",
   parentChannelId: "p1",
   workDir: "C:\\repo",
+  devMode: "local",
   ...over,
 });
 
@@ -153,11 +154,13 @@ describe("SessionStore — v1 migration", () => {
     expect(s.get("old-thread")).toMatchObject({ sessionId: "old-sess", state: "active" });
     // v1 predates isolation: that session ran directly in the controlled repo.
     expect(s.get("old-thread")?.workDir).toBe("C:\\repo");
+    // …which is what `local` mode now means.
+    expect(s.get("old-thread")?.devMode).toBe("local");
     // and its generation must not be handed out again
     expect(s.nextGeneration()).toBe(10);
   });
 
-  it("upgrades the file to v2 on the next write, without losing the old session", () => {
+  it("upgrades the file to the current schema on the next write, without losing the old session", () => {
     const f = tmpFile();
     writeFileSync(
       f,
@@ -177,9 +180,79 @@ describe("SessionStore — v1 migration", () => {
     const s = new SessionStore(f);
     s.reserve(bind("new-thread", { generation: s.nextGeneration() }));
     const onDisk = JSON.parse(readFileSync(f, "utf8")) as { schemaVersion: number; sessions: unknown[] };
-    expect(onDisk.schemaVersion).toBe(2);
+    expect(onDisk.schemaVersion).toBe(3);
     expect(onDisk.sessions).toHaveLength(2);
     expect(new SessionStore(f).get("old-thread")?.sessionId).toBe("old-sess");
+  });
+});
+
+describe("SessionStore — devMode migration (v3)", () => {
+  /** Write a v2 store file holding one record with `over` applied. */
+  function v2File(over: Record<string, unknown>): string {
+    const f = tmpFile();
+    writeFileSync(
+      f,
+      JSON.stringify({
+        schemaVersion: 2,
+        generationHighWater: 4,
+        sessions: [
+          {
+            schemaVersion: 2,
+            threadId: "t1",
+            sessionId: "s1",
+            generation: 4,
+            repoPath: "C:\\repo",
+            guildId: "g1",
+            parentChannelId: "p1",
+            workDir: "C:\\repo",
+            state: "active",
+            updatedAt: 1,
+            ...over,
+          },
+        ],
+      }),
+      "utf8"
+    );
+    return f;
+  }
+
+  it("reads a v2 WORKTREE record (it has a branch) as devMode=worktree", () => {
+    const f = v2File({ workDir: "C:\\wt\\t1", branch: "copilot/t-t1" });
+    expect(new SessionStore(f).get("t1")).toMatchObject({ devMode: "worktree", branch: "copilot/t-t1" });
+  });
+
+  it("reads a v2 SHARED record (no branch, workDir === repoPath) as devMode=local", () => {
+    // This is the migration that must NOT be left to inference at the call site:
+    // a shared-isolation session really did work directly in the repo, which is
+    // exactly what `local` now means — and `local` is the mode that needs a
+    // repo lease, so getting it wrong lets two sessions share one checkout.
+    expect(new SessionStore(v2File({})).get("t1")).toMatchObject({ devMode: "local" });
+    expect(new SessionStore(v2File({})).get("t1")?.branch).toBeUndefined();
+  });
+
+  it("honours an explicit devMode over the inference", () => {
+    const f = v2File({ devMode: "worktree", workDir: "C:\\wt\\t1", branch: "b" });
+    expect(new SessionStore(f).get("t1")?.devMode).toBe("worktree");
+  });
+
+  it("ignores a devMode that is not one of the two modes, rather than trusting it", () => {
+    const f = v2File({ devMode: "shared" });
+    expect(new SessionStore(f).get("t1")?.devMode).toBe("local");
+  });
+
+  it("does NOT copy unknown or wrongly-typed fields out of the JSON", () => {
+    // The old reader spread the raw object, so a `branch: 42` (or any field a
+    // future version adds) landed in a typed record unchecked.
+    const f = v2File({ branch: 42, injected: "surprise" });
+    const rec = new SessionStore(f).get("t1") as Record<string, unknown> | undefined;
+    expect(rec?.["branch"]).toBeUndefined();
+    expect(rec?.["injected"]).toBeUndefined();
+    expect(rec?.["devMode"]).toBe("local"); // a non-string branch is not a branch
+  });
+
+  it("still rejects a record missing a required field (corrupt, not silently fresh)", () => {
+    const f = v2File({ sessionId: undefined });
+    expect(new SessionStore(f).isCorrupt()).toBe(true);
   });
 });
 

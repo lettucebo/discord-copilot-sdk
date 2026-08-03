@@ -16,46 +16,89 @@ export function nodeVersionOk(v = process.versions.node) {
 }
 
 /**
- * Fast mirror of the filesystem rules in src/core/repo.ts's
- * resolveControlledRepo(): CONTROLLED_REPO_PATH must exist, be a directory, and
- * be a git WORKING-TREE ROOT — i.e. carry a `.git` entry (a directory for a
- * normal clone, a FILE for a worktree, which is why this tests existence rather
- * than isDirectory on `.git`). A subdirectory of a repo has no `.git`, so this
- * also enforces "root".
+ * Fast mirror of the filesystem rules in src/core/repo.ts's resolveReposRoot().
+ *
+ * REPOS_ROOT must exist, be a directory, and — this is the INVERSE of the rule
+ * this function enforced when there was one `CONTROLLED_REPO_PATH` — must NOT
+ * itself be a git working-tree root. A repos root CONTAINS repos; pointing it at
+ * a repo (by pasting the old single-repo value during migration) is exactly the
+ * mistake this check exists to name.
+ *
+ * It must also not sit on either side of the bot's own state directory: an
+ * agent's working directory may not have the trust store as an ancestor, and the
+ * trust store may not be reachable as a "repo" under the root.
  *
  * Returns a reason CODE, not a message, so this stays pure and i18n-free:
- *   null          — acceptable
- *   "notAbsolute" — not an absolute path (the runtime refuses these outright,
- *                   because a relative path silently means a different
- *                   directory depending on the process's cwd)
- *   "missing"     — does not exist, or is not a directory
- *   "notGit"      — exists as a directory, but is not a git working-tree root
+ *   null           — acceptable
+ *   "notAbsolute"  — not an absolute path (the runtime refuses these outright,
+ *                    because a relative path silently means a different
+ *                    directory depending on the process's cwd; this also catches
+ *                    Windows drive-relative `C:foo`)
+ *   "missing"      — does not exist, or is not a directory
+ *   "isRepo"       — exists, but is itself a git working-tree root (a `.git`
+ *                    entry: a directory for a normal clone, a FILE for a linked
+ *                    worktree, which is why this tests existence rather than
+ *                    isDirectory)
+ *   "trustOverlap" — contains, or sits inside, the bot's state/worktree dirs
  *
- * Why it exists even though setup.mjs also calls the REAL resolveControlledRepo
- * after building: that one lives in dist/ and cannot run until after npm ci +
- * build (minutes). This gives the interactive prompt an immediate answer and
- * fails a bad --yes install in seconds. test/setup-core.test.ts asserts the two
- * agree, the same way test/config-contract.test.ts pins validate.mjs to the zod
- * schema — a mirror nobody checks is how they drift. (The absoluteness rule was
- * added precisely because the first version of this mirror omitted it and
- * accepted `.`, which the runtime rejects.)
+ * Why it exists even though setup.mjs also calls the REAL resolveReposRoot after
+ * building: that one lives in dist/ and cannot run until after npm ci + build
+ * (minutes). This gives the interactive prompt an immediate answer and fails a
+ * bad --yes install in seconds. test/setup-core.test.ts asserts the two agree,
+ * the same way test/config-contract.test.ts pins validate.mjs to the zod schema —
+ * a mirror nobody checks is how they drift. (The absoluteness rule was added
+ * precisely because the first version of this mirror omitted it and accepted
+ * `.`, which the runtime rejects.)
  *
  * Why any of this is needed: parseConfig()'s zod schema deliberately does no
- * filesystem I/O, so it cannot tell that a path exists but is not a repo. The
- * installer once accepted a folder that merely CONTAINED several repos (the
- * parent directory of a clone), reported "installation complete", and the bot
- * then died on its very first launch inside DiscordCopilotApp.start(). An
- * installer that reports success for a config the runtime refuses is lying.
+ * filesystem I/O, so it cannot tell that a path exists but is the wrong KIND of
+ * directory. The installer once accepted a folder that merely CONTAINED several
+ * repos, reported "installation complete", and the bot then died on its very
+ * first launch inside DiscordCopilotApp.start(). An installer that reports
+ * success for a config the runtime refuses is lying — in either direction.
  *
  * @param {string} p absolute path to check
  * @param {{existsSync:Function, statSync:Function}} fsMod node:fs (injectable for tests)
- * @param {{join:Function, isAbsolute:Function}} pathMod node:path (injectable for tests)
+ * @param {{join:Function, isAbsolute:Function, resolve:Function, relative:Function, parse:Function}} pathMod node:path
+ * @param {string} [stateDirPath] the bot's state directory (omit to skip the overlap rule)
  */
-export function controlledRepoProblem(p, fsMod, pathMod) {
+export function reposRootProblem(p, fsMod, pathMod, stateDirPath) {
   if (!p || !pathMod.isAbsolute(p)) return "notAbsolute";
   if (!fsMod.existsSync(p) || !fsMod.statSync(p).isDirectory()) return "missing";
-  if (!fsMod.existsSync(pathMod.join(p, ".git"))) return "notGit";
+  if (fsMod.existsSync(pathMod.join(p, ".git"))) return "isRepo";
+  if (stateDirPath) {
+    for (const other of [stateDirPath, `${stateDirPath}-worktrees`]) {
+      if (pathsOverlap(p, other, pathMod)) return "trustOverlap";
+    }
+  }
   return null;
+}
+
+/**
+ * True when either path IS the other, or contains it.
+ *
+ * Mirrors `pathRelation` in src/core/repo.ts, including the "case-fold only on
+ * Windows" rule: lowercasing on Linux would report two genuinely different
+ * directories (`/srv/Repos` and `/srv/repos`) as the same one.
+ *
+ * @param {string} a
+ * @param {string} b
+ * @param {{resolve:Function, relative:Function, isAbsolute:Function, parse:Function}} pathMod
+ */
+export function pathsOverlap(a, b, pathMod) {
+  const fold = (s) => (process.platform === "win32" ? s.toLowerCase() : s);
+  const trim = (s) => {
+    const root = pathMod.parse(s).root;
+    return s === root ? s : s.replace(/[\\/]+$/, "") || root;
+  };
+  const fa = fold(trim(pathMod.resolve(a)));
+  const fb = fold(trim(pathMod.resolve(b)));
+  if (fa === fb) return true;
+  const inside = (child, parent) => {
+    const rel = pathMod.relative(parent, child);
+    return !!rel && !rel.startsWith("..") && !pathMod.isAbsolute(rel);
+  };
+  return inside(fa, fb) || inside(fb, fa);
 }
 
 /**

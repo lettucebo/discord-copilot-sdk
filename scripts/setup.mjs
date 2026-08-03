@@ -10,11 +10,11 @@ import readline from "node:readline";
 import { parseEnv } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, execSync } from "node:child_process";
-import { mergeEnv } from "./lib/env-file.mjs";
+import { mergeEnv, dropEnvKeys } from "./lib/env-file.mjs";
 import { secureWrite, secureBackup, hardenExisting } from "./lib/secure-file.mjs";
-import { nodeVersionOk, controlledRepoProblem, livePidFromLock } from "./lib/setup-core.mjs";
+import { nodeVersionOk, reposRootProblem, livePidFromLock } from "./lib/setup-core.mjs";
 import { t, detectLang, normalizeLang } from "./lib/i18n.mjs";
-import { MANAGED_KEYS, validateConfig } from "./lib/validate.mjs";
+import { MANAGED_KEYS, validateConfig, REMOVED_KEYS } from "./lib/validate.mjs";
 import { setupResidency, residencyName, chooseResidencyMode, instanceId } from "./lib/residency.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -314,6 +314,13 @@ async function main() {
   // 3) Load existing .env as defaults (read-only) and collect config in memory.
   info("\n" + c(1, t("configHeader", lang)));
   const existing = readEnvValues();
+  // 3a) Migrate a pre-multi-repo .env BEFORE prompting, so the operator is shown
+  //     the derived values and can correct them, rather than being asked to
+  //     retype a root the old value already implies.
+  //     CONTROLLED_REPO_PATH=C:\Source\Repos\my-repo
+  //       → REPOS_ROOT=C:\Source\Repos, DEFAULT_REPO=my-repo
+  const migrated = migrateLegacyKeys(existing);
+  if (migrated) info(c(90, t("migratedKeys", lang) + migrated));
   const values = {};
   for (const spec of MANAGED_KEYS) {
     const cur = existing[spec.key] ?? spec.defaultValue ?? "";
@@ -321,7 +328,7 @@ async function main() {
       values[spec.key] = cur;
       continue;
     }
-    if (spec.key === "CONTROLLED_REPO_PATH") warn(t("repoLabWarn", lang));
+    if (spec.key === "REPOS_ROOT") warn(t("repoLabWarn", lang));
     values[spec.key] = await promptField(spec, cur, lang);
   }
 
@@ -334,27 +341,30 @@ async function main() {
     throw new SetupError(t("missingRequiredNonInteractive", lang) + missingRequired);
   }
 
-  // 4b) CONTROLLED_REPO_PATH shape check, run UNCONDITIONALLY (interactive AND
-  // --yes), unlike promptField's copy which only runs when a human is typing.
-  // A --yes install reuses the EXISTING .env value without prompting, so
-  // without this a long-broken path sails straight through to "complete".
+  // 4b) REPOS_ROOT shape check, run UNCONDITIONALLY (interactive AND --yes),
+  // unlike promptField's copy which only runs when a human is typing. A --yes
+  // install reuses the EXISTING .env value without prompting, so without this a
+  // long-broken path sails straight through to "complete".
   //
   // This is a FAST PRE-FLIGHT, not the source of truth: step 8b below calls the
-  // runtime's own resolveControlledRepo() once dist/ exists. Running here too
-  // means a bad path fails in seconds instead of after minutes of npm ci +
-  // build. Deliberately NOT folded into validateConfig()/MANAGED_KEYS: that is
-  // the config CONTRACT with the runtime zod schema (test/config-contract.test.ts
+  // runtime's own resolveReposRoot() once dist/ exists. Running here too means a
+  // bad path fails in seconds instead of after minutes of npm ci + build.
+  // Deliberately NOT folded into validateConfig()/MANAGED_KEYS: that is the
+  // config CONTRACT with the runtime zod schema (test/config-contract.test.ts
   // asserts they accept/reject identically), and parseConfig() does no
   // filesystem I/O by design.
   {
-    const repoErr = checkControlledRepoShape(values.CONTROLLED_REPO_PATH, lang);
+    const repoErr = checkReposRootShape(values.REPOS_ROOT, lang);
     if (repoErr) throw new SetupError(repoErr);
   }
 
-  // 5) Compute the merged .env in memory.
+  // 5) Compute the merged .env in memory. Removed keys are DELETED from the base
+  //    text first: mergeEnv preserves every unmanaged line, so a leftover
+  //    CONTROLLED_REPO_PATH would survive and the bot would refuse to start on
+  //    the config this installer just reported as complete.
   const exampleText = fs.existsSync(EXAMPLE_PATH) ? fs.readFileSync(EXAMPLE_PATH, "utf8") : "";
   const baseText = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : exampleText;
-  const merged = mergeEnv(baseText, values);
+  const merged = mergeEnv(dropEnvKeys(baseText, REMOVED_KEYS), values);
 
   // 6) Dry-run stops here — nothing mutated. Never print the token.
   if (FLAGS.dryRun) {
@@ -407,18 +417,18 @@ async function main() {
     throw new SetupError(t("healthFail", lang) + " " + (e instanceof Error ? e.message : String(e)));
   }
 
-  // 8b) AUTHORITATIVE controlled-repo check: call the very function the bot
-  //     calls at startup (app.ts → resolveControlledRepo), not a copy of its
-  //     rules. parseConfig deliberately does no filesystem I/O, so the zod
-  //     schema alone cannot catch a path that exists but is not a git
-  //     working-tree root — which is exactly how an install once reported
-  //     success while the bot died on its first launch. checkControlledRepo()
-  //     above fails faster (before minutes of npm ci/build) but is a mirror of
-  //     these rules; THIS is the one that cannot drift, because it is the same
-  //     code. Run only after build, since it lives in dist/.
-  const { resolveControlledRepo } = await import(pathToFileURL(path.join(REPO_ROOT, "dist", "core", "repo.js")).href);
+  // 8b) AUTHORITATIVE repos-root check: call the very function the bot calls at
+  //     startup (app.ts → resolveReposRoot), not a copy of its rules.
+  //     parseConfig deliberately does no filesystem I/O, so the zod schema alone
+  //     cannot catch a path that exists but is the wrong KIND of directory —
+  //     which is exactly how an install once reported success while the bot died
+  //     on its first launch. checkReposRootShape() above fails faster (before
+  //     minutes of npm ci/build) but is a mirror of these rules; THIS is the one
+  //     that cannot drift, because it is the same code. Run only after build,
+  //     since it lives in dist/.
+  const { resolveReposRoot } = await import(pathToFileURL(path.join(REPO_ROOT, "dist", "core", "repo.js")).href);
   try {
-    resolveControlledRepo(parsed.CONTROLLED_REPO_PATH);
+    resolveReposRoot(parsed.REPOS_ROOT);
   } catch (e) {
     throw new SetupError(t("healthFail", lang) + " " + (e instanceof Error ? e.message : String(e)));
   }
@@ -494,11 +504,11 @@ async function promptField(spec, cur, lang) {
       continue;
     }
     if (val !== "" && !spec.validate(val)) {
-      err(t(spec.errKey, lang) + (spec.key === "CONTROLLED_REPO_PATH" ? "" : ""));
+      err(t(spec.errKey, lang));
       continue;
     }
-    if (spec.key === "CONTROLLED_REPO_PATH" && val !== "") {
-      const repoErr = checkControlledRepoShape(val, lang);
+    if (spec.key === "REPOS_ROOT" && val !== "") {
+      const repoErr = checkReposRootShape(val, lang);
       if (repoErr) {
         err(repoErr);
         continue;
@@ -509,16 +519,49 @@ async function promptField(spec, cur, lang) {
 }
 
 /**
- * Localizing wrapper over controlledRepoProblem() (scripts/lib/setup-core.mjs,
- * where the rules live and are unit-tested against the real
- * resolveControlledRepo). Returns a localized error string, or null when the
- * path is acceptable.
+ * Rewrite pre-multi-repo keys in-place on the values read from `.env`, so the
+ * rest of setup only ever sees the current shape.
+ *
+ * `CONTROLLED_REPO_PATH=C:\Source\Repos\my-repo` carries both new values: its
+ * PARENT is the repos root and its BASENAME is the default repo. Deriving them
+ * is what makes an upgrade a no-op for the operator instead of a puzzle. An
+ * explicit REPOS_ROOT already in the file always wins — we never overwrite a
+ * deliberate choice.
+ *
+ * Returns a short description of what was migrated, or null.
  */
-function checkControlledRepoShape(val, lang) {
-  const problem = controlledRepoProblem(val, fs, path);
+function migrateLegacyKeys(values) {
+  const legacy = values.CONTROLLED_REPO_PATH;
+  const notes = [];
+  if (legacy && legacy.trim() && !(values.REPOS_ROOT && values.REPOS_ROOT.trim())) {
+    const trimmed = legacy.replace(/[\\/]+$/, "");
+    const parent = path.dirname(trimmed);
+    const name = path.basename(trimmed);
+    // `path.dirname` of a bare root ("C:\" or "/") returns the root itself; there
+    // is no meaningful repos root to derive there, so leave it to validation.
+    if (parent && parent !== trimmed && name) {
+      values.REPOS_ROOT = parent;
+      if (!values.DEFAULT_REPO) values.DEFAULT_REPO = name;
+      notes.push(`CONTROLLED_REPO_PATH → REPOS_ROOT=${parent}, DEFAULT_REPO=${name}`);
+    }
+  }
+  // The old value must not survive into the new config in any form; the removed
+  // lines themselves are stripped from the .env text by dropEnvKeys().
+  for (const key of REMOVED_KEYS) delete values[key];
+  return notes.length ? notes.join("; ") : null;
+}
+
+/**
+ * Localizing wrapper over reposRootProblem() (scripts/lib/setup-core.mjs,
+ * where the rules live and are unit-tested against the real resolveReposRoot).
+ * Returns a localized error string, or null when the path is acceptable.
+ */
+function checkReposRootShape(val, lang) {
+  const problem = reposRootProblem(val, fs, path, STATE_DIR);
   if (problem === "notAbsolute") return t("errRepoNotAbsolute", lang) + val;
   if (problem === "missing") return t("errRepoMissing", lang) + val;
-  if (problem === "notGit") return t("errRepoNotGit", lang) + val;
+  if (problem === "isRepo") return t("errReposRootIsRepo", lang) + val;
+  if (problem === "trustOverlap") return t("errReposRootTrustOverlap", lang) + val;
   return null;
 }
 

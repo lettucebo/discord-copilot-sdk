@@ -1,5 +1,15 @@
 import { describe, it, expect } from "vitest";
-import { legacyNameWarnings, LEGACY_STATE_DIR_NAME, LEGACY_ENV_PREFIX } from "../src/core/paths.js";
+import os from "node:os";
+import path from "node:path";
+import { readFileSync } from "node:fs";
+import {
+  legacyNameWarnings,
+  LEGACY_STATE_DIR_NAME,
+  LEGACY_ENV_PREFIX,
+  STATE_DIR_NAME,
+  stateDir,
+  worktreeRoot,
+} from "../src/core/paths.js";
 
 describe("legacyNameWarnings (post-rename `discopilot` leftovers)", () => {
   it("says nothing when there is nothing left over", () => {
@@ -49,5 +59,31 @@ describe("legacyNameWarnings (post-rename `discopilot` leftovers)", () => {
   it("exposes the legacy names it checks, so they can't drift from the docs", () => {
     expect(LEGACY_STATE_DIR_NAME).toBe(".discopilot");
     expect(LEGACY_ENV_PREFIX).toBe("DISCOPILOT_");
+  });
+});
+
+describe("worktreeRoot (trust-boundary sibling)", () => {
+  it("is a SIBLING of the state dir, never a descendant of it", () => {
+    // The whole point: `stateDir()` holds approvals.json, the session store and
+    // the instance lock. If a worktree lived under it, every agent's cwd would
+    // sit below the bot's own trust store, and one approved relative-path write
+    // would be enough to grant durable auto-approval for arbitrary executables.
+    const rel = path.relative(stateDir(), worktreeRoot());
+    expect(rel.startsWith("..")).toBe(true);
+    expect(path.dirname(worktreeRoot())).toBe(path.dirname(stateDir()));
+  });
+
+  it("derives its name from the state dir name, so the two cannot drift apart", () => {
+    expect(worktreeRoot()).toBe(path.join(os.homedir(), `${STATE_DIR_NAME}-worktrees`));
+    expect(stateDir()).toBe(path.join(os.homedir(), STATE_DIR_NAME));
+  });
+
+  it("does NOT create the directory — validators call it before any worktree exists", () => {
+    // `stateDir()` mkdirs on purpose; this one must not, or every rejected
+    // config would leave an empty directory behind as a side effect of merely
+    // *checking* a path.
+    const src = readFileSync(new URL("../src/core/paths.ts", import.meta.url), "utf8");
+    const body = src.slice(src.indexOf("export function worktreeRoot"));
+    expect(body.slice(0, body.indexOf("}"))).not.toContain("mkdir");
   });
 });

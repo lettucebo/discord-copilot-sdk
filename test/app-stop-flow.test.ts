@@ -4,6 +4,7 @@ import { AddressInfo } from "node:net";
 import { DiscordCopilotApp, type Session } from "../src/app.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Transport } from "../src/core/transport.js";
+import { PendingInteractionBroker } from "../src/core/broker.js";
 
 /**
  * App-level regression for the /stop-during-download blocker (RubberDuck P5):
@@ -93,13 +94,17 @@ const cfg = {
   DISCORD_ALLOWED_USER_IDS: ["u1"],
   DISCORD_GUILD_ID: "g1",
   DISCORD_PARENT_CHANNEL_ID: "c1",
-  CONTROLLED_REPO_PATH: "C:\\repo",
+  REPOS_ROOT: "C:\\Repos",
   DEFAULT_MODEL: "claude-sonnet-5",
   DEFAULT_CONTEXT_TIER: "default",
   PERMISSION_POLICY: "ask",
 } as unknown as Parameters<typeof DiscordCopilotApp.createForTest>[0];
 
-const fakeCopilot = {} as unknown as CopilotClient;
+const fakeCopilot = {
+  // `stop()` is exercised by the shutdown test; the fake must offer it or the
+  // assertion fails on the fixture rather than on the behaviour under test.
+  stop: async () => {},
+} as unknown as CopilotClient;
 
 function imageMessage(url: string): unknown {
   const att = { contentType: "image/png", size: PNG_1x1.length, url, name: "x.png" };
@@ -108,18 +113,23 @@ function imageMessage(url: string): unknown {
 
 function buildAppWithSession(): { app: DiscordCopilotApp; actor: FakeActor; transport: FakeTransport; session: Session } {
   const transport = new FakeTransport();
-  const app = DiscordCopilotApp.createForTest(cfg, "C:\\repo", fakeCopilot, transport);
+  const app = DiscordCopilotApp.createForTest(cfg, "C:\\Repos", fakeCopilot, transport);
   const actor = new FakeActor();
   // Typed on purpose: a `Record<string, unknown>` fixture silently drifts from
   // the real Session shape and fails at runtime instead of at typecheck.
   const session: Session = {
     actor: actor as unknown as Session["actor"],
-    broker: {} as unknown as Session["broker"],
+    // A REAL broker: `stop()` aborts every session's pending interactions, so a
+    // `{}` stand-in turns a teardown assertion into a TypeError about the fixture.
+    broker: new PendingInteractionBroker(),
     running: false,
     titled: true,
     titleEpoch: 0,
     queue: [],
-    workDir: "C:\\repo",
+    workDir: "C:\\Repos\\repo",
+    repoPath: "C:\\Repos\\repo",
+    devMode: "local",
+    hasRunTurn: false,
   };
   (app as unknown as { sessions: Map<string, unknown> }).sessions.set("thread-1", session);
   return { app, actor, transport, session };
@@ -163,18 +173,20 @@ describe("/stop during image download (app-level wiring)", () => {
     expect(actor.runTurnCalls[0]?.images).toBe(1); // the image was attached
   });
 
-  it("endAllSessions during a download aborts it and never starts the turn", async () => {
+  it("shutdown during a download aborts it and never starts the turn", async () => {
+    // Previously exercised through `endAllSessions`, which existed only for the
+    // shared-checkout mode where `/new` had to end the previous session. Per-thread
+    // dev modes removed that path; `stop()` is now the only bulk teardown, and it
+    // must keep the same property: a turn still downloading its attachment is
+    // aborted, never sent.
     const { app, actor } = buildAppWithSession();
     const runTurn = (app as unknown as {
       runTurn(t: string, text: string, m?: unknown): Promise<void>;
     }).runTurn.bind(app);
-    const endAll = (app as unknown as {
-      endAllSessions(r: string): Promise<boolean>;
-    }).endAllSessions.bind(app);
 
     const p = runTurn("thread-1", "分析這張圖", imageMessage(`${base}/hang`));
     await tick();
-    await endAll("shutting down");
+    await app.stop();
     await p;
 
     expect(actor.runTurnCalls.length).toBe(0); // no send-after-teardown

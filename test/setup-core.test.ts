@@ -2,8 +2,8 @@ import { describe, it, expect, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { nodeVersionOk, controlledRepoProblem, livePidFromLock } from "../scripts/lib/setup-core.mjs";
-import { resolveControlledRepo } from "../src/core/repo.js";
+import { nodeVersionOk, reposRootProblem, livePidFromLock } from "../scripts/lib/setup-core.mjs";
+import { resolveReposRoot } from "../src/core/repo.js";
 
 describe("nodeVersionOk (engines: ^20.19 || >=22.12)", () => {
   it.each([
@@ -38,23 +38,30 @@ describe("nodeVersionOk (engines: ^20.19 || >=22.12)", () => {
 
 /**
  * Contract test, same spirit as test/config-contract.test.ts: the installer's
- * FAST controlled-repo check (controlledRepoProblem, used before npm ci/build
- * and by the interactive prompt) must accept and reject exactly what the
- * RUNTIME's resolveControlledRepo does — the function the bot actually calls at
- * startup. A mirror nobody checks is how they drift, and drift here means the
- * installer reports "complete" for a config that kills the bot on first launch
- * (the real incident this guards).
+ * FAST repos-root check (reposRootProblem, used before npm ci/build and by the
+ * interactive prompt) must accept and reject exactly what the RUNTIME's
+ * resolveReposRoot does — the function the bot actually calls at startup. A
+ * mirror nobody checks is how they drift, and drift here means the installer
+ * reports "complete" for a config that kills the bot on first launch (the real
+ * incident this guards).
+ *
+ * Note the polarity flip since the single-repo version: a directory that merely
+ * CONTAINS repos used to be the canonical REJECT case and is now the canonical
+ * ACCEPT case.
  */
-describe("controlledRepoProblem ⇄ resolveControlledRepo contract", () => {
+describe("reposRootProblem ⇄ resolveReposRoot contract", () => {
   const made: string[] = [];
   const mkTmp = (): string => {
     const d = fs.mkdtempSync(path.join(os.tmpdir(), "dcs-repochk-"));
     made.push(d);
     return d;
   };
+  // Trust-store stand-ins kept well away from the fixtures, so the overlap rule
+  // only fires in the test that asks for it.
+  const stateDir = path.join(os.tmpdir(), "dcs-repochk-state-fixture");
   const runtimeAccepts = (p: string): boolean => {
     try {
-      resolveControlledRepo(p);
+      resolveReposRoot(p, { stateDir, worktreeRoot: `${stateDir}-worktrees` });
       return true;
     } catch {
       return false;
@@ -63,7 +70,16 @@ describe("controlledRepoProblem ⇄ resolveControlledRepo contract", () => {
 
   const cases: Array<[string, () => string]> = [
     [
-      "a normal clone (.git is a DIRECTORY)",
+      "a directory that merely CONTAINS repos (the shape REPOS_ROOT must accept)",
+      () => {
+        const parent = mkTmp();
+        fs.mkdirSync(path.join(parent, "child-repo", ".git"), { recursive: true });
+        return parent;
+      },
+    ],
+    ["an empty plain directory", () => mkTmp()],
+    [
+      "a normal clone (.git is a DIRECTORY) — now REJECTED, it is a repo not a root",
       () => {
         const d = mkTmp();
         fs.mkdirSync(path.join(d, ".git"));
@@ -71,7 +87,7 @@ describe("controlledRepoProblem ⇄ resolveControlledRepo contract", () => {
       },
     ],
     [
-      "a git worktree (.git is a FILE, not a directory)",
+      "a git worktree (.git is a FILE, not a directory) — also a repo, also rejected",
       () => {
         const d = mkTmp();
         fs.writeFileSync(path.join(d, ".git"), "gitdir: /somewhere/.git/worktrees/x\n");
@@ -79,19 +95,7 @@ describe("controlledRepoProblem ⇄ resolveControlledRepo contract", () => {
       },
     ],
     [
-      "a plain directory that is not a repo",
-      () => mkTmp(),
-    ],
-    [
-      "a directory that merely CONTAINS repos (the real incident: parent of a clone)",
-      () => {
-        const parent = mkTmp();
-        fs.mkdirSync(path.join(parent, "child-repo", ".git"), { recursive: true });
-        return parent;
-      },
-    ],
-    [
-      "a SUBdirectory of a repo (has no .git of its own, so it is not a root)",
+      "a SUBdirectory of a repo (no .git of its own, so it is a usable root)",
       () => {
         const d = mkTmp();
         fs.mkdirSync(path.join(d, ".git"));
@@ -100,10 +104,7 @@ describe("controlledRepoProblem ⇄ resolveControlledRepo contract", () => {
         return sub;
       },
     ],
-    [
-      "a path that does not exist at all",
-      () => path.join(mkTmp(), "nope"),
-    ],
+    ["a path that does not exist at all", () => path.join(mkTmp(), "nope")],
     [
       "a FILE where a directory was expected",
       () => {
@@ -122,24 +123,42 @@ describe("controlledRepoProblem ⇄ resolveControlledRepo contract", () => {
     // it is pinned here permanently.
     ["a relative path that IS a repo root relative to cwd", () => "."],
     ["a relative path with a separator", () => path.join(".", "src")],
+    ["a Windows drive-relative path", () => "C:repos"],
     ["an empty string", () => ""],
   ];
 
   it.each(cases)("agrees on: %s", (_name, build) => {
     const p = build();
-    const installerAccepts = controlledRepoProblem(p, fs, path) === null;
+    const installerAccepts = reposRootProblem(p, fs, path, stateDir) === null;
     expect(installerAccepts).toBe(runtimeAccepts(p));
   });
 
-  it("distinguishes 'missing' from 'notGit' from 'notAbsolute' so the user gets the right advice", () => {
-    // Three different mistakes with three different fixes: make it absolute vs
-    // create/choose a path vs `git init` (or point at the repo instead of its
-    // parent). One generic message for all three is how "path is wrong"
-    // becomes a guessing game.
+  it("distinguishes the four mistakes so the user gets the right advice", () => {
+    // Four different mistakes with four different fixes: make it absolute vs
+    // create/choose a path vs point at the PARENT instead of the repo vs move it
+    // away from the bot's own state. One generic message for all of them is how
+    // "path is wrong" becomes a guessing game.
     const plain = mkTmp();
-    expect(controlledRepoProblem(plain, fs, path)).toBe("notGit");
-    expect(controlledRepoProblem(path.join(plain, "nope"), fs, path)).toBe("missing");
-    expect(controlledRepoProblem(".", fs, path)).toBe("notAbsolute");
+    const repo = mkTmp();
+    fs.mkdirSync(path.join(repo, ".git"));
+    expect(reposRootProblem(plain, fs, path, stateDir)).toBe(null);
+    expect(reposRootProblem(repo, fs, path, stateDir)).toBe("isRepo");
+    expect(reposRootProblem(path.join(plain, "nope"), fs, path, stateDir)).toBe("missing");
+    expect(reposRootProblem(".", fs, path, stateDir)).toBe("notAbsolute");
+    expect(reposRootProblem("C:repos", fs, path, stateDir)).toBe("notAbsolute");
+  });
+
+  it("refuses a root that overlaps the bot's own state directory, in BOTH directions", () => {
+    const state = mkTmp(); // pretend this is ~/.discord-copilot-sdk
+    const inside = path.join(state, "repos");
+    fs.mkdirSync(inside, { recursive: true });
+    expect(reposRootProblem(inside, fs, path, state)).toBe("trustOverlap");
+    expect(reposRootProblem(path.dirname(state), fs, path, state)).toBe("trustOverlap");
+    // …and the worktree sibling counts too.
+    const wt = `${state}-worktrees`;
+    fs.mkdirSync(path.join(wt, "x"), { recursive: true });
+    made.push(wt);
+    expect(reposRootProblem(path.join(wt, "x"), fs, path, state)).toBe("trustOverlap");
   });
 
   afterAll(() => {

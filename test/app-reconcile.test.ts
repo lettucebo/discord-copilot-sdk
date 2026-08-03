@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { DiscordCopilotApp } from "../src/app.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import type { CopilotClient } from "@github/copilot-sdk";
@@ -8,18 +8,48 @@ import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
 import { rmSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
 
-const REPO = "C:\\repo";
+const REPOS_ROOT = "C:\\Repos";
+const REPO = "C:\\Repos\\repo";
+/** Where `bindingOk` requires a worktree-mode workDir to live. */
+const WT_ROOT = `${stateDir()}-worktrees`;
 const tmpFile = (): string => join(tmpdir(), `dp-reconcile-${Math.random()}.json`);
 
-const bind = (over: Partial<SessionBinding> = {}): SessionBinding => ({
-  threadId: "t1",
-  sessionId: "sess-1",
-  generation: 1,
-  repoPath: REPO,
-  guildId: "g1",
-  parentChannelId: "c1",
-  workDir: REPO,
-  ...over,
+const bind = (over: Partial<SessionBinding> = {}): SessionBinding => {
+  const merged = {
+    threadId: "t1",
+    sessionId: "sess-1",
+    generation: 1,
+    repoPath: REPO,
+    guildId: "g1",
+    parentChannelId: "c1",
+    workDir: REPO,
+    ...over,
+  };
+  // Infer the mode from the branch the same way the store's v2→v3 migration
+  // does, so a fixture that sets `branch` reads as the worktree session it is.
+  return { ...merged, devMode: over.devMode ?? (merged.branch ? "worktree" : "local") };
+};
+
+/** A worktree-mode record — what every session created by `/new` actually is.
+ *  The directory is created for real: `resumeRecord` rebuilds a MISSING worktree
+ *  from its branch, which needs a genuine repo, and that is not what these
+ *  fixtures are testing. */
+const wtDirs: string[] = [];
+const wtBind = (id: string, over: Partial<SessionBinding> = {}): SessionBinding => {
+  const workDir = join(WT_ROOT, "repo-hash", id);
+  mkdirSync(workDir, { recursive: true });
+  wtDirs.push(workDir);
+  return bind({
+    threadId: id,
+    sessionId: `s-${id}`,
+    workDir,
+    branch: `copilot/t-${id}`,
+    ...over,
+  });
+};
+
+afterEach(() => {
+  for (const d of wtDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
 const cfg = {
@@ -27,7 +57,7 @@ const cfg = {
   DISCORD_ALLOWED_USER_IDS: ["u1"],
   DISCORD_GUILD_ID: "g1",
   DISCORD_PARENT_CHANNEL_ID: "c1",
-  CONTROLLED_REPO_PATH: REPO,
+  REPOS_ROOT: REPOS_ROOT,
   DEFAULT_MODEL: "claude-sonnet-5",
   DEFAULT_CONTEXT_TIER: "default",
   PERMISSION_POLICY: "ask",
@@ -92,8 +122,18 @@ function sessionsOf(app: DiscordCopilotApp): Map<string, unknown> {
 }
 function reconcile(app: DiscordCopilotApp, classify: () => Promise<string>): Promise<void> {
   return (app as unknown as {
-    reconcileOnStartup(d?: { classifyThread?: (id: string) => Promise<string> }): Promise<void>;
-  }).reconcileOnStartup({ classifyThread: classify });
+    reconcileOnStartup(d?: {
+      classifyThread?: (id: string) => Promise<string>;
+      validateBinding?: () => Promise<{ ok: true }>;
+    }): Promise<void>;
+  }).reconcileOnStartup({
+    classifyThread: classify,
+    // These fixtures use paths that do not exist on disk: they exercise the
+    // reconcile STATE MACHINE, not the git-backed ownership proof (which has its
+    // own suite in binding.test.ts, against real worktrees). Injecting a
+    // pass-through keeps the two concerns from smearing into each other.
+    validateBinding: async () => ({ ok: true }),
+  });
 }
 
 describe("reconcileOnStartup (app-level wiring, P2)", () => {
@@ -103,7 +143,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const store = new SessionStore(f);
       store.reserve(bind()); store.commit("t1");
       const transport = new FakeTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(true);
       expect(store.get("t1")?.state).toBe("active");
@@ -119,7 +159,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const store = new SessionStore(f);
       store.reserve(bind()); store.commit("t1");
       const transport = new FakeTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot({ resumeError: "session not found" }), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot({ resumeError: "session not found" }), transport, store);
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(false);
       expect(store.get("t1")?.state).toBe("orphaned");
@@ -137,7 +177,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const transport = new FakeTransport();
       const app = DiscordCopilotApp.createForTest(
         cfg,
-        REPO,
+        REPOS_ROOT,
         fakeCopilot({ resumeError: "getaddrinfo ENOTFOUND api.githubcopilot.com" }),
         transport,
         store
@@ -163,7 +203,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
           return fakeSession;
         },
       } as unknown as CopilotClient;
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, client, new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, client, new FakeTransport(), store);
       await reconcile(app, async () => "gone");
       expect(store.get("t1")?.state).toBe("blocked");
       expect(store.get("t1")?.reason).toBe("thread-gone");
@@ -179,7 +219,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     try {
       const store = new SessionStore(f);
       store.reserve(bind({ repoPath: "C:\\different-repo" })); store.commit("t1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
       let classifyCalls = 0;
       await reconcile(app, async () => {
         classifyCalls++;
@@ -199,7 +239,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     try {
       const store = new SessionStore(f);
       store.reserve(bind()); store.commit("t1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "transient");
       expect(store.get("t1")?.state).toBe("active"); // preserved for a later retry
       expect(sessionsOf(app).has("t1")).toBe(false);
@@ -213,7 +253,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     try {
       const store = new SessionStore(f);
       store.reserve(bind()); // creating
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "valid");
       expect(store.get("t1")?.state).toBe("orphaned");
       expect(sessionsOf(app).has("t1")).toBe(false);
@@ -226,7 +266,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).size).toBe(0);
     } finally {
@@ -240,7 +280,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       writeFileSync(f, "{ not valid json", "utf8");
       const store = new SessionStore(f);
       expect(store.isCorrupt()).toBe(true);
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
       await expect(reconcile(app, async () => "valid")).rejects.toThrow(/corrupt/i);
     } finally {
       rmSync(f, { force: true });
@@ -254,10 +294,10 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
     try {
       const store = new SessionStore(f);
       for (const id of ["t1", "t2", "t3"]) {
-        store.reserve(bind({ threadId: id, sessionId: `s-${id}`, generation: 1 }));
+        store.reserve(wtBind(id, { generation: 1 }));
         store.commit(id);
       }
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "valid");
       expect([...sessionsOf(app).keys()].sort()).toEqual(["t1", "t2", "t3"]);
     } finally {
@@ -272,11 +312,11 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
     try {
       const store = new SessionStore(f);
       for (const id of ["t1", "bad", "t3"]) {
-        store.reserve(bind({ threadId: id, sessionId: `s-${id}`, generation: 1 }));
+        store.reserve(wtBind(id, { generation: 1 }));
         store.commit(id);
       }
       const copilot = fakeCopilot({ resumeError: (id) => (id === "s-bad" ? "boom" : undefined) });
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, copilot, new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, copilot, new FakeTransport(), store);
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(true);
       expect(sessionsOf(app).has("t3")).toBe(true);
@@ -301,7 +341,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
       store.commit("t1");
       store.reserve(bind({ threadId: "t2", sessionId: "s-2", workDir: REPO }));
       store.commit("t2");
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "valid");
       const byId = Object.fromEntries(resumeCalls.map((c) => [c.id, c.cfg["workingDirectory"]]));
       expect(byId["s-1"]).toBe(wt);
@@ -309,6 +349,46 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
     } finally {
       rmSync(f, { force: true });
       rmSync(wt, { recursive: true, force: true });
+    }
+  });
+
+  it("BLOCKS a second local-mode record on the same repo instead of resuming both", async () => {
+    // Two agents in one checkout silently overwrite each other, and a
+    // `git checkout` in one destroys the other's uncommitted work. The lease has
+    // to be taken while records are READ, not as a side effect of a successful
+    // resume — see the pre-scan in reconcileOnStartup.
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "first", sessionId: "s-first" }));
+      store.commit("first");
+      store.reserve(bind({ threadId: "second", sessionId: "s-second" }));
+      store.commit("second");
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      await reconcile(app, async () => "valid");
+      expect(sessionsOf(app).has("first")).toBe(true);
+      expect(sessionsOf(app).has("second")).toBe(false);
+      expect(store.get("second")?.state).toBe("blocked");
+      expect(store.get("second")?.reason).toBe("local-conflict");
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
+  it("lets two WORKTREE records share a repo — that is what worktrees are for", async () => {
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      store.reserve(wtBind("a"));
+      store.commit("a");
+      store.reserve(wtBind("b"));
+      store.commit("b");
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      await reconcile(app, async () => "valid");
+      expect(sessionsOf(app).has("a")).toBe(true);
+      expect(sessionsOf(app).has("b")).toBe(true);
+    } finally {
+      rmSync(f, { force: true });
     }
   });
 
@@ -320,7 +400,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
       const store = new SessionStore(f);
       store.reserve(bind({ threadId: "t1", sessionId: "s-1", workDir: "C:\\somewhere\\else" }));
       store.commit("t1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(false);
       expect(store.get("t1")?.state).toBe("blocked");
@@ -376,7 +456,7 @@ describe("startup announcement for records whose thread is gone", () => {
       store.reserve(bind({ threadId: "dead", workDir: wt, branch: "copilot/t-dead" }));
       store.commit("dead");
       const transport = new KeyedTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
       await reconcile(app, async () => "gone");
 
       const parent = transport.sent.filter((m) => m.key === "c1");
@@ -395,7 +475,7 @@ describe("startup announcement for records whose thread is gone", () => {
       const store = new SessionStore(f);
       store.reserve(bind()); store.commit("t1");
       const transport = new KeyedTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
       await reconcile(app, async () => "valid");
       expect(transport.sent.filter((m) => m.key === "c1")).toHaveLength(0);
     } finally {
@@ -425,7 +505,7 @@ describe("a record retired by reclaim stays announceable", () => {
       store.reserve(bind({ threadId: "kept", workDir: wt, branch: "copilot/t-kept" }));
       store.commit("kept");
       const transport = new KeyedTransport2();
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
       await reconcile(app, async () => "gone");
       expect(store.get("kept")?.reason).toBe("thread-gone");
 
@@ -454,7 +534,7 @@ describe("a record retired by reclaim stays announceable", () => {
       store.reserve(bind({ threadId: "live-end", workDir: wt, branch: "copilot/t-live-end" }));
       store.commit("live-end"); // active, no reason
       const transport = new KeyedTransport2();
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
       (app as unknown as { retire(id: string): boolean }).retire("live-end");
       expect(store.get("live-end")?.reason).toBe("worktree-kept");
 
@@ -490,7 +570,7 @@ describe("startup announcement length budget", () => {
         store.setState(id, "blocked", "thread-gone");
       }
       const transport = new Cap();
-      const app = DiscordCopilotApp.createForTest(cfg, REPO, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
       await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
       expect(transport.sent).toHaveLength(1);
       const msg = transport.sent[0]!;

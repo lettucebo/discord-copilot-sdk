@@ -182,25 +182,82 @@ function findProcess() {
   return out;
 }
 
-/** Worktrees this tool made, with git's verdict on each. */
-function findWorktrees(repoPath) {
+/**
+ * Worktrees this tool made, with git's verdict on each.
+ *
+ * Two things changed with multi-repo, and both are load-bearing here:
+ *
+ *  - the layout is now `<root>/<repoSlug>/<threadId>`, while records written
+ *    before the change legitimately still use the flat `<root>/<threadId>`, so
+ *    BOTH have to be walked;
+ *  - the owning repo is no longer "the one configured repo". It is asked of git
+ *    directly (`--git-common-dir` resolves a linked worktree to its MAIN repo),
+ *    because `git worktree remove` run with the wrong repo as cwd simply fails,
+ *    and a worktree that cannot name its owner is one we must not remove.
+ */
+function findWorktrees() {
   if (!fs.existsSync(WORKTREE_ROOT)) return [];
-  return fs
-    .readdirSync(WORKTREE_ROOT, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
-    .map((d) => {
-      const dir = path.join(WORKTREE_ROOT, d.name);
-      const status = tryRun("git", ["status", "--porcelain", "--ignored=matching"], { cwd: dir });
-      const head = tryRun("git", ["symbolic-ref", "--quiet", "HEAD"], { cwd: dir });
-      const branch = `copilot/t-${d.name}`;
-      return { dir, branch, repoPath, verdict: classifyWorktree(status, head === null ? null : head.trim(), branch) };
-    });
+  const out = [];
+  const inspect = (dir, name) => {
+    const owner = ownerRepoOf(dir);
+    const status = tryRun("git", ["status", "--porcelain", "--ignored=matching"], { cwd: dir });
+    const head = tryRun("git", ["symbolic-ref", "--quiet", "HEAD"], { cwd: dir });
+    const branch = `copilot/t-${name}`;
+    const verdict = owner === null ? "unknown-owner" : classifyWorktree(status, head === null ? null : head.trim(), branch);
+    out.push({ dir, branch, repoPath: owner, verdict });
+  };
+  for (const top of fs.readdirSync(WORKTREE_ROOT, { withFileTypes: true })) {
+    if (!top.isDirectory()) continue;
+    const dir = path.join(WORKTREE_ROOT, top.name);
+    if (fs.existsSync(path.join(dir, ".git"))) {
+      inspect(dir, top.name); // legacy flat layout: this IS a worktree
+      continue;
+    }
+    let inner = [];
+    try {
+      inner = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const child of inner) {
+      if (!child.isDirectory()) continue;
+      inspect(path.join(dir, child.name), child.name);
+    }
+  }
+  return out;
 }
 
-function findBranches(repoPath) {
-  if (!repoPath || !fs.existsSync(repoPath)) return [];
-  const out = tryRun("git", ["-C", repoPath, "branch", "--list", "copilot/t-*", "--format=%(refname:short)"]);
-  return out ? out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean) : [];
+/** The repo a worktree belongs to, or null when git cannot say. Never guesses:
+ *  a wrong answer here means `git worktree remove` targets the wrong repo. */
+function ownerRepoOf(dir) {
+  const common = tryRun("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: dir });
+  if (common === null || !common.trim()) return null;
+  return path.resolve(path.dirname(common.trim()));
+}
+
+/** `copilot/t-*` branches across EVERY repo under the repos root. Scanning only
+ *  one repo (all there was before multi-repo) silently leaves branches behind in
+ *  every other project the bot has worked in. */
+function findBranches(reposRoot) {
+  if (!reposRoot || !fs.existsSync(reposRoot)) return [];
+  const out = [];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(reposRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  for (const e of entries) {
+    if (!e.isDirectory() || e.name.startsWith(".")) continue;
+    const repo = path.join(reposRoot, e.name);
+    if (!fs.existsSync(path.join(repo, ".git"))) continue;
+    const listed = tryRun("git", ["-C", repo, "branch", "--list", "copilot/t-*", "--format=%(refname:short)"]);
+    if (!listed) continue;
+    for (const b of listed.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)) {
+      out.push({ repo, branch: b });
+    }
+  }
+  return out;
 }
 
 // ------------------------------------------------------------------- steps --
@@ -422,20 +479,25 @@ function stepWorktrees(worktrees) {
   return allGood;
 }
 
-function stepBranches(repoPath, branches) {
+function stepBranches(branches) {
   if (!branches.length) {
     say("  （沒有 copilot/t-* 分支）", "  (no copilot/t-* branches)");
     return true;
   }
-  for (const b of branches) {
+  for (const { repo, branch } of branches) {
     // `-d`, never `-D`: git refuses to delete a branch holding unmerged commits,
     // and that refusal is the whole safety net here. Report git's own words
     // rather than assuming "unmerged" — it may be a lock or a checked-out branch.
-    const out = tryRun("git", ["-C", repoPath, "branch", "-d", b]);
+    const out = tryRun("git", ["-C", repo, "branch", "-d", branch]);
+    const where = path.basename(repo);
     if (out === null) {
-      warn(ZH ? `保留分支 ${b}（git 拒絕刪除：可能有未合併的 commit，或正被 worktree 使用）` : `kept branch ${b} (git refused: unmerged commits, or checked out in a worktree)`);
+      warn(
+        ZH
+          ? `保留分支 ${where}/${branch}（git 拒絕刪除：可能有未合併的 commit，或正被 worktree 使用）`
+          : `kept branch ${where}/${branch} (git refused: unmerged commits, or checked out in a worktree)`
+      );
     } else {
-      ok(ZH ? `已刪除分支：${b}` : `deleted branch: ${b}`);
+      ok(ZH ? `已刪除分支：${where}/${branch}` : `deleted branch: ${where}/${branch}`);
     }
   }
   return true; // a refusal to delete is a safety feature, not a failure
@@ -479,12 +541,14 @@ function stepEnv() {
 async function main() {
   say("== discord-copilot-sdk 解除安裝 ==", "== discord-copilot-sdk uninstall ==");
   const env = readEnv();
-  const repoPath = env.CONTROLLED_REPO_PATH || "";
+  // Multi-repo: worktrees name their own owner (git is asked), and branches are
+  // swept across every repo under the root — not just one configured repo.
+  const reposRoot = env.REPOS_ROOT || "";
   const residency = findResidency();
   const wrappers = findWrappers();
   const proc = findProcess();
-  const worktrees = findWorktrees(repoPath);
-  const branches = findBranches(repoPath);
+  const worktrees = findWorktrees();
+  const branches = findBranches(reposRoot);
   const { steps, refusals } = planUninstall(FLAGS);
 
   // --- the plan, before anything happens ---
@@ -599,7 +663,7 @@ async function main() {
         failed.add("worktrees");
       } else if (!stepWorktrees(worktrees)) failed.add("worktrees");
     } else if (s === "branches") {
-      if (!stepBranches(repoPath, branches)) failed.add("branches");
+      if (!stepBranches(branches)) failed.add("branches");
     } else if (s === "state") {
       if (failed.has("process")) {
         warn(ZH ? "有 bot 仍在執行，略過刪除狀態目錄。" : "a bot is still running; skipped deleting the state dir.");

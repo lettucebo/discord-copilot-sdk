@@ -89,6 +89,13 @@ export class SessionActor {
   private session!: CopilotSession;
   private renderer = new TurnRenderer();
   private readonly generation: number;
+  /** The generation this actor was created with — the fence a broker settle is
+   *  checked against. Exposed so the app can register its OWN pending
+   *  interactions (the repo-rebind confirmation) on this session's broker with
+   *  the same fence the actor uses. */
+  generationOf(): number {
+    return this.generation;
+  }
   /** See `SessionActorOpts.approvalKey`. */
   private get approvalKey(): string {
     return this.opts.approvalKey ?? this.opts.workingDirectory;

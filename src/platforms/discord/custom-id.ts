@@ -49,6 +49,32 @@ export function decodeChoiceId(customId: string): DecodedChoice | undefined {
   return { nonce, index };
 }
 
+// ---- repo rebind confirmation ------------------------------------------
+
+/** Confirm or cancel a repo/dev-mode rebind. `cancel` is the SAFE default that
+ *  a timeout, an abort or an unacknowledged click resolves to. */
+export type RebindAction = "confirm" | "cancel";
+
+const REBIND_ACTIONS: ReadonlySet<string> = new Set(["confirm", "cancel"]);
+
+export function encodeRepoId(nonce: string, action: RebindAction): string {
+  return `${NS}:repo:${action}:${nonce}`;
+}
+
+export interface DecodedRepo {
+  nonce: string;
+  action: RebindAction;
+}
+
+export function decodeRepoId(customId: string): DecodedRepo | undefined {
+  const parts = customId.split(":");
+  if (parts.length !== 4) return undefined;
+  const [ns, kind, action, nonce] = parts;
+  if (ns !== NS || kind !== "repo" || !nonce) return undefined;
+  if (!action || !REBIND_ACTIONS.has(action)) return undefined;
+  return { nonce, action: action as RebindAction };
+}
+
 // ---- exit-plan buttons --------------------------------------------------
 
 /** Plan action: an index into the request's `actions`, or "reject". */

@@ -46,7 +46,7 @@ const cfgFor = (r: string): Parameters<typeof DiscordCopilotApp.createForTest>[0
     DISCORD_ALLOWED_USER_IDS: ["u1"],
     DISCORD_GUILD_ID: "g1",
     DISCORD_PARENT_CHANNEL_ID: "c1",
-    CONTROLLED_REPO_PATH: r,
+    REPOS_ROOT: path.dirname(r),
     DEFAULT_MODEL: "claude-sonnet-5",
     DEFAULT_CONTEXT_TIER: "default",
     PERMISSION_POLICY: "ask",
@@ -88,25 +88,33 @@ async function seed(): Promise<{ app: DiscordCopilotApp; store: SessionStore; di
     guildId: "g1",
     parentChannelId: "c1",
     workDir: dir,
+    devMode: "worktree",
     branch,
   };
   store.reserve(b);
   store.commit("t1");
-  const app = DiscordCopilotApp.createForTest(cfgFor(repo), repo, fakeCopilot(), new NullTransport(), store);
+  const app = DiscordCopilotApp.createForTest(
+    cfgFor(repo),
+    path.dirname(repo),
+    fakeCopilot(),
+    new NullTransport(),
+    store
+  );
   return { app, store, dir, branch };
 }
 
 const reclaim = (
   app: DiscordCopilotApp,
   id: string,
+  repoPath: string,
   wd: string,
   br?: string
 ): Promise<{ ok: boolean; tail: string }> =>
   (
     app as unknown as {
-      reclaim(t: string, w: string, b?: string): Promise<{ ok: boolean; tail: string }>;
+      reclaim(t: string, r: string, w: string, b?: string): Promise<{ ok: boolean; tail: string }>;
     }
-  ).reclaim(id, wd, br);
+  ).reclaim(id, repoPath, wd, br);
 
 // Each test here creates a real git repo AND a real worktree, so it pays for
 // several git subprocesses. Locally that is ~1.4s; CI runs roughly 4-5x slower
@@ -115,7 +123,7 @@ const reclaim = (
 describe("reclaim — the record and its worktree retire together", { timeout: 60_000 }, () => {
   it("clean worktree: both go, branch stays", async () => {
     const { app, store, dir, branch } = await seed();
-    const out = await reclaim(app, "t1", dir, branch);
+    const out = await reclaim(app, "t1", repo, dir, branch);
     expect(out.ok).toBe(true);
     expect(store.get("t1")).toBeUndefined();
     expect(fs.existsSync(dir)).toBe(false);
@@ -130,7 +138,7 @@ describe("reclaim — the record and its worktree retire together", { timeout: 6
     // that has already been stopped.
     const { app, store, dir, branch } = await seed();
     await fs.promises.writeFile(path.join(dir, "untracked.txt"), "operator's work\n");
-    const out = await reclaim(app, "t1", dir, branch);
+    const out = await reclaim(app, "t1", repo, dir, branch);
     expect(out.ok).toBe(false);
     expect(fs.existsSync(dir)).toBe(true);
     const rec = store.get("t1");
@@ -147,7 +155,7 @@ describe("reclaim — the record and its worktree retire together", { timeout: 6
     const { app, store, dir, branch } = await seed();
     await git(repo, "worktree", "remove", "--force", dir);
     expect(fs.existsSync(dir)).toBe(false);
-    const out = await reclaim(app, "t1", dir, branch);
+    const out = await reclaim(app, "t1", repo, dir, branch);
     expect(out.ok).toBe(true);
     expect(store.get("t1")).toBeUndefined();
   });
@@ -155,10 +163,10 @@ describe("reclaim — the record and its worktree retire together", { timeout: 6
   it("a retired record can be reclaimed on a later attempt once the tree is dealt with", async () => {
     const { app, store, dir, branch } = await seed();
     await fs.promises.writeFile(path.join(dir, "untracked.txt"), "x\n");
-    expect((await reclaim(app, "t1", dir, branch)).ok).toBe(false);
+    expect((await reclaim(app, "t1", repo, dir, branch)).ok).toBe(false);
     expect(store.get("t1")).toBeDefined();
     await git(repo, "worktree", "remove", "--force", dir); // operator cleans up
-    expect((await reclaim(app, "t1", dir, branch)).ok).toBe(true);
+    expect((await reclaim(app, "t1", repo, dir, branch)).ok).toBe(true);
     expect(store.get("t1")).toBeUndefined();
   });
 
@@ -172,10 +180,11 @@ describe("reclaim — the record and its worktree retire together", { timeout: 6
       guildId: "g1",
       parentChannelId: "c1",
       workDir: repo,
+      devMode: "local",
     });
     store.commit("t2");
-    const app = DiscordCopilotApp.createForTest(cfgFor(repo), repo, fakeCopilot(), new NullTransport(), store);
-    const out = await reclaim(app, "t2", repo, undefined);
+    const app = DiscordCopilotApp.createForTest(cfgFor(repo), path.dirname(repo), fakeCopilot(), new NullTransport(), store);
+    const out = await reclaim(app, "t2", repo, repo, undefined);
     expect(out.ok).toBe(true);
     expect(store.get("t2")).toBeUndefined();
     expect(fs.existsSync(path.join(repo, "a.txt"))).toBe(true); // repo untouched

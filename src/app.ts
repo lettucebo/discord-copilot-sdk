@@ -8,8 +8,12 @@ import {
   ChannelType,
   ThreadAutoArchiveDuration,
   MessageFlags,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   type Interaction,
   type ButtonInteraction,
+  type AutocompleteInteraction,
   type ChatInputCommandInteraction,
   type Message,
   type TextChannel,
@@ -18,8 +22,10 @@ import {
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Config } from "./config.js";
 import { acquireSingleInstanceLock, type InstanceLock } from "./core/single-instance.js";
-import { lockPath, sessionStorePath, stateDir } from "./core/paths.js";
-import { resolveControlledRepo } from "./core/repo.js";
+import { lockPath, sessionStorePath, worktreeRoot } from "./core/paths.js";
+import { resolveReposRoot, resolveRepoWithinRoot, listRepos, isStrictlyInside, pathRelation } from "./core/repo.js";
+import { validateBinding, describeBindingProblem, type DevMode } from "./core/binding.js";
+import { RepoProvisioner, sweepStaleStaging } from "./core/repo-provision.js";
 import { gitDiffSummary } from "./core/git.js";
 import { downloadBounded } from "./core/download.js";
 import { SessionStore, type SessionRecord } from "./core/session-store.js";
@@ -32,19 +38,19 @@ import {
 import { deriveThreadTitle, THREAD_NAME_MAX } from "./core/thread-name.js";
 import { pickTitleModel, buildTitlePrompt, cleanModelTitle } from "./core/title.js";
 import {
-  chooseIsolation,
   isGitRepo,
   repoRoot,
   addWorktree,
+  inspectWorktree,
   removeWorktreeIfClean,
   pruneWorktrees,
   worktreeBranch,
   worktreePath,
-  type Isolation,
 } from "./core/worktree.js";
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, type Dirent } from "node:fs";
+import { tmpdir } from "node:os";
+import path, { join } from "node:path";
 
 import { sendUnlessAborted } from "./core/turn-gate.js";
 import { shouldResetEffort, validateEffort, EFFORT_LEVELS } from "./core/effort.js";
@@ -53,7 +59,14 @@ import { PendingInteractionBroker, type PendingView } from "./core/broker.js";
 import { SessionActor, type BlobAttachment, formatTodos } from "./copilot/session-actor.js";
 import { ApprovalPolicy } from "./core/approval-policy.js";
 import { DiscordTransport } from "./platforms/discord/discord-transport.js";
-import { decodePermissionId, decodeChoiceId, decodePlanId } from "./platforms/discord/custom-id.js";
+import {
+  decodePermissionId,
+  decodeChoiceId,
+  decodePlanId,
+  decodeRepoId,
+  encodeRepoId,
+  type RebindAction,
+} from "./platforms/discord/custom-id.js";
 import { isAuthorized, type AuthContext, type AuthPolicy } from "./platforms/discord/auth.js";
 import type { Decision, Transport } from "./core/transport.js";
 
@@ -80,11 +93,21 @@ export interface Session {
    *  NOT drain the runtime queue (verified — a queued message still ran after an
    *  abort), so `/stop` could not honestly stop anything we had pushed there. */
   queue: string[];
-  /** Directory this session's agent works in — its own git worktree, or the
-   *  controlled repo under `shared` isolation. */
+  /** Directory this session's agent works in — its own git worktree, or the repo
+   *  itself under `local` dev mode. */
   workDir: string;
+  /** The repo this session is bound to (canonical, under `REPOS_ROOT`). */
+  repoPath: string;
+  /** How this session gets its working directory. */
+  devMode: DevMode;
   /** Branch checked out in `workDir` when it is a worktree we created. */
   branch?: string;
+  /** True once a turn has actually run, i.e. the session carries conversation
+   *  history worth warning about before a rebind throws it away. A resumed
+   *  session is initialised `true`: preserving history is the entire point of
+   *  resume, so by definition it has some. Deliberately NOT derived from
+   *  `titled` — `/rename` and resume both set that. */
+  hasRunTurn: boolean;
 }
 
 /** The subset of an SDK session the throwaway titler uses. */
@@ -95,10 +118,41 @@ interface TitlerSession {
   disconnect?: () => Promise<unknown>;
 }
 
+/** Every reply that can carry agent- or remote-derived text must pass this.
+ *  `DiscordTransport` spreads the same thing on every send path; a new path in
+ *  the orchestrator that forgets it is a real regression, and `/repo clone`
+ *  relays a remote git server's own words. */
+const NO_MENTIONS = { allowedMentions: { parse: [] as never[] } };
+
 /** Most prompts `/queue` will hold. A queue is a convenience, not a job runner;
  *  an unbounded one just defers a pile of work the operator has forgotten
  *  about onto an unattended machine. */
 const QUEUE_MAX = 10;
+
+/** How long a repo-rebind confirmation card stays live. Shorter than the
+ *  5-minute permission timeout on purpose: this one blocks nothing (the session
+ *  keeps working), and a stale "shall I throw away your history?" button sitting
+ *  around for five minutes is more likely to be clicked by accident than
+ *  answered deliberately. */
+const REBIND_CONFIRM_TIMEOUT_MS = 120_000;
+
+/** What a rebind confirmation settles to. */
+type RebindDecision = RebindAction;
+
+/** The two buttons on a rebind confirmation. `Danger` on confirm because the
+ *  action is irreversible: it discards the conversation. */
+function rebindButtons(nonce: string): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(encodeRepoId(nonce, "confirm"))
+      .setLabel("切換（放棄目前對話）")
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(encodeRepoId(nonce, "cancel"))
+      .setLabel("取消")
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
 
 /** A reconcile failure that must stop startup (a required state transition
  *  could not be persisted), as opposed to one bad record we can skip past. */
@@ -109,18 +163,10 @@ class FatalReconcileError extends Error {}
  *  lab machine is a resource leak, not a feature. */
 const MAX_LIVE_SESSIONS = 8;
 
-/** Where per-session worktrees live.
- *
- * Deliberately NOT under `stateDir()`: that directory holds `approvals.json`,
- * the session store and the instance lock, and every agent's cwd would then sit
- * two levels below the bot's own trust store. In a threat model where the
- * controlled repo is untrusted and tools run unsandboxed as the OS user, one
- * approved relative-path write would be enough to grant durable auto-approval
- * for arbitrary executables. Keeping worktrees in a sibling directory means no
- * agent's working directory has the trust store as an ancestor. */
-function worktreeRoot(): string {
-  return `${stateDir()}-worktrees`;
-}
+/** Where per-session worktrees live — see `worktreeRoot()` in `core/paths.ts`,
+ *  which owns the definition because it is half of a security boundary that
+ *  `resolveReposRoot`, `validateBinding`, the stray scan and the uninstaller all
+ *  have to agree on. */
 
 /** Milliseconds a single session teardown may take during /new before we give
  *  up on it (and keep it for a later retry) rather than stalling. */
@@ -295,17 +341,35 @@ export class DiscordCopilotApp {
   /** Startup phase gate (P2): input is rejected until reconciliation completes,
    *  so a /new can't race startup resume and create a second live actor. */
   private phase: "booting" | "reconciling" | "ready" | "shuttingDown" = "booting";
-  /** How each session gets its working directory. Resolved once at startup from
-   *  the controlled repo + `SESSION_ISOLATION`; see `chooseIsolation`. */
-  private isolation: Isolation = "shared";
-  /** Repository root that "always allow for this repo" rules are keyed by. With
-   *  worktrees every session has a different `workDir`, so keying on that would
-   *  silently re-prompt for a command the operator already trusted here. */
-  private approvalRepoKey = "";
+  /** Canonical `REPOS_ROOT` — the directory that contains every bindable repo.
+   *  Resolved once at startup by `resolveReposRoot`. */
+  private reposRoot = "";
+  /** Repos currently held by a live `local`-mode session, canonical path → thread
+   *  id. Two agents in one checkout silently overwrite each other, so this is a
+   *  hard mutual exclusion, not a warning. Taken during reconcile BEFORE any
+   *  resume, and held across a transient resume failure. */
+  private readonly localLeases = new Map<string, string>();
+  /** Seam for the git-backed binding proof. Production always uses the real
+   *  `validateBinding`; `reconcileOnStartup` lets a test inject one so the
+   *  reconcile state machine can be exercised without building real repos on
+   *  disk for every case. */
+  private bindingCheck: typeof validateBinding = validateBinding;
+  /** Threads with a clone/init in flight. A clone can take minutes, during which
+   *  a second one in the same thread would race for the same destination. */
+  private readonly provisioning = new Set<string>();
+  /** Threads with a rebind in progress. Two `applyRebind` runs on one thread
+   *  would each create a session and each `sessions.set`, leaving the loser's
+   *  SDK session live but referenced by nothing. */
+  private readonly rebinding = new Set<string>();
+  /** The pending rebind confirmation per thread, so a second `/repo set` can
+   *  supersede the first instead of leaving two live cards that can both be
+   *  confirmed. */
+  private readonly rebindCards = new Map<string, string>();
+  /** See `provisioner()` — one instance, because its lease is instance state. */
+  private repoProvisioner?: RepoProvisioner;
 
   private constructor(
     private readonly config: Config,
-    private readonly repoPath: string,
     private readonly copilot: CopilotClient,
     private readonly lock: InstanceLock,
     transportOverride?: Transport,
@@ -330,21 +394,27 @@ export class DiscordCopilotApp {
   /** Test-only seam: construct the app with an injected transport + store (and
    *  fake copilot/lock), skipping the lock/SDK/login startup, so unit tests can
    *  drive the real runTurn/stop/reconcile wiring without a live Discord
-   *  connection. Not used in production (start() is the only production entry). */
+   *  connection. Not used in production (start() is the only production entry).
+   *
+   *  `reposRoot` is set directly rather than resolved: the filesystem checks in
+   *  `resolveReposRoot` are covered by their own tests, and requiring a real
+   *  directory here would make every app-level test build one. */
   static createForTest(
     config: Config,
-    repoPath: string,
+    reposRoot: string,
     copilot: CopilotClient,
     transport: Transport,
     store?: SessionStore
   ): DiscordCopilotApp {
     const noopLock: InstanceLock = { path: "(test)", release: async () => {} };
-    return new DiscordCopilotApp(config, repoPath, copilot, noopLock, transport, store);
+    const app = new DiscordCopilotApp(config, copilot, noopLock, transport, store);
+    app.reposRoot = reposRoot;
+    return app;
   }
 
   /** Build and fully start the app (lock → SDK → Discord login + commands). */
   static async start(config: Config): Promise<DiscordCopilotApp> {
-    const repoPath = resolveControlledRepo(config.CONTROLLED_REPO_PATH);
+    const reposRoot = resolveReposRoot(config.REPOS_ROOT);
     const compat = checkSdkCompat();
     if (!compat.ok) {
       // Fatal in bot mode: our event-field and permission-shape assumptions are
@@ -359,10 +429,14 @@ export class DiscordCopilotApp {
     let copilot: CopilotClient | undefined;
     let app: DiscordCopilotApp | undefined;
     try {
-      copilot = createCopilotClient({ workingDirectory: repoPath });
+      // A NEUTRAL working directory. Every session sets its own, and pointing the
+      // shared client at a repo would make whichever repo happens to be
+      // "default" the implicit cwd for anything that forgets to.
+      copilot = createCopilotClient();
       await copilot.start();
       await preflightModel(copilot, config.DEFAULT_MODEL);
-      app = new DiscordCopilotApp(config, repoPath, copilot, lock);
+      app = new DiscordCopilotApp(config, copilot, lock);
+      app.reposRoot = reposRoot;
       await app.login();
       return app;
     } catch (err) {
@@ -378,28 +452,33 @@ export class DiscordCopilotApp {
     }
   }
 
-  /** Decide how concurrent sessions are isolated, and pick the key that repo-wide
-   *  approvals are stored under. Fails startup when the operator explicitly asked
-   *  for worktrees somewhere they cannot exist — running unprotected while they
-   *  believe otherwise is the one outcome worth refusing to boot over. */
-  private async resolveIsolation(): Promise<void> {
-    const git = await isGitRepo(this.repoPath);
-    const chosen = chooseIsolation({ isGitRepo: git, configured: this.config.SESSION_ISOLATION });
-    if (chosen === "impossible") {
-      throw new Error(
-        `SESSION_ISOLATION=worktree was requested but ${this.repoPath} is not a git repository. ` +
-          `Point CONTROLLED_REPO_PATH at a git repo, or set SESSION_ISOLATION=shared (only ONE session is safe at a time).`
-      );
+  /** Resolve the repo a name refers to, or throw with a readable reason. */
+  private repoByName(name: string): string {
+    return resolveRepoWithinRoot(this.reposRoot, name);
+  }
+
+  /** The repo `/new` binds to when no `repo:` was given, or undefined. */
+  private defaultRepo(): string | undefined {
+    const name = this.config.DEFAULT_REPO;
+    if (!name) return undefined;
+    try {
+      return this.repoByName(name);
+    } catch {
+      return undefined;
     }
-    this.isolation = chosen;
-    // Approvals follow the REPOSITORY, not the per-session checkout.
-    this.approvalRepoKey = git ? await repoRoot(this.repoPath) : this.repoPath;
-    if (chosen === "worktree") await pruneWorktrees(this.repoPath);
-    else {
-      console.warn(
-        "⚠️  SESSION_ISOLATION=shared — every session works in the SAME directory, so only one is safe at a time. /new will end the previous session."
-      );
-    }
+  }
+
+  /**
+   * Identity that "always allow for this repo" rules are stored under.
+   *
+   * Follows the REPOSITORY, not the per-session checkout: with worktrees every
+   * session has a different `workDir`, so keying on that would silently
+   * re-prompt for a command the operator already trusted in this repository.
+   * Lenient on purpose — a wrong key only costs an extra prompt, and this is not
+   * the security boundary (`validateBinding` is).
+   */
+  private async approvalKeyFor(repoPath: string): Promise<string> {
+    return (await isGitRepo(repoPath)) ? repoRoot(repoPath) : repoPath;
   }
 
   /** Log in and resolve only once the gateway is ready AND slash commands are
@@ -419,21 +498,32 @@ export class DiscordCopilotApp {
 
   private async onReady(clientId: string): Promise<void> {
     await this.loadModels();
-    await this.resolveIsolation();
     await this.registerCommands(clientId);
     // Reconcile persisted sessions BEFORE accepting input (phase gate), so a
     // /new can't race startup resume and double-register a thread.
     this.phase = "reconciling";
     await this.reconcileOnStartup();
+    // Clear scratch left by a clone that died mid-flight. Safe here: nothing is
+    // provisioning yet, and only directories carrying our own marker are swept.
+    await sweepStaleStaging(this.reposRoot);
     this.phase = "ready";
+    const repos = listRepos(this.reposRoot);
+    const dflt = this.config.DEFAULT_REPO;
     console.log(
-      `✅ discord-copilot-sdk ready — controlling ${this.repoPath}\n` +
+      `✅ discord-copilot-sdk ready — repos root ${this.reposRoot} (${repos.length} repo(s))\n` +
+        `   default repo=${dflt ?? "(none — /new needs repo:)"} · new sessions get their own git worktree\n` +
         `   guild=${this.config.DISCORD_GUILD_ID} channel=${this.config.DISCORD_PARENT_CHANNEL_ID}\n` +
         `   model=${this.config.DEFAULT_MODEL} contextTier=${this.config.DEFAULT_CONTEXT_TIER} (${this.modelIds.length} models)\n` +
-        `   isolation=${this.isolation} (concurrent sessions: up to ${MAX_LIVE_SESSIONS})\n` +
+        `   concurrent sessions: up to ${MAX_LIVE_SESSIONS}\n` +
         `   ⚠️  lab mode: tools run as this OS user with no sandbox. The bot uses your\n` +
         `      logged-in Copilot, so any saved "always allow" rules bypass the Discord prompt.`
     );
+    if (dflt && !this.defaultRepo()) {
+      console.warn(
+        `⚠️  DEFAULT_REPO=${dflt} is not a usable repo under ${this.reposRoot}. ` +
+          `/new will require an explicit repo: until that is fixed.`
+      );
+    }
   }
 
   /** Snapshot the available models + their supported reasoning efforts for the
@@ -464,6 +554,62 @@ export class DiscordCopilotApp {
         .setDescription("Start a new Copilot session in a thread")
         .addStringOption((o) =>
           o.setName("prompt").setDescription("Optional first prompt").setRequired(false)
+        )
+        .addStringOption((o) =>
+          o
+            .setName("repo")
+            .setDescription("Repo under REPOS_ROOT (defaults to DEFAULT_REPO)")
+            .setRequired(false)
+            .setAutocomplete(true)
+        )
+        .toJSON(),
+      new SlashCommandBuilder()
+        .setName("repo")
+        .setDescription("Which repo this thread works in, and how")
+        .addSubcommand((s) => s.setName("show").setDescription("What this thread is bound to"))
+        .addSubcommand((s) => s.setName("list").setDescription("Repos available under REPOS_ROOT"))
+        .addSubcommand((s) =>
+          s
+            .setName("set")
+            .setDescription("Bind this thread to a different repo (starts a fresh conversation)")
+            .addStringOption((o) =>
+              o.setName("name").setDescription("Repo name").setRequired(true).setAutocomplete(true)
+            )
+        )
+        .addSubcommand((s) =>
+          s
+            .setName("dev")
+            .setDescription("Work in this session's own worktree, or directly in the repo")
+            .addStringOption((o) =>
+              o
+                .setName("mode")
+                .setDescription("worktree (isolated, default) or local (edits the repo itself)")
+                .setRequired(true)
+                .addChoices(
+                  { name: "worktree — isolated copy for this session", value: "worktree" },
+                  { name: "local — work directly in the repo", value: "local" }
+                )
+            )
+        )
+        .addSubcommand((s) =>
+          s
+            .setName("clone")
+            .setDescription("Clone a remote repo into REPOS_ROOT and bind this thread to it")
+            .addStringOption((o) =>
+              o
+                .setName("source")
+                .setDescription("owner/repo, https://…, ssh://…, or git@host:owner/repo")
+                .setRequired(true)
+            )
+            .addStringOption((o) =>
+              o.setName("name").setDescription("Folder name (defaults to the repo name)").setRequired(false)
+            )
+        )
+        .addSubcommand((s) =>
+          s
+            .setName("new")
+            .setDescription("Create a new empty git repo in REPOS_ROOT and bind this thread to it")
+            .addStringOption((o) => o.setName("name").setDescription("New project name").setRequired(true))
         )
         .toJSON(),
       new SlashCommandBuilder()
@@ -582,6 +728,15 @@ export class DiscordCopilotApp {
 
   private async onInteraction(interaction: Interaction): Promise<void> {
     try {
+      // Autocomplete is handled BEFORE the phase gate's repliable path: an
+      // autocomplete interaction is not repliable, so `reply()` throws and
+      // Discord shows a stuck "loading options" spinner instead of an empty
+      // list. `respond([])` is the only valid answer, and an empty list is the
+      // right one while the bot is still booting.
+      if (interaction.isAutocomplete()) {
+        await this.onAutocomplete(interaction);
+        return;
+      }
       // Startup gate (P2): reject input until reconciliation finished, so a /new
       // can't race startup resume. Also blocks during shutdown.
       if (this.phase !== "ready") {
@@ -610,6 +765,7 @@ export class DiscordCopilotApp {
         else if (c === "queue") await this.cmdQueue(interaction);
         else if (c === "end") await this.cmdEnd(interaction);
         else if (c === "sessions") await this.cmdSessions(interaction);
+        else if (c === "repo") await this.cmdRepo(interaction);
       }
     } catch (err) {
       console.error("interaction error:", err);
@@ -620,13 +776,14 @@ export class DiscordCopilotApp {
     const perm = decodePermissionId(interaction.customId);
     const choice = perm ? undefined : decodeChoiceId(interaction.customId);
     const plan = perm || choice ? undefined : decodePlanId(interaction.customId);
-    if (!perm && !choice && !plan) return; // not one of ours
+    const repo = perm || choice || plan ? undefined : decodeRepoId(interaction.customId);
+    if (!perm && !choice && !plan && !repo) return; // not one of ours
     if (!isAuthorized(ctxOf(interaction), this.policy)) {
       await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
       return;
     }
     const uid = interaction.user.id;
-    const nonce = perm?.nonce ?? choice?.nonce ?? plan?.nonce ?? "";
+    const nonce = perm?.nonce ?? choice?.nonce ?? plan?.nonce ?? repo?.nonce ?? "";
     // Unknown nonce (P2): the broker has no entry for it. That is execution-safe
     // (settle would no-op) but it is NOT only the restart case — the same state
     // is reached by the 5-minute timeout, by /stop (which settles pending cards
@@ -697,6 +854,13 @@ export class DiscordCopilotApp {
     } else if (plan) {
       // ack failure ⇒ safe default is reject.
       this.transport.deliverPlan(plan.nonce, acked ? plan.action : "reject", uid);
+    } else if (repo) {
+      // Same ack-before-act rule as every other card: an unacknowledged click
+      // must not discard a conversation. Settling on the OWNING session's broker
+      // (`decisionBindsToChannel` above already proved the click came from it)
+      // keeps the exactly-once and generation guarantees.
+      const owner = this.sessions.get(interaction.channelId);
+      owner?.broker.settle<RebindAction>(repo.nonce, acked ? repo.action : "cancel");
     }
   }
 
@@ -729,9 +893,32 @@ export class DiscordCopilotApp {
       await interaction.editReply("A session is already being created — please retry in a moment.");
       return;
     }
-    if (this.isolation === "worktree" && this.sessions.size >= MAX_LIVE_SESSIONS) {
+    // The cap applies to every mode now. It used to be checked only under
+    // worktree isolation, because the alternative mode ended the previous
+    // session anyway; with per-thread modes nothing else bounds the count.
+    if (this.sessions.size >= MAX_LIVE_SESSIONS) {
       await interaction.editReply(
         `⚠️ 已達同時進行的 session 上限（${MAX_LIVE_SESSIONS}）。請先在某個討論串用 \`/end\` 結束，再開新的。用 \`/sessions\` 看目前有哪些。`
+      );
+      return;
+    }
+    // Resolve the repo BEFORE creating a thread. A thread with no repo would be
+    // a lifecycle state nothing else models — reconcile, /end and the rebind
+    // confirmation all assume a session has a working directory — so the
+    // failure has to happen while there is still nothing to clean up.
+    const repoOption = interaction.options.getString("repo");
+    let repoPath: string;
+    try {
+      repoPath = repoOption ? this.repoByName(repoOption) : (this.defaultRepo() ?? "");
+    } catch (err) {
+      await interaction.editReply(`⚠️ ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    if (!repoPath) {
+      const names = listRepos(this.reposRoot);
+      await interaction.editReply(
+        `⚠️ 沒有指定 repo，而且沒有可用的 \`DEFAULT_REPO\`。請用 \`/new repo:<名稱>\`。` +
+          (names.length ? `\n可用的 repo：${names.slice(0, 20).map((n) => `\`${n}\``).join(", ")}` : "\n（`REPOS_ROOT` 底下目前沒有 repo，可用 `/repo clone` 或 `/repo new` 建立。）")
       );
       return;
     }
@@ -767,25 +954,25 @@ export class DiscordCopilotApp {
       const sessionId = randomUUID();
       const generation = this.store.nextGeneration();
 
-      // Isolate this session's files from the other live ones. Without it,
-      // concurrent agents share one checkout and silently overwrite each other.
-      let workDir = this.repoPath;
-      let branch: string | undefined;
+      // Every new session is isolated. `local` is reachable only through an
+      // explicit `/repo dev local` in the thread — a config key that made it the
+      // default for every new thread would be the same hazard with a longer
+      // fuse, since it silently opts every future session into editing the
+      // operator's own checkout.
+      const devMode: DevMode = "worktree";
+      const branch = worktreeBranch(thread.id);
+      const workDir = worktreePath(worktreeRoot(), repoPath, thread.id);
       let worktreeCreated = false;
-      if (this.isolation === "worktree") {
-        branch = worktreeBranch(thread.id);
-        workDir = worktreePath(worktreeRoot(), thread.id);
-        try {
-          await addWorktree(this.repoPath, workDir, branch);
-          worktreeCreated = true;
-        } catch (err) {
-          await dropThread();
-          await interaction.editReply(
-            `⚠️ 無法為這個 session 建立 git worktree（${err instanceof Error ? err.message : String(err)}）。` +
-              "未建立 session。可設定 `SESSION_ISOLATION=shared` 改用共用工作目錄（**同時只能有一個 session 安全執行**）。"
-          );
-          return;
-        }
+      await pruneWorktrees(repoPath);
+      try {
+        await addWorktree(repoPath, workDir, branch);
+        worktreeCreated = true;
+      } catch (err) {
+        await dropThread();
+        await interaction.editReply(
+          `⚠️ 無法為這個 session 建立 git worktree（${err instanceof Error ? err.message : String(err)}）。未建立 session。`
+        );
+        return;
       }
       // Every abort path from here on must undo the worktree too, or the
       // operator is told "未建立 session" while a full checkout (and a branch)
@@ -794,7 +981,7 @@ export class DiscordCopilotApp {
       // created is clean by construction, so nothing can be lost.
       const dropWorktree = async (): Promise<void> => {
         if (!worktreeCreated) return;
-        await removeWorktreeIfClean(this.repoPath, workDir, branch).catch(() => "failed" as const);
+        await removeWorktreeIfClean(repoPath, workDir, branch).catch(() => "failed" as const);
       };
       const abort = async (msg: string): Promise<void> => {
         await dropWorktree();
@@ -802,33 +989,36 @@ export class DiscordCopilotApp {
         await interaction.editReply(msg);
       };
 
+      // Prove the binding before an agent is pointed at it — the same gate the
+      // resume and rebind paths use. `addWorktree` already refuses to adopt a
+      // directory belonging to another repo, but asking git directly is what
+      // makes "this worktree belongs to this repo" a fact rather than an
+      // inference from how we happened to build the path.
+      const newVerdict = await this.bindingCheck(
+        { repoPath, workDir, devMode, branch },
+        { reposRoot: this.reposRoot, worktreeRoot: worktreeRoot() }
+      );
+      if (!newVerdict.ok) {
+        await abort(
+          `⚠️ 無法確認工作目錄歸屬（${describeBindingProblem(newVerdict.problem)}：${newVerdict.detail}）。未建立 session。`
+        );
+        return;
+      }
+
       const reserved = this.store.reserve({
         threadId: thread.id,
         sessionId,
         generation,
-        repoPath: this.repoPath,
+        repoPath,
         guildId: this.config.DISCORD_GUILD_ID,
         parentChannelId: this.config.DISCORD_PARENT_CHANNEL_ID,
         workDir,
-        ...(branch ? { branch } : {}),
+        devMode,
+        branch,
       });
       if (!reserved) {
         await abort("⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未建立新的 session。請檢查磁碟／權限後重試。");
         return;
-      }
-
-      // Sessions run CONCURRENTLY. Under `shared` isolation they all point at
-      // the same checkout, which is only safe one at a time — so that mode ends
-      // the previous session, exactly as v1 did.
-      if (this.isolation !== "worktree" && this.sessions.size > 0) {
-        const ended = await this.endAllSessions("A new session was started; this one has ended.");
-        if (!ended) {
-          this.store.remove(thread.id);
-          await abort(
-            "無法結束前一個 session（可能已失效），未建立新的。前一個 session 已保留——請重試；若持續發生請重啟 bot。"
-          );
-          return;
-        }
       }
 
       const broker = new PendingInteractionBroker();
@@ -837,7 +1027,7 @@ export class DiscordCopilotApp {
         actor = await SessionActor.create(this.copilot, {
           sessionKey: thread.id,
           workingDirectory: workDir,
-          approvalKey: this.approvalRepoKey,
+          approvalKey: await this.approvalKeyFor(repoPath),
           model: this.config.DEFAULT_MODEL,
           contextTier: this.config.DEFAULT_CONTEXT_TIER,
           broker,
@@ -847,12 +1037,12 @@ export class DiscordCopilotApp {
           createSessionId: sessionId,
         });
       } catch (err) {
-        // Create failed after the old session was torn down. The RPC may or may
-        // not have created the assigned id, so best-effort DELETE it to remove any
-        // dormant runtime session (it has no actor and can never receive a turn,
-        // so it can't contend for the tree, but we don't want it lingering). The
-        // record stays `creating` (→ orphaned on restart, fail-closed); no live
-        // actor exists, so /new can be retried.
+        // Create failed. The RPC may or may not have created the assigned id, so
+        // best-effort DELETE it to remove any dormant runtime session (it has no
+        // actor and can never receive a turn, so it can't contend for the tree,
+        // but we don't want it lingering). The record stays `creating` (→
+        // orphaned on restart, fail-closed); no live actor exists, so /new can be
+        // retried.
         await withTimeout(
           ((this.copilot as unknown as { deleteSession?: (id: string) => Promise<unknown> }).deleteSession?.(
             sessionId
@@ -892,7 +1082,10 @@ export class DiscordCopilotApp {
             titleEpoch: 0,
             queue: [],
             workDir,
-            ...(branch ? { branch } : {}),
+            repoPath,
+            devMode,
+            branch,
+            hasRunTurn: true,
           });
           await interaction.editReply(
             "⚠️ 無法持久化 session 狀態，且無法確認前述 runtime 已關閉。已保留為屏障——請重啟 bot。"
@@ -908,18 +1101,19 @@ export class DiscordCopilotApp {
         titleEpoch: 0,
         queue: [],
         workDir,
-        ...(branch ? { branch } : {}),
+        repoPath,
+        devMode,
+        branch,
+        hasRunTurn: false,
       };
       this.sessions.set(thread.id, session);
       const live = this.sessions.size;
-      const where =
-        this.isolation === "worktree"
-          ? `\n🌿 這個 session 有自己的 git worktree（分支 \`${branch}\`），與其他 session 的檔案互相隔離。`
-          : "\n⚠️ 共用工作目錄模式：一次只有一個 session 是安全的。";
       await interaction.editReply(
         `Started a session in <#${thread.id}>. Send prompts there.` +
           (live > 1 ? `（目前有 ${live} 個 session 同時進行）` : "") +
-          where
+          `\n📁 repo：\`${path.basename(repoPath)}\`` +
+          `\n🌿 這個 session 有自己的 git worktree（分支 \`${branch}\`），與其他 session 的檔案互相隔離。` +
+          `\n（想直接在 repo 本體上開發，在該討論串用 \`/repo dev local\`。）`
       );
 
       if (promptOption) {
@@ -991,8 +1185,9 @@ export class DiscordCopilotApp {
     }
     this.sessions.delete(threadId);
     this.approvals.clearSession(threadId);
+    this.releaseLocalLease(threadId);
     this.transport.dispose(threadId);
-    const outcome = await this.reclaim(threadId, session.workDir, session.branch);
+    const outcome = await this.reclaim(threadId, session.repoPath, session.workDir, session.branch);
     const left = this.sessions.size;
     await interaction.editReply(
       `${outcome.ok ? "✅" : "⚠️"} 這個 session 已結束。${left ? `其他 ${left} 個 session 仍在執行。` : "目前沒有其他 session。"}${outcome.tail}`
@@ -1016,12 +1211,20 @@ export class DiscordCopilotApp {
    */
   private async reclaim(
     threadId: string,
+    repoPath: string,
     workDir: string,
     branch: string | undefined
   ): Promise<{ ok: boolean; tail: string }> {
     let tail = "";
-    if (branch && workDir !== this.repoPath) {
-      const r = await removeWorktreeIfClean(this.repoPath, workDir, branch);
+    // Whatever happens to the worktree and the record, this thread is finished
+    // with the repo: hold on to a local lease here and `/repo dev local` reports
+    // a holder that no longer exists, with no way to clear it but a restart.
+    this.releaseLocalLease(threadId);
+    // A worktree is exactly "there is a branch and the work dir is not the repo".
+    // The owning repo comes from the RECORD, not from a single configured repo:
+    // with many repos, `git worktree remove` run in the wrong one simply fails.
+    if (branch && workDir !== repoPath) {
+      const r = await removeWorktreeIfClean(repoPath, workDir, branch);
       tail = this.worktreeOutcomeText(r, workDir, branch);
       if (r !== "removed" && r !== "already-absent") {
         if (!this.retire(threadId)) {
@@ -1127,7 +1330,7 @@ export class DiscordCopilotApp {
       return;
     }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const outcome = await this.reclaim(threadId, rec.workDir, rec.branch);
+    const outcome = await this.reclaim(threadId, rec.repoPath, rec.workDir, rec.branch);
     // Re-read: reclaim may have retired the record, so the captured `rec.state`
     // would be stale in the failure message.
     const now = this.store.get(threadId)?.state ?? rec.state;
@@ -1147,8 +1350,10 @@ export class DiscordCopilotApp {
     const rows = [...this.sessions.entries()].map(([id, s]) => {
       const state = s.running ? "執行中" : "閒置";
       const q = s.queue.length ? ` · 佇列 ${s.queue.length}` : "";
-      const where = s.branch ? ` · \`${s.branch}\`` : " · 共用工作目錄";
-      return `• <#${id}> — ${state}${q}${where}`;
+      const repo = `\`${path.basename(s.repoPath)}\``;
+      const where =
+        s.devMode === "worktree" ? ` · 🌿 \`${s.branch ?? "?"}\`` : " · 📍 local（直接在 repo 上）";
+      return `• <#${id}> — ${repo} · ${state}${q}${where}`;
     });
     // Records with no live actor still own a worktree and a branch. Surface
     // them, or the disk they hold is invisible. Split by what may actually be
@@ -1159,11 +1364,16 @@ export class DiscordCopilotApp {
     for (const r of this.store.all()) {
       const d = classifyRecordDisposition(r.state, this.sessions.has(r.threadId), this.creating);
       if (d === "live") continue;
-      const line = `• <#${r.threadId}> — ${r.state}${r.reason ? `（${r.reason}）` : ""}${r.branch ? ` · \`${r.branch}\`` : ""}`;
+      const line = `• <#${r.threadId}> — \`${path.basename(r.repoPath)}\` · ${r.state}${r.reason ? `（${r.reason}）` : ""}${r.branch ? ` · \`${r.branch}\`` : ""}`;
       if (d === "reapable") reapable.push(`${line} · id \`${r.threadId}\``);
       else pending.push(line);
     }
-    const header = `目前 ${rows.length}/${MAX_LIVE_SESSIONS} 個 session（隔離模式：\`${this.isolation}\`）`;
+    const leases = [...this.localLeases.entries()].map(
+      ([repo, tid]) => `\`${path.basename(repo)}\` → <#${tid}>`
+    );
+    const header =
+      `目前 ${rows.length}/${MAX_LIVE_SESSIONS} 個 session（repos 根目錄：\`${this.reposRoot}\`）` +
+      (leases.length ? `\nlocal 模式佔用中：${leases.join("、")}` : "");
     const body = rows.length ? `${header}\n${rows.join("\n")}` : `${header}\n（沒有進行中的 session）`;
     // The commonest leftover is a DELETED thread, which you cannot type inside —
     // hence `/end thread:<id>`, usable from this channel.
@@ -1178,9 +1388,557 @@ export class DiscordCopilotApp {
     });
   }
 
-  /** Fire the one-shot thread titler for `text`, fenced so it can never run
-   *  twice or overwrite a later `/rename`. Fire-and-forget by design: naming is
-   *  cosmetic and must never delay or fail a turn. */
+  // ------------------------------------------------------------ /repo -------
+
+  /**
+   * Autocomplete for repo names. Auth-gated: the choice list names every project
+   * on the operator's disk, so an unauthorized user must not be able to
+   * enumerate it by opening the command picker.
+   *
+   * `respond()` is the only valid reply to an autocomplete interaction — it is
+   * NOT repliable, so `reply()` throws and the client is left spinning. An empty
+   * list is always a safe answer.
+   */
+  private async onAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
+    const respond = async (choices: Array<{ name: string; value: string }>): Promise<void> => {
+      await interaction.respond(choices.slice(0, 25)).catch(() => {});
+    };
+    if (this.phase !== "ready" || !isAuthorized(ctxOf(interaction), this.policy)) {
+      await respond([]);
+      return;
+    }
+    const focused = interaction.options.getFocused(true);
+    if (focused.name !== "repo" && focused.name !== "name") {
+      await respond([]);
+      return;
+    }
+    const q = focused.value.trim().toLowerCase();
+    const names = listRepos(this.reposRoot).filter((n) => !q || n.toLowerCase().includes(q));
+    await respond(names.map((n) => ({ name: n.slice(0, 100), value: n.slice(0, 100) })));
+  }
+
+  private async cmdRepo(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isAuthorized(ctxOf(interaction), this.policy)) {
+      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const sub = interaction.options.getSubcommand();
+    if (sub === "list") {
+      const names = listRepos(this.reposRoot);
+      const held = new Map([...this.localLeases].map(([k, v]) => [k, v]));
+      const lines = names.map((n) => {
+        const holder = held.get(this.leaseKey(join(this.reposRoot, n)));
+        return `• \`${n}\`${holder ? ` — 🔒 local 模式由 <#${holder}> 佔用中` : ""}`;
+      });
+      await interaction.reply({
+        content:
+          `📁 \`${this.reposRoot}\` 底下的 repo（${names.length}）：\n` +
+          (lines.length ? lines.join("\n") : "（沒有。用 `/repo clone` 或 `/repo new` 建立。）"),
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (sub === "show") {
+      const s = this.sessions.get(interaction.channelId);
+      if (!s) {
+        await interaction.reply({
+          content: "這個討論串沒有進行中的 session。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      await interaction.reply({
+        content:
+          `📁 repo：\`${path.basename(s.repoPath)}\`（\`${s.repoPath}\`）\n` +
+          `🛠️ 模式：\`${s.devMode}\`${s.branch ? ` · 分支 \`${s.branch}\`` : ""}\n` +
+          `📂 完整工作目錄：\`${s.workDir}\``,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (sub === "set") {
+      const name = interaction.options.getString("name", true);
+      let repoPath: string;
+      try {
+        repoPath = this.repoByName(name);
+      } catch (err) {
+        await interaction.reply({
+          content: `⚠️ ${err instanceof Error ? err.message : String(err)}`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      await this.beginRebind(interaction, { repoPath });
+      return;
+    }
+    if (sub === "clone" || sub === "new") {
+      await this.cmdProvision(interaction, sub);
+      return;
+    }
+    // sub === "dev"
+    const mode = interaction.options.getString("mode", true) as DevMode;
+    await this.beginRebind(interaction, { devMode: mode });
+  }
+
+  /**
+   * `/repo clone` and `/repo new` — create a repo under REPOS_ROOT, then bind
+   * this thread to it through the same rebind path as `/repo set`.
+   *
+   * Provisioning runs OUTSIDE the rebind: a clone can take minutes, and holding
+   * a confirmation card open across it would guarantee the post-click
+   * revalidation fails. So the repo is created first (a new folder harms
+   * nothing), and only then is the operator asked whether to move this thread
+   * onto it.
+   */
+  private async cmdProvision(
+    interaction: ChatInputCommandInteraction,
+    kind: "clone" | "new"
+  ): Promise<void> {
+    const threadId = interaction.channelId;
+    if (this.provisioning.has(threadId)) {
+      await interaction.reply({
+        content: "⏳ 這個討論串正在建立 repo，請等它完成。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    this.provisioning.add(threadId);
+    try {
+      let result;
+      if (kind === "new") {
+        result = await this.provisioner().init(interaction.options.getString("name", true));
+      } else {
+        result = await this.provisioner().clone(
+          interaction.options.getString("source", true),
+          interaction.options.getString("name") ?? undefined,
+          {
+            hostPolicy: this.config.REPO_CLONE_HOST_POLICY,
+            allowedHosts: this.config.REPO_CLONE_ALLOWED_HOSTS,
+          }
+        );
+      }
+      const made = `✅ 已建立 \`${result.name}\`\n📂 \`${result.path}\``;
+      // Bind it if this thread has a session; otherwise the repo simply exists
+      // and `/new repo:<name>` can pick it up.
+      if (!this.sessions.has(threadId)) {
+        await interaction.editReply({
+          content: `${made}\n（這個討論串沒有 session，用 \`/new repo:${result.name}\` 開一個。）`,
+          ...NO_MENTIONS,
+        });
+        return;
+      }
+      await interaction.editReply({ content: made, ...NO_MENTIONS });
+      await this.beginRebind(interaction, { repoPath: result.path }, { alreadyReplied: true });
+    } catch (err) {
+      // The message can quote a REMOTE git server's own words. `RepoProvisioner`
+      // already runs them through `sanitizeForInlineCode`; `NO_MENTIONS` closes
+      // the other half.
+      await interaction.editReply({
+        content: `⚠️ ${err instanceof Error ? err.message : String(err)}`,
+        ...NO_MENTIONS,
+      });
+    } finally {
+      this.provisioning.delete(threadId);
+    }
+  }
+
+  /**
+   * The ONE provisioner for this process.
+   *
+   * It must be a single instance: its destination lease ("this name is being
+   * created right now", "one clone at a time") lives in an instance field, so
+   * constructing a fresh one per command — as the first version did — made every
+   * one of those guards unreachable, since each invocation started with an empty
+   * set. The atomic rename still prevented a same-name clobber, but nothing
+   * bounded how many clones ran at once.
+   */
+  private provisioner(): RepoProvisioner {
+    this.repoProvisioner ??= new RepoProvisioner({
+      reposRoot: this.reposRoot,
+      timeoutMs: this.config.REPO_CLONE_TIMEOUT_MS,
+    });
+    return this.repoProvisioner;
+  }
+
+  /**
+   * Start a rebind: check what can be checked NOW, then either do it (no history
+   * to lose) or put a confirmation in front of it.
+   *
+   * The pre-checks are deliberately repeated after the click (`applyRebind`).
+   * Anything decided here is stale by the time a button is pressed: a plain
+   * message starts a turn, `/queue` starts one when idle, and neither knows a
+   * rebind is pending. What is checked here is only to fail fast and to say
+   * something useful.
+   */
+  private async beginRebind(
+    interaction: ChatInputCommandInteraction,
+    want: { repoPath?: string; devMode?: DevMode },
+    opts: { alreadyReplied?: boolean } = {}
+  ): Promise<void> {
+    const threadId = interaction.channelId;
+    const session = this.sessions.get(threadId);
+    const say = async (content: string, components?: ActionRowBuilder<ButtonBuilder>[]): Promise<void> => {
+      // `/repo clone` has already deferred AND edited its reply, so a further
+      // `reply()` would throw "already acknowledged"; a follow-up is the only
+      // way to add the confirmation card to that same interaction.
+      const body = { content, ...NO_MENTIONS, ...(components ? { components } : {}) };
+      if (opts.alreadyReplied) {
+        await interaction.followUp({ ...body, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply(body);
+        return;
+      }
+      await interaction.reply({ ...body, flags: MessageFlags.Ephemeral });
+    };
+    if (!session) {
+      await say("這個討論串沒有進行中的 session，請先用 `/new`。");
+      return;
+    }
+    const target = {
+      repoPath: want.repoPath ?? session.repoPath,
+      devMode: want.devMode ?? session.devMode,
+    };
+    if (target.repoPath === session.repoPath && target.devMode === session.devMode) {
+      await say(`已經是這個設定了（\`${path.basename(target.repoPath)}\` · \`${target.devMode}\`），沒有變更。`);
+      return;
+    }
+    if (!opts.alreadyReplied && !interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    }
+    const blocked = await this.rebindBlocker(threadId, session, target);
+    if (blocked) {
+      await say(blocked);
+      return;
+    }
+    // Nothing to lose ⇒ no confirmation. A session that has never run a turn has
+    // no conversation to discard, and making the operator confirm the discarding
+    // of nothing is how confirmations stop being read.
+    if (!session.hasRunTurn) {
+      await say(await this.applyRebind(threadId, target));
+      return;
+    }
+    const nonce = this.publishRebindConfirm(threadId, session, target);
+    await say(
+      `⚠️ 這個討論串已經有對話紀錄。切換到 \`${path.basename(target.repoPath)}\` · \`${target.devMode}\` ` +
+        `必須建立新的 Copilot session，**目前的對話歷史會消失**（Copilot SDK 只在建立 session 時接受工作目錄）。\n` +
+        // Provisioning happens BEFORE this card on purpose — a clone can take
+        // minutes, and a confirmation held open across it would be stale by the
+        // time it was answered. The cost is that "取消" does not undo the clone,
+        // so say so rather than let the operator infer it.
+        (opts.alreadyReplied ? "（取消只會維持原本的綁定；剛剛建立的 repo 會留在 `REPOS_ROOT` 底下。）\n" : "") +
+        `要繼續嗎？`,
+      [rebindButtons(nonce)]
+    );
+  }
+
+  /**
+   * Everything that must be true for a rebind, or a message saying what is not.
+   *
+   * Called BOTH before the confirmation is shown and again after the click,
+   * because every one of these can change while a button sits on screen: a plain
+   * message starts a turn (`onMessage`), `/queue` starts one when idle, and
+   * another thread can take the local lease.
+   */
+  private async rebindBlocker(
+    threadId: string,
+    session: Session,
+    target: { repoPath: string; devMode: DevMode }
+  ): Promise<string | undefined> {
+    if (session.running) {
+      return "⏳ 這個 session 正在執行中。請等它結束，或先用 `/stop`，再改綁。";
+    }
+    if (session.queue.length) {
+      return `⏳ 佇列中還有 ${session.queue.length} 則訊息。請先 \`/queue clear:true\`，或等它跑完。`;
+    }
+    if (target.devMode === "local") {
+      const holder = this.localHolder(target.repoPath);
+      if (holder !== undefined && holder !== threadId) {
+        return (
+          `🔒 \`${path.basename(target.repoPath)}\` 已經被 <#${holder}> 以 local 模式佔用。\n` +
+          "同一個 repo 同時只能有一個 local session——兩個 agent 改同一份 checkout 會互相覆蓋，" +
+          "其中一個 `git checkout` 就會毀掉另一個未提交的工作。請改用 `worktree` 模式，或先結束那個討論串。"
+        );
+      }
+    }
+    // The CURRENT worktree is about to be left behind. Refuse rather than orphan
+    // it: after a rebind nothing points at it any more — `/end` acts on the
+    // session's NEW binding — so a tree with uncommitted work would become
+    // unreachable from every command.
+    if (session.devMode === "worktree" && session.branch) {
+      const condition = await inspectWorktree(session.workDir, session.branch);
+      if (condition === "dirty") {
+        return (
+          `🌿 目前的 worktree \`${session.workDir}\` 還有未提交／未追蹤／被忽略的內容。\n` +
+          "改綁之後就沒有任何記錄指向它了，所以這裡不動它。請先 commit／push 或自行處理後再試。"
+        );
+      }
+      if (condition === "detached") {
+        return (
+          `🌿 目前 worktree 的 HEAD 不是 \`${session.branch}\`（detached 或換了分支），` +
+          "裡面可能有沒有任何分支指向的 commit。請自行確認後再改綁。"
+        );
+      }
+      if (condition === "unknown") {
+        return "🌿 無法確認目前 worktree 是否乾淨（git 沒有回應），為安全起見不改綁。";
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Register the confirmation with the session's own broker and return its nonce.
+   *
+   * Reusing `PendingInteractionBroker` rather than inventing a second
+   * confirmation mechanism buys the whole set of properties it already
+   * guarantees, for free: settle-exactly-once, a cryptographic nonce, the
+   * cross-thread guard in `onButton`, the "此互動已失效" reply for an expired
+   * card, and — the important one — `/stop`, disconnect and shutdown already
+   * abort every pending entry with its SAFE default. Here that default is
+   * `cancel`, so a rebind can never outlive the session being stopped.
+   */
+  private publishRebindConfirm(
+    threadId: string,
+    session: Session,
+    target: { repoPath: string; devMode: DevMode }
+  ): string {
+    // Supersede any card already on screen for this thread. Without this, two
+    // `/repo set` commands leave TWO live nonces on the same broker, both
+    // settleable, and each `.then` calls `applyRebind` — the loser's SDK session
+    // then exists with nothing referencing it. Cancelling first is friendlier
+    // than refusing and keeps "the last thing you asked for is what happens".
+    const previousNonce = this.rebindCards.get(threadId);
+    if (previousNonce) session.broker.settle<RebindAction>(previousNonce, "cancel");
+
+    const { nonce, promise } = session.broker.register<RebindDecision>({
+      sessionKey: threadId,
+      generation: session.actor.generationOf(),
+      kind: "repo-rebind",
+      timeoutMs: REBIND_CONFIRM_TIMEOUT_MS,
+      onDefault: () => "cancel",
+    });
+    this.rebindCards.set(threadId, nonce);
+    void promise.then(async (decision) => {
+      if (this.rebindCards.get(threadId) === nonce) this.rebindCards.delete(threadId);
+      if (decision !== "confirm") {
+        await this.transport.notice(threadId, "↩️ 取消改綁，維持原本的 repo／模式。").catch(() => {});
+        return;
+      }
+      const msg = await this.applyRebind(threadId, target);
+      await this.transport.notice(threadId, msg).catch(() => {});
+    });
+    return nonce;
+  }
+
+  /**
+   * Perform the rebind, in the order that leaves nothing stranded on any failure.
+   *
+   * Mirrors the discipline in `cmdNew` and `reclaim`: prepare the new resource
+   * before touching the old one, persist before creating, and keep a fence
+   * rather than lose track of a runtime that might still be live.
+   *
+   *  1. re-check everything (the pre-click checks are stale by now)
+   *  2. build the TARGET worktree — the old one is not touched yet
+   *  3. prove the new binding with git before an agent is pointed at it
+   *  4. reserve the new record durably
+   *  5. create the new SDK session
+   *  6. commit, swap the in-memory session, take/release the local lease
+   *  7. disconnect the old actor (report honestly if that cannot be confirmed)
+   *  8. only now let go of the old worktree
+   */
+  private async applyRebind(
+    threadId: string,
+    target: { repoPath: string; devMode: DevMode }
+  ): Promise<string> {
+    // One rebind per thread at a time. Everything below is a long chain of
+    // awaits (git subprocesses, then an SDK create), and two runs would each
+    // build a worktree, each reserve+commit over the other's record, and each
+    // `sessions.set` — after which the loser's SessionActor is live, referenced
+    // by nothing, invisible to `stop()`, holding a worktree the store does not
+    // mention. Mirrors the `this.creating` guard on `/new`.
+    if (this.rebinding.has(threadId)) {
+      return "⏳ 這個討論串已經有一個改綁在進行中，這次沒有執行。";
+    }
+    this.rebinding.add(threadId);
+    try {
+      return await this.applyRebindInner(threadId, target);
+    } finally {
+      this.rebinding.delete(threadId);
+    }
+  }
+
+  private async applyRebindInner(
+    threadId: string,
+    target: { repoPath: string; devMode: DevMode }
+  ): Promise<string> {
+    const session = this.sessions.get(threadId);
+    if (!session) return "⚠️ 這個討論串已經沒有進行中的 session，未改綁。";
+    const stale = await this.rebindBlocker(threadId, session, target);
+    if (stale) return `${stale}\n（在你確認的這段時間內狀態改變了，因此未改綁。）`;
+
+    const old = { ...session };
+    const branch = target.devMode === "worktree" ? worktreeBranch(threadId) : undefined;
+    const workDir =
+      target.devMode === "worktree"
+        ? worktreePath(worktreeRoot(), target.repoPath, threadId)
+        : target.repoPath;
+
+    let createdWorktree = false;
+    if (target.devMode === "worktree" && branch) {
+      try {
+        await pruneWorktrees(target.repoPath);
+        await addWorktree(target.repoPath, workDir, branch);
+        createdWorktree = true;
+      } catch (err) {
+        return `⚠️ 無法建立目標 worktree（${err instanceof Error ? err.message : String(err)}）。未改綁，原本的設定不變。`;
+      }
+    }
+    const undoWorktree = async (): Promise<void> => {
+      if (createdWorktree) {
+        await removeWorktreeIfClean(target.repoPath, workDir, branch).catch(() => "failed" as const);
+      }
+    };
+
+    const verdict = await this.bindingCheck(
+      { repoPath: target.repoPath, workDir, devMode: target.devMode, branch },
+      { reposRoot: this.reposRoot, worktreeRoot: worktreeRoot() }
+    );
+    if (!verdict.ok) {
+      await undoWorktree();
+      return `⚠️ 目標綁定無法通過驗證（${describeBindingProblem(verdict.problem)}：${verdict.detail}）。未改綁。`;
+    }
+
+    // Take the lease BEFORE the new session exists, so a concurrent
+    // `/repo dev local` in another thread cannot slip in between check and create.
+    // Release the OLD one first: a local→local move to a DIFFERENT repo would
+    // otherwise leave this thread holding the repo it just left, blocking every
+    // other thread from it for ever.
+    if (target.devMode === "local") {
+      this.releaseLocalLease(threadId);
+      const lease = this.acquireLocalLease(target.repoPath, threadId);
+      if (!lease.ok) {
+        this.restoreLeaseFor(threadId, old);
+        await undoWorktree();
+        return `🔒 \`${path.basename(target.repoPath)}\` 剛剛被 <#${lease.holder}> 取走 local 佔用，未改綁。`;
+      }
+    }
+
+    const sessionId = randomUUID();
+    const generation = this.store.nextGeneration();
+    const previous = this.store.get(threadId);
+    const reserved = this.store.reserve({
+      threadId,
+      sessionId,
+      generation,
+      repoPath: target.repoPath,
+      guildId: this.config.DISCORD_GUILD_ID,
+      parentChannelId: this.config.DISCORD_PARENT_CHANNEL_ID,
+      workDir,
+      devMode: target.devMode,
+      branch,
+    });
+    if (!reserved) {
+      this.restoreLeaseFor(threadId, old);
+      await undoWorktree();
+      return "⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未改綁。請檢查磁碟／權限後重試。";
+    }
+
+    const broker = new PendingInteractionBroker();
+    let actor: SessionActor;
+    try {
+      actor = await SessionActor.create(this.copilot, {
+        sessionKey: threadId,
+        workingDirectory: workDir,
+        approvalKey: await this.approvalKeyFor(target.repoPath),
+        model: this.config.DEFAULT_MODEL,
+        contextTier: this.config.DEFAULT_CONTEXT_TIER,
+        broker,
+        transport: this.transport,
+        policy: this.approvals,
+        generation,
+        createSessionId: sessionId,
+      });
+    } catch (err) {
+      // The OLD session is still live and registered — nothing has been swapped
+      // yet — so restoring its record puts everything back exactly as it was.
+      if (previous) this.store.restore(previous);
+      else this.store.remove(threadId);
+      this.restoreLeaseFor(threadId, old);
+      await undoWorktree();
+      return `⚠️ 建立新的 Copilot session 失敗（${err instanceof Error ? err.message : String(err)}）。未改綁，原本的對話仍在。`;
+    }
+    if (!this.store.commit(threadId)) {
+      await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS).catch(() => {});
+      if (previous) this.store.restore(previous);
+      this.restoreLeaseFor(threadId, old);
+      await undoWorktree();
+      return "⚠️ 無法持久化 session 狀態（commit 失敗），未改綁。請檢查磁碟／權限後重試。";
+    }
+
+    // Swap. From here the new session owns the thread.
+    this.sessions.set(threadId, {
+      actor,
+      broker,
+      running: false,
+      titled: session.titled,
+      titleEpoch: session.titleEpoch,
+      queue: [],
+      workDir,
+      repoPath: target.repoPath,
+      devMode: target.devMode,
+      branch,
+      hasRunTurn: false,
+    });
+    if (target.devMode !== "local") this.releaseLocalLease(threadId);
+    // Session-scoped approvals are grants for THIS conversation in THIS repo;
+    // carrying them into a different repo would widen a grant the operator never
+    // made there.
+    this.approvals.clearSession(threadId);
+
+    let tail = "";
+    let oldClosed = true;
+    try {
+      await withTimeout(old.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
+    } catch {
+      // Cannot confirm the old runtime is gone. Say so rather than pretend: it
+      // owns no thread any more, but it may still be alive in the runtime.
+      oldClosed = false;
+      tail += "\n⚠️ 無法確認舊的 runtime 已關閉，建議稍後重啟 bot。";
+    }
+    // Only now is the old worktree genuinely unreferenced — and only if the
+    // runtime that was working in it is provably gone. Removing a tree an
+    // unconfirmed agent may still be writing to is the one ordering that can
+    // destroy work, so an unconfirmed teardown KEEPS it and says where it is.
+    if (old.devMode === "worktree" && old.branch && old.workDir !== old.repoPath) {
+      if (!oldClosed) {
+        tail += `\n🌿 舊的 worktree **保留**：\`${old.workDir}\`（分支 \`${old.branch}\`）—— 無法確認舊 runtime 已停止，不在此時移除。`;
+      } else {
+        const r = await removeWorktreeIfClean(old.repoPath, old.workDir, old.branch).catch(
+          () => "failed" as const
+        );
+        if (r !== "removed" && r !== "already-absent") {
+          tail += `\n${this.worktreeOutcomeText(r, old.workDir, old.branch)}`;
+        }
+      }
+    }
+    return (
+      `✅ 已改綁到 \`${path.basename(target.repoPath)}\` · \`${target.devMode}\`` +
+      (branch ? `（分支 \`${branch}\`）` : "（直接在 repo 本體上開發）") +
+      `\n📂 工作目錄：\`${workDir}\`\n🧠 這是一段全新的對話，先前的歷史不再沿用。` +
+      (target.devMode === "local"
+        ? "\n⚠️ local 模式：agent 會直接改這個 repo 的工作區，`/end` 沒有東西可以清除。"
+        : "") +
+      tail
+    );
+  }
+
+  /** Put the local lease back where it was after a failed rebind. */
+  private restoreLeaseFor(threadId: string, previous: Session): void {
+    this.releaseLocalLease(threadId);
+    if (previous.devMode === "local") this.acquireLocalLease(previous.repoPath, threadId);
+  }
   private startTitling(threadId: string, session: Session, text: string): void {
     if (session.titled || !text) return;
     session.titled = true;
@@ -1257,7 +2015,9 @@ export class DiscordCopilotApp {
     // `await` continuation that would have set it — which disposes the session
     // the instant it is created.
     const creating = this.copilot.createSession({
-      workingDirectory: this.repoPath,
+      // A neutral temp dir: the titler reads ONE string, has no tools at all
+      // (see below) and must not be implicitly attached to any repo.
+      workingDirectory: tmpdir(),
       model,
       streaming: false,
       // The titler reads ONE string and must never touch the machine. Denying
@@ -1322,8 +2082,10 @@ export class DiscordCopilotApp {
    *  store so startup fails closed rather than silently starting fresh. */
   private async reconcileOnStartup(deps?: {
     classifyThread?: (threadId: string) => Promise<ThreadStatus>;
+    validateBinding?: typeof validateBinding;
   }): Promise<void> {
     const classify = deps?.classifyThread ?? ((id: string) => this.classifyThread(id));
+    this.bindingCheck = deps?.validateBinding ?? validateBinding;
     if (this.store.isCorrupt()) {
       // Checked once, for the whole file: a corrupt store says nothing reliable
       // about ANY session, so per-record handling would be guesswork.
@@ -1331,6 +2093,36 @@ export class DiscordCopilotApp {
       throw new Error(
         `session store at ${sessionStorePath()} is corrupt; refusing to start. Inspect/remove it and restart.`
       );
+    }
+    // Reserve every local-mode repo BEFORE the first resume attempt.
+    //
+    // A lease cannot be taken as a side effect of a successful resume: a
+    // TRANSIENT resume failure deliberately leaves the record `active` so the
+    // next restart retries it (and `/end` refuses to reap it for the same
+    // reason). If that record's repo were left unheld, another thread could bind
+    // it in local mode meanwhile, and the following restart would face two
+    // durable claimants on one checkout with no principled way to choose.
+    // Holding the lease from the moment the record is READ costs nothing when
+    // the resume succeeds and is the only thing that keeps the invariant true
+    // when it does not.
+    for (const rec of this.store.all()) {
+      if (rec.devMode !== "local" || rec.state !== "active") continue;
+      if (!this.bindingOk(rec)) continue; // a record we will refuse to resume holds nothing
+      const lease = this.acquireLocalLease(rec.repoPath, rec.threadId);
+      if (!lease.ok) {
+        console.warn(
+          `reconcile: ${rec.threadId} wants ${rec.repoPath} in local mode, already claimed by ${lease.holder}; blocking.`
+        );
+        // A failed persist here must NOT fall through to resuming the record —
+        // that would put a second agent into a checkout we just decided it may
+        // not have. Fail startup instead, as with every other required
+        // transition.
+        if (!this.store.setState(rec.threadId, "blocked", "local-conflict")) {
+          throw new FatalReconcileError(
+            `reconcile: could not persist local-conflict for ${rec.threadId} at ${sessionStorePath()}`
+          );
+        }
+      }
     }
     // Resume sequentially: each resume is a runtime RPC, and a burst of them on
     // startup competes with the reconnect the runtime is already doing.
@@ -1374,15 +2166,15 @@ export class DiscordCopilotApp {
     // invisible to /sessions and to /end alike. Same for a store file replaced
     // by hand. Listing both directions is what makes "nothing is silently
     // holding disk" actually true.
-    const known = new Set(records.map((r) => r.workDir.toLowerCase()));
-    let stray: string[] = [];
-    try {
-      stray = readdirSync(worktreeRoot(), { withFileTypes: true })
-        .filter((d) => d.isDirectory() && !known.has(join(worktreeRoot(), d.name).toLowerCase()))
-        .map((d) => `• \`${join(worktreeRoot(), d.name)}\`（沒有對應的 session 記錄）`);
-    } catch {
-      /* no worktree root yet — nothing to report */
-    }
+    //
+    // Two layouts have to be walked: `<root>/<repoSlug>/<threadId>` for anything
+    // created since multi-repo, and the flat `<root>/<threadId>` that older
+    // records still legitimately point at (they are never migrated, because
+    // moving a checkout is exactly the operation that loses uncommitted work).
+    const known = new Set(records.map((r) => this.leaseKey(r.workDir)));
+    const stray = this.strayWorktreeDirs(known).map(
+      (d) => `• \`${d}\`（沒有對應的 session 記錄）`
+    );
     if (!lines.length && !stray.length) return;
     // Budget by LENGTH, not by count: `notice()` slices at 1900, and a fixed cap
     // does not bound the message — 15 realistic entries (19-digit snowflakes plus
@@ -1413,6 +2205,50 @@ export class DiscordCopilotApp {
       .catch(() => {
         /* discoverability aid — never fail startup for it */
       });
+  }
+
+  /**
+   * Directories under the worktree root that no record accounts for.
+   *
+   * Walks BOTH layouts: a directory that itself looks like a worktree (the flat
+   * `<root>/<threadId>` older records use) and one level deeper for the current
+   * `<root>/<repoSlug>/<threadId>`. A repo-slug directory is not itself a
+   * leftover, so it is only reported through its children.
+   *
+   * `leaseKey` does the comparison so the case rules match everywhere else —
+   * lowercasing unconditionally would make two distinct directories look like
+   * the same one on Linux, and a stray tree would go unreported.
+   */
+  private strayWorktreeDirs(known: ReadonlySet<string>): string[] {
+    const root = worktreeRoot();
+    const out: string[] = [];
+    let top: Dirent[];
+    try {
+      top = readdirSync(root, { withFileTypes: true });
+    } catch {
+      return out; // no worktree root yet — nothing to report
+    }
+    for (const entry of top) {
+      if (!entry.isDirectory()) continue;
+      const dir = join(root, entry.name);
+      if (existsSync(join(dir, ".git"))) {
+        // Flat legacy layout: this IS a worktree.
+        if (!known.has(this.leaseKey(dir))) out.push(dir);
+        continue;
+      }
+      let inner: Dirent[];
+      try {
+        inner = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const child of inner) {
+        if (!child.isDirectory()) continue;
+        const childDir = join(dir, child.name);
+        if (!known.has(this.leaseKey(childDir))) out.push(childDir);
+      }
+    }
+    return out;
   }
 
   private async reconcileRecord(
@@ -1449,6 +2285,14 @@ export class DiscordCopilotApp {
           .catch(() => {});
         return;
       case "block":
+        // A record leaving `active` for a terminal state gives up its repo. The
+        // reconcile PRE-SCAN took a lease for every local+active record before
+        // any thread was classified, so a thread that turns out to be gone would
+        // otherwise hold its repo for the life of the process — and the only
+        // command that can reap the record (`/end thread:<id>`) never touched
+        // the lease either, so `/repo dev local` would report a phantom holder
+        // with a deleted thread, permanently.
+        this.releaseLocalLease(rec.threadId);
         if (!this.store.setState(rec.threadId, "blocked", action.reason)) {
           throw new FatalReconcileError(`reconcile: could not persist blocked state at ${sessionStorePath()}`);
         }
@@ -1472,9 +2316,9 @@ export class DiscordCopilotApp {
     // classified `transient`, and the record is retried on EVERY boot forever —
     // unrecoverable without hand-editing the store, since /end refuses a thread
     // with no live session.
-    if (rec.branch && rec.workDir !== this.repoPath && !existsSync(rec.workDir)) {
+    if (rec.devMode === "worktree" && rec.branch && !existsSync(rec.workDir)) {
       try {
-        await addWorktree(this.repoPath, rec.workDir, rec.branch);
+        await addWorktree(rec.repoPath, rec.workDir, rec.branch);
         console.warn(`reconcile: recreated missing worktree for ${rec.threadId} at ${rec.workDir}`);
       } catch (err) {
         // Terminal, not transient: retrying every boot cannot fix a tree we
@@ -1490,16 +2334,33 @@ export class DiscordCopilotApp {
         return;
       }
     }
+    // Prove the binding BEFORE handing the directory to an agent. The record is
+    // plain JSON in the user's home, and a worktree that belongs to a different
+    // repo than the record claims is indistinguishable from a valid one by shape
+    // alone — only git can answer, and it must.
+    const verdict = await this.bindingCheck(
+      { repoPath: rec.repoPath, workDir: rec.workDir, devMode: rec.devMode, branch: rec.branch },
+      { reposRoot: this.reposRoot, worktreeRoot: worktreeRoot() }
+    );
+    if (!verdict.ok) {
+      console.warn(`reconcile: refusing to resume ${rec.threadId} — ${verdict.detail}`);
+      this.store.setState(rec.threadId, "blocked", `binding-${verdict.problem}`);
+      this.releaseLocalLease(rec.threadId);
+      await this.transport
+        .notice(rec.threadId, `⚠️ 無法復原：${describeBindingProblem(verdict.problem)}。請用 /new 開新的。`)
+        .catch(() => {});
+      return;
+    }
     const broker = new PendingInteractionBroker();
     let actor: SessionActor;
     try {
       actor = await SessionActor.create(this.copilot, {
         sessionKey: rec.threadId,
         // Back into the SAME directory this session was created in — resuming a
-        // worktree session into the shared repo would run one thread's
-        // conversation against another thread's files.
+        // worktree session into another tree would run one thread's conversation
+        // against another thread's files.
         workingDirectory: rec.workDir,
-        approvalKey: this.approvalRepoKey,
+        approvalKey: await this.approvalKeyFor(rec.repoPath),
         model: this.config.DEFAULT_MODEL,
         contextTier: this.config.DEFAULT_CONTEXT_TIER,
         broker,
@@ -1513,6 +2374,8 @@ export class DiscordCopilotApp {
       if (classifyResumeError(msg) === "session-lost") {
         // Definitive: the session id is gone. Mark terminal; a failed persist of
         // that transition is a disk problem we must surface (fail startup).
+        // Terminal ⇒ the repo it held in local mode is free again.
+        this.releaseLocalLease(rec.threadId);
         if (!this.store.setState(rec.threadId, "orphaned", "session-lost")) {
           throw new FatalReconcileError(`reconcile: could not persist orphaned state for ${rec.threadId}`);
         }
@@ -1543,7 +2406,12 @@ export class DiscordCopilotApp {
       titleEpoch: 0,
       queue: [],
       workDir: rec.workDir,
-      ...(rec.branch ? { branch: rec.branch } : {}),
+      repoPath: rec.repoPath,
+      devMode: rec.devMode,
+      branch: rec.branch,
+      // A resumed session carries conversation history by definition — that is
+      // what resume is FOR — so a rebind must always confirm before discarding it.
+      hasRunTurn: true,
     });
     this.store.commit(rec.threadId); // keep active, refresh updatedAt
     await this.transport
@@ -1556,19 +2424,63 @@ export class DiscordCopilotApp {
       .catch(() => {});
   }
 
-  /** Whether the stored binding still matches this bot's config + controlled repo.
-   *  A mismatch (e.g. CONTROLLED_REPO_PATH or guild/parent changed between runs)
-   *  must NOT resume — it would run one repo's conversation against another. */
+  // ----------------------------------------------------------- local leases --
+
+  /** Canonical key a local-mode lease is held under. Case-folded on Windows
+   *  only — on Linux two paths differing in case are different directories. */
+  private leaseKey(repoPath: string): string {
+    const p = path.resolve(repoPath);
+    return process.platform === "win32" ? p.toLowerCase() : p;
+  }
+
+  /** Thread currently holding `repoPath` in local mode, if any. */
+  private localHolder(repoPath: string): string | undefined {
+    return this.localLeases.get(this.leaseKey(repoPath));
+  }
+
+  /**
+   * Take the exclusive local-mode lease on a repo, or report who has it.
+   *
+   * Synchronous and check-and-set in ONE step, deliberately: interaction
+   * handlers run concurrently, so a check followed by an `await` followed by a
+   * set is a race that ends with two agents in one checkout — the exact failure
+   * worktrees exist to prevent.
+   */
+  private acquireLocalLease(repoPath: string, threadId: string): { ok: true } | { ok: false; holder: string } {
+    const key = this.leaseKey(repoPath);
+    const holder = this.localLeases.get(key);
+    if (holder !== undefined && holder !== threadId) return { ok: false, holder };
+    this.localLeases.set(key, threadId);
+    return { ok: true };
+  }
+
+  /** Drop whatever lease `threadId` holds. Safe to call when it holds none. */
+  private releaseLocalLease(threadId: string): void {
+    for (const [key, holder] of this.localLeases) {
+      if (holder === threadId) this.localLeases.delete(key);
+    }
+  }
+
+  /**
+   * Whether the stored binding still matches this bot's configuration.
+   *
+   * Structural half only — the repo must live under THIS `REPOS_ROOT` and the
+   * Discord binding must be unchanged. Proving that `workDir` really belongs to
+   * `repoPath` needs git and happens in `resumeRecord` via `validateBinding`;
+   * doing it here would make this async for the sake of one caller and would
+   * still have to be re-checked before the session is created.
+   *
+   * A mismatch (e.g. REPOS_ROOT or guild/parent changed between runs) must NOT
+   * resume — it would run one repo's conversation against another.
+   */
   private bindingOk(rec: SessionRecord): boolean {
-    const norm = (p: string): string => p.replace(/[\\/]+$/, "").toLowerCase();
-    // `workDir` must be somewhere WE would have put it — the controlled repo
-    // itself, or under the worktree root. The store file is plain JSON in the
-    // user's home; a record whose workDir was edited to point elsewhere would
-    // otherwise resume an agent into an arbitrary directory.
-    const wd = norm(rec.workDir);
-    const workDirOk = wd === norm(this.repoPath) || wd.startsWith(norm(worktreeRoot()) + "\\") || wd.startsWith(norm(worktreeRoot()) + "/");
+    const wd = rec.workDir;
+    const workDirOk =
+      rec.devMode === "local"
+        ? pathRelation(wd, rec.repoPath) === "same"
+        : isStrictlyInside(wd, worktreeRoot());
     return (
-      norm(rec.repoPath) === norm(this.repoPath) &&
+      isStrictlyInside(rec.repoPath, this.reposRoot) &&
       workDirOk &&
       rec.guildId === this.config.DISCORD_GUILD_ID &&
       rec.parentChannelId === this.config.DISCORD_PARENT_CHANNEL_ID
@@ -1799,22 +2711,35 @@ export class DiscordCopilotApp {
     // in-memory rules while still claiming they were revoked.
     const scope = approvalScopeKeys(this.sessions.keys());
     const sessionRules = [...new Set(scope.flatMap((k) => this.approvals.sessionApprovals(k)))];
-    const repoRules = this.approvals.repoApprovals(this.approvalRepoKey);
+    // Show the CURRENT thread's repo rules when there is one, else everything.
+    const here = this.sessions.get(interaction.channelId);
+    const hereKey = here ? await this.approvalKeyFor(here.repoPath) : undefined;
+    const repoRules = hereKey
+      ? this.approvals.repoApprovals(hereKey)
+      : [...new Set(this.approvals.repoKeys().flatMap((k) => this.approvals.repoApprovals(k)))];
     if (clear) {
       for (const key of scope) this.approvals.clearSession(key);
-      const durable = this.approvals.clearRepo(this.approvalRepoKey);
+      // ALL repos, not just the live ones. A rule survives in three places a
+      // live-session sweep would miss: a `retry-pending` record that will resume
+      // on the next boot, a blocked record that may yet be rebound, and a
+      // persisted grant with no record at all. This command's own comment says a
+      // false revocation claim is worse than having no command, and "cleared"
+      // has to mean cleared.
+      const durable = this.approvals.clearAllRepos();
       const tail = durable
         ? "Future commands will prompt again."
         : "⚠️ 已在記憶體中清除（本次執行不會再自動核准），但寫入磁碟失敗 — 重啟後 repo 規則可能重現，請檢查檔案權限。";
       await interaction.reply({
         content:
-          `Cleared approvals — session: ${fmtList(sessionRules)} · repo: ${fmtList(repoRules)}. ` + tail,
+          `Cleared approvals for ALL repos — session: ${fmtList(sessionRules)} · repo: ${fmtList(repoRules)}. ` + tail,
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
     await interaction.reply({
-      content: `Approved (auto-run, no prompt):\n• session: ${fmtList(sessionRules)}\n• this repo: ${fmtList(repoRules)}`,
+      content:
+        `Approved (auto-run, no prompt):\n• session: ${fmtList(sessionRules)}\n` +
+        `• ${hereKey ? `this repo (\`${path.basename(hereKey)}\`)` : "all repos"}: ${fmtList(repoRules)}`,
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -1831,8 +2756,16 @@ export class DiscordCopilotApp {
     // "no changes" for a session that has changed plenty, which is the one
     // answer this command must never give.
     const session = this.sessions.get(interaction.channelId);
-    const dir = session?.workDir ?? this.repoPath;
-    const where = session?.branch ? `（分支 \`${session.branch}\`）` : "";
+    if (!session) {
+      // No fallback to "some repo": with many repos there is no meaningful
+      // default, and diffing the wrong tree is exactly the wrong answer.
+      await interaction.editReply({
+        content: "這個討論串沒有進行中的 session，無法判斷要 diff 哪個工作目錄。",
+      });
+      return;
+    }
+    const dir = session.workDir;
+    const where = session.branch ? `（分支 \`${session.branch}\`）` : `（\`${path.basename(session.repoPath)}\` · local）`;
     try {
       const summary = await gitDiffSummary(dir, staged);
       await interaction.editReply({ content: (where ? where + "\n" : "") + summary });
@@ -2024,7 +2957,7 @@ export class DiscordCopilotApp {
       await this.transport
         .notice(
           message.channelId,
-          "💤 這個討論串的 session 已經結束（可能是你用了 `/end`，或在共用工作目錄模式下被後來的 `/new` 接手），訊息不會送出。" +
+          "💤 這個討論串的 session 已經結束（可能是你用了 `/end`，或它在啟動時無法復原），訊息不會送出。" +
             "用 `/sessions` 看還有哪些在跑，或在父頻道用 `/new` 開一個新的。"
         )
         .catch(() => {});
@@ -2131,6 +3064,10 @@ export class DiscordCopilotApp {
       return;
     }
     session.running = true;
+    // A turn is about to run, so from now on this thread has conversation
+    // history worth confirming before a rebind discards it. Set BEFORE the send:
+    // an aborted or failed turn still consumed context in the runtime.
+    session.hasRunTurn = true;
     const ac = new AbortController();
     session.currentAbort = ac;
     this.transport.resetTurn(threadId);
@@ -2194,39 +3131,6 @@ export class DiscordCopilotApp {
     await this.runTurn(threadId, next);
   }
 
-  /** Tear down every live session. A cleanly-disconnected session is removed; a
-   *  session that FAILS or TIMES OUT on disconnect is kept (its runtime session
-   *  may still be live) so a later /new retries the idempotent disconnect; a
-   *  FAULTED session is a permanent fence (kept, not re-disconnected) that keeps
-   *  /new refusing until the bot is restarted. Returns false if anything was
-   *  left behind. */
-  private async endAllSessions(reason: string): Promise<boolean> {
-    let ok = true;
-    for (const [threadId, session] of [...this.sessions]) {
-      session.currentAbort?.abort(); // cancel any pre-send download in flight
-      if (session.actor.isFaulted()) {
-        ok = false; // fence — needs a restart, don't re-hit the dead runtime
-        continue;
-      }
-      await this.transport.notice(threadId, reason).catch(() => {});
-      try {
-        // Bound the disconnect so a hung teardown RPC can't stall /new.
-        await withTimeout(session.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
-        this.sessions.delete(threadId);
-        this.transport.dispose(threadId);
-        // Drop the durable record too. v1 got this for free because `reserve()`
-        // OVERWROTE the single record; with a per-thread store the ended row
-        // would survive as `active` and be resumed on the next boot — putting a
-        // second live agent back into the shared checkout that ending it was
-        // meant to prevent, in a thread the operator was told had ended.
-        this.store.remove(threadId);
-      } catch {
-        ok = false; // keep it — a later /new retries the (idempotent) disconnect
-      }
-    }
-    return ok;
-  }
-
   // ---- shutdown ----------------------------------------------------------
 
   private installSignalHandlers(): void {
@@ -2241,6 +3145,12 @@ export class DiscordCopilotApp {
     this.shuttingDown = true;
     this.phase = "shuttingDown"; // reject any late input while tearing down
     for (const [threadId, session] of this.sessions) {
+      // Cancel a turn that is reserved but not yet sent (e.g. still downloading
+      // an attachment). `/stop` and `/end` both do this; shutdown only got it
+      // via `endAllSessions`, which existed for the shared-checkout mode and is
+      // gone — without it a SIGTERM leaves a download running against an actor
+      // that is about to be disconnected.
+      session.currentAbort?.abort();
       session.broker.abort();
       // Bound the disconnect: a retained fence's disconnect can be permanently
       // hung, and shutdown must not block forever on it.

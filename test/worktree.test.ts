@@ -1,28 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { worktreeBranch, worktreePath, chooseIsolation } from "../src/core/worktree.js";
+import path from "node:path";
+import { worktreeBranch, worktreePath, repoSlug } from "../src/core/worktree.js";
 
-describe("chooseIsolation", () => {
-  it("uses a worktree when the controlled path is a git repo", () => {
-    expect(chooseIsolation({ isGitRepo: true, configured: undefined })).toBe("worktree");
-  });
-
-  it("falls back to the shared tree when it is NOT a git repo", () => {
-    // git worktree is simply unavailable there — there is no third option.
-    expect(chooseIsolation({ isGitRepo: false, configured: undefined })).toBe("shared");
-  });
-
-  it("honours an explicit `shared` even in a git repo", () => {
-    expect(chooseIsolation({ isGitRepo: true, configured: "shared" })).toBe("shared");
-  });
-
-  it("REFUSES an explicit `worktree` when it is impossible, rather than pretending", () => {
-    // Silently running shared while the operator asked for isolation is the one
-    // outcome that could lose their work without warning.
-    expect(chooseIsolation({ isGitRepo: false, configured: "worktree" })).toBe("impossible");
-  });
-});
-
-describe("worktreeBranch / worktreePath", () => {  it("derives a stable, namespaced branch from the thread id", () => {
+describe("worktreeBranch / worktreePath", () => {
+  it("derives a stable, namespaced branch from the thread id", () => {
     expect(worktreeBranch("123456")).toBe("copilot/t-123456");
   });
 
@@ -39,15 +20,52 @@ describe("worktreeBranch / worktreePath", () => {  it("derives a stable, namespa
     expect(worktreeBranch("...")).toBe("copilot/t-session");
   });
 
-  it("puts each thread's worktree in its own directory under the given root", () => {
-    const p = worktreePath("C:\\state\\worktrees", "123456");
-    expect(p.startsWith("C:\\state\\worktrees")).toBe(true);
-    expect(p.endsWith("123456")).toBe(true);
+  it("puts each thread's worktree under a per-REPO directory", () => {
+    // The repo segment is what stops a rebound thread from silently reusing the
+    // checkout of the repo it was moved away from: `addWorktree` adopts an
+    // existing directory, so one path per (repo, thread) is the invariant.
+    const root = "C:\\state\\worktrees";
+    const p = worktreePath(root, "C:\\Source\\Repos\\alpha", "123456");
+    expect(p.startsWith(root)).toBe(true);
+    expect(p.endsWith(`${path.sep}123456`)).toBe(true);
+    expect(path.dirname(p)).not.toBe(root); // there IS a repo level in between
+  });
+
+  it("gives DIFFERENT directories to the same thread on different repos", () => {
+    const root = "C:\\state\\worktrees";
+    const a = worktreePath(root, "C:\\Source\\Repos\\alpha", "t1");
+    const b = worktreePath(root, "C:\\Source\\Repos\\beta", "t1");
+    expect(a).not.toBe(b);
+  });
+
+  it("gives the SAME directory for the same repo + thread (idempotent resume)", () => {
+    const root = "C:\\state\\worktrees";
+    expect(worktreePath(root, "C:\\Source\\Repos\\alpha", "t1")).toBe(
+      worktreePath(root, "C:\\Source\\Repos\\alpha", "t1")
+    );
   });
 
   it("cannot be escaped by a hostile thread id (no path traversal)", () => {
-    const p = worktreePath("C:\\state\\worktrees", "../../evil");
+    const p = worktreePath("C:\\state\\worktrees", "C:\\Source\\Repos\\alpha", "../../evil");
     expect(p.includes("..")).toBe(false);
     expect(p.startsWith("C:\\state\\worktrees")).toBe(true);
+  });
+});
+
+describe("repoSlug", () => {
+  it("keeps the repo name readable and appends a hash of the full path", () => {
+    // Readability matters: the leftover-worktree report exists to tell a human
+    // which project a stray checkout belongs to.
+    const slug = repoSlug("C:\\Source\\Repos\\career-ops");
+    expect(slug.startsWith("career-ops-")).toBe(true);
+    expect(slug).toMatch(/^career-ops-[0-9a-f]{10}$/);
+  });
+
+  it("distinguishes same-named repos in different roots", () => {
+    expect(repoSlug("C:\\a\\proj")).not.toBe(repoSlug("C:\\b\\proj"));
+  });
+
+  it("produces a filesystem-safe segment even for an awkward name", () => {
+    expect(repoSlug("C:\\Source\\Repos\\weird name!")).toMatch(/^[A-Za-z0-9._-]+$/);
   });
 });

@@ -6,6 +6,11 @@ import { mkdirSync } from "node:fs";
  *  `discopilot`. Exported so the startup check and the docs can't drift apart. */
 export const LEGACY_STATE_DIR_NAME = ".discopilot";
 
+/** Name of the per-user state directory. A single constant because
+ *  `worktreeRoot()` is derived from it by suffix — spelling the literal twice is
+ *  how the worktree root would silently stop being the state dir's sibling. */
+export const STATE_DIR_NAME = ".discord-copilot-sdk";
+
 /** The environment prefix this project used before it was renamed. Still
  *  stripped from the agent's environment (see `sanitizeRuntimeEnv`), but NOT
  *  honoured as configuration. */
@@ -24,7 +29,7 @@ export function instanceId(): string {
 /** Stable per-user application state directory (created on demand). Unlike
  *  os.tmpdir(), this is not swept by temp cleaners while the bot runs. */
 export function stateDir(): string {
-  const dir = path.join(os.homedir(), ".discord-copilot-sdk");
+  const dir = path.join(os.homedir(), STATE_DIR_NAME);
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -32,6 +37,32 @@ export function stateDir(): string {
 /** Where a pre-rename install kept its state. Never read — only reported. */
 export function legacyStateDir(): string {
   return path.join(os.homedir(), LEGACY_STATE_DIR_NAME);
+}
+
+/**
+ * Where per-session worktrees live.
+ *
+ * Deliberately NOT under `stateDir()`: that directory holds `approvals.json`,
+ * the session store and the instance lock, and every agent's cwd would then sit
+ * two levels below the bot's own trust store. In a threat model where the
+ * controlled repo is untrusted and tools run unsandboxed as the OS user, one
+ * approved relative-path write would be enough to grant durable auto-approval
+ * for arbitrary executables. Keeping worktrees in a sibling directory means no
+ * agent's working directory has the trust store as an ancestor.
+ *
+ * It lives HERE rather than in `app.ts` because it is now half of a security
+ * boundary that four separate places must agree on — `resolveReposRoot`'s
+ * disjointness check, `validateBinding`, the stray-worktree scan and the
+ * uninstaller. A private copy in the orchestrator is how two of them would
+ * quietly come to disagree about where the boundary is.
+ *
+ * NOTE: unlike `stateDir()` this does NOT create the directory. It is asked for
+ * by validators that must be able to run before any worktree exists, and
+ * creating it as a side effect of *checking a path* would leave an empty
+ * directory behind on every rejected config.
+ */
+export function worktreeRoot(): string {
+  return `${path.join(os.homedir(), STATE_DIR_NAME)}-worktrees`;
 }
 
 /**

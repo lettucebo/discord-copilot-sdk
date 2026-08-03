@@ -90,6 +90,11 @@ export class ApprovalPolicy {
     return [...(this.repo[repoPath] ?? [])];
   }
 
+  /** Every repo that currently has persisted rules. */
+  repoKeys(): string[] {
+    return Object.keys(this.repo);
+  }
+
   /** Forget a repo's persisted approvals (e.g. /approvals clear). Returns true
    *  only if the current (cleared) map is durably on disk. Always attempts a
    *  write — even when the in-memory entry is already gone — so that a retry
@@ -98,6 +103,23 @@ export class ApprovalPolicy {
    *  cleared first, so THIS process is fail-closed regardless of the disk write. */
   clearRepo(repoPath: string): boolean {
     if (this.repo[repoPath]) delete this.repo[repoPath];
+    this.epoch++;
+    return this.persist();
+  }
+
+  /**
+   * Forget EVERY repo's persisted approvals.
+   *
+   * `/approvals clear` used to clear only the key of the one controlled repo.
+   * With many repos, sweeping just the repos of currently-LIVE sessions leaves
+   * rules behind in three places the operator cannot see: a `retry-pending`
+   * record that will resume on the next boot, a blocked record that may yet be
+   * rebound, and a persisted grant with no record at all. Reporting "cleared"
+   * while any of those survive is a false claim about a security control, which
+   * this file already treats as worse than having no command.
+   */
+  clearAllRepos(): boolean {
+    this.repo = {};
     this.epoch++;
     return this.persist();
   }

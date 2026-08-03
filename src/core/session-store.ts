@@ -1,26 +1,33 @@
 import fs from "node:fs";
 import path from "node:path";
+import { isDevMode, type DevMode } from "./binding.js";
 
 /** Lifecycle state of a persisted session record.
  *  Absent record = tombstone (nothing to resume). */
 export type SessionState = "creating" | "active" | "orphaned" | "blocked";
 
 /** v1 stored ONE bare record at the top level. v2 stores many, plus a
- *  generation high-water mark. v1 files are migrated on read. */
-const SCHEMA_VERSION = 2;
+ *  generation high-water mark. v3 adds `devMode`, because it can no longer be
+ *  inferred (see `asRecord`). Older files are migrated on read. */
+const SCHEMA_VERSION = 3;
 
 export interface SessionRecord {
   schemaVersion: number;
   threadId: string;
   sessionId: string;
   generation: number;
+  /** The repo this session is bound to — a git working-tree root under
+   *  `REPOS_ROOT`. Was the single controlled repo before multi-repo. */
   repoPath: string;
   guildId: string;
   parentChannelId: string;
-  /** Directory the agent actually works in. Equals `repoPath` for a shared-tree
-   *  session; a per-session git worktree otherwise. Absent in v1 records, which
+  /** Directory the agent actually works in. Equals `repoPath` in `local` mode;
+   *  a per-session git worktree in `worktree` mode. Absent in v1 records, which
    *  predate isolation — migrated to `repoPath`. */
   workDir: string;
+  /** How this session gets its working directory. See `asRecord` for why this
+   *  is persisted rather than inferred from `branch`. */
+  devMode: DevMode;
   /** Git branch checked out in `workDir`, when it is a worktree we created. */
   branch?: string;
   state: SessionState;
@@ -38,6 +45,7 @@ export interface SessionBinding {
   guildId: string;
   parentChannelId: string;
   workDir: string;
+  devMode: DevMode;
   branch?: string;
 }
 
@@ -167,6 +175,7 @@ export class SessionStore {
       guildId: b.guildId,
       parentChannelId: b.parentChannelId,
       workDir: b.workDir,
+      devMode: b.devMode,
       ...(b.branch ? { branch: b.branch } : {}),
       state: "active",
       updatedAt: Date.now(),
@@ -303,23 +312,95 @@ function readRecords(v: unknown): { sessions: SessionRecord[]; highWater: number
   return { sessions: [single], highWater: single.generation };
 }
 
+/**
+ * Parse ONE record, building every field explicitly.
+ *
+ * The previous version validated a handful of fields and then did
+ * `{ ...(r as unknown as SessionRecord) }`, which copied whatever else was in
+ * the JSON straight into a typed object — including a `branch` of the wrong
+ * type, and any field a later version adds. The store file is plain JSON in the
+ * user's home directory, so "trust the shape after checking four keys" is not a
+ * property worth keeping.
+ *
+ * Migration of `devMode`, which v1/v2 records do not carry:
+ *
+ * - `branch` present ⇒ `worktree` (only worktree sessions ever recorded one);
+ * - otherwise ⇒ `local`, which is what a v1 record and a v2 `shared`-isolation
+ *   record actually were: the agent worked directly in the repo.
+ *
+ * This is deliberately only the STRUCTURAL half of the migration. It cannot ask
+ * git whether a worktree really belongs to the recorded repo, or whether a
+ * `local` record's workDir really is its repo — that is `validateBinding`'s job
+ * at reconcile time, which blocks the record with a precise reason. Doing it
+ * here would either need a subprocess inside a synchronous read, or would have
+ * to mark the whole file corrupt and refuse to start over one bad row.
+ */
 function asRecord(v: unknown): SessionRecord | undefined {
-  if (!v || typeof v !== "object") return undefined;
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
   const r = v as Record<string, unknown>;
-  const ok =
-    typeof r["schemaVersion"] === "number" &&
-    typeof r["threadId"] === "string" &&
-    typeof r["sessionId"] === "string" &&
-    typeof r["generation"] === "number" &&
-    typeof r["repoPath"] === "string" &&
-    typeof r["guildId"] === "string" &&
-    typeof r["parentChannelId"] === "string" &&
-    (r["state"] === "creating" || r["state"] === "active" || r["state"] === "orphaned" || r["state"] === "blocked") &&
-    typeof r["updatedAt"] === "number";
-  if (!ok) return undefined;
-  // `workDir` is absent in v1 records, which predate per-session isolation: those
-  // sessions ran directly in the controlled repo, so that is their work dir.
-  const workDir = typeof r["workDir"] === "string" ? r["workDir"] : (r["repoPath"] as string);
-  const branch = typeof r["branch"] === "string" ? r["branch"] : undefined;
-  return { ...(r as unknown as SessionRecord), workDir, ...(branch ? { branch } : {}) };
+  const str = (k: string): string | undefined => (typeof r[k] === "string" ? (r[k] as string) : undefined);
+  const num = (k: string): number | undefined => (typeof r[k] === "number" ? (r[k] as number) : undefined);
+
+  const schemaVersion = num("schemaVersion");
+  const threadId = str("threadId");
+  const sessionId = str("sessionId");
+  const generation = num("generation");
+  const repoPath = str("repoPath");
+  const guildId = str("guildId");
+  const parentChannelId = str("parentChannelId");
+  const updatedAt = num("updatedAt");
+  const rawState = str("state");
+  const state: SessionState | undefined =
+    rawState === "creating" || rawState === "active" || rawState === "orphaned" || rawState === "blocked"
+      ? rawState
+      : undefined;
+
+  if (
+    schemaVersion === undefined ||
+    threadId === undefined ||
+    sessionId === undefined ||
+    generation === undefined ||
+    repoPath === undefined ||
+    guildId === undefined ||
+    parentChannelId === undefined ||
+    updatedAt === undefined ||
+    state === undefined
+  ) {
+    return undefined;
+  }
+
+  // v1 records predate per-session isolation: those sessions ran directly in the
+  // controlled repo, so that is their work dir.
+  const workDir = str("workDir") ?? repoPath;
+  const branch = str("branch");
+  const rawMode = r["devMode"];
+  // Inference is a MIGRATION, not a fallback. A file already claiming v3+ must
+  // carry a valid `devMode`: guessing one there would silently paper over a
+  // corrupt or hand-edited record, and `local` is the mode that needs a repo
+  // lease — getting it wrong puts two agents in one checkout.
+  const devMode: DevMode | undefined = isDevMode(rawMode)
+    ? rawMode
+    : schemaVersion >= 3
+      ? undefined
+      : branch
+        ? "worktree"
+        : "local";
+  if (devMode === undefined) return undefined;
+  const reason = str("reason");
+
+  return {
+    schemaVersion,
+    threadId,
+    sessionId,
+    generation,
+    repoPath,
+    guildId,
+    parentChannelId,
+    workDir,
+    devMode,
+    ...(branch ? { branch } : {}),
+    state,
+    ...(reason ? { reason } : {}),
+    updatedAt,
+  };
 }

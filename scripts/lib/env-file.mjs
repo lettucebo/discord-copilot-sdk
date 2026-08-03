@@ -50,6 +50,30 @@ export function serializeLine(key, value) {
 }
 
 /**
+ * Physically REMOVE `keys` from `.env` text, replacing each line with a comment
+ * that records what was dropped (never the value — it may be a secret).
+ *
+ * `mergeEnv` cannot do this: it preserves every line it does not manage, which
+ * is exactly right for comments and unrelated settings, and exactly wrong for a
+ * key the runtime now REJECTS. A migrated install that left
+ * `CONTROLLED_REPO_PATH=` in the file would report success and then refuse to
+ * start, which is the failure mode the whole two-sided config contract exists to
+ * prevent.
+ */
+export function dropEnvKeys(existingText, keys) {
+  const drop = new Set(keys);
+  if (drop.size === 0) return existingText || "";
+  const eol = detectEol(existingText || "");
+  const lines = parseLines(existingText || "");
+  const out = lines.map((line) =>
+    line.kind === "kv" && drop.has(line.key)
+      ? { kind: "other", raw: `# (removed in this version) ${line.key}` }
+      : line
+  );
+  return out.map((l) => l.raw).join(eol) + eol;
+}
+
+/**
  * Merge `updates` (a plain object of KEY→value) into existing `.env` text,
  * changing ONLY those keys. Because Node's parseEnv resolves a duplicated key to
  * its LAST occurrence, we rewrite the LAST occurrence of each managed key (and
