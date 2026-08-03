@@ -99,7 +99,7 @@ describe("resolveReposRoot", () => {
   it("accepts a plain directory that merely CONTAINS repos", () => {
     // Exactly the shape the single-repo installer used to REJECT.
     makeRepo(root, "career-ops");
-    expect(resolveReposRoot(root, deps)).toBe(path.resolve(root));
+    expect(resolveReposRoot(root, deps)).toBe(canonicalPath(root));
   });
 
   it("rejects a relative path and a Windows drive-relative path", () => {
@@ -172,7 +172,7 @@ describe("resolveReposRoot", () => {
 describe("resolveRepoWithinRoot (the binding gate)", () => {
   it("resolves a repo by name to its canonical path", () => {
     const repo = makeRepo(root, "career-ops");
-    expect(resolveRepoWithinRoot(root, "career-ops")).toBe(path.resolve(repo));
+    expect(resolveRepoWithinRoot(root, "career-ops")).toBe(canonicalPath(repo));
   });
 
   it("refuses traversal, absolute paths and separators outright", () => {

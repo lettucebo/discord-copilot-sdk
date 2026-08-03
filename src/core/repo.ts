@@ -72,10 +72,18 @@ function trimTrailingSep(p: string): string {
  * `path.relative` is used rather than a string prefix test because a prefix test
  * claims `C:\Source\Repos-evil` is inside `C:\Source\Repos` — the classic
  * separator-boundary bug. `relative` returns `..\Repos-evil` there.
+ *
+ * BOTH sides are canonicalised first. Comparing a canonical path against a
+ * merely-resolved one is how a security check fails OPEN: on a machine where a
+ * path component has an 8.3 short name, `resolveReposRoot` canonicalised its
+ * input to `C:\Users\runneradmin\...` and compared it against a trust-store path
+ * still spelled `C:\Users\RUNNER~1\...`, decided they were disjoint, and
+ * accepted a root that in fact contained the approval store. CI found it; a
+ * machine with only long paths never would.
  */
 export function pathRelation(a: string, b: string): PathRelation {
-  const fa = fold(trimTrailingSep(path.resolve(a)));
-  const fb = fold(trimTrailingSep(path.resolve(b)));
+  const fa = fold(trimTrailingSep(canonicalPathOr(a)));
+  const fb = fold(trimTrailingSep(canonicalPathOr(b)));
   if (fa === fb) return "same";
   const aFromB = path.relative(fb, fa);
   if (aFromB && !aFromB.startsWith("..") && !path.isAbsolute(aFromB)) return "a-inside-b";

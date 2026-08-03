@@ -151,9 +151,9 @@ describe("repoRootStrict", () => {
       await initRepo(repo);
       const wt = path.join(t, "wt", "one");
       await addWorktree(repo, wt, "copilot/t-x");
-      const { realpathSync } = await import("node:fs");
-      expect(await repoRootStrict(wt)).toBe(realpathSync(repo));
-      expect(await repoRootStrict(repo)).toBe(realpathSync(repo));
+      const { canonicalPath } = await import("../src/core/repo.js");
+      expect(await repoRootStrict(wt)).toBe(canonicalPath(repo));
+      expect(await repoRootStrict(repo)).toBe(canonicalPath(repo));
     } finally {
       rmSync(t, { recursive: true, force: true });
     }

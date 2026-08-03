@@ -23,7 +23,7 @@ import type { CopilotClient } from "@github/copilot-sdk";
 import type { Config } from "./config.js";
 import { acquireSingleInstanceLock, type InstanceLock } from "./core/single-instance.js";
 import { lockPath, sessionStorePath, worktreeRoot } from "./core/paths.js";
-import { resolveReposRoot, resolveRepoWithinRoot, listRepos, isStrictlyInside, pathRelation } from "./core/repo.js";
+import { resolveReposRoot, resolveRepoWithinRoot, listRepos, isStrictlyInside, pathRelation, canonicalPathOr } from "./core/repo.js";
 import { validateBinding, describeBindingProblem, type DevMode } from "./core/binding.js";
 import { RepoProvisioner, sweepStaleStaging } from "./core/repo-provision.js";
 import { gitDiffSummary } from "./core/git.js";
@@ -2429,7 +2429,7 @@ export class DiscordCopilotApp {
   /** Canonical key a local-mode lease is held under. Case-folded on Windows
    *  only — on Linux two paths differing in case are different directories. */
   private leaseKey(repoPath: string): string {
-    const p = path.resolve(repoPath);
+    const p = canonicalPathOr(repoPath);
     return process.platform === "win32" ? p.toLowerCase() : p;
   }
 
