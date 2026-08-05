@@ -9,6 +9,7 @@ import { SessionStore } from "../src/core/session-store.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { addWorktree } from "../src/core/worktree.js";
 import { canonicalPathOr } from "../src/core/repo.js";
+import { ChannelRegistry } from "../src/core/channel-registry.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Transport } from "../src/core/transport.js";
 import type { DevMode } from "../src/core/binding.js";
@@ -55,6 +56,10 @@ class FakeTransport implements Transport {
   async showPlan(): Promise<void> {}
   async notice(k: string, t: string): Promise<void> {
     this.notices.push({ key: k, text: t });
+  }
+  async noticeDelivered(k: string, t: string): Promise<boolean> {
+    this.notices.push({ key: k, text: t });
+    return true;
   }
   onDecision(): () => void {
     return () => {};
@@ -112,13 +117,34 @@ interface Harness {
   actor: FakeActor;
 }
 
-function harness(over: { devMode?: DevMode; repo?: string; hasRunTurn?: boolean; createFails?: boolean } = {}): Harness {
+function testChannels(): ChannelRegistry {
+  return new ChannelRegistry("c1", "g1", path.join(tmp, "channels.json"));
+}
+
+function harness(
+  over: {
+    devMode?: DevMode;
+    repo?: string;
+    hasRunTurn?: boolean;
+    createFails?: boolean;
+    parentChannelId?: string;
+    channels?: ChannelRegistry;
+  } = {}
+): Harness {
   const transport = new FakeTransport();
   const store = new SessionStore(storeFile);
-  const app = DiscordCopilotApp.createForTest(cfg(), reposRoot, fakeCopilot(over), transport, store);
+  const app = DiscordCopilotApp.createForTest(
+    cfg(),
+    reposRoot,
+    fakeCopilot(over),
+    transport,
+    store,
+    over.channels ?? testChannels()
+  );
   const actor = new FakeActor();
   const devMode = over.devMode ?? "local";
   const repo = over.repo ?? repoA;
+  const parentChannelId = over.parentChannelId ?? "c1";
   const session: Session = {
     actor: actor as unknown as Session["actor"],
     broker: new PendingInteractionBroker(),
@@ -129,6 +155,7 @@ function harness(over: { devMode?: DevMode; repo?: string; hasRunTurn?: boolean;
     workDir: repo,
     repoPath: repo,
     devMode,
+    parentChannelId,
     hasRunTurn: over.hasRunTurn ?? true,
   };
   store.reserve({
@@ -137,7 +164,7 @@ function harness(over: { devMode?: DevMode; repo?: string; hasRunTurn?: boolean;
     generation: 1,
     repoPath: repo,
     guildId: "g1",
-    parentChannelId: "c1",
+    parentChannelId,
     workDir: repo,
     devMode,
   });
@@ -271,7 +298,14 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
   it("leaves EVERYTHING as it was when the new session cannot be created", async () => {
     const transport = new FakeTransport();
     const store = new SessionStore(storeFile);
-    const app = DiscordCopilotApp.createForTest(cfg(), reposRoot, fakeCopilot({ createFails: true }), transport, store);
+    const app = DiscordCopilotApp.createForTest(
+      cfg(),
+      reposRoot,
+      fakeCopilot({ createFails: true }),
+      transport,
+      store,
+      testChannels()
+    );
     const actor = new FakeActor();
     const session: Session = {
       actor: actor as unknown as Session["actor"],
@@ -283,6 +317,7 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       workDir: repoA,
       repoPath: repoA,
       devMode: "local",
+      parentChannelId: "c1",
       hasRunTurn: true,
     };
     store.reserve({
@@ -331,6 +366,17 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     expect(out).toMatch(/全新的對話/);
     expect(sessions(app).get("t1")?.hasRunTurn).toBe(false);
     expect(sessions(app).get("t1")?.repoPath).toBe(repoB);
+  });
+
+  it("preserves a secondary parent channel in the rebound durable record", async () => {
+    const channels = testChannels();
+    expect(channels.enable("c2", "u1")).toBe(true);
+    const { app, store } = harness({ parentChannelId: "c2", channels });
+
+    const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+
+    expect(out).toMatch(/已改綁/);
+    expect(store.get("t1")?.parentChannelId).toBe("c2");
   });
 
   it("warns loudly, and does NOT reclaim the old worktree, when teardown is unconfirmed", async () => {

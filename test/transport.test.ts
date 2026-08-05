@@ -253,6 +253,20 @@ describe("DiscordTransport ask_user / plan cards", () => {
     ).rejects.toThrow();
   });
 
+  it("noticeDelivered returns false when it cannot fetch the channel", async () => {
+    const t = new DiscordTransport({ channels: { fetch: async () => null } } as unknown as Client);
+    await expect(t.noticeDelivered("x", "leftover worktree")).resolves.toBe(false);
+  });
+
+  it("noticeDelivered returns false when posting to the channel fails", async () => {
+    const ch = new FakeChannel();
+    ch.send = async () => {
+      throw new Error("Missing Send Messages");
+    };
+    const t = new DiscordTransport(fakeClient(ch));
+    await expect(t.noticeDelivered("x", "leftover worktree")).resolves.toBe(false);
+  });
+
   it("a flush racing dispose() posts NOTHING into the ended thread", async () => {
     // doFlush captures its own state object and THEN awaits fetchThread. dispose()
     // only deletes the map entry, so without a re-check after that await the

@@ -114,3 +114,10 @@ export function lockPath(id: string = instanceId()): string {
 export function sessionStorePath(id: string = instanceId()): string {
   return path.join(stateDir(), `${id}.session.json`);
 }
+
+/** Path to the enabled-channel registry for a logical instance. Per-instance
+ *  like the lock and the session store, because a second instance is a second
+ *  bot with its own guild/channel configuration. */
+export function channelRegistryPath(id: string = instanceId()): string {
+  return path.join(stateDir(), `${id}.channels.json`);
+}

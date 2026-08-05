@@ -214,6 +214,19 @@ export class DiscordTransport implements Transport {
     if (channel) await channel.send({ content: text.slice(0, 1900), ...NO_MENTIONS });
   }
 
+  async noticeDelivered(sessionKey: string, text: string): Promise<boolean> {
+    const channel = await this.fetchThread(sessionKey);
+    if (!channel) return false;
+    try {
+      await channel.send({ content: text.slice(0, 1900), ...NO_MENTIONS });
+      return true;
+    } catch {
+      // A channel we can fetch but not post in (missing Send Messages) is just
+      // as undelivered as one that is gone — the caller needs to try elsewhere.
+      return false;
+    }
+  }
+
   async showUserInput(view: UserInputView): Promise<void> {
     const channel = await this.fetchThread(view.sessionKey);
     if (!channel) throw new Error("ask_user thread unavailable"); // never report false success

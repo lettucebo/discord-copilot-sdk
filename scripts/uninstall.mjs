@@ -579,8 +579,8 @@ async function main() {
       : null,
     state: fs.existsSync(STATE_DIR)
       ? ZH
-        ? `${STATE_DIR}（核准紀錄、session 記錄、日誌、.env 備份）`
-        : `${STATE_DIR} (approvals, session records, logs, .env backups)`
+        ? `${STATE_DIR}（核准紀錄、session 記錄、頻道登錄、日誌、.env 備份）`
+        : `${STATE_DIR} (approvals, session records, channel registry, logs, .env backups)`
       : null,
     legacy: fs.existsSync(LEGACY_DIR) ? (ZH ? `${LEGACY_DIR}（改名前的殘留）` : `${LEGACY_DIR} (pre-rename leftovers)`) : null,
     env: fs.existsSync(ENV_PATH) ? (ZH ? `${ENV_PATH}（含 bot token）` : `${ENV_PATH} (contains the bot token)`) : null,

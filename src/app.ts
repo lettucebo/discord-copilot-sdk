@@ -8,6 +8,7 @@ import {
   ChannelType,
   ThreadAutoArchiveDuration,
   MessageFlags,
+  PermissionFlagsBits,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -22,7 +23,7 @@ import {
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Config } from "./config.js";
 import { acquireSingleInstanceLock, type InstanceLock } from "./core/single-instance.js";
-import { lockPath, sessionStorePath, worktreeRoot } from "./core/paths.js";
+import { lockPath, sessionStorePath, worktreeRoot, channelRegistryPath } from "./core/paths.js";
 import { resolveReposRoot, resolveRepoWithinRoot, listRepos, isStrictlyInside, pathRelation, canonicalPathOr } from "./core/repo.js";
 import { validateBinding, describeBindingProblem, type DevMode } from "./core/binding.js";
 import { RepoProvisioner, sweepStaleStaging } from "./core/repo-provision.js";
@@ -67,7 +68,8 @@ import {
   encodeRepoId,
   type RebindAction,
 } from "./platforms/discord/custom-id.js";
-import { isAuthorized, type AuthContext, type AuthPolicy } from "./platforms/discord/auth.js";
+import { isAuthorized, isOwner, type AuthContext, type AuthPolicy } from "./platforms/discord/auth.js";
+import { ChannelRegistry } from "./core/channel-registry.js";
 import type { Decision, Transport } from "./core/transport.js";
 
 /** One live Discord thread ↔ Copilot session. Exported so tests can build a
@@ -102,6 +104,12 @@ export interface Session {
   devMode: DevMode;
   /** Branch checked out in `workDir` when it is a worktree we created. */
   branch?: string;
+  /** The channel this session's thread hangs under. Carried HERE rather than
+   *  re-derived per call site: with several enabled channels, "the parent" is no
+   *  longer a constant, and a site that reached for the config value instead is
+   *  exactly the bug that broke rebind (it rewrote every record's parent to the
+   *  seed channel, so any session started elsewhere failed to resume). */
+  parentChannelId: string;
   /** True once a turn has actually run, i.e. the session carries conversation
    *  history worth warning about before a rebind throws it away. A resumed
    *  session is initialised `true`: preserving history is the entire point of
@@ -116,6 +124,31 @@ interface TitlerSession {
   on(ev: string, h: (e: unknown) => void): void;
   send(o: Record<string, unknown>): Promise<unknown>;
   disconnect?: () => Promise<unknown>;
+}
+
+/** What a bot actually needs to run a session in a channel, and the human name
+ *  to report when it is missing. `Manage Threads` is deliberately absent: it is
+ *  only used to delete the empty thread a failed `/new` leaves behind, which is
+ *  a tidiness feature, not a requirement (see `docs/DISCORD-SETUP.md` §4). */
+const REQUIRED_CHANNEL_PERMISSIONS: ReadonlyArray<{ flag: bigint; label: string }> = [
+  { flag: PermissionFlagsBits.ViewChannel, label: "View Channel" },
+  { flag: PermissionFlagsBits.SendMessages, label: "Send Messages" },
+  { flag: PermissionFlagsBits.CreatePublicThreads, label: "Create Public Threads" },
+  { flag: PermissionFlagsBits.SendMessagesInThreads, label: "Send Messages in Threads" },
+  { flag: PermissionFlagsBits.EmbedLinks, label: "Embed Links" },
+  { flag: PermissionFlagsBits.ReadMessageHistory, label: "Read Message History" },
+];
+
+/** Accept either a raw channel id or a `<#id>` mention, as `/end thread:<id>`
+ *  already does for threads. A raw id is the point: a channel that has been
+ *  DELETED, or that the bot can no longer see, cannot be picked from a channel
+ *  option, and that is exactly the one an operator needs to remove. */
+export function parseChannelRef(raw: string | null | undefined): string | undefined {
+  const t = (raw ?? "").trim();
+  if (!t) return undefined;
+  const m = /^<#(\d{5,25})>$/.exec(t);
+  if (m) return m[1];
+  return /^\d{5,25}$/.test(t) ? t : undefined;
 }
 
 /** Every reply that can carry agent- or remote-derived text must pass this.
@@ -257,18 +290,19 @@ export function approvalScopeKeys(liveSessionKeys: Iterable<string>): string[] {
  * vanished with no explanation.
  *
  * Deliberately narrow, and fails closed on anything unknown: we only speak in
- * threads the bot itself opened under the configured parent, never in the parent
- * channel and never in the operator's own threads.
+ * threads the bot itself opened under an ENABLED channel, never in the channel
+ * itself and never in the operator's own threads.
  */
 export function isOurEndedThread(o: {
   channelIsThread: boolean;
   threadParentId?: string;
   threadOwnerId?: string;
-  configuredParentChannelId: string;
+  /** Every channel the bot currently answers in (seed + `/channel enable`). */
+  enabledParentChannelIds: ReadonlySet<string>;
   botUserId?: string;
 }): boolean {
   if (!o.channelIsThread) return false;
-  if (!o.threadParentId || o.threadParentId !== o.configuredParentChannelId) return false;
+  if (!o.threadParentId || !o.enabledParentChannelIds.has(o.threadParentId)) return false;
   if (!o.botUserId || !o.threadOwnerId || o.threadOwnerId !== o.botUserId) return false;
   return true;
 }
@@ -323,7 +357,9 @@ export class DiscordCopilotApp {
   private readonly discord: Client;
   private readonly transport: Transport;
   private readonly sessions = new Map<string, Session>();
-  private readonly policy: AuthPolicy;
+  private readonly allowedUserIds: ReadonlySet<string>;
+  /** Durable set of channels the bot acts in (seed + `/channel enable`). */
+  private readonly channels: ChannelRegistry;
   /** Shared approval memory (session + persisted repo rules) across sessions. */
   private readonly approvals = new ApprovalPolicy();
   private modelIds: string[] = [];
@@ -373,7 +409,8 @@ export class DiscordCopilotApp {
     private readonly copilot: CopilotClient,
     private readonly lock: InstanceLock,
     transportOverride?: Transport,
-    storeOverride?: SessionStore
+    storeOverride?: SessionStore,
+    channelsOverride?: ChannelRegistry
   ) {
     this.discord = new Client({
       intents: [
@@ -384,11 +421,54 @@ export class DiscordCopilotApp {
     });
     this.transport = transportOverride ?? new DiscordTransport(this.discord);
     this.store = storeOverride ?? new SessionStore(sessionStorePath());
-    this.policy = {
-      allowedUserIds: new Set(this.config.DISCORD_ALLOWED_USER_IDS),
+    this.channels =
+      channelsOverride ??
+      new ChannelRegistry(
+        this.config.DISCORD_PARENT_CHANNEL_ID,
+        this.config.DISCORD_GUILD_ID,
+        channelRegistryPath()
+      );
+    this.allowedUserIds = new Set(this.config.DISCORD_ALLOWED_USER_IDS);
+  }
+
+  /**
+   * The authorization policy AS OF RIGHT NOW.
+   *
+   * Rebuilt per check instead of captured in the constructor: `/channel enable`
+   * would otherwise need a restart to take effect, and `/channel disable` would
+   * keep authorizing a channel the operator just revoked. The registry is
+   * persist-first, so anything this reports is already on disk.
+   */
+  private policyNow(): AuthPolicy {
+    return {
+      allowedUserIds: this.allowedUserIds,
       guildId: this.config.DISCORD_GUILD_ID,
-      parentChannelId: this.config.DISCORD_PARENT_CHANNEL_ID,
+      parentChannelIds: this.channels.enabledSet(),
     };
+  }
+
+  /**
+   * Ephemeral refusal for anything that failed the gate.
+   *
+   * Two different answers on purpose. A caller who is not on the allow-list
+   * learns nothing at all — the terse form leaks neither the channel policy nor
+   * the existence of `/channel`. The OPERATOR, who already knows everything
+   * here, gets the one fact they need: this channel is not enabled, and how to
+   * enable it (including from the seed channel, because a correctly locked-down
+   * server hides `/channel` in the very channel they are standing in).
+   *
+   * It has to be a reply at all: Discord invalidates an unanswered interaction
+   * after 3s and shows "The application did not respond", which reads as a
+   * broken bot rather than a deliberate refusal.
+   */
+  private async refuseUnauthorized(
+    interaction: ChatInputCommandInteraction | ButtonInteraction
+  ): Promise<void> {
+    const content = isOwner(ctxOf(interaction), this.policyNow())
+      ? `⚠️ 這個頻道尚未啟用。在這裡執行 \`/channel enable\`，或在主頻道執行 ` +
+        `\`/channel enable channel:${interaction.channelId}\`。詳見 \`docs/CHANNEL-ACCESS.md\`。`
+      : "Not authorized.";
+    await interaction.reply({ content, flags: MessageFlags.Ephemeral });
   }
 
   /** Test-only seam: construct the app with an injected transport + store (and
@@ -398,16 +478,20 @@ export class DiscordCopilotApp {
    *
    *  `reposRoot` is set directly rather than resolved: the filesystem checks in
    *  `resolveReposRoot` are covered by their own tests, and requiring a real
-   *  directory here would make every app-level test build one. */
+   *  directory here would make every app-level test build one.
+   *
+   *  `channels` MUST be injectable: without it every app-level test would load
+   *  the real `~/.discord-copilot-sdk` registry of whoever runs the suite. */
   static createForTest(
     config: Config,
     reposRoot: string,
     copilot: CopilotClient,
     transport: Transport,
-    store?: SessionStore
+    store?: SessionStore,
+    channels?: ChannelRegistry
   ): DiscordCopilotApp {
     const noopLock: InstanceLock = { path: "(test)", release: async () => {} };
-    const app = new DiscordCopilotApp(config, copilot, noopLock, transport, store);
+    const app = new DiscordCopilotApp(config, copilot, noopLock, transport, store, channels);
     app.reposRoot = reposRoot;
     return app;
   }
@@ -437,6 +521,9 @@ export class DiscordCopilotApp {
       await preflightModel(copilot, config.DEFAULT_MODEL);
       app = new DiscordCopilotApp(config, copilot, lock);
       app.reposRoot = reposRoot;
+      // Before the gateway, not after: a registry we cannot trust must not reach
+      // a state where the bot is online and answering with the wrong channel set.
+      app.assertChannelRegistryUsable();
       await app.login();
       return app;
     } catch (err) {
@@ -450,6 +537,25 @@ export class DiscordCopilotApp {
       }
       throw err;
     }
+  }
+
+  /**
+   * Refuse to run on an untrustworthy channel registry.
+   *
+   * Deliberately fatal rather than "fall back to the seed channel": that
+   * fallback silently narrows the authorized set, and the reconcile pass that
+   * follows would mark every session under a secondary channel `blocked` —
+   * terminal, so re-enabling the channel afterwards does not bring the
+   * conversations back. Losing a boot is recoverable; losing them is not.
+   */
+  private assertChannelRegistryUsable(): void {
+    if (!this.channels.isCorrupt()) return;
+    throw new Error(
+      `channel registry at ${channelRegistryPath()} cannot be trusted: ${this.channels.corruptReason()}. ` +
+        `Refusing to start rather than silently falling back to ${this.config.DISCORD_PARENT_CHANNEL_ID} alone, ` +
+        `which would permanently block every session under another channel. ` +
+        `Inspect or delete the file (channels can be re-added with /channel enable) and restart.`
+    );
   }
 
   /** Resolve the repo a name refers to, or throw with a readable reason. */
@@ -512,7 +618,8 @@ export class DiscordCopilotApp {
     console.log(
       `✅ discord-copilot-sdk ready — repos root ${this.reposRoot} (${repos.length} repo(s))\n` +
         `   default repo=${dflt ?? "(none — /new needs repo:)"} · new sessions get their own git worktree\n` +
-        `   guild=${this.config.DISCORD_GUILD_ID} channel=${this.config.DISCORD_PARENT_CHANNEL_ID}\n` +
+        `   guild=${this.config.DISCORD_GUILD_ID} seedChannel=${this.config.DISCORD_PARENT_CHANNEL_ID}` +
+          ` enabledChannels=${this.channels.enabledSet().size}\n` +
         `   model=${this.config.DEFAULT_MODEL} contextTier=${this.config.DEFAULT_CONTEXT_TIER} (${this.modelIds.length} models)\n` +
         `   concurrent sessions: up to ${MAX_LIVE_SESSIONS}\n` +
         `   ⚠️  lab mode: tools run as this OS user with no sandbox. The bot uses your\n` +
@@ -714,6 +821,35 @@ export class DiscordCopilotApp {
         .setName("sessions")
         .setDescription("List the sessions running right now")
         .toJSON(),
+      new SlashCommandBuilder()
+        .setName("channel")
+        .setDescription("Manage which channels this bot answers in")
+        .addSubcommand((s) =>
+          s
+            .setName("enable")
+            .setDescription("Let sessions be started in a channel")
+            .addStringOption((o) =>
+              o
+                .setName("channel")
+                .setDescription("Channel id or #mention (default: this channel)")
+                .setRequired(false)
+            )
+        )
+        .addSubcommand((s) =>
+          s
+            .setName("disable")
+            .setDescription("Stop answering in a channel (end its sessions first)")
+            .addStringOption((o) =>
+              o
+                .setName("channel")
+                .setDescription("Channel id or #mention (default: this channel)")
+                .setRequired(false)
+            )
+        )
+        .addSubcommand((s) =>
+          s.setName("list").setDescription("Show which channels this bot answers in")
+        )
+        .toJSON(),
     ];
     // Register in the AUTHORIZED guild so command availability matches the auth
     // policy (DEV_GUILD_ID is intentionally not used here to avoid registering
@@ -766,6 +902,9 @@ export class DiscordCopilotApp {
         else if (c === "end") await this.cmdEnd(interaction);
         else if (c === "sessions") await this.cmdSessions(interaction);
         else if (c === "repo") await this.cmdRepo(interaction);
+        // `/channel` is the ONLY command gated on `isOwner` instead of
+        // `isAuthorized` — see cmdChannel.
+        else if (c === "channel") await this.cmdChannel(interaction);
       }
     } catch (err) {
       console.error("interaction error:", err);
@@ -778,8 +917,8 @@ export class DiscordCopilotApp {
     const plan = perm || choice ? undefined : decodePlanId(interaction.customId);
     const repo = perm || choice || plan ? undefined : decodeRepoId(interaction.customId);
     if (!perm && !choice && !plan && !repo) return; // not one of ours
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const uid = interaction.user.id;
@@ -877,17 +1016,23 @@ export class DiscordCopilotApp {
   }
 
   private async cmdNew(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
-    if (interaction.channelId !== this.config.DISCORD_PARENT_CHANNEL_ID) {
+    if (!this.channels.has(interaction.channelId)) {
+      // Reached only when the channel gate passed via a THREAD under an enabled
+      // channel: `/new` must open a thread on a text channel, so it has to run
+      // in the channel itself, never inside an existing thread.
       await interaction.reply({
-        content: "Run /new in the configured parent channel.",
+        content:
+          "`/new` 要在**已啟用的文字頻道**裡執行，不能在討論串裡（不支援討論串中的討論串）。" +
+          "用 `/channel list` 看目前啟用了哪些頻道。",
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
+    const parentChannelId = interaction.channelId;
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     if (this.creating) {
       await interaction.editReply("A session is already being created — please retry in a moment.");
@@ -924,9 +1069,37 @@ export class DiscordCopilotApp {
     }
     this.creating = true;
     try {
-      const parent = await this.discord.channels.fetch(this.config.DISCORD_PARENT_CHANNEL_ID);
+      // Everything below crosses several awaits, and `/channel disable` can
+      // land in any of those gaps: it checks for live sessions, sees none (this
+      // one has no record yet), and revokes. Recheck the TARGET channel before
+      // creating the thread and before reserving the record, or this session
+      // could be created under a channel the operator had already revoked and
+      // become terminally `blocked` on the next restart.
+      //
+      // This deliberately does NOT use the registry's GLOBAL epoch. An enable
+      // or disable for a completely unrelated channel must not abort a valid
+      // `/new` here, then falsely tell the operator THIS channel was disabled.
+      // The authorization question is only whether THIS parent is enabled now.
+      const stillEnabled = (): boolean => this.channels.has(parentChannelId);
+      let parent;
+      try {
+        parent = await this.discord.channels.fetch(parentChannelId);
+      } catch (err) {
+        // Locally, not via the outer handler: an exception there leaves the
+        // deferred reply hanging as a permanent "thinking…".
+        await interaction.editReply(
+          `⚠️ 無法讀取頻道 <#${parentChannelId}>：${err instanceof Error ? err.message : String(err)}`
+        );
+        return;
+      }
       if (!parent || parent.type !== ChannelType.GuildText) {
         await interaction.editReply("Parent channel is not a text channel.");
+        return;
+      }
+      if (!stillEnabled()) {
+        await interaction.editReply(
+          `⚠️ <#${parentChannelId}> 在這期間被停用了，沒有建立 session。`
+        );
         return;
       }
 
@@ -938,10 +1111,22 @@ export class DiscordCopilotApp {
       const stamp = new Date().toISOString().slice(5, 16).replace("T", " ");
       const threadName = (promptOption ? deriveThreadTitle(promptOption) : "") || `copilot ${stamp}`;
 
-      const thread = await (parent as TextChannel).threads.create({
-        name: threadName.slice(0, THREAD_NAME_MAX),
-        autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
-      });
+      let thread;
+      try {
+        thread = await (parent as TextChannel).threads.create({
+          name: threadName.slice(0, THREAD_NAME_MAX),
+          autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+        });
+      } catch (err) {
+        // Almost always a missing Create Public Threads / Send Messages in
+        // Threads permission in a newly enabled channel. Say so here rather than
+        // leaving the deferred reply spinning forever.
+        await interaction.editReply(
+          `⚠️ 無法在 <#${parentChannelId}> 建立討論串：${err instanceof Error ? err.message : String(err)}\n` +
+            "常見原因是 bot 在該頻道缺少 `Create Public Threads` 或 `Send Messages in Threads`。"
+        );
+        return;
+      }
       // Best-effort cleanup of the just-created thread on any abort path below,
       // so a failed /new doesn't litter empty threads.
       const dropThread = async (): Promise<void> => {
@@ -1005,13 +1190,23 @@ export class DiscordCopilotApp {
         return;
       }
 
+      // LAST authorization check before anything durable exists. The window from
+      // the first check to here spans a thread creation, a `git worktree add`
+      // and a binding proof — easily seconds — and `/channel disable` cannot see
+      // this session until the record below exists. Checking here is what makes
+      // "a disabled channel never gains a session" true rather than likely.
+      if (!stillEnabled()) {
+        await abort(`⚠️ <#${parentChannelId}> 在這期間被停用了，已回復（討論串與 worktree 都已移除）。`);
+        return;
+      }
+
       const reserved = this.store.reserve({
         threadId: thread.id,
         sessionId,
         generation,
         repoPath,
         guildId: this.config.DISCORD_GUILD_ID,
-        parentChannelId: this.config.DISCORD_PARENT_CHANNEL_ID,
+        parentChannelId,
         workDir,
         devMode,
         branch,
@@ -1085,6 +1280,7 @@ export class DiscordCopilotApp {
             repoPath,
             devMode,
             branch,
+            parentChannelId,
             hasRunTurn: true,
           });
           await interaction.editReply(
@@ -1104,6 +1300,7 @@ export class DiscordCopilotApp {
         repoPath,
         devMode,
         branch,
+        parentChannelId,
         hasRunTurn: false,
       };
       this.sessions.set(thread.id, session);
@@ -1137,8 +1334,8 @@ export class DiscordCopilotApp {
    * it to tidy up would be the worst possible trade.
    */
   private async cmdEnd(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const explicit = interaction.options.getString("thread")?.trim();
@@ -1343,8 +1540,8 @@ export class DiscordCopilotApp {
 
   /** `/sessions` — what is live right now, and where each one is working. */
   private async cmdSessions(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const rows = [...this.sessions.entries()].map(([id, s]) => {
@@ -1388,6 +1585,229 @@ export class DiscordCopilotApp {
     });
   }
 
+  /**
+   * `/channel enable | disable | list` — which channels this bot answers in.
+   *
+   * The ONE command gated on `isOwner` rather than `isAuthorized`: it must work
+   * in a channel that is not enabled yet, or no channel could ever be added.
+   * Nothing else may follow it — a button or autocomplete accepted on `isOwner`
+   * would let a click from an unrelated channel drive a session.
+   *
+   * Note this only moves the BOT's gate. Whether Discord even offers the command
+   * in a channel is a separate, admin-only setting (a bot token cannot set
+   * command permissions at all), so a locked-down server may hide `/channel` in
+   * the very channel the operator is standing in — hence the `channel:` option,
+   * which also lets a DELETED channel be removed by id.
+   */
+  private async cmdChannel(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isOwner(ctxOf(interaction), this.policyNow())) {
+      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const sub = interaction.options.getSubcommand();
+    if (sub === "list") {
+      await this.channelList(interaction);
+      return;
+    }
+    const raw = interaction.options.getString("channel");
+    const explicit = parseChannelRef(raw);
+    // An unparseable value must NOT silently fall back to "here": that would
+    // enable or disable a different channel than the one the operator named.
+    if ((raw ?? "").trim() && !explicit) {
+      await interaction.reply({
+        content: "`channel:` 只接受頻道 ID 或 `#頻道` 提及（例如 `123456789012345678` 或 `<#123…>`）。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const target = explicit ?? interaction.channelId;
+    if (sub === "enable") await this.channelEnable(interaction, target);
+    else if (sub === "disable") await this.channelDisable(interaction, target);
+  }
+
+  private async channelList(interaction: ChatInputCommandInteraction): Promise<void> {
+    const counts = new Map<string, number>();
+    for (const s of this.sessions.values()) {
+      counts.set(s.parentChannelId, (counts.get(s.parentChannelId) ?? 0) + 1);
+    }
+    const line = (id: string, seed: boolean): string =>
+      `• <#${id}>（\`${id}\`）${seed ? " — 主頻道（來自 `.env`，無法停用）" : ""} · ${counts.get(id) ?? 0} 個 session`;
+    const rows = [
+      line(this.channels.seedChannelId, true),
+      ...this.channels.entries().map((e) => `${line(e.id, false)} · 由 <@${e.addedBy}> 啟用`),
+    ];
+    await interaction.reply({
+      content:
+        `這個 bot 會回應的頻道：\n${rows.join("\n")}\n\n` +
+        "ℹ️ 這是 **bot 的授權**清單，**不等於**指令會不會出現在選單裡。" +
+        "指令的可見度只有伺服器管理員能在 Server Settings → Integrations 設定" +
+        "（bot token 沒有權限改）。見 `docs/CHANNEL-ACCESS.md`。",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  /**
+   * Enable a channel. Widening, so it follows the same ack-before-allow ordering
+   * as `/yolo`: acknowledge FIRST, apply only after Discord confirms, and only
+   * if nothing else moved the registry meanwhile. A reply that never lands must
+   * not leave the bot answering somewhere the operator was never told about.
+   */
+  private async channelEnable(
+    interaction: ChatInputCommandInteraction,
+    target: string
+  ): Promise<void> {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    if (this.channels.has(target)) {
+      await interaction.editReply(
+        this.channels.isSeed(target)
+          ? `<#${target}> 是 \`.env\` 設定的主頻道，本來就一直是啟用的。`
+          : `<#${target}> 已經是啟用狀態了。`
+      );
+      return;
+    }
+    const check = await this.inspectChannelTarget(target);
+    if (check.error) {
+      await interaction.editReply(check.error);
+      return;
+    }
+    const warn = check.missing.length
+      ? `\n⚠️ bot 在該頻道缺少這些權限：${check.missing.join("、")}。` +
+        `\n仍然可以啟用（Discord 的互動不受頻道權限影響，照樣會送到 bot），但實際發文會失敗。`
+      : "";
+    // The acknowledgement. If it throws, nothing below runs and the channel
+    // stays disabled — the failure direction that is safe.
+    await interaction.editReply(
+      `正在啟用 <#${target}>，之後這個頻道就能用 \`/new\` 開 session。${warn}`
+    );
+    // A concurrent enable of THIS target is a harmless durable no-op; a change
+    // for a DIFFERENT target is irrelevant. The former is reported by
+    // `ChannelRegistry.enable()` as success, and the latter must not make this
+    // operator retry a request whose target is still disabled.
+    const ok = this.channels.enable(target, interaction.user.id);
+    await interaction
+      .editReply(
+        ok
+          ? `✅ 已啟用 <#${target}>。${warn}\n` +
+            "ℹ️ 指令要不要出現在該頻道的 `/` 選單，是另一件事，只有伺服器管理員能在 " +
+            "Server Settings → Integrations 設定。見 `docs/CHANNEL-ACCESS.md`。"
+          : `⚠️ 無法寫入頻道清單，**沒有**啟用 <#${target}>（詳見 bot 的日誌）。`
+      )
+      .catch(() => {});
+  }
+
+  /**
+   * Disable a channel. Narrowing, so it persists FIRST and only then reports —
+   * a revocation that cannot be written must be reported as a failure, never as
+   * success.
+   *
+   * Refused while the channel still owns work. `blocked` is terminal
+   * (`reconcile.ts`), so letting a disable strand live sessions would destroy
+   * conversations to tidy up a list; `/end` is the command that is allowed to
+   * decide a session is over.
+   */
+  private async channelDisable(
+    interaction: ChatInputCommandInteraction,
+    target: string
+  ): Promise<void> {
+    if (this.channels.isSeed(target)) {
+      await interaction.reply({
+        content:
+          `<#${target}> 是 \`.env\` 的 \`DISCORD_PARENT_CHANNEL_ID\`（主頻道），不能從 Discord 停用。` +
+          "要換主頻道請改 `.env` 再重啟 —— 舊主頻道底下的 session 會在下次啟動時變成 `blocked`。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (!this.channels.has(target)) {
+      await interaction.reply({
+        content: `<#${target}> 本來就沒有啟用。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const held = this.channelHolders(target);
+    if (held.length) {
+      await interaction.reply({
+        content:
+          `⚠️ <#${target}> 底下還有 ${held.length} 個 session（或建立中的記錄），先用 \`/end\` 結束它們再停用：\n` +
+          held
+            .slice(0, 10)
+            .map((t) => `• <#${t}> — \`/end\`，討論串已刪除時用 \`/end thread:${t}\``)
+            .join("\n") +
+          (held.length > 10 ? `\n…另有 ${held.length - 10} 個（用 \`/sessions\` 查看）。` : ""),
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const ok = this.channels.disable(target);
+    await interaction.reply({
+      content: ok
+        ? `✅ 已停用 <#${target}>。bot 不會再回應那裡；記得也在 Server Settings → Integrations 把指令關掉。`
+        : `⚠️ 無法寫入頻道清單，<#${target}> **仍然是啟用狀態**（詳見 bot 的日誌）。`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  /** Threads that still tie work to `channelId` — live actors plus records that
+   *  reconcile would still try to resume or that a `/new` is mid-way through. */
+  private channelHolders(channelId: string): string[] {
+    const out = new Set<string>();
+    for (const [threadId, s] of this.sessions) {
+      if (s.parentChannelId === channelId) out.add(threadId);
+    }
+    for (const r of this.store.all()) {
+      if (r.parentChannelId !== channelId) continue;
+      if (r.state === "active" || r.state === "creating") out.add(r.threadId);
+    }
+    return [...out];
+  }
+
+  /** Validate an enable target and report which working permissions the bot is
+   *  missing there. Missing permissions are advisory, not a refusal: a
+   *  permission is not an authorization, and Discord delivers interactions to
+   *  the bot either way. */
+  private async inspectChannelTarget(
+    target: string
+  ): Promise<{ error?: string; missing: string[] }> {
+    let ch: unknown;
+    try {
+      ch = await this.discord.channels.fetch(target);
+    } catch (err) {
+      const e = err as { code?: number };
+      return {
+        missing: [],
+        error:
+          e?.code === 10003
+            ? `找不到頻道 \`${target}\`。請確認 ID 正確，且 bot 看得到它。`
+            : `無法讀取頻道 \`${target}\`：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    const c = ch as {
+      type?: number;
+      guildId?: string;
+      permissionsFor?: (m: unknown) => { has: (p: bigint) => boolean } | null;
+      guild?: { members?: { me?: unknown } };
+    } | null;
+    if (!c) return { missing: [], error: `找不到頻道 \`${target}\`。` };
+    if (c.guildId !== this.config.DISCORD_GUILD_ID) {
+      return { missing: [], error: `\`${target}\` 不在設定的伺服器裡，拒絕啟用。` };
+    }
+    if (c.type !== ChannelType.GuildText) {
+      return {
+        missing: [],
+        error:
+          `\`${target}\` 不是一般文字頻道（討論串、論壇、公告、語音都不行）。` +
+          "session 是「文字頻道底下的討論串」，所以父層必須是文字頻道。",
+      };
+    }
+    const me = c.guild?.members?.me;
+    if (!me || typeof c.permissionsFor !== "function") return { missing: [] };
+    const perms = c.permissionsFor(me);
+    if (!perms) return { missing: [] };
+    const missing = REQUIRED_CHANNEL_PERMISSIONS.filter((p) => !perms.has(p.flag)).map((p) => p.label);
+    return { missing };
+  }
+
   // ------------------------------------------------------------ /repo -------
 
   /**
@@ -1403,7 +1823,7 @@ export class DiscordCopilotApp {
     const respond = async (choices: Array<{ name: string; value: string }>): Promise<void> => {
       await interaction.respond(choices.slice(0, 25)).catch(() => {});
     };
-    if (this.phase !== "ready" || !isAuthorized(ctxOf(interaction), this.policy)) {
+    if (this.phase !== "ready" || !isAuthorized(ctxOf(interaction), this.policyNow())) {
       await respond([]);
       return;
     }
@@ -1418,8 +1838,8 @@ export class DiscordCopilotApp {
   }
 
   private async cmdRepo(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const sub = interaction.options.getSubcommand();
@@ -1834,7 +2254,12 @@ export class DiscordCopilotApp {
       generation,
       repoPath: target.repoPath,
       guildId: this.config.DISCORD_GUILD_ID,
-      parentChannelId: this.config.DISCORD_PARENT_CHANNEL_ID,
+      // The thread does not MOVE when its repo is rebound, so its parent is
+      // whatever it already was. Writing the configured seed channel here (as
+      // this did) silently relocated every rebound session onto the seed: a
+      // session started in any other enabled channel then failed `bindingOk` on
+      // the next restart and was marked `blocked` — terminal.
+      parentChannelId: session.parentChannelId,
       workDir,
       devMode: target.devMode,
       branch,
@@ -1889,6 +2314,7 @@ export class DiscordCopilotApp {
       repoPath: target.repoPath,
       devMode: target.devMode,
       branch,
+      parentChannelId: session.parentChannelId,
       hasRunTurn: false,
     });
     if (target.devMode !== "local") this.releaseLocalLease(threadId);
@@ -2081,11 +2507,18 @@ export class DiscordCopilotApp {
    *  any /new. `deps.classifyThread` is injectable for tests. Throws on a corrupt
    *  store so startup fails closed rather than silently starting fresh. */
   private async reconcileOnStartup(deps?: {
-    classifyThread?: (threadId: string) => Promise<ThreadStatus>;
+    classifyThread?: (threadId: string, expectedParentChannelId: string) => Promise<ThreadStatus>;
     validateBinding?: typeof validateBinding;
   }): Promise<void> {
-    const classify = deps?.classifyThread ?? ((id: string) => this.classifyThread(id));
+    const classify =
+      deps?.classifyThread ?? ((id: string, parent: string) => this.classifyThread(id, parent));
     this.bindingCheck = deps?.validateBinding ?? validateBinding;
+    // BEFORE anything reads or writes a record. A registry that could not be
+    // trusted would resolve to "seed channel only", every record under another
+    // channel would fail `bindingOk`, and reconcile would mark them `blocked` —
+    // a TERMINAL state that re-enabling the channel does not undo. Checked here
+    // as well as in `start()` so the ordering invariant survives a refactor.
+    this.assertChannelRegistryUsable();
     if (this.store.isCorrupt()) {
       // Checked once, for the whole file: a corrupt store says nothing reliable
       // about ANY session, so per-record handling would be guesswork.
@@ -2151,16 +2584,33 @@ export class DiscordCopilotApp {
    * startup, and only when there is something to say.
    */
   private async announceUnreachableRecords(): Promise<void> {
-    const unreachable = new Set(["thread-gone", "thread-inaccessible", "thread-archived", "worktree-kept"]);
+    const unreachable = new Set([
+      "thread-gone",
+      "thread-inaccessible",
+      "thread-archived",
+      "worktree-kept",
+      // `bindingOk` rejects a disabled/changed parent BEFORE it attempts to
+      // fetch the thread. If the thread is ALSO gone, its direct `notice()` is
+      // silently undeliverable; route this config mismatch to the parent/seed
+      // fallback too rather than leaving a disk-holding record unannounced.
+      "config-mismatch",
+    ]);
     const records = this.store.all();
-    const lines = records
-      .filter(
-        (r) =>
-          classifyRecordDisposition(r.state, this.sessions.has(r.threadId), this.creating) === "reapable" &&
-          !!r.reason &&
-          unreachable.has(r.reason)
-      )
-      .map((r) => `• \`${r.threadId}\`（${r.reason}）${r.branch ? ` · 分支 \`${r.branch}\`` : ""} — \`${r.workDir}\``);
+    const byParent = new Map<string, string[]>();
+    for (const r of records) {
+      if (
+        classifyRecordDisposition(r.state, this.sessions.has(r.threadId), this.creating) !== "reapable" ||
+        !r.reason ||
+        !unreachable.has(r.reason)
+      ) {
+        continue;
+      }
+      const lines = byParent.get(r.parentChannelId) ?? [];
+      lines.push(
+        `• \`${r.threadId}\`（${r.reason}）${r.branch ? ` · 分支 \`${r.branch}\`` : ""} — \`${r.workDir}\``
+      );
+      byParent.set(r.parentChannelId, lines);
+    }
     // The other direction: /new creates the worktree BEFORE it persists the
     // record, so a crash in between leaves a checkout that no record mentions —
     // invisible to /sessions and to /end alike. Same for a store file replaced
@@ -2175,36 +2625,64 @@ export class DiscordCopilotApp {
     const stray = this.strayWorktreeDirs(known).map(
       (d) => `• \`${d}\`（沒有對應的 session 記錄）`
     );
-    if (!lines.length && !stray.length) return;
-    // Budget by LENGTH, not by count: `notice()` slices at 1900, and a fixed cap
-    // does not bound the message — 15 realistic entries (19-digit snowflakes plus
-    // absolute paths) measure ~2250 chars, which silently drops the last ids AND
-    // the instruction line, in a message whose whole purpose is to name ids.
-    const all = [...lines, ...stray];
-    const head = `🧹 有 ${all.length} 項殘留仍佔著磁碟：\n`;
+    if (!byParent.size && !stray.length) return;
+
+    // Record-less worktrees have no trustworthy home channel, so the seed owns
+    // their report. All recorded work stays grouped by the precise parent that
+    // owned it — one blob sent to the seed would be both noisy and useless to an
+    // operator who deliberately separates repos/channels.
+    if (stray.length) {
+      const seedLines = byParent.get(this.channels.seedChannelId) ?? [];
+      seedLines.push(...stray);
+      byParent.set(this.channels.seedChannelId, seedLines);
+    }
+
+    for (const [parentChannelId, lines] of byParent) {
+      const direct = this.channels.has(parentChannelId)
+        ? parentChannelId
+        : this.channels.seedChannelId;
+      const text = this.formatUnreachableNotice(lines, parentChannelId === this.channels.seedChannelId && stray.length > 0);
+      let delivered = await this.transport.noticeDelivered(direct, text).catch(() => false);
+      // `notice()` used to turn an inaccessible channel into a quiet apparent
+      // success, which meant this report could never try the parent fallback.
+      // `noticeDelivered()` makes the second attempt real rather than cosmetic.
+      if (!delivered && direct !== this.channels.seedChannelId) {
+        delivered = await this.transport
+          .noticeDelivered(this.channels.seedChannelId, text)
+          .catch(() => false);
+      }
+      if (!delivered) {
+        console.warn(
+          `reconcile: could not deliver ${lines.length} leftover-worktree notice(s) ` +
+            `for parent ${parentChannelId}, including the seed fallback`
+        );
+      }
+    }
+  }
+
+  /** Build ONE parent group's leftover notice. The length budget has to be
+   *  recalculated for every group: a fixed item count can cut off the very ids
+   *  this message exists to make reclaimable. */
+  private formatUnreachableNotice(lines: readonly string[], hasStray: boolean): string {
+    const head = `🧹 有 ${lines.length} 項殘留仍佔著磁碟：\n`;
     const foot =
-      (lines.length ? "\n討論串已無法使用，請在本頻道用 `/end thread:<id>` 清除（有未提交內容的 worktree 會保留）。" : "") +
-      (stray.length ? "\n沒有記錄的目錄請自行確認後 `git worktree remove`。" : "");
-    const BUDGET = 1850 - head.length - foot.length - 40; // 40 = room for the "omitted" line
+      "\n討論串已無法使用，請在本頻道用 `/end thread:<id>` 清除（有未提交內容的 worktree 會保留）。" +
+      (hasStray ? "\n沒有記錄的目錄請自行確認後 `git worktree remove`。" : "");
+    const budget = 1850 - head.length - foot.length - 40; // room for omission line
     const shown: string[] = [];
     let used = 0;
-    for (const l of all) {
-      if (used + l.length + 1 > BUDGET) break;
-      shown.push(l);
-      used += l.length + 1;
+    for (const line of lines) {
+      if (used + line.length + 1 > budget) break;
+      shown.push(line);
+      used += line.length + 1;
     }
-    const omitted = all.length - shown.length;
-    await this.transport
-      .notice(
-        this.config.DISCORD_PARENT_CHANNEL_ID,
-        head +
-          shown.join("\n") +
-          (omitted > 0 ? `\n…另有 ${omitted} 項未列出（用 \`/sessions\` 查看）。` : "") +
-          foot
-      )
-      .catch(() => {
-        /* discoverability aid — never fail startup for it */
-      });
+    const omitted = lines.length - shown.length;
+    return (
+      head +
+      shown.join("\n") +
+      (omitted > 0 ? `\n…另有 ${omitted} 項未列出（用 \`/sessions\` 查看）。` : "") +
+      foot
+    );
   }
 
   /**
@@ -2253,13 +2731,13 @@ export class DiscordCopilotApp {
 
   private async reconcileRecord(
     rec: SessionRecord,
-    classify: (threadId: string) => Promise<ThreadStatus>
+    classify: (threadId: string, expectedParentChannelId: string) => Promise<ThreadStatus>
   ): Promise<void> {
     let bindingOk: boolean | undefined;
     let threadStatus: ThreadStatus | undefined;
     if (rec.state === "active") {
       bindingOk = this.bindingOk(rec);
-      if (bindingOk) threadStatus = await classify(rec.threadId);
+      if (bindingOk) threadStatus = await classify(rec.threadId, rec.parentChannelId);
     }
 
     const action = planReconcile({ corrupt: false, state: rec.state, bindingOk, threadStatus });
@@ -2409,6 +2887,7 @@ export class DiscordCopilotApp {
       repoPath: rec.repoPath,
       devMode: rec.devMode,
       branch: rec.branch,
+      parentChannelId: rec.parentChannelId,
       // A resumed session carries conversation history by definition — that is
       // what resume is FOR — so a rebind must always confirm before discarding it.
       hasRunTurn: true,
@@ -2470,8 +2949,14 @@ export class DiscordCopilotApp {
    * doing it here would make this async for the sake of one caller and would
    * still have to be re-checked before the session is created.
    *
-   * A mismatch (e.g. REPOS_ROOT or guild/parent changed between runs) must NOT
+   * A mismatch (e.g. REPOS_ROOT or the guild changed between runs) must NOT
    * resume — it would run one repo's conversation against another.
+   *
+   * The parent channel is checked for MEMBERSHIP of the enabled set, not against
+   * one configured id: sessions legitimately live under any channel the operator
+   * enabled. A channel that has since been disabled therefore blocks its records
+   * — which is why `/channel disable` refuses while any of them are still alive,
+   * since `blocked` is terminal.
    */
   private bindingOk(rec: SessionRecord): boolean {
     const wd = rec.workDir;
@@ -2483,14 +2968,22 @@ export class DiscordCopilotApp {
       isStrictlyInside(rec.repoPath, this.reposRoot) &&
       workDirOk &&
       rec.guildId === this.config.DISCORD_GUILD_ID &&
-      rec.parentChannelId === this.config.DISCORD_PARENT_CHANNEL_ID
+      this.channels.has(rec.parentChannelId)
     );
   }
 
   /** Classify the Discord thread a record is bound to. Distinguishes definitive
    *  absence/inaccessibility from a transient fetch failure so a startup blip
-   *  can't drop a recoverable session. Unarchives an archived thread if possible. */
-  private async classifyThread(threadId: string): Promise<ThreadStatus> {
+   *  can't drop a recoverable session. Unarchives an archived thread if possible.
+   *
+   *  `expectedParentChannelId` is the parent the RECORD claims. It must match the
+   *  thread's real parent exactly — "sits under any enabled channel" would let a
+   *  record naming channel A resume a thread that actually lives under channel B,
+   *  which is the whole point of storing the parent per record. */
+  private async classifyThread(
+    threadId: string,
+    expectedParentChannelId: string
+  ): Promise<ThreadStatus> {
     let ch;
     try {
       ch = await this.discord.channels.fetch(threadId);
@@ -2511,7 +3004,8 @@ export class DiscordCopilotApp {
     };
     if (typeof anyCh.isThread === "function" && !anyCh.isThread()) return "inaccessible";
     if (anyCh.guildId !== this.config.DISCORD_GUILD_ID) return "inaccessible";
-    if (anyCh.parentId !== this.config.DISCORD_PARENT_CHANNEL_ID) return "inaccessible";
+    if (!this.channels.has(expectedParentChannelId)) return "inaccessible";
+    if (anyCh.parentId !== expectedParentChannelId) return "inaccessible";
     if (anyCh.archived) {
       try {
         await anyCh.setArchived?.(false);
@@ -2524,8 +3018,8 @@ export class DiscordCopilotApp {
   }
 
   private async cmdStop(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const session = this.sessions.get(interaction.channelId);
@@ -2568,8 +3062,8 @@ export class DiscordCopilotApp {
 
   /** /model, /effort, /context — reconfigure the current thread's session. */
   private async cmdReconfigure(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const session = this.sessions.get(interaction.channelId);
@@ -2619,8 +3113,8 @@ export class DiscordCopilotApp {
   }
 
   private async cmdUsage(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const session = this.sessions.get(interaction.channelId);
@@ -2658,8 +3152,8 @@ export class DiscordCopilotApp {
    *  so a failed reply can never leave the session silently unguarded. Turning
    *  it **off** happens FIRST, because a failure there must still be safe. */
   private async cmdYolo(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const session = this.sessions.get(interaction.channelId);
@@ -2701,8 +3195,8 @@ export class DiscordCopilotApp {
   }
 
   private async cmdApprovals(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const clear = interaction.options.getBoolean("clear") ?? false;
@@ -2745,8 +3239,8 @@ export class DiscordCopilotApp {
   }
 
   private async cmdDiff(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const staged = interaction.options.getBoolean("staged") ?? false;
@@ -2777,8 +3271,8 @@ export class DiscordCopilotApp {
   }
 
   private async cmdTodos(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const session = this.sessions.get(interaction.channelId);
@@ -2800,8 +3294,8 @@ export class DiscordCopilotApp {
 
   /** /rename — retitle the current session thread. */
   private async cmdRename(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const session = this.sessions.get(interaction.channelId);
@@ -2841,8 +3335,8 @@ export class DiscordCopilotApp {
    * resurrecting work the operator has long forgotten about.
    */
   private async cmdQueue(interaction: ChatInputCommandInteraction): Promise<void> {
-    if (!isAuthorized(ctxOf(interaction), this.policy)) {
-      await interaction.reply({ content: "Not authorized.", flags: MessageFlags.Ephemeral });
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
       return;
     }
     const session = this.sessions.get(interaction.channelId);
@@ -2893,7 +3387,7 @@ export class DiscordCopilotApp {
       await this.hintEndedSession(message);
       return; // not a live session thread
     }
-    if (!isAuthorized(ctxOf(message), this.policy)) return; // silent for non-owners
+    if (!isAuthorized(ctxOf(message), this.policyNow())) return; // silent for non-owners
     // Startup gate, checked AFTER the thread+author checks so it can never spam
     // unrelated channels. resumeRecord registers the session and posts its
     // recovery notice while `phase` is still "reconciling", so a user replying
@@ -2934,12 +3428,12 @@ export class DiscordCopilotApp {
 
   /** Tell an authorized operator that the thread they just typed into is a spent
    *  session, instead of silently swallowing the message. Once per thread per
-   *  process, and only in threads this bot opened under the configured parent —
+   *  process, and only in threads this bot opened under an enabled channel —
    *  see `isOurEndedThread`. Never throws: this is a courtesy, not a feature. */
   private async hintEndedSession(message: Message): Promise<void> {
     try {
       if (this.endedHinted.has(message.channelId)) return;
-      if (!isAuthorized(ctxOf(message), this.policy)) return; // silent for non-owners
+      if (!isAuthorized(ctxOf(message), this.policyNow())) return; // silent for non-owners
       const ch = message.channel as unknown as {
         isThread?: () => boolean;
         parentId?: string | null;
@@ -2949,7 +3443,7 @@ export class DiscordCopilotApp {
         channelIsThread: ch.isThread?.() === true,
         threadParentId: ch.parentId ?? undefined,
         threadOwnerId: ch.ownerId ?? undefined,
-        configuredParentChannelId: this.config.DISCORD_PARENT_CHANNEL_ID,
+        enabledParentChannelIds: this.channels.enabledSet(),
         botUserId: this.discord.user?.id,
       });
       if (!ours) return;
@@ -3202,5 +3696,3 @@ async function preflightModel(copilot: CopilotClient, model: string): Promise<vo
 
 // Keep the discord.js thread type referenced (used via casts above).
 export type { AnyThreadChannel };
-
-

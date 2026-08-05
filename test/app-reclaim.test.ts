@@ -19,6 +19,9 @@ class NullTransport implements Transport {
   async showUserInput(): Promise<void> {}
   async showPlan(): Promise<void> {}
   async notice(): Promise<void> {}
+  async noticeDelivered(): Promise<boolean> {
+    return true;
+  }
   onDecision(): () => void {
     return () => {};
   }
