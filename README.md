@@ -1,5 +1,7 @@
 # discord-copilot-sdk
 
+> **English** · [繁體中文](README.zh-TW.md)
+
 Control your **local GitHub Copilot** from **Discord** — with the full "GitHub Copilot app"
 experience — from anywhere, including your phone.
 
@@ -68,8 +70,10 @@ Mitigations that **are** in place:
 - **Access gate**: only allow-listed user id(s), in the configured guild + parent channel/threads,
   can drive a session. (This gates *input*; anyone who can read the channel can read *output* — use
   a private channel.) Secrets (`DISCORD_*`/`DISCORD_COPILOT_SDK_*`) are stripped from the agent's runtime env.
-  By default the bot can also *read* every channel in the server; confining it to one is a few clicks
-  and is written up in [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) §4b.
+  By default the bot can also *read* every channel in the server; §4b of
+  [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) covers limiting what it can read. Hiding the slash
+  commands themselves is a separate, admin-only Discord setting documented in
+  [`docs/CHANNEL-ACCESS.md`](docs/CHANNEL-ACCESS.md).
 
 **Known limitation — inherited approvals:** the bot uses your logged-in Copilot (`~/.copilot`), so
 any blanket "always allow" approval rules you've saved there apply and would bypass the per-command
@@ -228,6 +232,12 @@ while the controlled repo stayed untouched.
 `/end` removes the worktree **only when git reports it clean**. A dirty one is
 kept and its path reported: uncommitted work is not ours to discard. To land a
 session's work, ask it to commit, then `git merge copilot/t-<threadId>`.
+
+### Channel access (`/channel`)
+
+Sessions can live in more than one Discord channel. `DISCORD_PARENT_CHANNEL_ID` is the always-enabled seed channel; an owner can add another channel with `/channel enable` inside that channel, or `/channel enable channel:<id>` from the seed channel. Use `/channel disable` to remove a channel and `/channel list` to inspect the bot-authorized list.
+
+`/channel list` shows **bot authorization** only. Whether Discord shows the slash commands in a user's command picker is controlled separately by server admin settings; see [`docs/CHANNEL-ACCESS.md`](docs/CHANNEL-ACCESS.md).
 
 ## Repos and dev mode
 

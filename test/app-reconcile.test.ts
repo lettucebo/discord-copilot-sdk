@@ -1,12 +1,22 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, vi, afterAll, afterEach } from "vitest";
 import { DiscordCopilotApp } from "../src/app.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
+import { ChannelRegistry } from "../src/core/channel-registry.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Transport } from "../src/core/transport.js";
 import { tmpdir } from "node:os";
 import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
 import { rmSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
+
+// The app owns durable state beneath os.homedir(). Redirect it before any
+// fixture calls stateDir(), so this suite never reads a developer's registry
+// or leaves worktrees in their real home directory.
+const realHome = process.env.HOME;
+const realUserProfile = process.env.USERPROFILE;
+const fakeHome = mkdtempSync(join(tmpdir(), "dp-reconcile-home-"));
+process.env.HOME = fakeHome;
+process.env.USERPROFILE = fakeHome;
 
 const REPOS_ROOT = join(tmpdir(), "dcs-fixture-repos");
 const REPO = join(REPOS_ROOT, "repo");
@@ -52,6 +62,14 @@ afterEach(() => {
   for (const d of wtDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
+afterAll(() => {
+  if (realHome === undefined) delete process.env.HOME;
+  else process.env.HOME = realHome;
+  if (realUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = realUserProfile;
+  rmSync(fakeHome, { recursive: true, force: true });
+});
+
 const cfg = {
   DISCORD_BOT_TOKEN: "t",
   DISCORD_ALLOWED_USER_IDS: ["u1"],
@@ -71,6 +89,10 @@ class FakeTransport implements Transport {
   async showPlan(): Promise<void> {}
   async notice(_k: string, t: string): Promise<void> {
     this.notices.push(t);
+  }
+  async noticeDelivered(_k: string, t: string): Promise<boolean> {
+    this.notices.push(t);
+    return true;
   }
   onDecision(): () => void {
     return () => {};
@@ -120,10 +142,13 @@ function fakeCopilot(
 function sessionsOf(app: DiscordCopilotApp): Map<string, unknown> {
   return (app as unknown as { sessions: Map<string, unknown> }).sessions;
 }
-function reconcile(app: DiscordCopilotApp, classify: () => Promise<string>): Promise<void> {
+function reconcile(
+  app: DiscordCopilotApp,
+  classify: (threadId: string, expectedParentChannelId: string) => Promise<string>
+): Promise<void> {
   return (app as unknown as {
     reconcileOnStartup(d?: {
-      classifyThread?: (id: string) => Promise<string>;
+      classifyThread?: (id: string, expectedParentChannelId: string) => Promise<string>;
       validateBinding?: () => Promise<{ ok: true }>;
     }): Promise<void>;
   }).reconcileOnStartup({
@@ -136,17 +161,34 @@ function reconcile(app: DiscordCopilotApp, classify: () => Promise<string>): Pro
   });
 }
 
+function classifyThread(
+  app: DiscordCopilotApp,
+  threadId: string,
+  expectedParentChannelId: string
+): Promise<string> {
+  return (
+    app as unknown as {
+      classifyThread(id: string, parentChannelId: string): Promise<string>;
+    }
+  ).classifyThread(threadId, expectedParentChannelId);
+}
+
 describe("reconcileOnStartup (app-level wiring, P2)", () => {
-  it("active + valid thread → resumes, registers, keeps active, posts recovery notice", async () => {
+  it("active + valid thread → resumes under its recorded parent, registers, keeps active, posts recovery notice", async () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
       store.reserve(bind()); store.commit("t1");
       const transport = new FakeTransport();
       const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
-      await reconcile(app, async () => "valid");
+      let classifiedParent: string | undefined;
+      await reconcile(app, async (_threadId, expectedParentChannelId) => {
+        classifiedParent = expectedParentChannelId;
+        return "valid";
+      });
       expect(sessionsOf(app).has("t1")).toBe(true);
       expect(store.get("t1")?.state).toBe("active");
+      expect(classifiedParent).toBe("c1");
       expect(transport.notices.some((n) => n.includes("復原"))).toBe(true);
     } finally {
       rmSync(f, { force: true });
@@ -234,6 +276,25 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     }
   });
 
+  it("active + disabled recorded parent → blocked:config-mismatch WITHOUT fetching the thread", async () => {
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ parentChannelId: "c2" })); store.commit("t1");
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      let classifyCalls = 0;
+      await reconcile(app, async () => {
+        classifyCalls++;
+        return "valid";
+      });
+      expect(store.get("t1")?.state).toBe("blocked");
+      expect(store.get("t1")?.reason).toBe("config-mismatch");
+      expect(classifyCalls).toBe(0);
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
   it("transient thread failure → record left unchanged (active), not resumed", async () => {
     const f = tmpFile();
     try {
@@ -271,6 +332,106 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       expect(sessionsOf(app).size).toBe(0);
     } finally {
       rmSync(f, { force: true });
+    }
+  });
+
+  it("resumes a record under an enabled secondary parent", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ parentChannelId: "c2" })); store.commit("t1");
+      const channels = new ChannelRegistry("c1", "g1", registryFile);
+      expect(channels.enable("c2", "u1")).toBe(true);
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        channels
+      );
+      let classifiedParent: string | undefined;
+      await reconcile(app, async (_threadId, expectedParentChannelId) => {
+        classifiedParent = expectedParentChannelId;
+        return "valid";
+      });
+      expect(classifiedParent).toBe("c2");
+      expect(sessionsOf(app).has("t1")).toBe(true);
+      expect(store.get("t1")?.state).toBe("active");
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("refuses corrupt channel registry before reconciliation can mutate an active record", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind()); store.commit("t1");
+      writeFileSync(registryFile, "{ not valid json", "utf8");
+      const channels = new ChannelRegistry("c1", "g1", registryFile);
+      expect(channels.isCorrupt()).toBe(true);
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        channels
+      );
+      let classifyCalls = 0;
+      await expect(
+        reconcile(app, async () => {
+          classifyCalls++;
+          return "valid";
+        })
+      ).rejects.toThrow(/channel registry/i);
+      expect(classifyCalls).toBe(0);
+      expect(store.get("t1")?.state).toBe("active");
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("classifies only a thread under the expected parent while that parent remains enabled", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const channels = new ChannelRegistry("c1", "g1", registryFile);
+      expect(channels.enable("c2", "u1")).toBe(true);
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        new SessionStore(f),
+        channels
+      );
+      (app as unknown as {
+        discord: { channels: { fetch(id: string): Promise<unknown> } };
+      }).discord = {
+        channels: {
+          async fetch() {
+            return {
+              isThread: () => true,
+              guildId: "g1",
+              parentId: "c2",
+            };
+          },
+        },
+      };
+
+      await expect(classifyThread(app, "t1", "c2")).resolves.toBe("valid");
+      await expect(classifyThread(app, "t1", "c1")).resolves.toBe("inaccessible");
+      expect(channels.disable("c2")).toBe(true);
+      await expect(classifyThread(app, "t1", "c2")).resolves.toBe("inaccessible");
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
     }
   });
 
@@ -417,36 +578,12 @@ describe("startup announcement for records whose thread is gone", () => {
   // those records (one full checkout each) accumulate in total silence.
   class KeyedTransport extends FakeTransport {
     sent: Array<{ key: string; text: string }> = [];
-    override async notice(k: string, t: string): Promise<void> {
+    rejectedKeys = new Set<string>();
+    override async noticeDelivered(k: string, t: string): Promise<boolean> {
       this.sent.push({ key: k, text: t });
+      return !this.rejectedKeys.has(k);
     }
   }
-
-  // announceUnreachableRecords() ALSO reports "stray" worktree directories by
-  // reading worktreeRoot() (= `${stateDir()}-worktrees`) off the real disk, and
-  // stateDir() resolves through os.homedir(). Without redirecting HOME these
-  // tests read the DEVELOPER'S OWN worktree root: run the bot once, leave a
-  // session's checkout behind, and "stays silent when nothing is unreachable"
-  // starts failing on that machine only — a test whose verdict depends on
-  // whether you have ever used the app. os.homedir() reads $HOME/%USERPROFILE%
-  // on every call, so pointing them at an empty temp dir is enough.
-  let realHome: string | undefined;
-  let realUserProfile: string | undefined;
-  let fakeHome: string;
-  beforeAll(() => {
-    realHome = process.env.HOME;
-    realUserProfile = process.env.USERPROFILE;
-    fakeHome = mkdtempSync(join(tmpdir(), "dp-reconcile-home-"));
-    process.env.HOME = fakeHome;
-    process.env.USERPROFILE = fakeHome;
-  });
-  afterAll(() => {
-    if (realHome === undefined) delete process.env.HOME;
-    else process.env.HOME = realHome;
-    if (realUserProfile === undefined) delete process.env.USERPROFILE;
-    else process.env.USERPROFILE = realUserProfile;
-    rmSync(fakeHome, { recursive: true, force: true });
-  });
 
   it("posts ONE parent-channel line naming the thread id and its worktree", async () => {
     const f = tmpFile();
@@ -482,6 +619,167 @@ describe("startup announcement for records whose thread is gone", () => {
       rmSync(f, { force: true });
     }
   });
+
+  it("groups records by their enabled parent channel", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      for (const [threadId, parentChannelId] of [
+        ["seed-record", "c1"],
+        ["secondary-record", "c2"],
+      ] as const) {
+        store.reserve(bind({ threadId, parentChannelId, workDir: join(`${stateDir()}-worktrees`, threadId) }));
+        store.commit(threadId);
+        store.setState(threadId, "blocked", "thread-gone");
+      }
+      const channels = new ChannelRegistry("c1", "g1", registryFile);
+      expect(channels.enable("c2", "u1")).toBe(true);
+      const transport = new KeyedTransport();
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store, channels);
+
+      await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
+
+      expect(transport.sent).toHaveLength(2);
+      const seed = transport.sent.find((notice) => notice.key === "c1")!;
+      const secondary = transport.sent.find((notice) => notice.key === "c2")!;
+      expect(seed.text).toContain("seed-record");
+      expect(seed.text).not.toContain("secondary-record");
+      expect(secondary.text).toContain("secondary-record");
+      expect(secondary.text).not.toContain("seed-record");
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("retries a failed direct parent notice through the seed channel", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "secondary-record", parentChannelId: "c2" }));
+      store.commit("secondary-record");
+      store.setState("secondary-record", "blocked", "thread-gone");
+      const channels = new ChannelRegistry("c1", "g1", registryFile);
+      expect(channels.enable("c2", "u1")).toBe(true);
+      const transport = new KeyedTransport();
+      transport.rejectedKeys.add("c2");
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store, channels);
+
+      await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
+
+      expect(transport.sent.map((notice) => notice.key)).toEqual(["c2", "c1"]);
+      expect(transport.sent[0]!.text).toContain("secondary-record");
+      expect(transport.sent[1]!.text).toBe(transport.sent[0]!.text);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("uses the seed channel when a record's direct parent is no longer enabled", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "disabled-parent-record", parentChannelId: "c2" }));
+      store.commit("disabled-parent-record");
+      store.setState("disabled-parent-record", "blocked", "thread-gone");
+      const transport = new KeyedTransport();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        transport,
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+
+      await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
+
+      expect(transport.sent.map((notice) => notice.key)).toEqual(["c1"]);
+      expect(transport.sent[0]!.text).toContain("disabled-parent-record");
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("reports a config-mismatch record from a disabled parent through noticeDelivered to the seed", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "mismatched-parent-record", parentChannelId: "c2" }));
+      store.commit("mismatched-parent-record");
+      store.setState("mismatched-parent-record", "blocked", "config-mismatch");
+      const transport = new KeyedTransport();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        transport,
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+
+      await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
+
+      expect(transport.sent.map((notice) => notice.key)).toEqual(["c1"]);
+      expect(transport.sent[0]!.text).toContain("mismatched-parent-record");
+      expect(transport.notices).toEqual([]);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("logs when neither a direct parent nor its seed fallback can receive the report", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "unreachable-record", parentChannelId: "c2" }));
+      store.commit("unreachable-record");
+      store.setState("unreachable-record", "blocked", "thread-gone");
+      const channels = new ChannelRegistry("c1", "g1", registryFile);
+      expect(channels.enable("c2", "u1")).toBe(true);
+      const transport = new KeyedTransport();
+      transport.rejectedKeys.add("c2");
+      transport.rejectedKeys.add("c1");
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store, channels);
+
+      await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
+
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("could not deliver"));
+    } finally {
+      warn.mockRestore();
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("reports unowned stray worktrees to the seed channel", async () => {
+    const f = tmpFile();
+    const stray = join(`${stateDir()}-worktrees`, "unowned");
+    try {
+      mkdirSync(stray, { recursive: true });
+      writeFileSync(join(stray, ".git"), "gitdir: nowhere", "utf8");
+      const transport = new KeyedTransport();
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, new SessionStore(f));
+
+      await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
+
+      expect(transport.sent).toHaveLength(1);
+      expect(transport.sent[0]!.key).toBe("c1");
+      expect(transport.sent[0]!.text).toContain(stray);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(stray, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("a record retired by reclaim stays announceable", () => {
@@ -492,8 +790,9 @@ describe("a record retired by reclaim stays announceable", () => {
   // the one leftover whose thread you cannot type into goes silent for ever.
   class KeyedTransport2 extends FakeTransport {
     sent: Array<{ key: string; text: string }> = [];
-    override async notice(k: string, t: string): Promise<void> {
+    override async noticeDelivered(k: string, t: string): Promise<boolean> {
       this.sent.push({ key: k, text: t });
+      return true;
     }
   }
 
@@ -549,36 +848,49 @@ describe("a record retired by reclaim stays announceable", () => {
 describe("startup announcement length budget", () => {
   class Cap extends FakeTransport {
     sent: string[] = [];
-    override async notice(_k: string, t: string): Promise<void> {
+    override async noticeDelivered(_k: string, t: string): Promise<boolean> {
       this.sent.push(t);
+      return true;
     }
   }
-  it("never composes past notice()'s 1900-char slice, and says how many it left out", async () => {
+  it("budgets the composed notice before transport truncation, and says how many it left out", async () => {
     // A fixed count cap does not bound a message built from 19-digit snowflakes
     // and absolute paths: 15 realistic entries measure ~2250 chars, so the last
     // ids AND the instruction line were silently dropped — in a message whose
     // entire job is to name ids.
     const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
     try {
       const store = new SessionStore(f);
-      for (let i = 0; i < 40; i++) {
-        const id = `153200000000000${String(i).padStart(4, "0")}`;
-        store.reserve(
-          bind({ threadId: id, workDir: join(`${stateDir()}-worktrees`, id), branch: `copilot/t-${id}` })
-        );
-        store.commit(id);
-        store.setState(id, "blocked", "thread-gone");
+      for (const parentChannelId of ["c1", "c2"]) {
+        for (let i = 0; i < 40; i++) {
+          const id = `${parentChannelId}-153200000000000${String(i).padStart(4, "0")}`;
+          store.reserve(
+            bind({
+              threadId: id,
+              parentChannelId,
+              workDir: join(`${stateDir()}-worktrees`, id),
+              branch: `copilot/t-${id}`,
+            })
+          );
+          store.commit(id);
+          store.setState(id, "blocked", "thread-gone");
+        }
       }
       const transport = new Cap();
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
+      const channels = new ChannelRegistry("c1", "g1", registryFile);
+      expect(channels.enable("c2", "u1")).toBe(true);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store, channels);
       await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
-      expect(transport.sent).toHaveLength(1);
-      const msg = transport.sent[0]!;
-      expect(msg.length).toBeLessThanOrEqual(1900);
-      expect(msg).toContain("另有"); // admits what it omitted
-      expect(msg).toContain("/end thread:"); // the instruction survives the cut
+      expect(transport.sent).toHaveLength(2);
+      for (const msg of transport.sent) {
+        expect(msg.length).toBeLessThanOrEqual(1850);
+        expect(msg).toContain("另有"); // admits what it omitted
+        expect(msg).toContain("/end thread:"); // the instruction survives the cut
+      }
     } finally {
       rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
     }
   });
 });

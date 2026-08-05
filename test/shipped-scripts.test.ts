@@ -5,6 +5,24 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const INSTALL_DOCUMENTS = ["README.md", "README.zh-TW.md", "INSTALL.md", "INSTALL.zh-TW.md"];
+const INSTALL_GUIDES = ["INSTALL.md", "INSTALL.zh-TW.md"];
+const DOCUMENTATION_PAIRS = [
+  ["README.md", "README.zh-TW.md"],
+  ["INSTALL.md", "INSTALL.zh-TW.md"],
+  ["docs/DISCORD-SETUP.md", "docs/DISCORD-SETUP.zh-TW.md"],
+  ["docs/CHANNEL-ACCESS.md", "docs/CHANNEL-ACCESS.zh-TW.md"],
+] as const;
+
+function relativeMarkdownLinks(text: string): string[] {
+  const prose = text.replace(/^```[\s\S]*?^```/gm, "");
+  const links = [...prose.matchAll(/\[[^\]]*]\((?:<([^>]+)>|([^\s)]+))(?:\s+["'][^)]*["'])?\)/g)];
+  return links
+    .map((match) => match[1] ?? match[2] ?? "")
+    .filter((href) => !/^(?:https?:|mailto:|#|\/)/i.test(href))
+    .map((href) => href.split("#", 1)[0] ?? "")
+    .filter((href) => href.endsWith(".md"));
+}
 
 /** Every .ps1 an end user is told to run. */
 const USER_FACING_PS1 = ["install.ps1", "get.ps1", "run-bot.ps1", "stop-bot.ps1", "uninstall.ps1"];
@@ -44,18 +62,18 @@ describe("shipped scripts", () => {
     }
   });
 
-  it("documents the one-line install in both README and INSTALL", () => {
-    for (const doc of ["README.md", "INSTALL.md"]) {
+  it("documents the one-line install in English and Traditional Chinese README and INSTALL", () => {
+    for (const doc of INSTALL_DOCUMENTS) {
       const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
       expect(text).toContain("get.ps1");
       expect(text).toContain("get.sh");
     }
   });
 
-  it("documents the uninstaller in both README and INSTALL", () => {
+  it("documents the uninstaller in English and Traditional Chinese README and INSTALL", () => {
     // A tool that installs residency, stores approval grants and holds a bot
     // token needs its removal documented where its installation is.
-    for (const doc of ["README.md", "INSTALL.md"]) {
+    for (const doc of INSTALL_DOCUMENTS) {
       const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
       expect(text).toContain("uninstall.ps1");
       expect(text).toContain("uninstall.sh");
@@ -68,13 +86,15 @@ describe("shipped scripts", () => {
     // docs had to lead with the `gh api` form. Now that it is public the plain
     // form works and is what a reader should see first — a documented command
     // that cannot run is worse than no command.
-    for (const doc of ["README.md", "INSTALL.md"]) {
+    for (const doc of INSTALL_DOCUMENTS) {
       const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
       expect(text).toMatch(/raw\.githubusercontent\.com\/lettucebo\/discord-copilot-sdk\/main\/get\.(ps1|sh)/);
     }
     // The private-fork fallback is still documented, but as a fallback.
-    const install = fs.readFileSync(path.join(ROOT, "INSTALL.md"), "utf8");
-    expect(install).toMatch(/gh api repos\/<owner>\/discord-copilot-sdk\/contents\/get\.ps1/);
+    for (const doc of INSTALL_GUIDES) {
+      const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
+      expect(text).toMatch(/gh api repos\/<owner>\/discord-copilot-sdk\/contents\/get\.ps1/);
+    }
   });
 
   it("every documented get.ps1 command strips the BOM before scriptblock::Create, and never bare-pipes into iex", () => {
@@ -87,7 +107,7 @@ describe("shipped scripts", () => {
     // take flags — so a bare `| iex` invocation must never be the documented
     // form again.
     const fence = /```powershell\r?\n([\s\S]*?)```/g;
-    for (const doc of ["README.md", "INSTALL.md"]) {
+    for (const doc of INSTALL_DOCUMENTS) {
       const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
       const blocks = [...text.matchAll(fence)].map((m) => m[1] ?? "");
       const getBlocks = blocks.filter((b) => b.includes("get.ps1"));
@@ -95,6 +115,28 @@ describe("shipped scripts", () => {
       for (const block of getBlocks) {
         expect(block).toContain("TrimStart([char]0xFEFF)");
         expect(block).not.toMatch(/\|\s*iex\b/);
+      }
+    }
+  });
+
+  it("keeps each bilingual documentation pair and language switcher linked", () => {
+    for (const [english, chinese] of DOCUMENTATION_PAIRS) {
+      expect(fs.existsSync(path.join(ROOT, english)), `${english} exists`).toBe(true);
+      expect(fs.existsSync(path.join(ROOT, chinese)), `${chinese} exists`).toBe(true);
+      expect(fs.readFileSync(path.join(ROOT, english), "utf8"))
+        .toContain(`> **English** · [繁體中文](${path.basename(chinese)})`);
+      expect(fs.readFileSync(path.join(ROOT, chinese), "utf8"))
+        .toContain(`> [English](${path.basename(english)}) · **繁體中文**`);
+    }
+  });
+
+  it("keeps relative Markdown document links within each language valid", () => {
+    for (const [english, chinese] of DOCUMENTATION_PAIRS) {
+      for (const doc of [english, chinese]) {
+        const directory = path.dirname(path.join(ROOT, doc));
+        for (const href of relativeMarkdownLinks(fs.readFileSync(path.join(ROOT, doc), "utf8"))) {
+          expect(fs.existsSync(path.resolve(directory, href)), `${doc} links to ${href}`).toBe(true);
+        }
       }
     }
   });

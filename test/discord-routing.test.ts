@@ -7,7 +7,7 @@ import {
   encodePlanId,
   decodePlanId,
 } from "../src/platforms/discord/custom-id.js";
-import { isAuthorized } from "../src/platforms/discord/auth.js";
+import { isAuthorized, isOwner, type AuthContext, type AuthPolicy } from "../src/platforms/discord/auth.js";
 import { resolveButtonAck, decisionBindsToChannel, applyYoloToggle, approvalScopeKeys } from "../src/app.js";
 
 describe("custom-id", () => {
@@ -52,32 +52,53 @@ describe("choice + plan custom ids", () => {
   });
 });
 
-describe("isAuthorized", () => {
-  const policy = {
+describe("Discord authorization", () => {
+  const policy: AuthPolicy = {
     allowedUserIds: new Set(["u1"]),
     guildId: "g1",
-    parentChannelId: "c1",
+    parentChannelIds: new Set(["c1", "c2"]),
   };
 
-  it("allows an allow-listed user in the parent channel", () => {
-    expect(isAuthorized({ userId: "u1", guildId: "g1", channelId: "c1", parentId: null }, policy)).toBe(true);
+  const context = (overrides: Partial<AuthContext> = {}): AuthContext => ({
+    userId: "u1",
+    guildId: "g1",
+    channelId: "c1",
+    parentId: null,
+    ...overrides,
   });
 
-  it("allows an allow-listed user in a thread under the parent", () => {
-    expect(isAuthorized({ userId: "u1", guildId: "g1", channelId: "t9", parentId: "c1" }, policy)).toBe(true);
+  it("allows an allow-listed user in either enabled parent channel", () => {
+    for (const channelId of ["c1", "c2"]) {
+      expect(isAuthorized(context({ channelId }), policy)).toBe(true);
+    }
   });
 
-  it("denies a non-allow-listed user", () => {
-    expect(isAuthorized({ userId: "u2", guildId: "g1", channelId: "c1", parentId: null }, policy)).toBe(false);
+  it("allows a thread under either enabled parent channel", () => {
+    for (const parentId of ["c1", "c2"]) {
+      expect(isAuthorized(context({ channelId: `thread-${parentId}`, parentId }), policy)).toBe(true);
+    }
   });
 
-  it("denies a wrong guild", () => {
-    expect(isAuthorized({ userId: "u1", guildId: "gX", channelId: "c1", parentId: null }, policy)).toBe(false);
-    expect(isAuthorized({ userId: "u1", guildId: null, channelId: "c1", parentId: null }, policy)).toBe(false);
+  it("keeps an owner outside enabled channels authorized only for bootstrap", () => {
+    const outsideEnabledChannels = context({ channelId: "cX" });
+    expect(isOwner(outsideEnabledChannels, policy)).toBe(true);
+    expect(isAuthorized(outsideEnabledChannels, policy)).toBe(false);
+
+    expect(isOwner(context({ guildId: "gX" }), policy)).toBe(false);
+    expect(isOwner(context({ userId: "u2" }), policy)).toBe(false);
   });
 
-  it("denies a channel/thread outside the parent", () => {
-    expect(isAuthorized({ userId: "u1", guildId: "g1", channelId: "cX", parentId: "cY" }, policy)).toBe(false);
+  it("denies a wrong guild, user, or foreign channel", () => {
+    const denied: AuthContext[] = [
+      context({ guildId: "gX" }),
+      context({ guildId: null }),
+      context({ userId: "u2" }),
+      context({ channelId: "cX", parentId: "cY" }),
+    ];
+
+    for (const unauthorized of denied) {
+      expect(isAuthorized(unauthorized, policy)).toBe(false);
+    }
   });
 });
 

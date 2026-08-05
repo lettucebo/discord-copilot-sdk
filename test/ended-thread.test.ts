@@ -2,18 +2,19 @@ import { describe, it, expect } from "vitest";
 import { isOurEndedThread } from "../src/app.js";
 
 const PARENT = "parent-123";
+const OTHER_PARENT = "parent-456";
 const BOT = "bot-999";
 
 const base = {
   channelIsThread: true,
   threadParentId: PARENT,
   threadOwnerId: BOT,
-  configuredParentChannelId: PARENT,
+  enabledParentChannelIds: new Set([PARENT, OTHER_PARENT]),
   botUserId: BOT,
 };
 
 describe("isOurEndedThread (who may we tell 'this session ended'?)", () => {
-  it("recognises a bot-created thread under the configured parent", () => {
+  it("recognises a bot-created thread under an enabled parent", () => {
     expect(isOurEndedThread(base)).toBe(true);
   });
 
@@ -22,7 +23,11 @@ describe("isOurEndedThread (who may we tell 'this session ended'?)", () => {
     expect(isOurEndedThread({ ...base, channelIsThread: false })).toBe(false);
   });
 
-  it("stays silent in a thread under a DIFFERENT channel", () => {
+  it("recognises a bot-created thread under another enabled channel", () => {
+    expect(isOurEndedThread({ ...base, threadParentId: OTHER_PARENT })).toBe(true);
+  });
+
+  it("stays silent in a thread under a disabled channel", () => {
     expect(isOurEndedThread({ ...base, threadParentId: "some-other-channel" })).toBe(false);
   });
 

@@ -14,10 +14,11 @@ const optionalSnowflake = z.preprocess(
 
 /**
  * discord-copilot-sdk config schema (v1, lab-only). Parsed from environment variables.
- * Discord scope is intentionally narrow: a single guild + parent channel + an
- * explicit user allow-list. `REPOS_ROOT` is the directory that CONTAINS every
- * repo a session may be bound to (⚠️ no isolation in v1 — run only in a
- * disposable environment).
+ * Discord scope is intentionally narrow: a single guild + always-enabled seed
+ * work channel (additional work channels are enabled at runtime) + an explicit
+ * user allow-list. `REPOS_ROOT` is the directory that CONTAINS every repo a
+ * session may be bound to (⚠️ no isolation in v1 — run only in a disposable
+ * environment).
  */
 /** Require a non-blank string WITHOUT transforming it — trimming here would
  *  silently change a value like a Unix path `/tmp/x ` (a real, different
@@ -77,6 +78,8 @@ export const ConfigSchema = z.object({
     .transform(csv)
     .pipe(z.array(snowflake).min(1, "at least one allowed user id is required")),
   DISCORD_GUILD_ID: snowflake,
+  /** Always-enabled seed work channel; additional work channels are enabled at
+   *  runtime. */
   DISCORD_PARENT_CHANNEL_ID: snowflake,
   DEV_GUILD_ID: optionalSnowflake,
   /** Absolute path to the directory that CONTAINS the repos a session may touch.

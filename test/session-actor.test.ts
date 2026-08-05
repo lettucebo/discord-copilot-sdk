@@ -91,6 +91,10 @@ class FakeTransport implements Transport {
   async notice(_k: string, t: string): Promise<void> {
     this.notices.push(t);
   }
+  async noticeDelivered(_k: string, t: string): Promise<boolean> {
+    this.notices.push(t);
+    return true;
+  }
   onDecision(h: (nonce: string, decision: Decision, userId: string) => void): () => void {
     this.decision = h;
     return () => {

@@ -1,351 +1,308 @@
-# Discord Bot 設定指南 / Discord Bot Setup
+# Discord Bot Setup
 
-建立 bot、開啟正確的 intent、用正確的權限邀請它，並取得 `.env` 需要的四個 ID。
+> **English** · [繁體中文](DISCORD-SETUP.zh-TW.md)
+
 Create the bot, enable the right intent, invite it with the right permissions, and collect the four IDs `.env` needs.
 
-> 這份文件只處理 **Discord 那一側**。裝好之後請回到 [`INSTALL.md`](../INSTALL.md)。
 > This covers the **Discord side** only. When you're done, go back to [`INSTALL.md`](../INSTALL.md).
 
-最後你會得到 `.env` 的這四個值 / You will end up with these four values:
+You will end up with these four values:
 
-```
-DISCORD_BOT_TOKEN=          # 步驟 3 / step 3
-DISCORD_ALLOWED_USER_IDS=   # 步驟 5 — 你自己的 user ID / your own user ID
-DISCORD_GUILD_ID=           # 步驟 5 — 伺服器 ID / server ID
-DISCORD_PARENT_CHANNEL_ID=  # 步驟 5 — 父頻道 ID / parent channel ID
+```env
+DISCORD_BOT_TOKEN=          # step 3
+DISCORD_ALLOWED_USER_IDS=   # step 5 — your own user ID
+DISCORD_GUILD_ID=           # step 5 — server ID
+DISCORD_PARENT_CHANNEL_ID=  # step 5 — seed/primary work channel ID
 ```
 
 ---
 
-## 0. 先建一個私人伺服器 / Start with a private server
+## 0. Start with a private server
 
-Discord → 左側 **+** → **Create My Own** → **For me and my friends**。
 Discord → **+** on the left → **Create My Own** → **For me and my friends**.
 
-在裡面建立一個**文字頻道**（例如 `#copilot`）當作父頻道。所有 session 都會是這個頻道底下的討論串。
-Create a **text channel** in it (e.g. `#copilot`) to act as the parent. Every session becomes a thread under it.
+Create a **text channel** in it (for example `#copilot`) to act as the seed/primary work channel. Each session becomes a thread under one enabled work channel; the seed is the first one configured in `.env`.
 
-> **為什麼要私人伺服器**：這個 bot 會以你的身分執行 shell 指令。任何看得到這個頻道的人都能看到 agent 的輸出（包含檔案內容）。輸入有 allow-list 保護，**輸出沒有**。
-> **Why private**: the bot runs shell commands as you. Anyone who can read the channel can read the agent's output, including file contents. Input is allow-listed; **output is not**.
+> **Why private**: the bot runs shell commands as you. Anyone who can read a work channel can read the agent's output, including file contents. Input is allow-listed; **output is not**.
 
-> 反過來也一樣值得管：預設情況下 **bot 讀得到你伺服器的每一個頻道**。§4b 有把它關進單一頻道的完整做法。
-> The reverse is worth controlling too: by default **the bot can read every channel in your server**. §4b confines it to one.
+> The reverse is worth controlling too: by default **the bot can read every channel in your server**. §4b explains how to confine what it can read; [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md) explains the separate command-visibility and `/channel` authorization model.
 
 ---
 
-## 1. 建立 Application 與 Bot / Create the application and bot
+## 1. Create the application and bot
 
-1. 前往 <https://discord.com/developers/applications> → **New Application** → 取名（這個名字會顯示在 Discord 上）。
-   Go to <https://discord.com/developers/applications> → **New Application** → name it (this is the name shown in Discord).
-2. 左側 **Bot** 分頁。較新的介面會自動建立 bot；若沒有就按 **Add Bot**。
-   Open the **Bot** tab. Newer portals create the bot automatically; otherwise click **Add Bot**.
+1. Go to <https://discord.com/developers/applications> → **New Application** → name it. This is the name shown in Discord.
+2. Open the **Bot** tab. Newer portals create the bot automatically; otherwise click **Add Bot**.
 
 ---
 
-## 2. ⚠️ 開啟 Message Content Intent（最多人卡在這裡）/ Enable the Message Content Intent (the #1 gotcha)
+## 2. ⚠️ Enable the Message Content Intent (the #1 gotcha)
 
-**Bot** 分頁 → **Privileged Gateway Intents** → 打開 **MESSAGE CONTENT INTENT** → **Save Changes**。
 **Bot** tab → **Privileged Gateway Intents** → turn on **MESSAGE CONTENT INTENT** → **Save Changes**.
 
-這個 bot 連線時會要求三個 intent（`src/app.ts`）：`Guilds`、`GuildMessages`、`MessageContent`。前兩個不需申請，**`MessageContent` 是特權 intent，必須在這裡手動打開**。
 The bot connects with three intents (`src/app.ts`): `Guilds`, `GuildMessages`, `MessageContent`. The first two are free; **`MessageContent` is privileged and must be toggled on here**.
 
-沒開會怎樣：bot 顯示在線、slash 指令也能用，但**你在討論串裡打字它完全沒反應** —— 因為它收得到訊息事件，卻讀不到內容。
-If it's off: the bot shows online and slash commands work, but **it silently ignores everything you type in a thread** — it receives the message event with empty content.
+If it is off: the bot shows online and slash commands work, but **it silently ignores everything you type in a thread** — it receives the message event with empty content.
 
-> 其他兩個特權 intent（Presence、Server Members）**不需要**開。
 > The other two privileged intents (Presence, Server Members) are **not** needed.
 
-### 順手關掉 Public Bot / While you are here: turn OFF "Public Bot"
+### While you are here: turn OFF "Public Bot"
 
-同一個 **Bot** 分頁往下找 **PUBLIC BOT**，把它**關掉**。開著的話（這是預設值），任何知道你 Application ID 的人都能把**你的 bot** 邀進**他們自己的**伺服器。
-Same **Bot** tab, scroll to **PUBLIC BOT** and turn it **off**. Left on (it is on by default), anyone who knows your application ID can invite **your bot** into **their own** server.
+In the same **Bot** tab, scroll to **PUBLIC BOT** and turn it **off**. Left on (it is on by default), anyone who knows your application ID can invite **your bot** into **their own** server.
 
-這不是漏洞 —— `DISCORD_GUILD_ID` 是精確比對，別人的伺服器一律被拒，slash 指令也只註冊在你的伺服器。但沒有理由讓它被邀出去，而 Application ID 並不是秘密（尤其這個 repo 是公開的）。
 This is not a hole: `DISCORD_GUILD_ID` is matched exactly so another guild is refused outright, and slash commands are registered per-guild. But there is no reason to let it be invited anywhere, and an application ID is not a secret.
 
-#### 會被這個錯誤擋住 / You will hit this error first
+#### You will hit this error first
 
-```
+```text
 Private application cannot have a default authorization link.
 Please check that the default authorization link is set to None in the installation tab.
 ```
 
-Discord 不允許「私有 App」帶著公開安裝連結，所以**順序是反過來的**：
 Discord refuses to make an app private while it still advertises an install link, so the order is inverted:
 
-1. **Installation** 分頁 → **Install Link** → 選 `None` → **Save Changes**
-2. **Bot** 分頁 → **PUBLIC BOT** 關掉 → **再按一次 Save Changes**
+1. **Installation** tab → **Install Link** → choose `None` → **Save Changes**.
+2. **Bot** tab → turn **PUBLIC BOT** off → click **Save Changes** again.
 
-> 兩個分頁**各自**要存一次。下拉選單已經顯示 `None` 不代表存過了 —— Discord 的存檔是手動的，畫面上會浮出 **Save Changes** 提示條。
 > Each tab has its **own** save. Seeing `None` in the dropdown does not mean it is saved — a **Save Changes** bar appears and must be clicked.
 
-拿掉 Install Link **不會**影響已經在伺服器裡的 bot：slash 指令是 bot 啟動時自己用 API 註冊的（`app.ts` 的 `applicationGuildCommands`），跟安裝連結無關。日後若要重新邀請，用下面第 4 節的網址即可。
 Removing the install link does **not** affect a bot already in your server: slash commands are registered by the bot itself over the API at startup, not through the install flow. To re-invite later, use the URL in §4.
 
 ---
 
-## 3. 取得 Bot Token / Copy the bot token
+## 3. Copy the bot token
 
-**Bot** 分頁 → **Reset Token** → 複製。**只會顯示這一次。**
 **Bot** tab → **Reset Token** → copy it. **It is shown only once.**
 
-- 這是密碼等級的東西：拿到的人就能以這個 bot 的身分做任何事。/ Treat it as a password: whoever holds it *is* the bot.
-- **不要**提交進版控。`.env` 已在 `.gitignore`，安裝器也會拒絕寫入被追蹤的 `.env`。/ **Never** commit it.
-- 外洩了就回這裡 **Reset Token**，舊的立刻失效。/ If it leaks, **Reset Token** here; the old one dies immediately.
+- Treat it as a password: whoever holds it *is* the bot.
+- **Never** commit it. `.env` is already in `.gitignore`, and the installer refuses to write a tracked `.env`.
+- If it leaks, come back here and **Reset Token**; the old one dies immediately.
 
 ---
 
-## 4. 邀請 Bot 進伺服器 / Invite the bot
+## 4. Invite the bot
 
-把下面網址中的 `YOUR_APP_ID` 換成 **General Information** 分頁的 **Application ID**：
 Replace `YOUR_APP_ID` below with the **Application ID** from the **General Information** tab:
 
-```
+```text
 https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20applications.commands&permissions=326417599488
 ```
 
-在瀏覽器開啟 → 選你的伺服器 → **Authorize**。
 Open it in a browser → pick your server → **Authorize**.
 
-### 這串數字是什麼 / What that number is
+### What that number is
 
-`permissions=326417599488` 就是下面這些權限。這個數字已向 Discord API 驗證過，會**原樣**解析成這一組、不多不少。
 `permissions=326417599488` is exactly the set below. The integer was verified against the Discord API: it round-trips to precisely these permissions, no more.
 
-| 權限 / Permission | 為什麼需要 / Why |
+| Permission | Why |
 | --- | --- |
-| View Channel | 看得到父頻道 / see the parent channel |
-| Send Messages | 一般 bot 慣例會給；這個 bot 自己的訊息**只發在討論串**，父頻道的回覆都是 ephemeral 互動回應。想再精簡的話這是第一個可以試著拿掉的 / conventionally granted; this bot's own messages go **only into threads** (parent-channel replies are ephemeral interaction responses). If you want to trim further, this is the first one to try removing |
-| Embed Links | 權限卡片是 embed / approval cards are embeds |
-| Read Message History | 串流輸出時要編輯自己先前的訊息 / edit its own earlier messages while streaming |
-| Create Public Threads | `/new` 開討論串 / `/new` opens a thread |
-| Send Messages in Threads | **在討論串發言**（`Send Messages` 對討論串無效）/ **talk in threads** (`Send Messages` has no effect there) |
-| Manage Threads | 只用在一件事：`/new` 失敗時清掉剛建的空討論串 / one job only: deleting the empty thread left by a failed `/new` |
+| View Channel | See the work channel. |
+| Send Messages | Conventionally granted; this bot's own messages go **only into threads**. Parent-channel replies are ephemeral interaction responses. If you want to trim further, this is the first one to try removing. |
+| Embed Links | Approval cards are embeds. |
+| Read Message History | Edit its own earlier messages while streaming. |
+| Create Public Threads | `/new` opens a thread. |
+| Send Messages in Threads | **Talk in threads**. `Send Messages` has no effect there. |
+| Manage Threads | One job only: deleting the empty thread left by a failed `/new`. |
 
-**想給更少權限**：拿掉 `Manage Threads`，改用 `permissions=309237730304`。所有功能照常，**唯一差別**是 `/new` 中途失敗時會留下一個空討論串要你自己刪。
 **Want to grant less**: drop `Manage Threads` and use `permissions=309237730304`. Everything still works; the **only** difference is that a failed `/new` leaves an empty thread for you to delete.
 
-> 改討論串名稱（自動命名與 `/rename`）**不需要** `Manage Threads` —— Discord 允許討論串的建立者改自己的討論串名稱，而討論串正是這個 bot 建的。
 > Renaming threads (auto-title and `/rename`) does **not** need `Manage Threads` — Discord lets a thread's creator rename it, and the bot is the creator.
 
-`scope=bot applications.commands` 兩個都要：`bot` 是 bot 本身，`applications.commands` 才能註冊 `/new`、`/stop` 這些指令。
 Both scopes are required: `bot` for the bot user, `applications.commands` so it can register `/new`, `/stop`, and the rest.
 
 ---
 
-## 4b. 🔒 只讓 bot 看到一個頻道 / Confine the bot to ONE channel
+## 4b. 🔒 Confine what the bot can read
 
-上面的邀請連結把權限給在**身分組**上，而身分組權限是**整個伺服器通用**的 —— 意思是 bot 看得到你**每一個**頻道，包括私人討論。對一個會把讀到的內容送進 Copilot 的工具來說，這值得收緊。
 The invite above grants permissions on the **role**, and role permissions apply **server-wide** — the bot can read **every** channel, including private ones. For a tool that feeds what it reads into Copilot, that is worth tightening.
 
-### 先理解為什麼「不給權限」沒有用 / Why removing role permissions is not enough
+> **Important correction:** denying the bot `View Channel` confines what the bot can **read**, but it does **not** hide the bot's slash commands from the `/` picker and does **not** stop Discord from delivering `INTERACTION_CREATE` events from other channels. Command visibility is controlled by the user's `USE_APPLICATION_COMMANDS` permission plus Application Command Permissions v2 ([Discord docs](https://docs.discord.com/developers/interactions/application-commands#application-command-permissions-object-using-default-permissions)), and interaction delivery is separate from channel send/read permissions ([Discord docs](https://docs.discord.com/developers/interactions/receiving-and-responding#responding-to-an-interaction)). Use [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md) for that separate admin-controlled plane.
 
-大多數伺服器的 `@everyone` 身分組本身就帶著 **View Channels**，而 bot 也是成員，**一樣繼承它**。所以把 bot 身分組的權限清成 `0`，它照樣看得到所有沒有明確拒絕它的頻道。
+### Why removing role permissions is not enough
+
 On most servers the `@everyone` role already grants **View Channels**, and a bot is a member like any other, so it **inherits that**. Clearing the bot role's permissions to `0` therefore changes nothing on its own.
 
-自己確認一下（在伺服器設定 → 身分組 → `@everyone` 看 View Channels 是否開著）：
-Check yours (Server Settings → Roles → `@everyone` → is View Channels on?):
+Check yours in Server Settings → Roles → `@everyone` → whether View Channels is on:
 
-| 設定位置 / Where | 效果 / Effect |
+| Where | Effect |
 | --- | --- |
-| 身分組（伺服器層級）給 View Channels | 看得到**每一個**沒明確拒絕它的頻道 |
-| 頻道層級 **允許** View Channels | 只加開**那一個**頻道 |
-| 頻道層級 **拒絕** View Channels | **擋住**該頻道，優先於 `@everyone` 的伺服器層級允許 |
+| Role, server level grants View Channels | Sees **every** channel that does not explicitly deny it. |
+| Channel-level **Allow** for View Channels | Adds **that one** channel. |
+| Channel-level **Deny** for View Channels | **Blocks** that channel, taking precedence over the `@everyone` server-level allow. |
 
-Discord 的權限解析順序是：`@everyone` 伺服器層級 → 身分組伺服器層級 → `@everyone` 頻道覆寫 → **身分組頻道覆寫**。所以身分組的頻道層級「拒絕」會蓋過 `@everyone` 的「允許」—— 這是唯一有效的擋法。
-Resolution order is: `@everyone` server → role server → `@everyone` channel overwrite → **role channel overwrite**. A role-level channel DENY therefore overrides the `@everyone` server-level allow — that is the only thing that actually blocks it.
+Resolution order is: `@everyone` server → role server → `@everyone` channel overwrite → **role channel overwrite**. A role-level channel DENY therefore overrides the `@everyone` server-level allow — that is the only thing that actually blocks reads.
 
-### 正確的設定 / The setup that works
+### The setup that works
 
-| 放哪裡 / Where | 給什麼 / What |
+| Where | What |
 | --- | --- |
-| Bot 的身分組 | **完全清空（`0`）** —— 包括不要 Administrator |
-| 工作頻道 | **允許**下面那組工作權限 |
-| 其他**每一個**頻道與**分類** | **拒絕** View Channels |
+| Bot role | **Clear it completely (`0`)**, including Administrator. |
+| Work channels | **Allow** the work-permission set below. |
+| Every other channel and category | **Deny** View Channels. |
 
-分類（Category）也要設，因為分類權限會往下繼承到底下的頻道。
 Categories matter too: their permissions cascade to the channels inside them.
 
-### ⚠️ 順序很重要 / Order matters
+### ⚠️ Order matters
 
-**先做頻道設定，最後才拿掉 Administrator。** 反過來的話 bot 會先失去 `Manage Roles`，就沒有權限再去改頻道設定了。
 **Do the channel overwrites first, remove Administrator last.** Reversed, the bot loses `Manage Roles` and can no longer edit channel permissions at all.
 
-### 步驟 / Steps
+### Steps
 
-1. **工作頻道** → 編輯頻道 → 權限 → 加入你的 bot 身分組 → 打開下面這些：
+1. **Each work channel** → Edit Channel → Permissions → add your bot role → allow:
    View Channels · Send Messages · Send Messages in Threads · Create Public Threads ·
    Create Private Threads · Manage Threads · Embed Links · Attach Files ·
    Read Message History · Add Reactions · Use External Emoji
-   （這組的整數是 `395137371200`。範圍鎖在單一頻道，所以可以給得寬鬆一點。）
-2. **其他每一個頻道與分類** → 權限 → 加入 bot 身分組 → **拒絕** View Channels
-3. **最後**：伺服器設定 → 身分組 → 你的 bot 身分組 → **關掉 Administrator**，其餘留空
-   （該頁右上角的 **Clear permissions** 可以一次清空。）
+   The integer for this set is `395137371200`. Because the scope is limited to work channels, it can be a little wider than the invite set.
+2. **Every other channel and category** → Permissions → add the bot role → **Deny** View Channels.
+3. **Last**: Server Settings → Roles → your bot role → turn **Administrator** off and leave the rest empty. The **Clear permissions** button in the upper-right can clear the page at once.
 
-> **確認你改的是對的身分組。** 伺服器裡可能有多個整合身分組（例如另一個 `GitHubCopilot`）。編輯畫面的標題要顯示**你的 bot 名稱**。
 > **Make sure you are editing the right role.** A server can carry several integration roles; the edit pane's title must show **your bot's** name.
 
-> **這一步只能在網頁介面做。** bot 不能修改自己最高的身分組 —— Discord 的階層規則，`ADMINISTRATOR` 也繞不過（API 會回 `50013 Missing Permissions`）。
 > **This step is UI-only.** A bot cannot edit its own highest role: Discord's hierarchy rule is not bypassed by `ADMINISTRATOR` (the API returns `50013 Missing Permissions`).
 
-### 刻意不給的權限 / Deliberately withheld
+### Deliberately withheld
 
-| 權限 | 為什麼不給 |
+| Permission | Why withheld |
 | --- | --- |
-| `Administrator` | 繞過**所有**頻道設定，上面做的隔離會全部失效 |
-| `Manage Messages` | 程式只刪**自己發的**訊息，那不需要這個權限；給了等於能刪你的訊息 |
-| `Manage Channels` / `Manage Roles` | 完全用不到 |
-| `Mention Everyone` | 完全用不到 |
+| `Administrator` | Bypasses **all** channel settings, which defeats the isolation above. |
+| `Manage Messages` | The program only deletes **its own** messages, which does not require this permission; granting it would let the bot delete yours. |
+| `Manage Channels` / `Manage Roles` | Not used. |
+| `Mention Everyone` | Not used. |
 
-### 驗收 / Verify
+### Verify
 
-不要只看設定畫面 —— 實際測一次：
 Do not trust the settings screen; test it:
 
-1. 在工作頻道 `/new`，送一則訊息 → 應該正常回覆
-2. 在**別的**頻道 tag 或提到 bot → 它應該**完全看不到**（連讀都讀不到）
+1. In an enabled work channel, run `/new`, send a message in the thread → it should reply.
+2. In a **different** channel, mention or tag the bot → it should not read or respond to that message. This proves message-read confinement only; slash-command visibility and interaction delivery are verified separately in [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md).
 
-在 Discord 左側頻道列表用 bot 的視角是看不到的，但你可以從**成員清單**確認：bot 只會出現在工作頻道的成員清單裡。
-The bot will appear in the member list of the work channel only.
-
+Discord does not expose a true "view as bot" channel list, but the member list is a useful signal: the bot should appear only in the work channels' member lists.
 
 ---
 
-## 5. 取得四個 ID / Collect the four IDs
+## 5. Collect the four IDs
 
-先開啟開發者模式：**User Settings → Advanced → Developer Mode**。
 Turn on **User Settings → Advanced → Developer Mode** first.
 
-| 要填的欄位 / Field | 怎麼拿 / How |
+| Field | How |
 | --- | --- |
-| `DISCORD_GUILD_ID` | 右鍵伺服器圖示 → **Copy Server ID** |
-| `DISCORD_PARENT_CHANNEL_ID` | 右鍵你的文字頻道 → **Copy Channel ID** |
-| `DISCORD_ALLOWED_USER_IDS` | 右鍵**你自己的名字** → **Copy User ID** |
-| `DISCORD_BOT_TOKEN` | 步驟 3 / from step 3 |
+| `DISCORD_GUILD_ID` | Right-click the server icon → **Copy Server ID**. |
+| `DISCORD_PARENT_CHANNEL_ID` | Right-click the seed/primary text channel → **Copy Channel ID**. This is the always-enabled seed channel, not the only channel the bot can use. |
+| `DISCORD_ALLOWED_USER_IDS` | Right-click **your own name** → **Copy User ID**. |
+| `DISCORD_BOT_TOKEN` | From §3. |
 
-- 父頻道必須是**文字頻道**（不能是分類、論壇或語音）；bot 啟動時會檢查。/ The parent must be a **text channel** (not a category, forum, or voice channel); the bot checks this.
-- `DISCORD_ALLOWED_USER_IDS` 是逗號分隔，但 v1 建議**只放你自己**。清單外的人即使在同一個頻道也無法下指令。/ Comma-separated, but v1 should be **just you**. Anyone not listed cannot drive the bot even in the same channel.
+- The seed channel must be a **text channel** (not a category, forum, announcement, voice channel, or thread); the bot checks this.
+- `DISCORD_ALLOWED_USER_IDS` is comma-separated, but v1 should be **just you**. Anyone not listed cannot drive the bot even in an enabled channel.
 
-### 之後想換父頻道 / Moving to a different parent channel later
+### Moving to a different parent channel later
 
-1. 改 `.env` 的 `DISCORD_PARENT_CHANNEL_ID`
-2. **趁 bot 還有權限時**，照 §4b 把新頻道的允許、舊頻道的拒絕設好
-3. 重啟 bot（`./stop-bot.ps1` → `./run-bot.ps1`）
+The bot now supports multiple work channels. `DISCORD_PARENT_CHANNEL_ID` is the **seed** channel: it is always enabled, cannot be disabled from Discord, and changing it still requires editing `.env` and restarting. Additional work channels are managed at runtime with `/channel enable`; see [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md).
 
-舊父頻道底下的討論串**會全部失效** —— 授權是綁父頻道的（`auth.ts`），不在新父頻道底下的一律拒絕。這些記錄不會自己消失：bot 下次啟動會在新父頻道列出它們，用 `/end thread:<id>` 清掉，順便回收 worktree。
-Threads under the old parent **all stop working**: authorization is bound to the parent channel, so anything outside it is refused. Those records do not disappear on their own — the bot lists them in the new parent at startup, and `/end thread:<id>` clears each one along with its worktree.
+To change the seed itself:
+
+1. Edit `DISCORD_PARENT_CHANNEL_ID` in `.env`.
+2. **While the bot still has permission**, set the new channel's allows and the old channel's denies per §4b.
+3. Restart the bot (`./stop-bot.ps1` → `./run-bot.ps1`).
+
+Threads under the old seed channel **all stop working**: authorization is bound to enabled work channels, and changing the seed in `.env` removes the old seed from the always-enabled set unless you also enable it with `/channel` before the move. Those records do not disappear on their own — startup lists the stranded records in the new seed channel, and `/end thread:<id>` clears each one along with its worktree.
 
 ---
 
-## 6. 驗收 / Verify
+## 6. Verify
 
-回到專案資料夾照 [`INSTALL.md`](../INSTALL.md) 裝好、啟動後：
 After installing and starting per [`INSTALL.md`](../INSTALL.md):
 
-1. bot 在成員清單顯示**在線** / the bot shows **online** in the member list
-2. 在父頻道打 `/` → 看得到 `/new`、`/stop`、`/usage` 等指令 / typing `/` in the parent channel lists `/new`, `/stop`, `/usage`, …
-3. `/new` → 開出一個新討論串 / `/new` opens a new thread
-4. 在討論串打「hello」→ **有回應**（沒回應 = 步驟 2 的 intent 沒開）/ type "hello" in the thread → **you get a reply** (no reply = the step-2 intent is off)
+1. The bot shows **online** in the member list.
+2. Typing `/` in the seed channel lists `/new`, `/stop`, `/usage`, and the rest.
+3. `/new` opens a new thread.
+4. Type "hello" in the thread → **you get a reply**. No reply means the §2 intent is off.
 
-### 做過 §4b 收緊權限的話，額外驗這兩件事 / If you locked it down per §4b
+### If you locked it down per §4b
 
-設定畫面看起來正確**不等於**真的生效 —— Discord 的權限是四層疊加運算出來的。實際驗證：
 A settings screen that looks right is **not** proof: effective permissions are computed across four layers. Test the real thing:
 
-1. **正向**：在工作頻道 `/new` → 開討論串 → 打字 → 有回應（證明允許那組有效）
-2. **反向**：到**別的**頻道提到 bot → 它應該**完全沒反應**（證明拒絕有效）
+1. **Positive**: in an enabled work channel, `/new` → thread opens → typing gets a reply. This proves the allow set works.
+2. **Read-confinement negative**: in a different channel, mention the bot → it should not read or respond to that message. This proves the deny works for messages.
+3. **Command-access negative**: in a channel you did not enable, `/` should not list the commands. If it still does, the Discord-plane integration setting is missing; see [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md).
 
-反向那一條才是重點。只驗第一條的話，你證明的是「能用」，不是「被關住」。
-The second one is the point. Testing only the first proves it works, not that it is confined.
-
+The negative checks are the point. Testing only the first proves it works, not that it is confined.
 
 ---
 
-## 7. 疑難排解 / Troubleshooting
+## 7. Troubleshooting
 
-| 症狀 / Symptom | 原因 / Cause |
+| Symptom | Cause |
 | --- | --- |
-| bot 在線，但討論串裡打字沒反應 / online but ignores thread messages | **Message Content Intent 沒開**（步驟 2）/ the privileged intent is off |
-| 打 `/` 看不到指令 / no slash commands | 邀請時少了 `applications.commands` scope → 用步驟 4 的網址重新邀請一次 / missing scope; re-invite with the step-4 URL |
-| `/new` 說 Missing Permissions | 少 `Create Public Threads`，或頻道權限覆寫擋掉了 bot / missing that permission, or a channel-level overwrite blocks the bot |
-| 討論串開了但 bot 不說話 / thread opens but the bot is mute in it | 少 `Send Messages in Threads`（`Send Messages` 對討論串無效）/ missing that permission |
-| 指令回「Not authorized」 | `DISCORD_ALLOWED_USER_IDS` 不是你的 user ID / not your user ID |
-| 指令只在某些伺服器出現 | 指令是註冊到 `DISCORD_GUILD_ID` 那個伺服器的 / commands are registered to that one guild |
-| 收緊權限後 bot 整個消失了 / the bot vanished after locking it down | 工作頻道的 View Channels 沒給到，或身分組的 Administrator 拿掉了但頻道覆寫沒設好 → 見 §4b。緊急還原：把 Administrator 打回去 / grant View Channels on the work channel, see §4b; to recover fast, re-enable Administrator |
-| 換了 `DISCORD_PARENT_CHANNEL_ID` 後舊討論串沒反應 / old threads stopped responding after changing the parent | 正常。授權是綁父頻道的，舊討論串不在新父頻道底下就一律拒絕。啟動時會在新父頻道列出這些殘留記錄，用 `/end thread:<id>` 清掉 / expected: authorization is bound to the parent channel. Startup lists the stranded records; clear them with `/end thread:<id>` |
+| Bot is online but ignores thread messages | **Message Content Intent is off** (§2). |
+| No slash commands after typing `/` | Missing `applications.commands` scope; re-invite with the §4 URL. If commands appear in the wrong channels, configure Server Settings → Integrations per [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md). |
+| `/new` says Missing Permissions | Missing `Create Public Threads`, or a channel-level overwrite blocks the bot. |
+| Thread opens but the bot is mute in it | Missing `Send Messages in Threads`; `Send Messages` does not apply to threads. |
+| Command replies `Not authorized` | `DISCORD_ALLOWED_USER_IDS` does not contain your user ID. |
+| Commands appear only in some servers | Commands are registered to the one `DISCORD_GUILD_ID`. |
+| The bot vanished after locking it down | Grant View Channels on each work channel, see §4b; to recover fast, re-enable Administrator. |
+| Old threads stopped responding after changing `DISCORD_PARENT_CHANNEL_ID` | Expected: changing the seed can leave old threads outside the enabled channel set. Startup lists stranded records; clear them with `/end thread:<id>`. |
 
 ---
 
-## 8. 在第二台電腦安裝 / Installing on a second computer
+## 8. Installing on a second computer
 
-**不要**兩台同時用同一個 token 跑。/ Do **not** run the same token on two machines at once.
+Do **not** run the same token on two machines at once.
 
-Bot 靠一個**本機** PID 鎖來避免重複啟動，它看不到別台機器（`src/core/single-instance.ts`）。實測：兩個實例同時連線時，`/new` 會被**其中一個**接走 —— 而且不是固定的哪一個（測兩次分別由不同實例處理）。由於每台機器有自己的 `REPOS_ROOT` 和自己的核准規則，你會無法預期指令到底跑在哪台機器、動到哪個 repo。
 The bot's single-instance guard is a **local** PID lock and cannot see other hosts (`src/core/single-instance.ts`). Verified: with two instances connected, `/new` is picked up by **one** of them — and not consistently the same one (two runs, two different winners). Since each machine has its own `REPOS_ROOT` and its own approval rules, you cannot predict which machine ran your command or which repo it touched.
 
-搬到新電腦的做法 / To move:
+To move:
 
-1. 舊機器先停掉（關掉程式，或 `schtasks /End /TN discord-copilot-sdk-default`）/ stop the old machine first
-2. 新機器照 [`INSTALL.md`](../INSTALL.md) 安裝，填**同樣**的四個值 / install on the new machine with the **same** four values
-3. 兩台都想留著 → 分別建立**各自的 Discord application**（各自的 token、各自的父頻道），不要共用 / keep both → give each its **own Discord application** (own token, own parent channel)
+1. Stop the old machine first: close the program, or run `schtasks /End /TN discord-copilot-sdk-default`.
+2. Install on the new machine with the **same** four values per [`INSTALL.md`](../INSTALL.md).
+3. To keep both machines, give each its **own Discord application**: own token and own seed/work channels. Do not share one token.
 
-> `~/.discord-copilot-sdk/` 底下的狀態（可復原的 session、已記住的核准規則）是**每台機器各自的**，不會跟著同步。新機器會從乾淨狀態開始，這是刻意的：核准規則不該悄悄跟著跑到另一台機器上。
-> State under `~/.discord-copilot-sdk/` (the resumable session, remembered approvals) is **per machine** and does not follow you. A new machine starts clean, deliberately: approval grants should not silently travel to another host.
+> State under `~/.discord-copilot-sdk/` (resumable sessions, channel registry, remembered approvals) is **per machine** and does not follow you. A new machine starts clean, deliberately: approval grants and channel authorization should not silently travel to another host.
 
 ---
 
-## 9. 多個 session 同時進行 / Concurrent sessions
+## 9. Concurrent sessions
 
-**可以並行。** 每個 `/new` 開的討論串都是獨立 session，預設每個都有**自己的 git worktree**（分支 `copilot/t-<threadId>`，放在 `~/.discord-copilot-sdk-worktrees/`），所以兩個 agent 同時改檔案不會互相覆蓋。
 **Yes, they run in parallel.** Each `/new` thread is its own session, and by default each gets its **own git worktree** (branch `copilot/t-<threadId>`, under `~/.discord-copilot-sdk-worktrees/`), so two agents editing files at the same time do not clobber each other.
 
-> 這是防止**意外**互相覆蓋，不是沙箱。lab 模式下工具以你的 OS 使用者身分執行且沒有隔離，被刻意操控的 agent 仍可用路徑存取別的 worktree。
 > This prevents *accidental* clobbering; it is not a sandbox. Tools run unsandboxed as your OS user, so a deliberately steered agent can still reach another worktree by path.
 
-| 指令 / Command | 用途 / Purpose |
+| Command | Purpose |
 | --- | --- |
-| `/new` | 開一個新的並行 session（不會結束其他的）/ start another concurrent session (ends nothing) |
-| `/sessions` | 列出進行中的 session，並把殘留記錄分成「可清除」與「重啟後會再試」兩類 / list live sessions, splitting leftovers into *clearable* and *will retry on restart* |
-| `/end` | 只結束**這個**討論串的 session；沒有進行中的 session 時，清除該討論串的殘留記錄與 worktree / end **this** thread's session — or reap its stale record and worktree when none is live |
-| `/end thread:<id>` | 討論串已被刪除時，從父頻道清除殘留記錄（`/sessions` 會列出 id）/ reap a leftover whose thread is gone, from the parent channel |
+| `/new` | Start another concurrent session. It ends nothing. |
+| `/sessions` | List live sessions, splitting leftovers into *clearable* and *will retry on restart*. |
+| `/end` | End **this** thread's session — or reap its stale record and worktree when none is live. |
+| `/end thread:<id>` | Reap a leftover whose thread is gone, from an enabled work channel. |
 
-上限同時 8 個 session。/ Up to 8 at once.
+Up to 8 sessions can run at once.
 
-`/end` 只有在 git 回報**乾淨**時才會移除 worktree（含被 `.gitignore` 忽略的檔案也算「有東西」）；有任何本地內容就保留並告訴你路徑 —— 沒提交的工作不該被順手刪掉。`/diff` 顯示的是**這個討論串自己的** worktree。
-`/end` removes the worktree **only when git reports it clean** (ignored files count as content too); anything local is kept and its path reported. `/diff` shows **this thread's own** worktree.
+`/end` removes the worktree **only when git reports it clean**. Ignored files count as content too; anything local is kept and its path reported. `/diff` shows **this thread's own** worktree.
 
-### `/repo` — 每個討論串綁哪個 repo、怎麼開發 / which repo a thread works in, and how
+### `/repo` — which repo a thread works in, and how
 
-| 指令 / Command | 作用 / What it does |
+| Command | What it does |
 | --- | --- |
-| `/repo show` | 這個討論串綁的 repo、模式、分支與**完整工作目錄** / repo, mode, branch and full working directory |
-| `/repo list` | `REPOS_ROOT` 底下可用的 repo，並標出被 local 模式佔用的 / bindable repos, marking any held in local mode |
-| `/repo set <name>` | 改綁（輸入即搜尋）/ rebind this thread (type to search) |
-| `/repo dev <worktree\|local>` | 換開發模式 / switch dev mode |
-| `/repo clone <source> [name]` | clone 進 `REPOS_ROOT` 再綁定 / clone into `REPOS_ROOT`, then bind |
-| `/repo new <name>` | 在 `REPOS_ROOT` 建空 repo 再綁定 / create an empty repo there, then bind |
+| `/repo show` | Show this thread's repo, mode, branch, and full working directory. |
+| `/repo list` | List bindable repos under `REPOS_ROOT`, marking any held in local mode. |
+| `/repo set <name>` | Rebind this thread; type to search. |
+| `/repo dev <worktree\|local>` | Switch dev mode. |
+| `/repo clone <source> [name]` | Clone into `REPOS_ROOT`, then bind. |
+| `/repo new <name>` | Create an empty repo under `REPOS_ROOT`, then bind. |
 
-**每個新 session 都有自己的 worktree。** `local`（agent 直接改 repo 本體）只能在該討論串用 `/repo dev local` 明確開啟；**沒有**任何設定鍵能把它變成預設，因為那等於讓之後每個討論串都在沒人決定的情況下直接動你的工作區。
 **Every new session gets its own worktree.** `local` — the agent editing the repo checkout directly — is reachable only through a per-thread `/repo dev local`. There is deliberately no config key that makes it the default: that would opt every future thread into editing your working copy without anyone deciding to.
 
-同一個 repo 同時只能有一個 **local** session（限**同一個 bot 行程**內；刻意跑兩個共用 `REPOS_ROOT` 的實例時互相看不到）。兩個 agent 改同一份 checkout 會互相靜默覆蓋，其中一個 `git checkout` 就會毀掉另一個未提交的工作 —— 所以第二個討論串會被直接拒絕，並告訴你是誰佔用中。worktree 模式沒有這個限制。
 At most **one live `local` session per repo**, within a single bot process (two instances deliberately sharing one `REPOS_ROOT` cannot see each other's leases): two agents in one checkout silently overwrite each other, and a `git checkout` in one destroys the other's uncommitted work. A second thread asking for the same repo is refused and told which thread holds it. Worktree sessions have no such limit.
 
-改綁會建立**新的** Copilot session（SDK 只在建立時接受工作目錄），因此**對話歷史會消失**；已經跑過回合的討論串會先要求按鈕確認。回合進行中一律拒絕改綁；目前 worktree 有未提交／未追蹤／被忽略的內容時也拒絕 —— 改綁後就沒有任何記錄指向那棵樹了。
-Rebinding builds a **new** Copilot session (the SDK fixes the working directory at creation), so the conversation history is lost and a thread that has already run a turn must confirm first. A rebind is refused while a turn is running, and while the current worktree holds uncommitted, untracked or ignored content — after a rebind nothing points at that tree any more.
+Rebinding builds a **new** Copilot session (the SDK fixes the working directory at creation), so the conversation history is lost and a thread that has already run a turn must confirm first. A rebind is refused while a turn is running, and while the current worktree holds uncommitted, untracked, or ignored content — after a rebind nothing points at that tree any more.
 
-`/repo clone` 只走 `https`/`ssh`，預設只允許 `github.com`（`REPO_CLONE_HOST_POLICY=allowlist` 可指定其他主機），且一律拒絕 internal／loopback／metadata 位址。git 以 argv 陣列啟動（永不經 shell），關閉 `ext::`／`file::`／credential helper，並忽略你的 global git 與 ssh 設定 —— `url.<base>.insteadOf` 會改寫網址，ssh 的 `ProxyCommand` 會執行程式。刻意不提供「任意公開主機」選項：主機名稱無法證明 DNS 會指向哪裡。
-`/repo clone` fetches only over `https`/`ssh`, only from `github.com` unless `REPO_CLONE_HOST_POLICY=allowlist`, and never from an internal, loopback or metadata address. git runs with an argv array (never a shell), with `ext::`, `file::` and credential helpers disabled, and with your global git and ssh config ignored — `url.<base>.insteadOf` rewrites URLs and an ssh `ProxyCommand` runs a program. There is deliberately no "any public host" option: a hostname cannot prove where DNS will point.
+`/repo clone` fetches only over `https`/`ssh`, only from `github.com` unless `REPO_CLONE_HOST_POLICY=allowlist`, and never from an internal, loopback, or metadata address. git runs with an argv array (never a shell), with `ext::`, `file::`, and credential helpers disabled, and with your global git and ssh config ignored — `url.<base>.insteadOf` rewrites URLs and an ssh `ProxyCommand` runs a program. There is deliberately no "any public host" option: a hostname cannot prove where DNS will point.
 
-> agent 在 worktree 裡看到的是 repo 的完整內容（共用 git 物件），但只有自己的工作檔案。要把成果帶回主分支，就在該討論串裡請 agent commit，之後在主 repo `git merge copilot/t-<threadId>`。
 > Inside a worktree the agent sees the whole repo (shared git objects) but only its own working files. To land the work, ask the agent to commit in that thread, then `git merge copilot/t-<threadId>` in the main repo.
 
-同一個 session 內的並行（steer / `/queue`）見第 10 節。/ For concurrency *inside* one session see §10.
+For concurrency *inside* one session see §10.
 
 ---
 
-## 10. 一個 session 內的插隊與排隊 / Steering and queueing inside one session
+## 10. Steering and queueing inside one session
 
-- 回合進行中**直接送訊息** → 插入目前回合（steer）/ send a message **while a turn is running** → steers it
-- `/queue message:…` → 排在目前回合之後執行 / queue a prompt to run after the current turn
+- Send a message **while a turn is running** → steers the current turn.
+- `/queue message:…` → queues a prompt to run after the current turn.

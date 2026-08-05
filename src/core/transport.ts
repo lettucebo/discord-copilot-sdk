@@ -41,6 +41,14 @@ export interface Transport {
   showPlan(view: PlanView): Promise<void>;
   /** Post a plain notice (errors, auto-denials, aborts). */
   notice(sessionKey: string, text: string): Promise<void>;
+  /** Post a notice and report whether it actually LANDED.
+   *
+   *  `notice()` deliberately swallows an unreachable channel — for an in-thread
+   *  aside that is the right trade. The startup leftover report is the opposite
+   *  case: it names ids that hold disk, and a channel that was deleted or is no
+   *  longer enabled must fall back to another one rather than be reported to
+   *  nobody. A silent success makes that fallback impossible to write. */
+  noticeDelivered(sessionKey: string, text: string): Promise<boolean>;
   /** Register the sink that receives user decisions (wired to broker.settle).
    *  Returns an unsubscribe function so a torn-down session's handler doesn't
    *  leak or keep receiving broadcasts. */

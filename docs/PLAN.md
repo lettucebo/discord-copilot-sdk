@@ -216,3 +216,68 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 | S6 | `repo-provision.test.ts`（`ext::`、`file:`、`http:`、`-` 開頭、`169.254.169.254`、`localhost.`、`::ffff:127.0.0.1`、Windows 保留字） |
 | schema v3 遷移 | `session-store.test.ts`（三條規則 + 不再展開未驗證欄位） |
 | 安裝器契約（極性反轉） | `setup-core.test.ts`、`setup-integration.test.ts`、`config-contract.test.ts` |
+
+## 13. 多頻道存取與 ChannelRegistry（後補決策紀錄）
+
+### 13.1 接受的設計與不變式
+
+這項變更刻意把「指令看得到」和「bot 會不會動作」拆成兩個平面：
+
+1. **Discord Integrations 平面**由伺服器管理員手動設定 command visibility；它決定 `/`
+   選單是否顯示指令，但不是本 bot 的安全邊界。Discord 依使用者的
+   `USE_APPLICATION_COMMANDS`／Application Command Permissions v2 決定可見性，而非 bot 的
+   `VIEW_CHANNEL`：<https://docs.discord.com/developers/interactions/application-commands#application-command-permissions-object-using-default-permissions>。
+   Bot token 不能改 command-permissions；該 endpoint 要有人類 OAuth2 bearer token 的
+   `applications.commands.permissions.update`：<https://docs.discord.com/developers/interactions/application-commands#permissions>。
+   因此 command visibility 必須由管理員維護，且與 bot 重啟時的 guild-command bulk overwrite
+   分開：<https://docs.discord.com/developers/interactions/application-commands#bulk-overwrite-guild-application-commands-json-params>。
+2. **Bot ChannelRegistry 平面**才是執行授權。除 `/channel` 外，`isAuthorized` 必須同時驗證
+   allow-listed user、設定的 guild，以及目前頻道本身或其直屬 thread parent 在 enabled set。
+   enabled set 是永遠存在的 `DISCORD_PARENT_CHANNEL_ID` seed 加上持久化
+   `~/.discord-copilot-sdk/<instance>.channels.json` 的 `/channel enable` 項目。Discord 仍會把
+   interaction 送到 bot，且 initial response 不需要 `SEND_MESSAGES`：
+   <https://docs.discord.com/developers/interactions/receiving-and-responding#responding-to-an-interaction>；
+   所以所有未通過 bot 平面的請求都要 fail-closed，ephemeral 拒絕且不做任何工作
+   （callback 規則：<https://docs.discord.com/developers/interactions/receiving-and-responding#interaction-callback>）。
+
+ChannelRegistry 的檔案存在卻無法讀取、不是合法 schema、版本不相容或 guild 不同時，啟動必須
+**拒絕**。把它靜默當成「只剩 seed」會在 reconcile 時把其他已啟用頻道的 records 標成
+`blocked`；`blocked` 是終態，之後重新啟用也不能復原對話。少一次啟動可恢復，錯誤地封鎖
+對話不可恢復。
+
+`/channel` 是唯一採 `isOwner` 而非 `isAuthorized` 的命令：它仍要求 allow-listed user 與設定
+guild，但刻意不要求目前位置已 enabled，否則無法從未啟用頻道 bootstrap。這也明確信任
+`DISCORD_ALLOWED_USER_IDS` 中每一位使用者都是頻道管理者；不得把此 location-independent
+gate 擴大到 button、autocomplete 或其他命令。
+
+`/new` 在建立 thread 前、以及建立 worktree 和 binding proof 後、寫入 record 前，重查其
+**目標 parent 是否仍 enabled**。這防止 `/channel disable` 穿插於多個 await 間，讓已撤銷的
+頻道取得 session，並在下一次啟動才被不可逆地標為 `blocked`。這裡刻意**不用**全域
+ChannelRegistry epoch：其他頻道的 enable／disable 不得誤中止本頻道合法的 `/new`。
+
+每個 `SessionRecord` 都保存其**精確** `parentChannelId`。resume 與 rebind 必須以該 record
+欄位比對 thread 的真實 parent，而不是拿目前 seed、或「任一 enabled channel」代替；rebind
+保留這個 per-record parent binding。這修正 record 聲稱在 A、實際 thread 卻在 B 時仍可
+resume 的錯誤。
+
+### 13.2 否決方案與已接受風險
+
+| 方案／風險 | 決定與理由 |
+|---|---|
+| bot token 自行用 OAuth2 改 command permissions | **否決**：bot token 沒有該 endpoint 所需的人類 OAuth2 bearer 權限；見 <https://docs.discord.com/developers/interactions/application-commands#permissions>。 |
+| 以 `VIEW_CHANNEL` 或可見頻道自動偵測授權 | **否決**：它不控制 slash-command visibility，也不阻止 interaction delivery；會把 Discord UI 設定誤當安全邊界。 |
+| 多 guild registry | **否決（v1）**：設定與 registry 都只屬一個 guild；跨 guild 的 registry 視為不可信並拒絕啟動。 |
+| Discord Integrations 設定需人工維護 | **接受**：管理員必須自行 deny-all 再 allow 工作頻道；bot 只保證自己的授權平面，不能替代平台可見性設定。 |
+| allow-list 使用者可啟用公開頻道 | **接受**：`isOwner` 使每個 allow-listed user 都能把 agent 輸出導向公開頻道；v1 是單一 owner lab 工具，靠 allow-list 的信任邊界與操作紀律。 |
+| `blocked` 為終態 | **接受**：為避免誤把舊 conversation 接到新授權位置，重新啟用頻道不復活 record；以 `/end` 清理後才可 `/new`。 |
+
+### 13.3 §9.1 涵蓋補充（已實作）
+
+| 測試檔 | 不變式 |
+|---|---|
+| `test/channel-registry.test.ts` | 缺檔以外的 read/parse/schema/version/guild 錯誤拒絕啟動；seed 永遠 enabled；成功 enable/disable 先持久化再變更記憶體，並遞增 epoch。 |
+| `test/discord-routing.test.ts` | 非 `/channel` 需要 user + guild + enabled channel／直屬 thread；`/channel` 的 `isOwner` 僅略過位置 gate，不能授權 button 或 autocomplete。 |
+| `test/app-channels.test.ts` / `test/app-channels-race.test.ts` | `/channel` 的 seed／權限／持久化失敗行為；`/new` 在目標頻道被 disable 時回復 thread/worktree 且不留 session，其他頻道變動不誤中止；disable 有 live 或 `active`/`creating` record 時拒絕。 |
+| `test/app-reconcile.test.ts` / `test/app-rebind.test.ts` | 每筆 record 的實際 thread parent 必須精確等於 `parentChannelId`；不是「任一 enabled parent」即可 resume，rebind 也保留該 binding；`config-mismatch` 不能靜默遺失 fallback 通知。 |
+| `test/transport.test.ts` | `noticeDelivered()` 對不存在或無法傳送的頻道回傳 `false`，讓 caller 能改投 seed。 |
+| `test/shipped-scripts.test.ts` | 英／繁中 twin 皆含安全安裝命令，並驗證 language switcher 與本地 Markdown 連結。 |

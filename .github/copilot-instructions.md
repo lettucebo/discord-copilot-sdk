@@ -151,9 +151,11 @@ asserts every user-facing `.ps1` starts with a UTF-8 BOM (Windows PowerShell 5.1
 mis-parses the Chinese strings), every `.sh` has a shebang, and every `.sh` is committed `100755`.
 `.gitattributes` pins `*.sh`/`*.mjs` to LF and `install/get/run-bot/stop-bot.ps1` to CRLF.
 
-**Bilingual where users read it.** `INSTALL.md` and `docs/DISCORD-SETUP.md` are Traditional
-Chinese + English; installer strings live in `scripts/lib/i18n.mjs` and `zh` and `en` must be
-updated together. `docs/PLAN.md` is Chinese-only.
+**Bilingual where users read it.** `README.md` / `README.zh-TW.md`, `INSTALL.md` /
+`INSTALL.zh-TW.md`, `docs/DISCORD-SETUP.md` / `docs/DISCORD-SETUP.zh-TW.md`, and
+`docs/CHANNEL-ACCESS.md` / `docs/CHANNEL-ACCESS.zh-TW.md` are separate English and zh-TW twin
+files; update both twins together. Installer strings live in `scripts/lib/i18n.mjs` and `zh` and
+`en` must be updated together. `docs/PLAN.md` is Chinese-only as the internal design record.
 
 **`docs/PLAN.md` is the §-numbered design record** — decisions, rejected alternatives, accepted
 residual risks, and §9's map of required async-orchestration tests to the files covering them
@@ -181,3 +183,11 @@ working-tree root", so two rules carry the weight the old single path used to:
 `REPOS_ROOT=~` would make `~/.discord-copilot-sdk` bindable, `REPOS_ROOT=~/.discord-copilot-sdk/x`
 would put every agent's cwd under it) and `validateBinding` (git must PROVE a worktree
 belongs to the repo a record claims; a path prefix cannot, and a git failure is a refusal).
+
+**Discord channel authorization is fail-closed.** Other than `/channel`, every inbound action
+requires an allow-listed user, the configured guild, and an enabled parent channel (the
+`DISCORD_PARENT_CHANNEL_ID` seed or a durable `ChannelRegistry` entry). `/channel` alone uses
+the location-independent owner gate so an owner can bootstrap an unenabled channel; do not widen
+that gate to buttons, autocomplete, or other commands. Discord command visibility is a separate,
+manual server-admin setting in Integrations, not bot authorization: a visible command from an
+unauthorized location must receive the normal safe refusal and perform no work.

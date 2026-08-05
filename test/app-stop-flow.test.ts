@@ -51,6 +51,10 @@ class FakeTransport implements Transport {
   async notice(_k: string, t: string): Promise<void> {
     this.notices.push(t);
   }
+  async noticeDelivered(_k: string, t: string): Promise<boolean> {
+    this.notices.push(t);
+    return true;
+  }
   onDecision(): () => void {
     return () => {};
   }
@@ -129,6 +133,7 @@ function buildAppWithSession(): { app: DiscordCopilotApp; actor: FakeActor; tran
     workDir: "C:\\Repos\\repo",
     repoPath: "C:\\Repos\\repo",
     devMode: "local",
+    parentChannelId: "c1",
     hasRunTurn: false,
   };
   (app as unknown as { sessions: Map<string, unknown> }).sessions.set("thread-1", session);
