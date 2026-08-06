@@ -214,5 +214,6 @@ describe("shipped scripts", () => {
     const workflow = fs.readFileSync(path.join(ROOT, ".github", "workflows", "ci.yml"), "utf8");
     expect(workflow).toContain("update.sh");
     expect(workflow).toContain("update.ps1");
+    expect(workflow).toMatch(/for f in scripts\/setup\.mjs scripts\/update\.mjs scripts\/lib\/\*\.mjs; do/);
   });
 });
