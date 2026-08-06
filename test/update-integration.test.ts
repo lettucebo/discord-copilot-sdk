@@ -17,6 +17,7 @@ const git = (cwd: string, ...args: string[]): Promise<{ stdout: string }> =>
 let root: string;
 let source: string;
 let remote: string;
+let bin: string;
 let serial = 0;
 
 async function cloneTarget(name: string): Promise<string> {
@@ -66,8 +67,10 @@ async function runUpdate(target: string, ...args: string[]): Promise<{ code: num
       env: {
         ...process.env,
         DISCORD_COPILOT_SDK_UPDATE_ROOT: target,
+        DISCORD_COPILOT_SDK_INSTANCE_ID: `integration-${serial}`,
         HOME: home,
         USERPROFILE: home,
+        PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
       },
       encoding: "utf8",
     });
@@ -86,6 +89,15 @@ beforeAll(async () => {
   root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dcs-update-git-"));
   source = path.join(root, "source");
   remote = path.join(root, "remote.git");
+  bin = path.join(root, "bin");
+  await fs.promises.mkdir(bin);
+  if (process.platform === "win32") {
+    await fs.promises.writeFile(path.join(bin, "copilot.cmd"), "@echo off\r\nexit /b 0\r\n");
+  } else {
+    const copilot = path.join(bin, "copilot");
+    await fs.promises.writeFile(copilot, "#!/usr/bin/env sh\nexit 0\n");
+    await fs.promises.chmod(copilot, 0o755);
+  }
   await git(root, "init", "-q", "-b", "main", source);
   await git(source, "config", "user.email", "update@test.invalid");
   await git(source, "config", "user.name", "update test");
@@ -95,6 +107,7 @@ beforeAll(async () => {
   await fs.promises.writeFile(path.join(source, ".gitignore"), ".env\n");
   await fs.promises.copyFile(path.join(ROOT, "scripts", "lib", "validate.mjs"), path.join(source, "scripts", "lib", "validate.mjs"));
   await fs.promises.copyFile(path.join(ROOT, "stop-bot.ps1"), path.join(source, "stop-bot.ps1"));
+  await fs.promises.copyFile(path.join(ROOT, "stop-bot.sh"), path.join(source, "stop-bot.sh"));
   await fs.promises.writeFile(path.join(source, "README.md"), "initial\n");
   await git(source, "add", "-A");
   await git(source, "commit", "-q", "-m", "initial");
