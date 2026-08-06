@@ -18,8 +18,11 @@ describe("update-core purity", () => {
     // mutating a checkout or probing a real process.
     const source = fs.readFileSync(path.join(ROOT, "scripts", "lib", "update-core.mjs"), "utf8");
 
-    expect(source).not.toMatch(/from\s+["']node:(?:fs|child_process|process)["']/);
-    expect(source).not.toMatch(/\b(?:execFileSync|execSync|spawnSync|readFileSync|writeFileSync)\b/);
+    const forbiddenModule = "(?:node:)?(?:fs(?:/promises)?|child_process|process)";
+    expect(source).not.toMatch(
+      new RegExp(`(?:from\\s+["']${forbiddenModule}["']|import\\s*\\(\\s*["']${forbiddenModule}["']\\s*\\)|require\\(\\s*["']${forbiddenModule}["']\\s*\\))`)
+    );
+    expect(source).not.toMatch(/\b(?:globalThis\.)?process\s*\./);
   });
 });
 
