@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
 import { parseLsRemote, resolveRemoteSha } from "../scripts/lib/update-core.mjs";
 
 const exec = promisify(execFile);
@@ -19,6 +20,7 @@ let source: string;
 let remote: string;
 let bin: string;
 let serial = 0;
+const instancePrefix = `test-${randomUUID()}`;
 
 async function cloneTarget(name: string): Promise<string> {
   const target = path.join(root, name);
@@ -67,7 +69,8 @@ async function runUpdate(target: string, ...args: string[]): Promise<{ code: num
       env: {
         ...process.env,
         DISCORD_COPILOT_SDK_UPDATE_ROOT: target,
-        DISCORD_COPILOT_SDK_INSTANCE_ID: `integration-${serial}`,
+        DISCORD_COPILOT_SDK_INSTANCE_ID: `${instancePrefix}-${serial}`,
+        DISCORD_COPILOT_SDK_REF: "main",
         HOME: home,
         USERPROFILE: home,
         PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
