@@ -22,6 +22,9 @@ describe("readAppVersion", () => {
     expect(readAppVersion("C:\\repo", () => JSON.stringify({ name: "discord-copilot-sdk", version: "not-semver" }))).toBe(
       "unknown"
     );
+    expect(readAppVersion("C:\\repo", () => JSON.stringify({ name: "discord-copilot-sdk", version: "1.0.0-01" }))).toBe(
+      "unknown"
+    );
   });
 });
 
