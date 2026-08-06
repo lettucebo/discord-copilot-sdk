@@ -10,6 +10,8 @@ export interface VersionInfo {
 
 type ReadFile = (file: string) => string;
 type RunGit = (command: string, args: string[]) => string;
+const SEMVER =
+  /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 /** Read the release version only when the package belongs to this application. */
 export function readAppVersion(
@@ -23,7 +25,8 @@ export function readAppVersion(
       typeof pkg !== "object" ||
       pkg === null ||
       (pkg as Record<string, unknown>)["name"] !== "discord-copilot-sdk" ||
-      typeof version !== "string"
+      typeof version !== "string" ||
+      !SEMVER.test(version)
     ) {
       return "unknown";
     }
@@ -44,7 +47,7 @@ export function readCommitSha(
 ): string {
   try {
     const sha = runGit("git", ["-C", repoRoot, "rev-parse", "--short", "HEAD"]).trim();
-    return /^[0-9a-f]{7,64}$/i.test(sha) ? sha : "unknown";
+    return /^[0-9a-f]{4,64}$/i.test(sha) ? sha : "unknown";
   } catch {
     return "unknown";
   }

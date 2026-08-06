@@ -19,6 +19,9 @@ describe("readAppVersion", () => {
     expect(readAppVersion("C:\\repo", () => "{")).toBe("unknown");
     expect(readAppVersion("C:\\repo", () => JSON.stringify({ name: "other", version: "9.9.9" }))).toBe("unknown");
     expect(readAppVersion("C:\\repo", () => JSON.stringify({ name: "discord-copilot-sdk", version: 1 }))).toBe("unknown");
+    expect(readAppVersion("C:\\repo", () => JSON.stringify({ name: "discord-copilot-sdk", version: "not-semver" }))).toBe(
+      "unknown"
+    );
   });
 });
 
@@ -35,6 +38,7 @@ describe("readCommitSha", () => {
   });
 
   it("fails closed to unknown when git cannot report a valid sha", () => {
+    expect(readCommitSha("C:\\repo", () => "a1b2c\n")).toBe("a1b2c");
     expect(readCommitSha("C:\\repo", () => "")).toBe("unknown");
     expect(readCommitSha("C:\\repo", () => "not-a-sha")).toBe("unknown");
     expect(readCommitSha("C:\\repo", () => {
