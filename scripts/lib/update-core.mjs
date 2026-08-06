@@ -60,6 +60,119 @@ export function resolveRemoteSha(records, requestedRef) {
   return find(`refs/heads/${requestedRef}`) ?? find(`refs/tags/${requestedRef}^{}`) ?? find(`refs/tags/${requestedRef}`);
 }
 
+/**
+ * Expand a requested ref to the exact remote refs needed to resolve it.
+ *
+ * @param {string} requestedRef
+ * @returns {string[]}
+ */
+export function remoteRefSpecs(requestedRef) {
+  if (typeof requestedRef !== "string" || requestedRef === "") return [];
+  if (requestedRef.startsWith("refs/heads/")) return [requestedRef];
+  if (requestedRef.startsWith("refs/tags/")) return [requestedRef, `${requestedRef}^{}`];
+  if (requestedRef.startsWith("refs/")) return [];
+  return [`refs/heads/${requestedRef}`, `refs/tags/${requestedRef}`, `refs/tags/${requestedRef}^{}`];
+}
+
+/**
+ * Decide whether an updater may move on from its read-only preflight.
+ *
+ * @param {{
+ *   checkout: CheckoutKind,
+ *   localSha: string,
+ *   remoteSha: string | null,
+ *   runningInstances: readonly string[],
+ *   allInstances: boolean,
+ *   mode?: "check" | "dry-run"
+ * }} input
+ * @returns {{action: "refuse", reason: string} | {action: "up-to-date" | "check" | "dry-run" | "apply"}}
+ */
+export function planUpdate({ checkout, localSha, remoteSha, runningInstances, allInstances, mode }) {
+  if (checkout !== "managed" && checkout !== "branch-clean") return { action: "refuse", reason: checkout };
+  if (typeof remoteSha !== "string" || remoteSha === "") return { action: "refuse", reason: "remote-not-found" };
+  if (Array.isArray(runningInstances) && runningInstances.length > 1 && !allInstances) {
+    return { action: "refuse", reason: "other-instances-running" };
+  }
+  if (localSha === remoteSha) return { action: "up-to-date" };
+  if (mode === "check") return { action: "check" };
+  if (mode === "dry-run") return { action: "dry-run" };
+  return { action: "apply" };
+}
+
+/**
+ * Parse update CLI arguments without reading environment or touching the repo.
+ *
+ * @param {string[]} args
+ * @returns {{
+ *   check: boolean,
+ *   dryRun: boolean,
+ *   yes: boolean,
+ *   noRestart: boolean,
+ *   allInstances: boolean,
+ *   restore: boolean,
+ *   ref: string | undefined,
+ *   lang: "zh" | "en" | undefined,
+ *   error: string | null
+ * }}
+ */
+export function parseUpdateArgs(args) {
+  const result = {
+    check: false,
+    dryRun: false,
+    yes: false,
+    noRestart: false,
+    allInstances: false,
+    restore: false,
+    ref: undefined,
+    lang: undefined,
+    error: null,
+  };
+  if (!Array.isArray(args)) return { ...result, error: "invalid-args" };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    switch (arg) {
+      case "--check":
+        result.check = true;
+        break;
+      case "--dry-run":
+        result.dryRun = true;
+        break;
+      case "--yes":
+      case "-y":
+        result.yes = true;
+        break;
+      case "--no-restart":
+        result.noRestart = true;
+        break;
+      case "--all-instances":
+        result.allInstances = true;
+        break;
+      case "--restore":
+        result.restore = true;
+        break;
+      case "--ref": {
+        const value = args[++i];
+        if (typeof value !== "string" || value === "" || value.startsWith("-")) return { ...result, error: "missing-ref" };
+        result.ref = value;
+        break;
+      }
+      case "--lang": {
+        const value = args[++i];
+        if (value !== "zh" && value !== "en") return { ...result, error: "invalid-lang" };
+        result.lang = value;
+        break;
+      }
+      default:
+        return { ...result, error: "unknown-flag" };
+    }
+  }
+
+  if (result.check && result.dryRun) return { ...result, error: "check-and-dry-run-conflict" };
+  if (result.restore && (result.check || result.dryRun)) return { ...result, error: "restore-with-read-only-mode" };
+  return result;
+}
+
 /** The apply sequence. Residency must stop before the process it restarts. */
 export const UPDATE_STEPS = ["residency", "process", "source", "setup"];
 

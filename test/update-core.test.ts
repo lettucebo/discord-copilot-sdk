@@ -6,7 +6,10 @@ import {
   classifyCheckout,
   orderUpdateSteps,
   parseLsRemote,
+  parseUpdateArgs,
+  planUpdate,
   resolveRemoteSha,
+  remoteRefSpecs,
 } from "../scripts/lib/update-core.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -116,5 +119,93 @@ describe("orderUpdateSteps", () => {
     const steps = orderUpdateSteps(["process", "residency", "source"]);
 
     expect(steps.indexOf("residency")).toBeLessThan(steps.indexOf("process"));
+  });
+});
+
+describe("remoteRefSpecs", () => {
+  it("queries a short ref as a branch first, then tag and peeled tag", () => {
+    expect(remoteRefSpecs("v1.2.3")).toEqual([
+      "refs/heads/v1.2.3",
+      "refs/tags/v1.2.3",
+      "refs/tags/v1.2.3^{}",
+    ]);
+  });
+
+  it("preserves a fully-qualified tag while asking for its peeled commit", () => {
+    expect(remoteRefSpecs("refs/tags/v1.2.3")).toEqual([
+      "refs/tags/v1.2.3",
+      "refs/tags/v1.2.3^{}",
+    ]);
+  });
+});
+
+describe("planUpdate", () => {
+  const base = {
+    checkout: "managed",
+    localSha: "1111111",
+    remoteSha: "2222222",
+    runningInstances: ["default"],
+    allInstances: false,
+  } as const;
+
+  it.each(["branch-dirty", "unknown"] as const)("refuses an unsafe %s checkout before stopping anything", (checkout) => {
+    expect(planUpdate({ ...base, checkout })).toEqual({ action: "refuse", reason: checkout });
+  });
+
+  it("refuses when the requested ref could not be resolved remotely", () => {
+    expect(planUpdate({ ...base, remoteSha: null })).toEqual({ action: "refuse", reason: "remote-not-found" });
+  });
+
+  it("refuses a multi-instance update unless the caller explicitly includes them all", () => {
+    expect(planUpdate({ ...base, runningInstances: ["default", "work"] })).toEqual({
+      action: "refuse",
+      reason: "other-instances-running",
+    });
+  });
+
+  describe("parseUpdateArgs", () => {
+    it("recognizes the supported non-destructive and restore flags", () => {
+      expect(
+        parseUpdateArgs(["--check", "--yes", "--ref", "v1.2.3", "--lang", "zh", "--all-instances", "--no-restart"])
+      ).toEqual({
+        check: true,
+        dryRun: false,
+        yes: true,
+        noRestart: true,
+        allInstances: true,
+        restore: false,
+        ref: "v1.2.3",
+        lang: "zh",
+        error: null,
+      });
+    });
+
+    it.each([
+      [["--check", "--dry-run"], "check-and-dry-run-conflict"],
+      [["--restore", "--check"], "restore-with-read-only-mode"],
+      [["--ref"], "missing-ref"],
+      [["--lang", "fr"], "invalid-lang"],
+      [["--unknown"], "unknown-flag"],
+    ])("fails closed for invalid args %o", (args, error) => {
+      expect(parseUpdateArgs(args)).toMatchObject({ error });
+    });
+  });
+
+  it("short-circuits an already-current checkout", () => {
+    expect(planUpdate({ ...base, localSha: base.remoteSha })).toEqual({ action: "up-to-date" });
+  });
+
+  it("--check reports availability without mutating", () => {
+    expect(planUpdate({ ...base, mode: "check" })).toEqual({ action: "check" });
+  });
+
+  it("--dry-run previews every destructive action without mutating", () => {
+    expect(planUpdate({ ...base, mode: "dry-run" })).toEqual({ action: "dry-run" });
+  });
+
+  it("allows an explicitly all-instance update after every preflight condition is met", () => {
+    expect(planUpdate({ ...base, runningInstances: ["default", "work"], allInstances: true })).toEqual({
+      action: "apply",
+    });
   });
 });
