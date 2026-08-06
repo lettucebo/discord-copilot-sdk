@@ -11,6 +11,7 @@ import {
   planUpdate,
   resolveRemoteSha,
   remoteRefSpecs,
+  shouldRetainRestoreState,
   updateLockRelativePath,
 } from "../scripts/lib/update-core.mjs";
 
@@ -186,6 +187,13 @@ describe("planUpdate", () => {
       it("places updater locks outside the bot PID lock namespace", () => {
         expect(updateLockRelativePath("default")).toBe("updates/default.lock");
         expect(updateLockRelativePath("work")).toBe("updates/work.lock");
+      });
+
+      describe("shouldRetainRestoreState", () => {
+        it("retains state only while setup has not succeeded", () => {
+          expect(shouldRetainRestoreState(false)).toBe(true);
+          expect(shouldRetainRestoreState(true)).toBe(false);
+        });
       });
 
       it("detects a replacement PID for a target instance while waiting for shutdown", () => {

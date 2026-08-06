@@ -192,6 +192,11 @@ export function targetInstancesStopped(live, targets) {
   return !live.some((entry) => targetSet.has(entry.instance));
 }
 
+/** A restore snapshot exists only to recover from a failed setup/apply path. */
+export function shouldRetainRestoreState(setupSucceeded) {
+  return !setupSucceeded;
+}
+
 /** The apply sequence. Residency must stop before the process it restarts. */
 export const UPDATE_STEPS = ["residency", "process", "source", "setup"];
 

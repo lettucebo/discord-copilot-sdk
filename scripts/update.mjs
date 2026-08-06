@@ -23,6 +23,7 @@ import {
   planUpdate,
   remoteRefSpecs,
   resolveRemoteSha,
+  shouldRetainRestoreState,
   targetInstancesStopped,
   updateLockRelativePath,
 } from "./lib/update-core.mjs";
@@ -532,6 +533,7 @@ async function main() {
     runSetup();
     setupSucceeded = true;
     if (flags.noRestart) {
+      if (!shouldRetainRestoreState(setupSucceeded)) fs.rmSync(statePath(instance), { force: true });
       console.log(message("updateNoRestart"));
       return;
     }

@@ -121,7 +121,7 @@ const MESSAGES = {
     updateCurrentRemote: "目前 {0}，遠端 {1}（{2}），checkout={3}。",
     updateDryRun: "Dry run：會 fetch、驗證新設定、先停止每個 bot 的常駐服務、移動 HEAD、執行 setup，再還原原本狀態。",
     updateManagedDangling: "警告：managed checkout 有 {0} 個即將失去 ref 的 commit。",
-    updateNoRestart: "更新成功；依 --no-restart 保持停止，保留 restore state。",
+    updateNoRestart: "更新成功；依 --no-restart 保持停止。",
     updateComplete: "更新完成：{0} -> {1}。",
     updateFailed: "更新未完成；bot 保持停止，沒有自動還原。修正原因後執行 node scripts/update.mjs --restore。",
     yes: "是",
@@ -216,7 +216,7 @@ const MESSAGES = {
     updateDryRun:
       "Dry run: would fetch, validate the incoming config, stop residency before every bot, move HEAD, run setup, then restore the prior state.",
     updateManagedDangling: "Warning: managed checkout has {0} commit(s) about to lose their ref.",
-    updateNoRestart: "Update succeeded; --no-restart leaves it stopped and retains restore state.",
+    updateNoRestart: "Update succeeded; --no-restart leaves it stopped.",
     updateComplete: "Update complete: {0} -> {1}.",
     updateFailed:
       "Update did not complete; the bot remains stopped and was not restored automatically. Fix the cause, then run node scripts/update.mjs --restore.",
