@@ -10,6 +10,15 @@ import {
 } from "../scripts/lib/update-core.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const forbiddenModule = "(?:node:)?(?:fs(?:/promises)?|child_process|process)";
+const forbiddenModuleImport = new RegExp(
+  `(?:from\\s+["']${forbiddenModule}["']|import\\s+["']${forbiddenModule}["']|import\\s*\\(\\s*["']${forbiddenModule}["']\\s*\\)|require\\s*\\(\\s*["']${forbiddenModule}["']\\s*\\))`
+);
+const forbiddenProcessAccess = /\b(?:(?:global|globalThis)\s*\.\s*)?process\s*\./;
+
+function hasForbiddenUpdateCoreEffect(source: string): boolean {
+  return forbiddenModuleImport.test(source) || forbiddenProcessAccess.test(source);
+}
 
 describe("update-core purity", () => {
   it("does not import or invoke filesystem or subprocess APIs", () => {
@@ -18,11 +27,16 @@ describe("update-core purity", () => {
     // mutating a checkout or probing a real process.
     const source = fs.readFileSync(path.join(ROOT, "scripts", "lib", "update-core.mjs"), "utf8");
 
-    const forbiddenModule = "(?:node:)?(?:fs(?:/promises)?|child_process|process)";
-    expect(source).not.toMatch(
-      new RegExp(`(?:from\\s+["']${forbiddenModule}["']|import\\s*\\(\\s*["']${forbiddenModule}["']\\s*\\)|require\\(\\s*["']${forbiddenModule}["']\\s*\\))`)
-    );
-    expect(source).not.toMatch(/\b(?:globalThis\.)?process\s*\./);
+    expect(hasForbiddenUpdateCoreEffect(source)).toBe(false);
+  });
+
+  it.each([
+    [`import "node:fs";`],
+    [`import "fs/promises";`],
+    [`require ("node:child_process");`],
+    [`global.process.exitCode = 1;`],
+  ])("rejects an otherwise bypassable I/O entry point: %s", (source) => {
+    expect(hasForbiddenUpdateCoreEffect(source)).toBe(true);
   });
 });
 
