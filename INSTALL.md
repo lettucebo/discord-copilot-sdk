@@ -139,6 +139,80 @@ The installer will: detect prerequisites → collect + **validate** config → `
 
 ---
 
+## 3b. Update an existing installation
+
+Use the updater instead of re-running `install.*`. It uses the same shared
+configuration/build engine, but first protects the lifecycle ordering that a
+manual `git pull && npm install` misses.
+
+### One-line network bootstrap
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.ps1).TrimStart([char]0xFEFF)))
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.sh | bash
+```
+
+The network form downloads a fresh updater engine to a private temporary
+directory. That engine stops residency and bot processes **before** it changes
+the target checkout, so the bootstrap never replaces files held by a live bot.
+For a private fork, fetch `update.ps1` / `update.sh` through the same `gh api`
+pattern shown in §2.
+
+### Local commands and guarantees
+
+```powershell
+./update.ps1 -Check
+./update.ps1 -DryRun
+./update.ps1 -Ref v0.1.0
+./update.ps1 -AllInstances
+./update.ps1 -Restore
+```
+
+```bash
+./update.sh --check
+./update.sh --dry-run
+./update.sh --ref v0.1.0
+./update.sh --all-instances
+./update.sh --restore
+```
+
+`--check` performs no writes and exits `0` if the requested ref already equals
+HEAD, otherwise `2`. `--dry-run` presents the lifecycle plan without fetch,
+stop, build, write, or checkout. Short refs prefer a branch over a same-named
+tag; use `--ref refs/tags/v0.1.0` to remove ambiguity. Annotated tags compare
+their peeled commit, not the tag object.
+
+The updater refuses a dirty or unknown checkout. A named development branch
+updates only through `git merge --ff-only`, after proving ancestry; a
+bootstrap-managed detached checkout fetches depth-one then detaches at
+`FETCH_HEAD`. It scans all live instance locks and requires `--all-instances`
+before touching source used by another instance.
+
+The apply sequence is: read-only preflight → stop residency → stop bot → move
+source → `setup.mjs --yes --skip-auth --no-residency` → restore. Existing
+residency is only re-enabled/restarted; it is never re-registered, so a Windows
+24/7 task is not silently downgraded to login-keepalive.
+
+> ⚠️ If setup fails after source changes, the updater intentionally leaves the
+> bot stopped, preserves `~/.discord-copilot-sdk/update-state.<instance>.json`,
+> and prints the `--restore` command. On Windows stopping is a hard termination,
+> so an in-flight turn may be lost. Review active threads/worktrees first and
+> confirm the guard (or pass `--yes`) only when that interruption is acceptable.
+
+### Releases
+
+`--version` shows the app SemVer release, commit SHA, and installed Copilot SDK.
+`CHANGELOG.md` is the GitHub Release source and starts at `0.1.0`; it is
+English-only by design because each tag creates one GitHub Release. Prepare
+`[Unreleased]`, then explicitly run `npm run release -- <version>` from a clean
+tree. The helper commits the version/changelog and creates annotated `v<version>`;
+push the branch and tag to publish the release workflow.
+
+---
+
 ## 4. Residency — two different things
 
 The installer asks separately. **Login-keepalive is the default**; a password is only involved if you explicitly choose 24/7.

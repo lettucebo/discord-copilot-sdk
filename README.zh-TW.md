@@ -94,6 +94,40 @@ npm run dev
 
 或設定完成後，用 `./run-bot.ps1` / `./run-bot.sh` detached 啟動，`./stop-bot.ps1` / `./stop-bot.sh` 停止。
 
+## 更新
+
+請用更新器，不要重跑安裝器。它會保留 `.env`、先停常駐再停 bot、驗證即將進來的版本並重新建置；**只有** setup 成功才會還原更新前的執行狀態。
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.ps1).TrimStart([char]0xFEFF)))
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.sh | bash
+```
+
+在本機執行可使用安全旗標：
+
+```powershell
+./update.ps1 -Check                 # 唯讀；ref 不同時回傳 exit 2
+./update.ps1 -DryRun                # 完整計畫，但不 fetch、停機、建置或寫入
+./update.ps1 -Ref v0.1.0            # 釘在 annotated 或 lightweight release tag
+./update.ps1 -AllInstances          # 明確同時處理所有 live 本機 instance
+./update.ps1 -Restore               # 在 apply 失敗後還原保留的狀態
+```
+
+```bash
+./update.sh --check
+./update.sh --dry-run
+./update.sh --ref v0.1.0
+./update.sh --all-instances
+./update.sh --restore
+```
+
+`--check` 適合監控：`0` 表示已在要求的 ref，`2` 表示不同。具名開發分支只有在乾淨且可 fast-forward 時才會更新；dirty、divergent 或無法辨識的 checkout 一律在停機前拒絕。若還有其他 live instance，必須明確加 `--all-instances`。
+
+若 source 已變更後 setup 失敗，更新器會刻意保持 bot 停止，並保留 `~/.discord-copilot-sdk/update-state.<instance>.json`；修正原因後再跑 `--restore`。Windows 停 bot 是硬終止，進行中的 turn 可能遺失。完整生命週期與發版規則見 [`INSTALL.zh-TW.md`](INSTALL.zh-TW.md)。
+
 ## 解除安裝
 
 ```powershell

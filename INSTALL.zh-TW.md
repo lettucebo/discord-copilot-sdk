@@ -139,6 +139,54 @@ bash install.sh --skip-auth
 
 ---
 
+## 3b. 更新既有安裝
+
+請用更新器，不要重跑 `install.*`。它同樣使用共用的設定／建置引擎，但會先處理手動 `git pull && npm install` 容易做錯的生命週期順序。
+
+### 一行網路啟動器
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.ps1).TrimStart([char]0xFEFF)))
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.sh | bash
+```
+
+網路形式會把最新更新 engine 下載到私有暫存目錄。engine 會在改動目標 checkout **之前**先停常駐與 bot，所以 bootstrap 不會覆寫 live bot 正在使用的檔案。若是 private fork，請用 §2 展示的同一種 `gh api` 方式取得 `update.ps1`／`update.sh`。
+
+### 本機命令與保證
+
+```powershell
+./update.ps1 -Check
+./update.ps1 -DryRun
+./update.ps1 -Ref v0.1.0
+./update.ps1 -AllInstances
+./update.ps1 -Restore
+```
+
+```bash
+./update.sh --check
+./update.sh --dry-run
+./update.sh --ref v0.1.0
+./update.sh --all-instances
+./update.sh --restore
+```
+
+`--check` 不寫入任何東西；要求的 ref 已等於 HEAD 時 exit `0`，否則 `2`。`--dry-run` 會顯示完整生命週期，但不 fetch、停機、建置、寫入或 checkout。短 ref 同時是 branch/tag 時優先選 branch；用 `--ref refs/tags/v0.1.0` 可消除歧義。annotated tag 比較的是 peeled commit，不是 tag object。
+
+更新器會拒絕 dirty 或無法辨識的 checkout。具名開發分支只有在先證明 ancestor 關係後，才用 `git merge --ff-only` 更新；bootstrap 管理的 detached checkout 則 depth-one fetch 後 detach 到 `FETCH_HEAD`。它會掃描所有 live instance lock，若有其他 instance 正在跑，必須顯式傳入 `--all-instances` 才能改動共用 source。
+
+apply 順序是：唯讀 preflight → 停常駐 → 停 bot → 移動 source → `setup.mjs --yes --skip-auth --no-residency` → 還原。既有常駐只會重新 enable/start，絕不重新 register，所以 Windows 24/7 task 不會悄悄降成登入後保活。
+
+> ⚠️ source 已變更後若 setup 失敗，更新器會刻意讓 bot 保持停止、保留 `~/.discord-copilot-sdk/update-state.<instance>.json`，並印出 `--restore` 指令。Windows 停止是硬終止，進行中的 turn 可能遺失。先查看 active thread/worktree，只有確定可中斷時才確認 guard（或使用 `--yes`）。
+
+### 發版
+
+`--version` 會顯示 app SemVer、commit SHA 與已安裝的 Copilot SDK。`CHANGELOG.md` 是 GitHub Release 的來源，從 `0.1.0` 開始；它刻意只用英文，因為一個 tag 只產生一份 GitHub Release。先寫好 `[Unreleased]`，再從乾淨工作樹明確執行 `npm run release -- <version>`。helper 會 commit 版本／changelog 並建立 annotated `v<version>`；推送 branch 與 tag 後才會發布 release workflow。
+
+---
+
 ## 4. 常駐 — 兩種，差很多
 
 安裝器會分開問。**預設是登入後保活**，只有你明確選擇才會用到密碼。

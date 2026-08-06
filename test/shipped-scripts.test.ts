@@ -80,6 +80,14 @@ describe("shipped scripts", () => {
     }
   });
 
+  it("documents the updater in English and Traditional Chinese README and INSTALL", () => {
+    for (const doc of INSTALL_DOCUMENTS) {
+      const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
+      expect(text).toContain("update.ps1");
+      expect(text).toContain("update.sh");
+    }
+  });
+
   it("documents an install one-liner that matches the repo's actual visibility", () => {
     // This used to assert the opposite: while the repo was private,
     // `raw.githubusercontent.com` 404'd for everyone including its owner, so the

@@ -281,3 +281,18 @@ resume 的錯誤。
 | `test/app-reconcile.test.ts` / `test/app-rebind.test.ts` | 每筆 record 的實際 thread parent 必須精確等於 `parentChannelId`；不是「任一 enabled parent」即可 resume，rebind 也保留該 binding；`config-mismatch` 不能靜默遺失 fallback 通知。 |
 | `test/transport.test.ts` | `noticeDelivered()` 對不存在或無法傳送的頻道回傳 `false`，讓 caller 能改投 seed。 |
 | `test/shipped-scripts.test.ts` | 英／繁中 twin 皆含安全安裝命令，並驗證 language switcher 與本地 Markdown 連結。 |
+
+## 14. 更新與發版機制（2026-08-06）
+
+### 14.1 決策
+
+- 採用本機 `update.ps1`／`update.sh` 加 `scripts/update.mjs` 的三階段流程：**唯讀 preflight → apply → 僅成功後 restore**。更新器在停止前檢查 origin、remote ref、checkout 形狀、多 instance、FF-only 可行性、新版設定與 active thread/worktree。
+- 網路一行形式不直接 fetch/checkout 目標；它下載最新 engine 到私有暫存目錄，讓 engine 先停常駐與 bot 再變更 source。這保留自救能力，也避免 Windows npm 覆寫 live runtime 的 EPERM。
+- dev branch 僅允許乾淨且 `merge-base --is-ancestor` 可證明的 `git merge --ff-only`；managed detached clone 用 depth-one fetch 加 `checkout --detach FETCH_HEAD`。
+- 不做 Discord `/update`：行程不能安全覆寫自己的 runtime，失敗後 Discord 也無法回報；這是 fail-closed 取捨，不是 UX 缺漏。
+- 初始版本為 SemVer `0.1.0`，`--version` 顯示 app 版號、commit 與 SDK。`CHANGELOG.md` 作為單一 GitHub Release 的英文來源；使用者可在乾淨 tree 執行 release helper 建 commit 與 annotated tag。
+
+### 14.2 殘留風險
+
+- source 移動後的完整 runtime/schema 驗證必須先 build，而 Windows build 不能與 live runtime 共存；故預檢覆蓋新版 `validate.mjs`，但 setup 在 apply 後失敗時**不**自動 restore。operator 修正後必須明確 `--restore`。
+- Windows 用硬終止停止 bot，in-flight turn 可能遺失；active-thread guard 只報告可 resume 的 thread 與髒 worktree，不能誠實地宣稱知道記憶體中的 turn 是否正在執行。
