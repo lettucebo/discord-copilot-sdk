@@ -27,6 +27,7 @@ import {
   updateLockRelativePath,
 } from "./lib/update-core.mjs";
 import { nodeVersionOk } from "./lib/setup-core.mjs";
+import { detectLang, t } from "./lib/i18n.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
@@ -37,8 +38,9 @@ const INSTANCE_RE = /^[A-Za-z0-9._-]{1,64}$/;
 class UpdateError extends Error {}
 
 const flags = parseUpdateArgs(process.argv.slice(2));
-const lang = flags.lang ?? (/^zh/i.test(process.env.DISCORD_COPILOT_SDK_LOCALE ?? process.env.LANG ?? "") ? "zh" : "en");
-const say = (zh, en) => console.log(lang === "zh" ? zh : en);
+const lang = flags.lang ?? detectLang(process.env);
+const message = (key, ...values) =>
+  t(key, lang).replace(/\{(\d+)\}/g, (_, index) => String(values[Number(index)] ?? ""));
 
 function run(command, args, opts = {}) {
   return execFileSync(command, args, {
@@ -258,12 +260,9 @@ function ask(question) {
 
 async function confirmActiveThreads(summary) {
   if (!summary.threads && !summary.dirtyWorktrees && !summary.unreadable) return;
-  say(
-    `警告：有 ${summary.threads} 個可恢復 thread、${summary.dirtyWorktrees} 個髒 worktree，${summary.unreadable} 個無法讀取的 session store。Windows 上更新會硬砍進行中的 turn。`,
-    `Warning: ${summary.threads} resumable thread(s), ${summary.dirtyWorktrees} dirty worktree(s), and ${summary.unreadable} unreadable session store(s) exist. Windows updates hard-kill an in-flight turn.`
-  );
+  console.log(message("updateActiveThreads", summary.threads, summary.dirtyWorktrees, summary.unreadable));
   if (flags.yes) return;
-  const accepted = await ask(lang === "zh" ? "仍要更新嗎？[y/N] " : "Continue with the update? [y/N] ");
+  const accepted = await ask(message("updateConfirm"));
   if (!accepted) throw new UpdateError("update cancelled at the active-thread guard");
 }
 
@@ -440,7 +439,7 @@ async function restoreSaved() {
     await restoreState(state);
     fs.rmSync(file, { force: true });
   }
-  say("已還原更新前的執行狀態。", "Restored the pre-update running state.");
+  console.log(message("updateRestoreDone"));
 }
 
 async function main() {
@@ -473,23 +472,17 @@ async function main() {
   });
   if (decision.action === "refuse") throw new UpdateError(`preflight refused: ${decision.reason}`);
   if (decision.action === "up-to-date") {
-    say(`已是最新版本（${local.slice(0, 12)}）。`, `Already up to date (${local.slice(0, 12)}).`);
+    console.log(message("updateAlreadyCurrent", local.slice(0, 12)));
     return;
   }
 
-  say(
-    `目前 ${local.slice(0, 12)}，遠端 ${remote.sha.slice(0, 12)}（${remote.ref}），checkout=${checkout.kind}。`,
-    `Local ${local.slice(0, 12)}, remote ${remote.sha.slice(0, 12)} (${remote.ref}), checkout=${checkout.kind}.`
-  );
+  console.log(message("updateCurrentRemote", local.slice(0, 12), remote.sha.slice(0, 12), remote.ref, checkout.kind));
   if (decision.action === "check") {
     process.exitCode = 2; // useful to a monitor: an update exists, no action taken
     return;
   }
   if (decision.action === "dry-run") {
-    say(
-      "Dry run: would fetch, validate the incoming config, stop residency before every bot, move HEAD, run setup, then restore the prior state.",
-      "Dry run: would fetch, validate the incoming config, stop residency before every bot, move HEAD, run setup, then restore the prior state."
-    );
+    console.log(message("updateDryRun"));
     return;
   }
 
@@ -499,7 +492,7 @@ async function main() {
   if (checkout.kind === "branch-clean") preflightBranchFastForward();
   if (checkout.kind === "managed") {
     const dangling = countDanglingManagedCommits();
-    if (dangling) say(`警告：managed checkout 有 ${dangling} 個即將失去 ref 的 commit。`, `Warning: managed checkout has ${dangling} commit(s) about to lose their ref.`);
+    if (dangling) console.log(message("updateManagedDangling", dangling));
   }
   await precheckIncomingConfig();
   await confirmActiveThreads(activeThreadSummary());
@@ -531,20 +524,17 @@ async function main() {
     runSetup();
     setupSucceeded = true;
     if (flags.noRestart) {
-      say("更新成功；依 --no-restart 保持停止，保留 restore state。", "Update succeeded; --no-restart leaves it stopped and retains restore state.");
+      console.log(message("updateNoRestart"));
       return;
     }
     await restoreState(state);
     fs.rmSync(statePath(instance), { force: true });
     const now = localSha();
-    say(`更新完成：${local.slice(0, 12)} -> ${now.slice(0, 12)}。`, `Update complete: ${local.slice(0, 12)} -> ${now.slice(0, 12)}.`);
+    console.log(message("updateComplete", local.slice(0, 12), now.slice(0, 12)));
   } finally {
     releaseLock();
     if (!setupSucceeded) {
-      say(
-        `更新未完成；bot 保持停止，沒有自動還原。修正原因後執行 node scripts/update.mjs --restore。`,
-        `Update did not complete; the bot remains stopped and was not restored automatically. Fix the cause, then run node scripts/update.mjs --restore.`
-      );
+      console.log(message("updateFailed"));
     }
   }
 }

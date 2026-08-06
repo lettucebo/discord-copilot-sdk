@@ -64,3 +64,19 @@ describe("message table parity", () => {
     }
   });
 });
+
+describe("update messages", () => {
+  it.each([
+    "updateActiveThreads",
+    "updateAlreadyCurrent",
+    "updateCurrentRemote",
+    "updateDryRun",
+    "updateManagedDangling",
+    "updateNoRestart",
+    "updateComplete",
+    "updateFailed",
+    "updateRestoreDone",
+  ])("defines the bilingual %s update message", (key) => {
+    for (const lang of LANGS) expect(t(key, lang)).not.toBe(key);
+  });
+});
