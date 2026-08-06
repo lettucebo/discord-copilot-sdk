@@ -182,7 +182,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 Run it locally for the available safeguards:
 
 ```powershell
-./update.ps1 -Check                 # read-only; exit 2 when the ref differs
+./update.ps1 -Check                 # read-only; 0=current, 2=differs, 1=preflight refusal
 ./update.ps1 -DryRun                # full plan, no fetch, stop, build, or write
 ./update.ps1 -Ref v0.1.0            # pin an annotated or lightweight release tag
 ./update.ps1 -AllInstances          # explicitly include every live local instance
@@ -198,10 +198,11 @@ Run it locally for the available safeguards:
 ```
 
 `--check` is suitable for monitoring: `0` means the requested ref is already
-current and `2` means it differs. A named development branch updates only by
-fast-forward when clean; a dirty, divergent, or unknown checkout is refused
-before downtime. An update also refuses when another live instance exists
-unless `--all-instances` is explicit.
+current, `2` means it differs, and `1` means a fail-closed preflight refusal
+needs attention. A named development branch updates only by fast-forward when
+clean; a dirty, divergent, or unknown checkout is refused before downtime. An
+update also refuses when another live instance exists unless `--all-instances`
+is explicit.
 
 If setup fails after source has changed, the updater deliberately leaves the
 bot stopped and retains `~/.discord-copilot-sdk/update-state.<instance>.json`;

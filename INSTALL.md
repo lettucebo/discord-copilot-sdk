@@ -181,10 +181,11 @@ fork is not supported in v1, even if its bootstrap script is fetched through
 ```
 
 `--check` performs no writes and exits `0` if the requested ref already equals
-HEAD, otherwise `2`. `--dry-run` presents the lifecycle plan without fetch,
-stop, build, write, or checkout. Short refs prefer a branch over a same-named
-tag; use `--ref refs/tags/v0.1.0` to remove ambiguity. Annotated tags compare
-their peeled commit, not the tag object.
+HEAD, `2` if it differs, or `1` on a fail-closed preflight refusal (for example,
+a dirty checkout or another live instance). `--dry-run` presents the lifecycle
+plan without fetch, stop, build, write, or checkout. Short refs prefer a branch
+over a same-named tag; use `--ref refs/tags/v0.1.0` to remove ambiguity.
+Annotated tags compare their peeled commit, not the tag object.
 
 The updater refuses a dirty or unknown checkout. A named development branch
 updates only through `git merge --ff-only`, after proving ancestry; a

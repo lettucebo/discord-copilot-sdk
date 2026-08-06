@@ -173,7 +173,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 ./update.sh --restore
 ```
 
-`--check` 不寫入任何東西；要求的 ref 已等於 HEAD 時 exit `0`，否則 `2`。`--dry-run` 會顯示完整生命週期，但不 fetch、停機、建置、寫入或 checkout。短 ref 同時是 branch/tag 時優先選 branch；用 `--ref refs/tags/v0.1.0` 可消除歧義。annotated tag 比較的是 peeled commit，不是 tag object。
+`--check` 不寫入任何東西；要求的 ref 已等於 HEAD 時 exit `0`、不同時 `2`、fail-closed preflight 拒絕時 `1`（例如 dirty checkout 或另一個 live instance）。`--dry-run` 會顯示完整生命週期，但不 fetch、停機、建置、寫入或 checkout。短 ref 同時是 branch/tag 時優先選 branch；用 `--ref refs/tags/v0.1.0` 可消除歧義。annotated tag 比較的是 peeled commit，不是 tag object。
 
 更新器會拒絕 dirty 或無法辨識的 checkout。具名開發分支只有在先證明 ancestor 關係後，才用 `git merge --ff-only` 更新；bootstrap 管理的 detached checkout 則 depth-one fetch 後 detach 到 `FETCH_HEAD`。它會掃描所有 live instance lock，若有其他 instance 正在跑，必須顯式傳入 `--all-instances` 才能改動共用 source。
 
