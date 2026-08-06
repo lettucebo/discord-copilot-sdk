@@ -23,6 +23,8 @@ import {
   planUpdate,
   remoteRefSpecs,
   resolveRemoteSha,
+  targetInstancesStopped,
+  updateLockRelativePath,
 } from "./lib/update-core.mjs";
 import { nodeVersionOk } from "./lib/setup-core.mjs";
 
@@ -69,7 +71,7 @@ function statePath(instance) {
 }
 
 function updateLockPath(instance) {
-  return path.join(STATE_DIR, `update.${instance}.lock`);
+  return path.join(STATE_DIR, ...updateLockRelativePath(instance).split("/"));
 }
 
 function ensureRepo() {
@@ -338,9 +340,12 @@ function stopInstance(instance) {
 }
 
 async function verifyStopped(instances) {
+  const targetIds = instances.map(({ instance }) => instance);
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
-    if (instances.every(({ pid }) => !isLivePid(pid))) return;
+    const originalPidsStopped = instances.every(({ pid }) => !isLivePid(pid));
+    const noSuccessor = targetInstancesStopped(liveInstances(), targetIds);
+    if (originalPidsStopped && noSuccessor) return;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new UpdateError("a bot process remained alive after stop-bot; refusing to update live files");

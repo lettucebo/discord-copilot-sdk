@@ -173,6 +173,23 @@ export function parseUpdateArgs(args) {
   return result;
 }
 
+/** A namespace distinct from `<instance>.lock`, which only the bot may own. */
+export function updateLockRelativePath(instance) {
+  return `updates/${instance}.lock`;
+}
+
+/**
+ * A successor PID is just as unsafe as the PID present before stop. This keeps
+ * a lifecycle wait from missing a launchd/systemd respawn between two polls.
+ *
+ * @param {{instance: string, pid?: number}[]} live
+ * @param {readonly string[]} targets
+ */
+export function targetInstancesStopped(live, targets) {
+  const targetSet = new Set(targets);
+  return !live.some((entry) => targetSet.has(entry.instance));
+}
+
 /** The apply sequence. Residency must stop before the process it restarts. */
 export const UPDATE_STEPS = ["residency", "process", "source", "setup"];
 

@@ -4,12 +4,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   classifyCheckout,
+  targetInstancesStopped,
   orderUpdateSteps,
   parseLsRemote,
   parseUpdateArgs,
   planUpdate,
   resolveRemoteSha,
   remoteRefSpecs,
+  updateLockRelativePath,
 } from "../scripts/lib/update-core.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -177,6 +179,19 @@ describe("planUpdate", () => {
         ref: "v1.2.3",
         lang: "zh",
         error: null,
+      });
+    });
+
+    describe("update lifecycle namespaces", () => {
+      it("places updater locks outside the bot PID lock namespace", () => {
+        expect(updateLockRelativePath("default")).toBe("updates/default.lock");
+        expect(updateLockRelativePath("work")).toBe("updates/work.lock");
+      });
+
+      it("detects a replacement PID for a target instance while waiting for shutdown", () => {
+        expect(targetInstancesStopped([{ instance: "default", pid: 456 }], ["default"])).toBe(false);
+        expect(targetInstancesStopped([{ instance: "work", pid: 456 }], ["default"])).toBe(true);
+        expect(targetInstancesStopped([], ["default"])).toBe(true);
       });
     });
 
