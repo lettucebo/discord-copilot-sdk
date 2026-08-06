@@ -56,6 +56,7 @@ param(
   $repoUrl = 'https://github.com/lettucebo/discord-copilot-sdk.git'
   $rawUrl = 'https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk'
   $refName = if ($Ref) { $Ref } elseif ($env:DISCORD_COPILOT_SDK_REF) { $env:DISCORD_COPILOT_SDK_REF } else { 'main' }
+  $encodedRef = [Uri]::EscapeDataString($refName).Replace('%2F', '/')
   $norm = { param($u) ($u -replace '\.git$', '' -replace '/$', '').ToLowerInvariant() }
   $target = if ($Dir) { $Dir } elseif ($env:DISCORD_COPILOT_SDK_DIR) { $env:DISCORD_COPILOT_SDK_DIR } else { $null }
   if (-not $target) {
@@ -70,7 +71,7 @@ param(
     foreach ($relative in 'scripts/update.mjs', 'scripts/lib/update-core.mjs', 'scripts/lib/setup-core.mjs', 'scripts/lib/i18n.mjs') {
       $destination = Join-Path $temp ($relative -replace '/', '\')
       New-Item -ItemType Directory -Path (Split-Path $destination) -Force | Out-Null
-      $uri = "$rawUrl/$([Uri]::EscapeDataString($refName))/$relative"
+      $uri = "$rawUrl/$encodedRef/$relative"
       $body = Invoke-RestMethod -Uri $uri -ErrorAction Stop
       [IO.File]::WriteAllText($destination, [string]$body, (New-Object Text.UTF8Encoding($false)))
     }

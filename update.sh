@@ -29,9 +29,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# A script started from disk is the trusted local entrypoint.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/scripts/update.mjs" ]; then
+# A script started from disk is the trusted local entrypoint. With `curl | bash`
+# BASH_SOURCE is empty; treating its dirname as "." would execute arbitrary CWD
+# content instead of the freshly downloaded engine.
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/scripts/update.mjs" ]; then
   exec node "$SCRIPT_DIR/scripts/update.mjs" "${FORWARD[@]+"${FORWARD[@]}"}"
 fi
 
@@ -51,6 +56,8 @@ if [ "$TARGET_EXPLICIT" = "0" ]; then
   fi
 fi
 [ -n "$TARGET" ] || { echo "A target directory is required." >&2; exit 1; }
+[ -d "$TARGET" ] || { echo "Target directory does not exist: $TARGET" >&2; exit 1; }
+TARGET="$(cd "$TARGET" && pwd -P)"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/dcs-update.XXXXXX")"
 cleanup() { rm -rf "$TMP"; }

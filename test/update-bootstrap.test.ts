@@ -14,6 +14,7 @@ describe("update bootstraps", () => {
     expect(text).toContain("scripts\\update.mjs");
     expect(text).toContain("DISCORD_COPILOT_SDK_UPDATE_ROOT");
     expect(text).toContain("Invoke-RestMethod");
+    expect(text).toContain(".Replace('%2F', '/')");
     expect(text).not.toMatch(/\|\s*iex\b/i);
   });
 
@@ -26,5 +27,7 @@ describe("update bootstraps", () => {
     expect(text).toContain("scripts/update.mjs");
     expect(text).toContain("DISCORD_COPILOT_SDK_UPDATE_ROOT");
     expect(text).toContain("curl");
+    expect(text).toContain('[ -n "${BASH_SOURCE[0]:-}" ]');
+    expect(text).toContain("pwd -P");
   });
 });
