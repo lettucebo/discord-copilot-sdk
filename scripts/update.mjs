@@ -87,7 +87,10 @@ function ensureRepo() {
     throw new UpdateError("not a readable discord-copilot-sdk checkout");
   }
   if (pkg?.name !== "discord-copilot-sdk") throw new UpdateError("not a discord-copilot-sdk checkout");
-  const origin = tryRun("git", ["remote", "get-url", "origin"])?.trim();
+  // `git remote get-url` expands url.*.insteadOf rules, so a legitimate
+  // corporate mirror can make a stored public origin appear untrusted. Compare
+  // the literal config value we own, while Git may still use its mirror later.
+  const origin = tryRun("git", ["config", "--get", "remote.origin.url"])?.trim();
   const normalize = (value) => value?.replace(/\.git$/, "").replace(/\/$/, "").toLowerCase();
   if (!origin || normalize(origin) !== normalize(REPO_URL)) {
     throw new UpdateError(`origin is '${origin ?? "(missing)"}', not ${REPO_URL}`);

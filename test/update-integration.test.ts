@@ -4,9 +4,13 @@ import { promisify } from "node:util";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { classifyCheckout, parseLsRemote, resolveRemoteSha } from "../scripts/lib/update-core.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { parseLsRemote, resolveRemoteSha } from "../scripts/lib/update-core.mjs";
 
 const exec = promisify(execFile);
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const ENGINE = path.join(ROOT, "scripts", "update.mjs");
+const PUBLIC_ORIGIN = "https://github.com/lettucebo/discord-copilot-sdk.git";
 const git = (cwd: string, ...args: string[]): Promise<{ stdout: string }> =>
   exec("git", args, { cwd, encoding: "utf8" });
 
@@ -15,9 +19,32 @@ let source: string;
 let remote: string;
 let serial = 0;
 
-async function clone(name: string): Promise<string> {
+async function cloneTarget(name: string): Promise<string> {
   const target = path.join(root, name);
   await exec("git", ["clone", "-q", "--branch", "main", remote, target], { encoding: "utf8" });
+  // The updater rejects every origin except the production project URL. A
+  // repository-local insteadOf rule redirects that exact URL to this temporary
+  // bare remote, so this test exercises the real origin gate and git commands
+  // without globally mutating the developer's Git configuration.
+  await git(target, "remote", "set-url", "origin", PUBLIC_ORIGIN);
+  await git(target, "config", `url.${pathToFileURL(remote).href}.insteadOf`, PUBLIC_ORIGIN);
+  const reposRoot = path.join(root, "repos-root");
+  await fs.promises.mkdir(reposRoot, { recursive: true });
+  await fs.promises.writeFile(
+    path.join(target, ".env"),
+    [
+      "DISCORD_BOT_TOKEN=token",
+      "DISCORD_ALLOWED_USER_IDS=12345",
+      "DISCORD_GUILD_ID=12345",
+      "DISCORD_PARENT_CHANNEL_ID=12345",
+      `REPOS_ROOT=${reposRoot}`,
+      "DEFAULT_REPO=",
+      "DEV_GUILD_ID=",
+      "DEFAULT_MODEL=claude-sonnet-5",
+      "DEFAULT_CONTEXT_TIER=default",
+      "",
+    ].join("\n")
+  );
   return target;
 }
 
@@ -30,6 +57,31 @@ async function advanceRemote(label: string): Promise<string> {
   return (await git(source, "rev-parse", "HEAD")).stdout.trim();
 }
 
+async function runUpdate(target: string, ...args: string[]): Promise<{ code: number; output: string }> {
+  const home = path.join(root, `home-${serial}`);
+  await fs.promises.mkdir(home, { recursive: true });
+  try {
+    await exec(process.execPath, [ENGINE, ...args], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        DISCORD_COPILOT_SDK_UPDATE_ROOT: target,
+        HOME: home,
+        USERPROFILE: home,
+      },
+      encoding: "utf8",
+    });
+    return { code: 0, output: "" };
+  } catch (error) {
+    const failure = typeof error === "object" && error !== null ? (error as Record<string, unknown>) : {};
+    const output = `${typeof failure["stdout"] === "string" ? failure["stdout"] : ""}${typeof failure["stderr"] === "string" ? failure["stderr"] : ""}`;
+    return {
+      code: typeof failure["code"] === "number" ? failure["code"] : 1,
+      output,
+    };
+  }
+}
+
 beforeAll(async () => {
   root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dcs-update-git-"));
   source = path.join(root, "source");
@@ -38,6 +90,11 @@ beforeAll(async () => {
   await git(source, "config", "user.email", "update@test.invalid");
   await git(source, "config", "user.name", "update test");
   await git(source, "config", "commit.gpgsign", "false");
+  await fs.promises.mkdir(path.join(source, "scripts", "lib"), { recursive: true });
+  await fs.promises.writeFile(path.join(source, "package.json"), JSON.stringify({ name: "discord-copilot-sdk" }));
+  await fs.promises.writeFile(path.join(source, ".gitignore"), ".env\n");
+  await fs.promises.copyFile(path.join(ROOT, "scripts", "lib", "validate.mjs"), path.join(source, "scripts", "lib", "validate.mjs"));
+  await fs.promises.copyFile(path.join(ROOT, "stop-bot.ps1"), path.join(source, "stop-bot.ps1"));
   await fs.promises.writeFile(path.join(source, "README.md"), "initial\n");
   await git(source, "add", "-A");
   await git(source, "commit", "-q", "-m", "initial");
@@ -51,42 +108,38 @@ afterAll(async () => {
 });
 
 describe("git update data paths", { timeout: 60_000 }, () => {
-  it("fails closed for a dirty named branch without moving HEAD", async () => {
-    const local = await clone("dirty");
+  it("refuses a dirty named branch before moving it to a newer remote commit", async () => {
+    const local = await cloneTarget("dirty");
     const before = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+    const remoteSha = await advanceRemote("dirty remote advance");
     await fs.promises.writeFile(path.join(local, "local-only.txt"), "do not overwrite\n");
-    const status = (await git(local, "status", "--porcelain")).stdout;
-    const branch = (await git(local, "symbolic-ref", "--short", "HEAD")).stdout.trim();
 
-    expect(classifyCheckout({ symbolicRef: branch, status })).toBe("branch-dirty");
+    expect((await runUpdate(local)).code).toBe(1);
+    expect(before).not.toBe(remoteSha);
     expect((await git(local, "rev-parse", "HEAD")).stdout.trim()).toBe(before);
   });
 
-  it("fast-forwards a clean named branch only after Git proves ancestry", async () => {
-    const local = await clone("fast-forward");
-    const before = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+  it("fast-forwards a clean named branch through the real updater", async () => {
+    const local = await cloneTarget("fast-forward");
     const expected = await advanceRemote("fast forward");
 
-    await git(local, "fetch", "origin", "main");
-    await git(local, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD");
-    await git(local, "merge", "--ff-only", "FETCH_HEAD");
-
-    expect(before).not.toBe(expected);
-    expect((await git(local, "rev-parse", "HEAD")).stdout.trim()).toBe(expected);
+    // The fixture deliberately omits setup.mjs. The updater therefore fails
+    // AFTER its git apply phase, which proves the engine's fetch/merge path
+    // without installing packages or touching the real bot state.
+    const result = await runUpdate(local);
+    expect(result.code, result.output).toBe(1);
+    expect((await git(local, "rev-parse", "HEAD")).stdout.trim(), result.output).toBe(expected);
   });
 
-  it("updates a bootstrap-managed detached checkout from FETCH_HEAD", async () => {
-    const local = await clone("managed");
+  it("moves a bootstrap-managed detached checkout to FETCH_HEAD through the engine", async () => {
+    const local = await cloneTarget("managed");
     await git(local, "checkout", "-q", "--detach");
     const expected = await advanceRemote("managed update");
-    const status = (await git(local, "status", "--porcelain")).stdout;
 
-    expect(classifyCheckout({ symbolicRef: "", status })).toBe("managed");
-    await git(local, "fetch", "--depth", "1", "origin", "main");
-    await git(local, "checkout", "-q", "--detach", "FETCH_HEAD");
-
-    expect((await git(local, "rev-parse", "HEAD")).stdout.trim()).toBe(expected);
-    expect((await git(local, "symbolic-ref", "--quiet", "HEAD").catch(() => ({ stdout: "" }))).stdout.trim()).toBe("");
+    const result = await runUpdate(local);
+    expect(result.code, result.output).toBe(1);
+    expect((await git(local, "rev-parse", "HEAD")).stdout.trim(), result.output).toBe(expected);
+    await expect(git(local, "symbolic-ref", "--quiet", "HEAD")).rejects.toBeDefined();
   });
 
   it("compares an annotated release tag with its peeled commit, not tag object", async () => {
