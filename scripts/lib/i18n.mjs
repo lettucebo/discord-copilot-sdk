@@ -116,6 +116,7 @@ const MESSAGES = {
       "警告：有 {0} 個可恢復 thread、{1} 個髒 worktree，{2} 個無法讀取的 session store。Windows 上更新會硬砍進行中的 turn。",
     updateConfirm: "仍要更新嗎？[y/N] ",
     updateRestoreDone: "已還原更新前的執行狀態。",
+    updateCancelled: "已在 active-thread guard 取消更新。",
     updateAlreadyCurrent: "已是最新版本（{0}）。",
     updateCurrentRemote: "目前 {0}，遠端 {1}（{2}），checkout={3}。",
     updateDryRun: "Dry run：會 fetch、驗證新設定、先停止每個 bot 的常駐服務、移動 HEAD、執行 setup，再還原原本狀態。",
@@ -209,6 +210,7 @@ const MESSAGES = {
       "Warning: {0} resumable thread(s), {1} dirty worktree(s), and {2} unreadable session store(s) exist. Windows updates hard-kill an in-flight turn.",
     updateConfirm: "Continue with the update? [y/N] ",
     updateRestoreDone: "Restored the pre-update running state.",
+    updateCancelled: "Update cancelled at the active-thread guard.",
     updateAlreadyCurrent: "Already up to date ({0}).",
     updateCurrentRemote: "Local {0}, remote {1} ({2}), checkout={3}.",
     updateDryRun:
@@ -232,6 +234,17 @@ export function t(key, lang) {
   if (key in table) return table[key];
   if (key in MESSAGES.en) return MESSAGES.en[key];
   return key;
+}
+
+/** Substitute numbered placeholders without hiding an incomplete operator message. */
+export function formatMessage(template, values) {
+  if (!Array.isArray(values)) throw new TypeError("message values must be an array");
+  return String(template).replace(/\{(\d+)\}/g, (_, indexText) => {
+    const index = Number(indexText);
+    const value = values[index];
+    if (value === undefined) throw new Error(`missing message value {${index}}`);
+    return String(value);
+  });
 }
 
 /** All message keys (for parity checks/tests). */

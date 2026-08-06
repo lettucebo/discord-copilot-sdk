@@ -27,7 +27,7 @@ import {
   updateLockRelativePath,
 } from "./lib/update-core.mjs";
 import { nodeVersionOk } from "./lib/setup-core.mjs";
-import { detectLang, t } from "./lib/i18n.mjs";
+import { detectLang, formatMessage, t } from "./lib/i18n.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
@@ -39,8 +39,7 @@ class UpdateError extends Error {}
 
 const flags = parseUpdateArgs(process.argv.slice(2));
 const lang = flags.lang ?? detectLang(process.env);
-const message = (key, ...values) =>
-  t(key, lang).replace(/\{(\d+)\}/g, (_, index) => String(values[Number(index)] ?? ""));
+const message = (key, ...values) => formatMessage(t(key, lang), values);
 
 function run(command, args, opts = {}) {
   return execFileSync(command, args, {
@@ -263,7 +262,7 @@ async function confirmActiveThreads(summary) {
   console.log(message("updateActiveThreads", summary.threads, summary.dirtyWorktrees, summary.unreadable));
   if (flags.yes) return;
   const accepted = await ask(message("updateConfirm"));
-  if (!accepted) throw new UpdateError("update cancelled at the active-thread guard");
+  if (!accepted) throw new UpdateError(message("updateCancelled"));
 }
 
 function readWindowsResidency(instance) {
