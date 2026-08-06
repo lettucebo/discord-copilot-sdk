@@ -158,8 +158,9 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 The network form downloads a fresh updater engine to a private temporary
 directory. That engine stops residency and bot processes **before** it changes
 the target checkout, so the bootstrap never replaces files held by a live bot.
-For a private fork, fetch `update.ps1` / `update.sh` through the same `gh api`
-pattern shown in §2.
+The updater deliberately trusts only this upstream origin; updating a private
+fork is not supported in v1, even if its bootstrap script is fetched through
+`gh api`.
 
 ### Local commands and guarantees
 
@@ -205,11 +206,12 @@ residency is only re-enabled/restarted; it is never re-registered, so a Windows
 ### Releases
 
 `--version` shows the app SemVer release, commit SHA, and installed Copilot SDK.
-`CHANGELOG.md` is the GitHub Release source and starts at `0.1.0`; it is
-English-only by design because each tag creates one GitHub Release. Prepare
-`[Unreleased]`, then explicitly run `npm run release -- <version>` from a clean
-tree. The helper commits the version/changelog and creates annotated `v<version>`;
-push the branch and tag to publish the release workflow.
+`CHANGELOG.md` records release changes and starts at `0.1.0`; it is English-only
+by design because each tag creates one GitHub Release. The workflow generates
+GitHub Release notes automatically. Prepare `[Unreleased]`, then explicitly run
+`npm run release -- <version>` from a clean tree. The helper commits the
+version/changelog and creates annotated `v<version>`; push the branch and tag
+to publish the release workflow.
 
 ---
 

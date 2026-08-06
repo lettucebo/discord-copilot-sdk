@@ -153,7 +153,7 @@ bash install.sh --skip-auth
 curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.sh | bash
 ```
 
-網路形式會把最新更新 engine 下載到私有暫存目錄。engine 會在改動目標 checkout **之前**先停常駐與 bot，所以 bootstrap 不會覆寫 live bot 正在使用的檔案。若是 private fork，請用 §2 展示的同一種 `gh api` 方式取得 `update.ps1`／`update.sh`。
+網路形式會把最新更新 engine 下載到私有暫存目錄。engine 會在改動目標 checkout **之前**先停常駐與 bot，所以 bootstrap 不會覆寫 live bot 正在使用的檔案。更新器刻意只信任本 upstream origin；即使可用 `gh api` 取得 bootstrap，v1 仍不支援更新 private fork。
 
 ### 本機命令與保證
 
@@ -183,7 +183,7 @@ apply 順序是：唯讀 preflight → 停常駐 → 停 bot → 移動 source �
 
 ### 發版
 
-`--version` 會顯示 app SemVer、commit SHA 與已安裝的 Copilot SDK。`CHANGELOG.md` 是 GitHub Release 的來源，從 `0.1.0` 開始；它刻意只用英文，因為一個 tag 只產生一份 GitHub Release。先寫好 `[Unreleased]`，再從乾淨工作樹明確執行 `npm run release -- <version>`。helper 會 commit 版本／changelog 並建立 annotated `v<version>`；推送 branch 與 tag 後才會發布 release workflow。
+`--version` 會顯示 app SemVer、commit SHA 與已安裝的 Copilot SDK。`CHANGELOG.md` 記錄發版變更，從 `0.1.0` 開始；它刻意只用英文，因為一個 tag 只產生一份 GitHub Release。workflow 會自動產生 GitHub Release notes。先寫好 `[Unreleased]`，再從乾淨工作樹明確執行 `npm run release -- <version>`。helper 會 commit 版本／changelog 並建立 annotated `v<version>`；推送 branch 與 tag 後才會發布 release workflow。
 
 ---
 

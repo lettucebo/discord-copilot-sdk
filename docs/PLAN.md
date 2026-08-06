@@ -290,7 +290,7 @@ resume 的錯誤。
 - 網路一行形式不直接 fetch/checkout 目標；它下載最新 engine 到私有暫存目錄，讓 engine 先停常駐與 bot 再變更 source。這保留自救能力，也避免 Windows npm 覆寫 live runtime 的 EPERM。
 - dev branch 僅允許乾淨且 `merge-base --is-ancestor` 可證明的 `git merge --ff-only`；managed detached clone 用 depth-one fetch 加 `checkout --detach FETCH_HEAD`。
 - 不做 Discord `/update`：行程不能安全覆寫自己的 runtime，失敗後 Discord 也無法回報；這是 fail-closed 取捨，不是 UX 缺漏。
-- 初始版本為 SemVer `0.1.0`，`--version` 顯示 app 版號、commit 與 SDK。`CHANGELOG.md` 作為單一 GitHub Release 的英文來源；使用者可在乾淨 tree 執行 release helper 建 commit 與 annotated tag。
+- 初始版本為 SemVer `0.1.0`，`--version` 顯示 app 版號、commit 與 SDK。`CHANGELOG.md` 以英文記錄 release 變更；tag push 的 workflow 另行自動產生 GitHub Release notes。使用者可在乾淨 tree 執行 release helper 建 commit 與 annotated tag。
 
 ### 14.2 殘留風險
 
