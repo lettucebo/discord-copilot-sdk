@@ -25,7 +25,7 @@ function relativeMarkdownLinks(text: string): string[] {
 }
 
 /** Every .ps1 an end user is told to run. */
-const USER_FACING_PS1 = ["install.ps1", "get.ps1", "run-bot.ps1", "stop-bot.ps1", "uninstall.ps1"];
+const USER_FACING_PS1 = ["install.ps1", "get.ps1", "update.ps1", "run-bot.ps1", "stop-bot.ps1", "uninstall.ps1"];
 
 describe("shipped scripts", () => {
   it.each(USER_FACING_PS1)("%s starts with a UTF-8 BOM", (name) => {
@@ -44,7 +44,7 @@ describe("shipped scripts", () => {
     expect(buf.subarray(3, 4).toString()).not.toMatch(/\s/);
   });
 
-  const SHELL = ["install.sh", "get.sh", "run-bot.sh", "stop-bot.sh", "uninstall.sh"];
+  const SHELL = ["install.sh", "get.sh", "update.sh", "run-bot.sh", "stop-bot.sh", "uninstall.sh"];
 
   it.each(SHELL)("%s has a shebang and no CRLF in the committed form", (name) => {
     // `.gitattributes` normalises *.sh to LF, but a stray CR would still make
@@ -201,5 +201,18 @@ describe("shipped scripts", () => {
     expect(tracked).toBe("");
     const ignore = fs.readFileSync(path.join(ROOT, ".gitignore"), "utf8");
     expect(ignore).toMatch(/^package-lock\.json$/m);
+  });
+
+  it("pins every user-facing PowerShell script to CRLF", () => {
+    const attributes = fs.readFileSync(path.join(ROOT, ".gitattributes"), "utf8");
+    for (const file of USER_FACING_PS1) {
+      expect(attributes).toContain(`${file} text eol=crlf`);
+    }
+  });
+
+  it("runs syntax checks for every shipped update entrypoint in CI", () => {
+    const workflow = fs.readFileSync(path.join(ROOT, ".github", "workflows", "ci.yml"), "utf8");
+    expect(workflow).toContain("update.sh");
+    expect(workflow).toContain("update.ps1");
   });
 });
