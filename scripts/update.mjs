@@ -302,8 +302,8 @@ function writeState(instance, state) {
 }
 
 function acquireUpdateLock(instance) {
-  fs.mkdirSync(STATE_DIR, { recursive: true });
   const lock = updateLockPath(instance);
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
   let fd;
   try {
     fd = fs.openSync(lock, "wx");
