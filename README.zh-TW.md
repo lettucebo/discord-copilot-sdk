@@ -111,7 +111,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 ```powershell
 ./update.ps1 -Check                 # 唯讀；0=已是目前、2=不同、1=preflight 拒絕
 ./update.ps1 -DryRun                # 完整計畫，但不 fetch、停機、建置或寫入
-./update.ps1 -Ref v0.1.0            # 釘在 annotated 或 lightweight release tag
+./update.ps1 -Ref refs/tags/v0.1.0  # 釘在 annotated 或 lightweight release tag
 ./update.ps1 -AllInstances          # 明確同時處理所有 live 本機 instance
 ./update.ps1 -Restore               # 在 apply 失敗後還原保留的狀態
 ```
@@ -119,7 +119,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 ```bash
 ./update.sh --check
 ./update.sh --dry-run
-./update.sh --ref v0.1.0
+./update.sh --ref refs/tags/v0.1.0
 ./update.sh --all-instances
 ./update.sh --restore
 ```

@@ -160,7 +160,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 ```powershell
 ./update.ps1 -Check
 ./update.ps1 -DryRun
-./update.ps1 -Ref v0.1.0
+./update.ps1 -Ref refs/tags/v0.1.0
 ./update.ps1 -AllInstances
 ./update.ps1 -Restore
 ```
@@ -168,7 +168,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 ```bash
 ./update.sh --check
 ./update.sh --dry-run
-./update.sh --ref v0.1.0
+./update.sh --ref refs/tags/v0.1.0
 ./update.sh --all-instances
 ./update.sh --restore
 ```

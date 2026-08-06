@@ -25,11 +25,12 @@ param(
   [string]$Dir
 )
 
+$exitProcess = [string]::IsNullOrEmpty($MyInvocation.Line)
 & {
   param(
     [string]$Lang, [switch]$Check, [switch]$DryRun, [switch]$Yes,
     [switch]$NoRestart, [switch]$AllInstances, [switch]$Restore,
-    [string]$Ref, [string]$Dir
+    [string]$Ref, [string]$Dir, [bool]$ExitProcess
   )
   $ErrorActionPreference = 'Stop'
   try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
@@ -46,6 +47,9 @@ param(
 
   if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot 'scripts\update.mjs'))) {
     & node (Join-Path $PSScriptRoot 'scripts\update.mjs') @forward
+    $code = $LASTEXITCODE
+    if ($ExitProcess) { exit $code }
+    $global:LASTEXITCODE = $code
     return
   }
 
@@ -77,10 +81,13 @@ param(
     }
     $env:DISCORD_COPILOT_SDK_UPDATE_ROOT = [IO.Path]::GetFullPath($target)
     & $node (Join-Path $temp 'scripts\update.mjs') @forward
+    $code = $LASTEXITCODE
+    if ($ExitProcess) { exit $code }
+    $global:LASTEXITCODE = $code
     return
   }
   finally {
     Remove-Item Env:\DISCORD_COPILOT_SDK_UPDATE_ROOT -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
   }
-} @PSBoundParameters
+} @PSBoundParameters -ExitProcess:$exitProcess

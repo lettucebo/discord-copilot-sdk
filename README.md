@@ -184,7 +184,7 @@ Run it locally for the available safeguards:
 ```powershell
 ./update.ps1 -Check                 # read-only; 0=current, 2=differs, 1=preflight refusal
 ./update.ps1 -DryRun                # full plan, no fetch, stop, build, or write
-./update.ps1 -Ref v0.1.0            # pin an annotated or lightweight release tag
+./update.ps1 -Ref refs/tags/v0.1.0  # pin an annotated or lightweight release tag
 ./update.ps1 -AllInstances          # explicitly include every live local instance
 ./update.ps1 -Restore               # restore state kept after a failed apply
 ```
@@ -192,7 +192,7 @@ Run it locally for the available safeguards:
 ```bash
 ./update.sh --check
 ./update.sh --dry-run
-./update.sh --ref v0.1.0
+./update.sh --ref refs/tags/v0.1.0
 ./update.sh --all-instances
 ./update.sh --restore
 ```

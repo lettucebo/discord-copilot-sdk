@@ -167,7 +167,7 @@ fork is not supported in v1, even if its bootstrap script is fetched through
 ```powershell
 ./update.ps1 -Check
 ./update.ps1 -DryRun
-./update.ps1 -Ref v0.1.0
+./update.ps1 -Ref refs/tags/v0.1.0
 ./update.ps1 -AllInstances
 ./update.ps1 -Restore
 ```
@@ -175,7 +175,7 @@ fork is not supported in v1, even if its bootstrap script is fetched through
 ```bash
 ./update.sh --check
 ./update.sh --dry-run
-./update.sh --ref v0.1.0
+./update.sh --ref refs/tags/v0.1.0
 ./update.sh --all-instances
 ./update.sh --restore
 ```
