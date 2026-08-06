@@ -1,10 +1,27 @@
 import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   classifyCheckout,
   orderUpdateSteps,
   parseLsRemote,
   resolveRemoteSha,
 } from "../scripts/lib/update-core.mjs";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+describe("update-core purity", () => {
+  it("does not import or invoke filesystem or subprocess APIs", () => {
+    // This module decides whether it is safe to stop a running bot. Keeping its
+    // decision functions free of effects lets its tests cover every path without
+    // mutating a checkout or probing a real process.
+    const source = fs.readFileSync(path.join(ROOT, "scripts", "lib", "update-core.mjs"), "utf8");
+
+    expect(source).not.toMatch(/from\s+["']node:(?:fs|child_process|process)["']/);
+    expect(source).not.toMatch(/\b(?:execFileSync|execSync|spawnSync|readFileSync|writeFileSync)\b/);
+  });
+});
 
 describe("classifyCheckout", () => {
   it("recognizes a clean detached checkout as bootstrap-managed", () => {
