@@ -30,7 +30,8 @@ import { nodeVersionOk } from "./lib/setup-core.mjs";
 import { detectLang, formatMessage, t } from "./lib/i18n.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(HERE, "..");
+const requestedRoot = process.env.DISCORD_COPILOT_SDK_UPDATE_ROOT;
+const REPO_ROOT = requestedRoot && path.isAbsolute(requestedRoot) ? path.resolve(requestedRoot) : path.resolve(HERE, "..");
 const STATE_DIR = path.join(os.homedir(), ".discord-copilot-sdk");
 const REPO_URL = "https://github.com/lettucebo/discord-copilot-sdk.git";
 const INSTANCE_RE = /^[A-Za-z0-9._-]{1,64}$/;
@@ -76,6 +77,9 @@ function updateLockPath(instance) {
 }
 
 function ensureRepo() {
+  if (requestedRoot && !path.isAbsolute(requestedRoot)) {
+    throw new UpdateError("DISCORD_COPILOT_SDK_UPDATE_ROOT must be absolute");
+  }
   let pkg;
   try {
     pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
