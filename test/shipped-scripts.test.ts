@@ -212,8 +212,8 @@ describe("shipped scripts", () => {
 
   it("runs syntax checks for every shipped update entrypoint in CI", () => {
     const workflow = fs.readFileSync(path.join(ROOT, ".github", "workflows", "ci.yml"), "utf8");
-    expect(workflow).toContain("update.sh");
-    expect(workflow).toContain("update.ps1");
+    expect(workflow).toMatch(/for f in install\.sh get\.sh update\.sh run-bot\.sh stop-bot\.sh uninstall\.sh; do/);
     expect(workflow).toMatch(/for f in scripts\/setup\.mjs scripts\/update\.mjs scripts\/lib\/\*\.mjs; do/);
+    expect(workflow).toMatch(/\$files = 'install\.ps1', 'get\.ps1', 'update\.ps1', 'run-bot\.ps1', 'stop-bot\.ps1', 'uninstall\.ps1'/);
   });
 });
