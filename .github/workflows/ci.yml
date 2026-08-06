@@ -63,7 +63,7 @@ jobs:
           done
       # Node syntax check for the installer engine + its pure libs.
       - run: |
-          for f in scripts/setup.mjs scripts/update.mjs scripts/uninstall.mjs scripts/lib/*.mjs; do
+          for f in scripts/setup.mjs scripts/update.mjs scripts/uninstall.mjs scripts/release.mjs scripts/lib/*.mjs; do
             echo "node --check $f"
             node --check "$f"
           done
