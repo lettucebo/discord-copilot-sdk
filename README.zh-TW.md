@@ -127,6 +127,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 `--check` 適合監控：`0` 表示已在要求的 ref，`2` 表示不同，`1` 表示 fail-closed preflight 拒絕、需要人工處理。具名開發分支只有在乾淨且可 fast-forward 時才會更新；dirty、divergent 或無法辨識的 checkout 一律在停機前拒絕。若還有其他 live instance，必須明確加 `--all-instances`。
 
 若 source 已變更後 setup 失敗，更新器會刻意保持 bot 停止，並保留 `~/.discord-copilot-sdk/update-state.<instance>.json`；修正原因後再跑 `--restore`。Windows 停 bot 是硬終止，進行中的 turn 可能遺失。完整生命週期與發版規則見 [`INSTALL.zh-TW.md`](INSTALL.zh-TW.md)。
+該 restore state 未處理前，新的 apply 會被拒絕；`--check` 與 `--dry-run` 仍可用於診斷。
 
 ## 解除安裝
 

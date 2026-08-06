@@ -83,11 +83,13 @@ export function remoteRefSpecs(requestedRef) {
  *   remoteSha: string | null,
  *   runningInstances: readonly string[],
  *   allInstances: boolean,
+ *   pendingRestore?: boolean,
  *   mode?: "check" | "dry-run"
  * }} input
  * @returns {{action: "refuse", reason: string} | {action: "up-to-date" | "check" | "dry-run" | "apply"}}
  */
-export function planUpdate({ checkout, localSha, remoteSha, runningInstances, allInstances, mode }) {
+export function planUpdate({ checkout, localSha, remoteSha, runningInstances, allInstances, pendingRestore, mode }) {
+  if (pendingRestore && mode === undefined) return { action: "refuse", reason: "pending-restore" };
   if (checkout !== "managed" && checkout !== "branch-clean") return { action: "refuse", reason: checkout };
   if (typeof remoteSha !== "string" || remoteSha === "") return { action: "refuse", reason: "remote-not-found" };
   if (Array.isArray(runningInstances) && runningInstances.length > 1 && !allInstances) {

@@ -209,6 +209,8 @@ bot stopped and retains `~/.discord-copilot-sdk/update-state.<instance>.json`;
 fix the reported problem, then run `--restore`. On Windows, stopping a bot is a
 hard process termination, so an in-flight turn can be lost. See
 [`INSTALL.md`](INSTALL.md) for the detailed lifecycle and release policy.
+Until that restore state is resolved, a new apply is refused; `--check` and
+`--dry-run` remain available for diagnosis.
 
 ## Uninstall
 

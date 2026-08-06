@@ -180,6 +180,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 apply 順序是：唯讀 preflight → 停常駐 → 停 bot → 移動 source → `setup.mjs --yes --skip-auth --no-residency` → 還原。既有常駐只會重新 enable/start，絕不重新 register，所以 Windows 24/7 task 不會悄悄降成登入後保活。
 
 > ⚠️ source 已變更後若 setup 失敗，更新器會刻意讓 bot 保持停止、保留 `~/.discord-copilot-sdk/update-state.<instance>.json`，並印出 `--restore` 指令。Windows 停止是硬終止，進行中的 turn 可能遺失。先查看 active thread/worktree，只有確定可中斷時才確認 guard（或使用 `--yes`）。
+> 未處理的 restore state 不能被新的 apply 覆蓋；在 `--restore` 解決前，`--check` 與 `--dry-run` 仍是安全的診斷方式。
 
 ### 發版
 

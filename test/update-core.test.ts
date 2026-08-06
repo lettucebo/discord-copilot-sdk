@@ -206,6 +206,18 @@ describe("planUpdate", () => {
     });
   });
 
+  it("refuses to overwrite a failed update's restore state", () => {
+    expect(planUpdate({ ...base, pendingRestore: true })).toEqual({
+      action: "refuse",
+      reason: "pending-restore",
+    });
+  });
+
+  it("allows read-only inspection while restore state is pending", () => {
+    expect(planUpdate({ ...base, pendingRestore: true, mode: "check" })).toEqual({ action: "check" });
+    expect(planUpdate({ ...base, pendingRestore: true, mode: "dry-run" })).toEqual({ action: "dry-run" });
+  });
+
   it("short-circuits an already-current checkout", () => {
     expect(planUpdate({ ...base, localSha: base.remoteSha })).toEqual({ action: "up-to-date" });
   });

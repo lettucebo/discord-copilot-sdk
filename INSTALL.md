@@ -203,6 +203,8 @@ residency is only re-enabled/restarted; it is never re-registered, so a Windows
 > and prints the `--restore` command. On Windows stopping is a hard termination,
 > so an in-flight turn may be lost. Review active threads/worktrees first and
 > confirm the guard (or pass `--yes`) only when that interruption is acceptable.
+> A new apply refuses to overwrite pending restore state; `--check` and
+> `--dry-run` remain safe diagnostics until `--restore` resolves it.
 
 ### Releases
 

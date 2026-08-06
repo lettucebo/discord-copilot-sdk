@@ -462,6 +462,7 @@ async function main() {
   const local = localSha();
   const checkout = checkoutFacts();
   const instance = currentInstance();
+  const pendingRestore = fs.existsSync(statePath(instance));
   const live = liveInstances();
   const otherLive = live.filter((entry) => entry.instance !== instance);
   if (otherLive.length && !flags.allInstances) {
@@ -474,6 +475,7 @@ async function main() {
     remoteSha: remote?.sha ?? null,
     runningInstances: live.map((entry) => entry.instance),
     allInstances: flags.allInstances,
+    pendingRestore,
     mode: flags.check ? "check" : flags.dryRun ? "dry-run" : undefined,
   });
   if (decision.action === "refuse") throw new UpdateError(`preflight refused: ${decision.reason}`);
