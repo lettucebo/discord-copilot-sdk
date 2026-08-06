@@ -1,0 +1,86 @@
+import { describe, expect, it } from "vitest";
+import {
+  classifyCheckout,
+  orderUpdateSteps,
+  parseLsRemote,
+  resolveRemoteSha,
+} from "../scripts/lib/update-core.mjs";
+
+describe("classifyCheckout", () => {
+  it("recognizes a clean detached checkout as bootstrap-managed", () => {
+    expect(classifyCheckout({ symbolicRef: "", status: "" })).toBe("managed");
+  });
+
+  it("recognizes a clean named branch as eligible for fast-forward-only update", () => {
+    expect(classifyCheckout({ symbolicRef: "main", status: "" })).toBe("branch-clean");
+  });
+
+  it("refuses a named branch with local changes before stopping the bot", () => {
+    expect(classifyCheckout({ symbolicRef: "main", status: " M README.md" })).toBe("branch-dirty");
+  });
+
+  it("fails closed when git could not supply a checkout fact", () => {
+    expect(classifyCheckout({ symbolicRef: null, status: "" })).toBe("unknown");
+    expect(classifyCheckout({ symbolicRef: "", status: null })).toBe("unknown");
+  });
+});
+
+describe("resolveRemoteSha", () => {
+  it("uses the peeled commit for an annotated tag instead of its tag object", () => {
+    const refs = parseLsRemote(
+      [
+        "1111111111111111111111111111111111111111\trefs/heads/main",
+        "2222222222222222222222222222222222222222\trefs/tags/v1.2.3",
+        "3333333333333333333333333333333333333333\trefs/tags/v1.2.3^{}",
+      ].join("\n")
+    );
+
+    expect(resolveRemoteSha(refs, "v1.2.3")).toEqual({
+      sha: "3333333333333333333333333333333333333333",
+      ref: "refs/tags/v1.2.3^{}",
+    });
+  });
+
+  it("prefers a branch when a short ref ambiguously names both a branch and a tag", () => {
+    const refs = parseLsRemote(
+      [
+        "1111111111111111111111111111111111111111\trefs/heads/release",
+        "2222222222222222222222222222222222222222\trefs/tags/release",
+        "3333333333333333333333333333333333333333\trefs/tags/release^{}",
+      ].join("\n")
+    );
+
+    expect(resolveRemoteSha(refs, "release")).toEqual({
+      sha: "1111111111111111111111111111111111111111",
+      ref: "refs/heads/release",
+    });
+  });
+
+  it("honors a fully-qualified tag ref to remove the branch/tag ambiguity", () => {
+    const refs = parseLsRemote(
+      [
+        "1111111111111111111111111111111111111111\trefs/heads/release",
+        "2222222222222222222222222222222222222222\trefs/tags/release",
+        "3333333333333333333333333333333333333333\trefs/tags/release^{}",
+      ].join("\n")
+    );
+
+    expect(resolveRemoteSha(refs, "refs/tags/release")).toEqual({
+      sha: "3333333333333333333333333333333333333333",
+      ref: "refs/tags/release^{}",
+    });
+  });
+
+  it("fails closed for malformed records and an unknown ref", () => {
+    expect(parseLsRemote("malformed\n")).toEqual([]);
+    expect(resolveRemoteSha(parseLsRemote("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main"), "nope")).toBe(null);
+  });
+});
+
+describe("orderUpdateSteps", () => {
+  it("disables residency before stopping the process", () => {
+    const steps = orderUpdateSteps(["process", "residency", "source"]);
+
+    expect(steps.indexOf("residency")).toBeLessThan(steps.indexOf("process"));
+  });
+});
