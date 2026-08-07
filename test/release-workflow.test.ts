@@ -23,6 +23,7 @@ describe("release workflow contract", () => {
     expect(workflow).toMatch(/version="\$\{GITHUB_REF_NAME#v\}"/);
     expect(workflow).toMatch(/node scripts\/release\.mjs --notes "\$version" > release-notes\.md/);
     expect(workflow).toMatch(/- uses: softprops\/action-gh-release@v2\s*\n\s*with:\s*\n(?:\s+.*\n)*\s*body_path:\s*release-notes\.md\n(?:\s+.*\n)*\s*generate_release_notes:\s*true/);
+    expect(workflow).not.toMatch(/\bappend_body\s*:/);
     expect(workflow).not.toMatch(/run:\s*npm install\b/);
     expect(workflow).not.toMatch(/\bgh release create\b/);
     expect(workflow).not.toMatch(/\bprevious_tag\s*:/);
