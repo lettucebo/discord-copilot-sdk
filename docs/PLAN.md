@@ -290,7 +290,9 @@ resume 的錯誤。
 - 網路一行形式不直接 fetch/checkout 目標；它下載最新 engine 到私有暫存目錄，讓 engine 先停常駐與 bot 再變更 source。這保留自救能力，也避免 Windows npm 覆寫 live runtime 的 EPERM。
 - dev branch 僅允許乾淨且 `merge-base --is-ancestor` 可證明的 `git merge --ff-only`；managed detached clone 用 depth-one fetch 加 `checkout --detach FETCH_HEAD`。
 - 不做 Discord `/update`：行程不能安全覆寫自己的 runtime，失敗後 Discord 也無法回報；這是 fail-closed 取捨，不是 UX 缺漏。
-- 初始版本為 SemVer `0.1.0`，`--version` 顯示 app 版號、commit 與 SDK。`CHANGELOG.md` 以英文記錄 release 變更；tag push 的 workflow 另行自動產生 GitHub Release notes。使用者可在乾淨 tree 執行 release helper 建 commit 與 annotated tag。
+- 初始版本為 SemVer `0.1.0`，`--version` 顯示 app 版號、commit 與 SDK。發版分成「規劃」與「發布」兩步：先跑 `node scripts/release.mjs --plan` 取得 version 提案、`CHANGELOG DRAFT` 與 `REVIEW BY HAND`，但那只是證據；必須由人確認版本與整理過的英文 notes，先合併進 `## [Unreleased]` 並 commit，之後才可在乾淨 tree 執行 `npm run release -- <version>` 建立 release commit 與 annotated tag。真正發布只靠 `git push --follow-tags` 觸發 workflow；workflow 先用 `node scripts/release.mjs --notes <version>` 讀取最終 `CHANGELOG.md` 區段當 release body，再附 GitHub 自動產生的 notes，不手動 `gh release create`。
+- 發版版本規則固定為：在 `0.x` 期間，breaking 變更升 **minor**、`feat` 升 **patch**、`fix` / `perf` / security fix（含 `fix(security)` 與 subject 含 `CVE`）都升 **patch**；`>=1.0.0` 後才改成 breaking 升 **major**、`feat` 升 **minor**、`fix` / `perf` / security fix 升 **patch**。若沒有任何 release-worthy commit，就不發版、不硬湊版本號。`REVIEW BY HAND` 會自動攔下非 conventional 與非 ASCII 主旨；任何不明確是英文的文字都必須先由人重寫或翻譯，才能進 CHANGELOG。
+- `scripts/update.mjs` 對 release ref 的相容性是刻意設計：`remoteRefSpecs()` 對 `refs/tags/vX.Y.Z` 會同時展開 `refs/tags/vX.Y.Z` 與 `refs/tags/vX.Y.Z^{}`，`resolveRemoteSha()` 會偏好 peeled `^{}` commit，再由 `fetchResolved()` 在實際 fetch 前去掉 `^{}`。這是為了讓 `npm run update -- --ref refs/tags/vX.Y.Z` 同時相容 annotated 與 lightweight tags，而 `--check` 比較的也是最終 checkout 會落到的 commit。
 
 ### 14.2 殘留風險
 

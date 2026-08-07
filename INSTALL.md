@@ -209,12 +209,36 @@ residency is only re-enabled/restarted; it is never re-registered, so a Windows
 ### Releases
 
 `--version` shows the app SemVer release, commit SHA, and installed Copilot SDK.
-`CHANGELOG.md` records release changes and starts at `0.1.0`; it is English-only
-by design because each tag creates one GitHub Release. The workflow generates
-GitHub Release notes automatically. Prepare `[Unreleased]`, then explicitly run
-`npm run release -- <version>` from a clean tree. The helper commits the
-version/changelog and creates annotated `v<version>`; push the branch and tag
-to publish the release workflow.
+`CHANGELOG.md` records release changes and stays English-only by design because
+each tag creates one GitHub Release.
+
+Use this exact release flow:
+
+1. Run `node scripts/release.mjs --plan`. Its proposal is **evidence, not truth**.
+   The human confirms the version and the curated English notes.
+2. `REVIEW BY HAND` automatically includes non-conventional and non-ASCII
+   subjects. Anything not clearly English must be rewritten or translated by a
+   human before it enters `CHANGELOG.md`.
+3. Merge the approved notes into `## [Unreleased]` and commit them before the
+   release.
+4. From a clean tree run `npm run release -- <version>`. It creates the release
+   commit and an annotated `v<version>` tag locally, and never pushes.
+5. Push with `git push --follow-tags`. The workflow then calls
+   `node scripts/release.mjs --notes <version>`. The GitHub Release body is the
+   curated changelog section first, followed by GitHub-generated notes.
+6. Never run `gh release create` manually.
+
+`node scripts/release.mjs --notes <version>` prints the exact body of
+`## [<version>]` and fails when the section is missing or empty. No date
+restriction applies to `--notes`.
+
+SemVer policy:
+
+- 0.x: breaking change → minor; `feat` → patch; `fix` / `perf` / security fix
+  (`fix(security)` or `CVE`) → patch.
+- >=1.0.0: breaking change → major; `feat` → minor; `fix` / `perf` / security
+  fix → patch.
+- If there are no release-worthy commits, do not invent a version.
 
 ---
 

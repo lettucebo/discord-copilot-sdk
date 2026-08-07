@@ -184,7 +184,34 @@ apply 順序是：唯讀 preflight → 停常駐 → 停 bot → 移動 source �
 
 ### 發版
 
-`--version` 會顯示 app SemVer、commit SHA 與已安裝的 Copilot SDK。`CHANGELOG.md` 記錄發版變更，從 `0.1.0` 開始；它刻意只用英文，因為一個 tag 只產生一份 GitHub Release。workflow 會自動產生 GitHub Release notes。先寫好 `[Unreleased]`，再從乾淨工作樹明確執行 `npm run release -- <version>`。helper 會 commit 版本／changelog 並建立 annotated `v<version>`；推送 branch 與 tag 後才會發布 release workflow。
+`--version` 會顯示 app SemVer、commit SHA 與已安裝的 Copilot SDK。
+`CHANGELOG.md` 記錄發版變更，而且刻意只用英文，因為一個 tag 只會
+產生一份 GitHub Release。
+
+請使用這個精確流程：
+
+1. 先執行 `node scripts/release.mjs --plan`。它給的是**證據，不是真相**。
+   由人確認版本與整理過的英文 notes。
+2. `REVIEW BY HAND` 會自動包含非 conventional 與非 ASCII 的主旨。
+   任何不明確是英文的文字都必須先由人重寫或翻譯，才能進
+   `CHANGELOG.md`。
+3. 把核准的內容合併到 `## [Unreleased]` 並先 commit，再做 release。
+4. 從乾淨工作樹執行 `npm run release -- <version>`。它只會在本機建立
+   release commit 與 annotated `v<version>` tag，絕不會自動 push。
+5. 用 `git push --follow-tags` 推送。workflow 之後會呼叫
+   `node scripts/release.mjs --notes <version>`，GitHub Release 內文會先放
+   整理過的 changelog 區段，再接 GitHub 自動產生的 notes。
+6. 絕對不要手動執行 `gh release create`。
+
+`node scripts/release.mjs --notes <version>` 會印出 `## [<version>]` 的精確內容，缺少或為空時失敗。`--notes` 沒有「今天日期」限制。
+
+SemVer 政策：
+
+- 0.x：breaking 版更 → minor；`feat` → patch；`fix` / `perf` / security fix
+  （`fix(security)` 或 `CVE`）→ patch。
+- >=1.0.0：breaking 變更 → major；`feat` → minor；`fix` / `perf` / security
+  fix → patch。
+- 如果沒有值得發版的 commit，就不要硬湊版本號。
 
 ---
 

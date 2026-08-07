@@ -88,6 +88,66 @@ describe("shipped scripts", () => {
     }
   });
 
+  it("keeps the INSTALL twins aligned on the release planning contract", () => {
+    const english = fs.readFileSync(path.join(ROOT, "INSTALL.md"), "utf8");
+    const chinese = fs.readFileSync(path.join(ROOT, "INSTALL.zh-TW.md"), "utf8");
+    const englishFlat = english.replace(/\s+/g, " ").trim();
+    const chineseFlat = chinese.replace(/\s+/g, " ").trim();
+
+    expect(english).toContain("> **English** · [繁體中文](INSTALL.zh-TW.md)");
+    expect(chinese).toContain("> [English](INSTALL.md) · **繁體中文**");
+
+    const englishChecks = [
+      "node scripts/release.mjs --plan",
+      "evidence, not truth",
+      "The human confirms the version and the curated English notes.",
+      "Merge the approved notes into `## [Unreleased]` and commit them before the release.",
+      "npm run release -- <version>",
+      "git push --follow-tags",
+      "Never run `gh release create` manually.",
+      "prints the exact body of `## [<version>]`",
+      "fails when the section is missing or empty",
+      "No date restriction applies to `--notes`.",
+      "0.x: breaking change → minor",
+      "`feat` → patch",
+      "`fix` / `perf` / security fix (`fix(security)` or `CVE`) → patch.",
+      ">=1.0.0: breaking change → major",
+      "`feat` → minor",
+      "`fix` / `perf` / security fix → patch.",
+      "If there are no release-worthy commits, do not invent a version.",
+      "`REVIEW BY HAND` automatically includes non-conventional and non-ASCII subjects.",
+      "Anything not clearly English must be rewritten or translated by a human before it enters `CHANGELOG.md`.",
+      "The GitHub Release body is the curated changelog section first, followed by GitHub-generated notes.",
+    ];
+    for (const snippet of englishChecks) expect(englishFlat).toContain(snippet);
+
+    const chineseChecks = [
+      "node scripts/release.mjs --plan",
+      "證據，不是真相",
+      "由人確認版本與整理過的英文 notes",
+      "把核准的內容合併到 `## [Unreleased]` 並先 commit",
+      "npm run release -- <version>",
+      "git push --follow-tags",
+      "絕對不要手動執行 `gh release create`",
+      "印出 `## [<version>]` 的精確內容",
+      "缺少或為空時失敗",
+      "`--notes` 沒有「今天日期」限制",
+      "0.x：breaking 版更 → minor",
+      "`feat` → patch",
+      "`fix` / `perf` / security fix",
+      "（`fix(security)` 或 `CVE`）→ patch。",
+      ">=1.0.0：breaking 變更 → major",
+      "`feat` → minor",
+      "`fix` / `perf` / security fix → patch。",
+      "如果沒有值得發版的 commit，就不要硬湊版本號。",
+      "`REVIEW BY HAND` 會自動包含非 conventional 與非 ASCII 的主旨。",
+      "任何不明確是英文的文字都必須先由人重寫或翻譯，才能進 `CHANGELOG.md`。",
+      "GitHub Release 內文會先放",
+      "整理過的 changelog 區段，再接 GitHub 自動產生的 notes。",
+    ];
+    for (const snippet of chineseChecks) expect(chineseFlat).toContain(snippet);
+  });
+
   it("documents an install one-liner that matches the repo's actual visibility", () => {
     // This used to assert the opposite: while the repo was private,
     // `raw.githubusercontent.com` 404'd for everyone including its owner, so the
