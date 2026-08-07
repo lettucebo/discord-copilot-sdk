@@ -298,3 +298,96 @@ resume 的錯誤。
 
 - source 移動後的完整 runtime/schema 驗證必須先 build，而 Windows build 不能與 live runtime 共存；故預檢覆蓋新版 `validate.mjs`，但 setup 在 apply 後失敗時**不**自動 restore。operator 修正後必須明確 `--restore`。
 - Windows 用硬終止停止 bot，in-flight turn 可能遺失；active-thread guard 只報告可 resume 的 thread 與髒 worktree，不能誠實地宣稱知道記憶體中的 turn 是否正在執行。
+
+## 15. 平台路徑 test 字面量稽核（2026-08-07）
+
+### 15.1 觸發原因
+
+原 `test/version.test.ts` 把 Windows 字面量 `"C:\\repo\\package.json"` 當作
+`path.join(root, "package.json")` 的 expected value，在 Ubuntu CI 上
+`path.posix.join("C:\\repo", "package.json")` 會回 `"C:\\repo/package.json"`
+（正斜線），等式因此失敗。父任務已把 expected 也改成透過 `path.join` 推出，
+本節記錄跨全部 test 檔的完整稽核，確認沒有其他同類 bug。
+
+### 15.2 稽核結果
+
+* 掃描目標：`test/*.ts` 內所有 `C:\\`（等同來源中 `C:\`）字面量。
+* 統計：**12 個 test 檔、61 個字面量**（與父任務初始 grep 結果一致）。
+  細分：`version.test.ts` 11、`session-actor.test.ts` 12、`session-store.test.ts` 11、
+  `app-stop-flow.test.ts` 4、`config-contract.test.ts` 4、`config.test.ts` 1、
+  `env-file.test.ts` 3、`repo.test.ts` 4、`residency-powershell.test.ts` 2、
+  `residency.test.ts` 4、`uninstall-core.test.ts` 4、`worktree.test.ts` 1。
+* 分類（每個字面量都逐一檢視，非只看檔名）：
+  * **(a) 純字面量 / 身份鍵**（55 個）：值以字串型式被存、序列化、
+    或做字典鍵查找。實際生產程式碼不會用 `path.join` / `path.resolve` /
+    `path.normalize` / `path.relative` 對它做跨平台比較。
+    * `version.test.ts` 全部 11：`readAppVersion` / `readCommitSha` 的
+      `repoRoot` 參數，經注入的 `readFile` / `runGit` 直接回顯。
+      `readAppVersion` 內部確實用 `path.join(repoRoot, "package.json")`
+      建構檔名，但 test 已把 expected 值同樣經 `path.join` 推導，兩邊在
+      任何平台都會匹配。
+    * `session-actor.test.ts` 12：`SessionActor.workingDirectory` /
+      `approvalKey` 傳入後被存回 SDK config 或作為 `ApprovalPolicy` 的
+      dict key（原碼 `src/core/approval-policy.ts:32,39,89` 直接字典查詢，
+      **絕不** 對 key 做 `path.resolve`）。
+    * `session-store.test.ts` 11：JSON record 的 `repoPath` / `workDir`
+      欄位，`src/core/session-store.ts:174,177,348,374` 全部原樣寫入、
+      原樣讀出。v1→v2 migration 也 pass-through。
+    * `app-stop-flow.test.ts` 4：fake `cfg.REPOS_ROOT` 與
+      `DiscordCopilotApp.createForTest` 第二參數 + `Session.workDir` /
+      `Session.repoPath` fixture — 這個測試路徑 (`/stop` 與圖片下載)
+      根本沒有 join 這些值。
+    * `config-contract.test.ts` / `config.test.ts` 5：zod schema 輸入值，
+      schema 本身無 I/O、無 path 運算（`src/config.ts:63-93`）。
+    * `env-file.test.ts` 3：`.env` 序列化 / 解析 round trip fixture，
+      是位元組層 API，與 OS 無關。
+    * `residency.test.ts` 4：`buildWindowsRegisterScript` 純字串
+      builder 的 fixture，輸出以 substring / equality 對照。
+    * `uninstall-core.test.ts` 4：`isOurBotCommandLine` /
+      `isOurTaskDefinition` 的字串 / 正則 matcher fixture — 用真實
+      Windows tasklist / schtasks 會產生的字串當輸入。
+    * `worktree.test.ts` 1：註解裡的反例，並非執行碼。
+    * `repo.test.ts` 兩處：拒絕清單裡的 `"C:\\Windows"`。
+  * **(b) 平台守衛**（6 個）：字面量在 `process.platform === "win32"`
+    或等價的 skip / fallback 保護內。
+    * `repo.test.ts` `canonicalPath("C:\\PROGRA~1")` 兩處在
+      `if (process.platform !== "win32" || !existsSync(...)) return;` 之後。
+    * `residency-powershell.test.ts` 2：整個檔以
+      `const isWindows = process.platform === "win32"` gate；`SystemRoot`
+      fallback 只在 Windows 執行時生效。
+    * `repo.test.ts` 第 179 行 `"C:\\Windows"` 傳入拒絕清單，行為與平台無關。
+  * **(c) 需要平台原生 path 運算**：**0 個**。
+  * **(d) 真正的 bug**：**0 個**（父任務已修好原本那 1 個）。
+
+### 15.3 操作規則（regression 防護）
+
+**永遠不要** 把寫死的 Windows 路徑字面量拿去跟 runtime `path.join` /
+`path.resolve` / `path.normalize` / `path.relative` 的輸出做等式比較。
+需要 expected value 時，用**同一個 platform `path` 模組**推導。Windows
+路徑字面量仍可保留、也**必須**保留在下列用途：純字串 fixture、序列化
+round trip、字典鍵、拒絕清單、`process.platform === "win32"` 之後的分支。
+本 repo 有意保留這些 fixture，一次全面禁絕 `C:\\` 字面量會把 env-file
+round-trip、residency 腳本、uninstaller matcher 這些真正需要 Windows
+輸入的測試都無謂地誤傷。
+
+### 15.4 為何刻意不新增 blanket 掃描 test
+
+觸發 CI 失敗的 error class 需要兩個事實同時成立（寫死 Windows 字面量
+**且** 等式另一側是 runtime `path.join`），純靜態 grep 無法把兩件事關聯
+起來而不誤傷像 `readCommitSha` 那樣讓字面量流過 `["-C", literal, ...]`
+再對同一個字面量斷言的合法場景。真正的 anti-regression 是 `version.test.ts`
+把 expected 改用 `path.join(repoRoot, "package.json")` 推導 — 未來若
+`readAppVersion` 又退回硬編字面量，這個斷言會在 Ubuntu CI 立刻紅。
+
+### 15.5 驗證
+
+```
+npm run typecheck
+npx vitest run test/version.test.ts test/session-actor.test.ts \
+  test/session-store.test.ts test/app-stop-flow.test.ts \
+  test/config-contract.test.ts test/config.test.ts \
+  test/env-file.test.ts test/repo.test.ts test/residency.test.ts \
+  test/uninstall-core.test.ts test/worktree.test.ts
+# Test Files  11 passed (11)
+# Tests       252 passed (252)
+```
