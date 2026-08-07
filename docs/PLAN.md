@@ -394,12 +394,12 @@ round-trip、residency 腳本、uninstaller matcher 這些真正需要 Windows
 ### 15.5 驗證
 
 ```
-npm run typecheck
+Set-Location C:\Source\Repos\discord-copilot-sdk-update-mechanism
 npx vitest run test/version.test.ts test/session-actor.test.ts \
   test/session-store.test.ts test/app-stop-flow.test.ts \
   test/config-contract.test.ts test/config.test.ts \
   test/env-file.test.ts test/repo.test.ts test/residency.test.ts \
   test/uninstall-core.test.ts test/worktree.test.ts
 # Test Files  11 passed (11)
-# Tests       250 passed (250)
+# Tests       252 passed (252)
 ```
