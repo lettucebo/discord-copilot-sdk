@@ -401,5 +401,5 @@ npx vitest run test/version.test.ts test/session-actor.test.ts \
   test/env-file.test.ts test/repo.test.ts test/residency.test.ts \
   test/uninstall-core.test.ts test/worktree.test.ts
 # Test Files  11 passed (11)
-# Tests       252 passed (252)
+# Tests       250 passed (250)
 ```
