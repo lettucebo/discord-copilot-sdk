@@ -139,6 +139,82 @@ bash install.sh --skip-auth
 
 ---
 
+## 3b. 更新既有安裝
+
+請用更新器，不要重跑 `install.*`。它同樣使用共用的設定／建置引擎，但會先處理手動 `git pull && npm install` 容易做錯的生命週期順序。
+
+### 一行網路啟動器
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.ps1).TrimStart([char]0xFEFF)))
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.sh | bash
+```
+
+網路形式會把最新更新 engine 下載到私有暫存目錄。engine 會在改動目標 checkout **之前**先停常駐與 bot，所以 bootstrap 不會覆寫 live bot 正在使用的檔案。更新器刻意只信任本 upstream origin；即使可用 `gh api` 取得 bootstrap，v1 仍不支援更新 private fork。
+
+### 本機命令與保證
+
+```powershell
+./update.ps1 -Check
+./update.ps1 -DryRun
+./update.ps1 -Ref refs/tags/v0.1.0
+./update.ps1 -AllInstances
+./update.ps1 -Restore
+```
+
+```bash
+./update.sh --check
+./update.sh --dry-run
+./update.sh --ref refs/tags/v0.1.0
+./update.sh --all-instances
+./update.sh --restore
+```
+
+`--check` 不寫入任何東西；要求的 ref 已等於 HEAD 時 exit `0`、不同時 `2`、fail-closed preflight 拒絕時 `1`（例如 dirty checkout 或另一個 live instance）。`--dry-run` 會顯示完整生命週期，但不 fetch、停機、建置、寫入或 checkout。短 ref 同時是 branch/tag 時優先選 branch；用 `--ref refs/tags/v0.1.0` 可消除歧義。annotated tag 比較的是 peeled commit，不是 tag object。
+
+更新器會拒絕 dirty 或無法辨識的 checkout。具名開發分支只有在先證明 ancestor 關係後，才用 `git merge --ff-only` 更新；bootstrap 管理的 detached checkout 則 depth-one fetch 後 detach 到 `FETCH_HEAD`。它會掃描所有 live instance lock，若有其他 instance 正在跑，必須顯式傳入 `--all-instances` 才能改動共用 source。
+
+apply 順序是：唯讀 preflight → 停常駐 → 停 bot → 移動 source → `setup.mjs --yes --skip-auth --no-residency` → 還原。既有常駐只會重新 enable/start，絕不重新 register，所以 Windows 24/7 task 不會悄悄降成登入後保活。
+
+> ⚠️ source 已變更後若 setup 失敗，更新器會刻意讓 bot 保持停止、保留 `~/.discord-copilot-sdk/update-state.<instance>.json`，並印出 `--restore` 指令。Windows 停止是硬終止，進行中的 turn 可能遺失。先查看 active thread/worktree，只有確定可中斷時才確認 guard（或使用 `--yes`）。
+> 未處理的 restore state 不能被新的 apply 覆蓋；在 `--restore` 解決前，`--check` 與 `--dry-run` 仍是安全的診斷方式。
+
+### 發版
+
+`--version` 會顯示 app SemVer、commit SHA 與已安裝的 Copilot SDK。
+`CHANGELOG.md` 記錄發版變更，而且刻意只用英文，因為一個 tag 只會
+產生一份 GitHub Release。
+
+請使用這個精確流程：
+
+1. 先執行 `node scripts/release.mjs --plan`。它給的是**證據，不是真相**。
+   由人確認版本與整理過的英文 notes。
+2. `REVIEW BY HAND` 會自動包含非 conventional 與非 ASCII 的主旨。
+   任何不明確是英文的文字都必須先由人重寫或翻譯，才能進
+   `CHANGELOG.md`。
+3. 把核准的內容合併到 `## [Unreleased]` 並先 commit，再做 release。
+4. 從乾淨工作樹執行 `npm run release -- <version>`。它只會在本機建立
+   release commit 與 annotated `v<version>` tag，絕不會自動 push。
+5. 用 `git push --follow-tags` 推送。workflow 之後會呼叫
+   `node scripts/release.mjs --notes <version>`，GitHub Release 內文會先放
+   整理過的 changelog 區段，再接 GitHub 自動產生的 notes。
+6. 絕對不要手動執行 `gh release create`。
+
+`node scripts/release.mjs --notes <version>` 會印出 `## [<version>]` 的精確內容，缺少或為空時失敗。`--notes` 沒有「今天日期」限制。
+
+SemVer 政策：
+
+- 0.x：breaking 版更 → minor；`feat` → patch；`fix` / `perf` / security fix
+  （`fix(security)` 或 `CVE`）→ patch。
+- >=1.0.0：breaking 變更 → major；`feat` → minor；`fix` / `perf` / security
+  fix → patch。
+- 如果沒有值得發版的 commit，就不要硬湊版本號。
+
+---
+
 ## 4. 常駐 — 兩種，差很多
 
 安裝器會分開問。**預設是登入後保活**，只有你明確選擇才會用到密碼。

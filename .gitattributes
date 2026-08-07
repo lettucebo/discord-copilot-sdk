@@ -2,5 +2,7 @@
 *.mjs text eol=lf
 install.ps1 text eol=crlf
 get.ps1 text eol=crlf
+update.ps1 text eol=crlf
 run-bot.ps1 text eol=crlf
 stop-bot.ps1 text eol=crlf
+uninstall.ps1 text eol=crlf

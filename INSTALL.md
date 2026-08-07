@@ -139,6 +139,109 @@ The installer will: detect prerequisites → collect + **validate** config → `
 
 ---
 
+## 3b. Update an existing installation
+
+Use the updater instead of re-running `install.*`. It uses the same shared
+configuration/build engine, but first protects the lifecycle ordering that a
+manual `git pull && npm install` misses.
+
+### One-line network bootstrap
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.ps1).TrimStart([char]0xFEFF)))
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.sh | bash
+```
+
+The network form downloads a fresh updater engine to a private temporary
+directory. That engine stops residency and bot processes **before** it changes
+the target checkout, so the bootstrap never replaces files held by a live bot.
+The updater deliberately trusts only this upstream origin; updating a private
+fork is not supported in v1, even if its bootstrap script is fetched through
+`gh api`.
+
+### Local commands and guarantees
+
+```powershell
+./update.ps1 -Check
+./update.ps1 -DryRun
+./update.ps1 -Ref refs/tags/v0.1.0
+./update.ps1 -AllInstances
+./update.ps1 -Restore
+```
+
+```bash
+./update.sh --check
+./update.sh --dry-run
+./update.sh --ref refs/tags/v0.1.0
+./update.sh --all-instances
+./update.sh --restore
+```
+
+`--check` performs no writes and exits `0` if the requested ref already equals
+HEAD, `2` if it differs, or `1` on a fail-closed preflight refusal (for example,
+a dirty checkout or another live instance). `--dry-run` presents the lifecycle
+plan without fetch, stop, build, write, or checkout. Short refs prefer a branch
+over a same-named tag; use `--ref refs/tags/v0.1.0` to remove ambiguity.
+Annotated tags compare their peeled commit, not the tag object.
+
+The updater refuses a dirty or unknown checkout. A named development branch
+updates only through `git merge --ff-only`, after proving ancestry; a
+bootstrap-managed detached checkout fetches depth-one then detaches at
+`FETCH_HEAD`. It scans all live instance locks and requires `--all-instances`
+before touching source used by another instance.
+
+The apply sequence is: read-only preflight → stop residency → stop bot → move
+source → `setup.mjs --yes --skip-auth --no-residency` → restore. Existing
+residency is only re-enabled/restarted; it is never re-registered, so a Windows
+24/7 task is not silently downgraded to login-keepalive.
+
+> ⚠️ If setup fails after source changes, the updater intentionally leaves the
+> bot stopped, preserves `~/.discord-copilot-sdk/update-state.<instance>.json`,
+> and prints the `--restore` command. On Windows stopping is a hard termination,
+> so an in-flight turn may be lost. Review active threads/worktrees first and
+> confirm the guard (or pass `--yes`) only when that interruption is acceptable.
+> A new apply refuses to overwrite pending restore state; `--check` and
+> `--dry-run` remain safe diagnostics until `--restore` resolves it.
+
+### Releases
+
+`--version` shows the app SemVer release, commit SHA, and installed Copilot SDK.
+`CHANGELOG.md` records release changes and stays English-only by design because
+each tag creates one GitHub Release.
+
+Use this exact release flow:
+
+1. Run `node scripts/release.mjs --plan`. Its proposal is **evidence, not truth**.
+   The human confirms the version and the curated English notes.
+2. `REVIEW BY HAND` automatically includes non-conventional and non-ASCII
+   subjects. Anything not clearly English must be rewritten or translated by a
+   human before it enters `CHANGELOG.md`.
+3. Merge the approved notes into `## [Unreleased]` and commit them before the
+   release.
+4. From a clean tree run `npm run release -- <version>`. It creates the release
+   commit and an annotated `v<version>` tag locally, and never pushes.
+5. Push with `git push --follow-tags`. The workflow then calls
+   `node scripts/release.mjs --notes <version>`. The GitHub Release body is the
+   curated changelog section first, followed by GitHub-generated notes.
+6. Never run `gh release create` manually.
+
+`node scripts/release.mjs --notes <version>` prints the exact body of
+`## [<version>]` and fails when the section is missing or empty. No date
+restriction applies to `--notes`.
+
+SemVer policy:
+
+- 0.x: breaking change → minor; `feat` → patch; `fix` / `perf` / security fix
+  (`fix(security)` or `CVE`) → patch.
+- >=1.0.0: breaking change → major; `feat` → minor; `fix` / `perf` / security
+  fix → patch.
+- If there are no release-worthy commits, do not invent a version.
+
+---
+
 ## 4. Residency — two different things
 
 The installer asks separately. **Login-keepalive is the default**; a password is only involved if you explicitly choose 24/7.

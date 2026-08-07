@@ -1,6 +1,6 @@
 {
   "name": "discord-copilot-sdk",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "description": "Control your local GitHub Copilot from Discord via the official @github/copilot-sdk.",
   "type": "module",
@@ -14,7 +14,9 @@
     "smoke:live": "npm run build && node scripts/smoke-live.mjs",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "setup": "node scripts/setup.mjs"
+    "setup": "node scripts/setup.mjs",
+    "update": "node scripts/update.mjs",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "@github/copilot-sdk": "1.0.7-preview.3",

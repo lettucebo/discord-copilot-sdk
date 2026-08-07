@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { detectLang, normalizeLang, t, LANGS, MESSAGES, messageKeys } from "../scripts/lib/i18n.mjs";
+import { detectLang, formatMessage, normalizeLang, t, LANGS, MESSAGES, messageKeys } from "../scripts/lib/i18n.mjs";
 
 describe("detectLang", () => {
   it("uses DISCORD_COPILOT_SDK_LOCALE first (Windows path)", () => {
@@ -39,6 +39,16 @@ describe("t", () => {
     expect(t("langChosen", "en")).toContain("English");
   });
 
+  describe("formatMessage", () => {
+    it("interpolates every referenced placeholder", () => {
+      expect(formatMessage("Local {0}, remote {1}.", ["abc", "def"])).toBe("Local abc, remote def.");
+    });
+
+    it("fails closed when a referenced placeholder has no value", () => {
+      expect(() => formatMessage("Local {0}, remote {1}.", ["abc"])).toThrow(/missing message value/i);
+    });
+  });
+
   it("falls back to English for an unknown language, then to the key", () => {
     expect(t("banner", "de")).toBe(MESSAGES.en.banner);
     expect(t("__nope__", "zh")).toBe("__nope__");
@@ -62,5 +72,22 @@ describe("message table parity", () => {
         expect(v, `${lang}.${k}`).toBeTruthy();
       }
     }
+  });
+});
+
+describe("update messages", () => {
+  it.each([
+    "updateActiveThreads",
+    "updateAlreadyCurrent",
+    "updateCurrentRemote",
+    "updateDryRun",
+    "updateManagedDangling",
+    "updateNoRestart",
+    "updateComplete",
+    "updateFailed",
+    "updateRestoreDone",
+    "updateCancelled",
+  ])("defines the bilingual %s update message", (key) => {
+    for (const lang of LANGS) expect(t(key, lang)).not.toBe(key);
   });
 });

@@ -25,7 +25,7 @@ function relativeMarkdownLinks(text: string): string[] {
 }
 
 /** Every .ps1 an end user is told to run. */
-const USER_FACING_PS1 = ["install.ps1", "get.ps1", "run-bot.ps1", "stop-bot.ps1", "uninstall.ps1"];
+const USER_FACING_PS1 = ["install.ps1", "get.ps1", "update.ps1", "run-bot.ps1", "stop-bot.ps1", "uninstall.ps1"];
 
 describe("shipped scripts", () => {
   it.each(USER_FACING_PS1)("%s starts with a UTF-8 BOM", (name) => {
@@ -44,7 +44,7 @@ describe("shipped scripts", () => {
     expect(buf.subarray(3, 4).toString()).not.toMatch(/\s/);
   });
 
-  const SHELL = ["install.sh", "get.sh", "run-bot.sh", "stop-bot.sh", "uninstall.sh"];
+  const SHELL = ["install.sh", "get.sh", "update.sh", "run-bot.sh", "stop-bot.sh", "uninstall.sh"];
 
   it.each(SHELL)("%s has a shebang and no CRLF in the committed form", (name) => {
     // `.gitattributes` normalises *.sh to LF, but a stray CR would still make
@@ -78,6 +78,74 @@ describe("shipped scripts", () => {
       expect(text).toContain("uninstall.ps1");
       expect(text).toContain("uninstall.sh");
     }
+  });
+
+  it("documents the updater in English and Traditional Chinese README and INSTALL", () => {
+    for (const doc of INSTALL_DOCUMENTS) {
+      const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
+      expect(text).toContain("update.ps1");
+      expect(text).toContain("update.sh");
+    }
+  });
+
+  it("keeps the INSTALL twins aligned on the release planning contract", () => {
+    const english = fs.readFileSync(path.join(ROOT, "INSTALL.md"), "utf8");
+    const chinese = fs.readFileSync(path.join(ROOT, "INSTALL.zh-TW.md"), "utf8");
+    const englishFlat = english.replace(/\s+/g, " ").trim();
+    const chineseFlat = chinese.replace(/\s+/g, " ").trim();
+
+    expect(english).toContain("> **English** · [繁體中文](INSTALL.zh-TW.md)");
+    expect(chinese).toContain("> [English](INSTALL.md) · **繁體中文**");
+
+    const englishChecks = [
+      "node scripts/release.mjs --plan",
+      "evidence, not truth",
+      "The human confirms the version and the curated English notes.",
+      "Merge the approved notes into `## [Unreleased]` and commit them before the release.",
+      "npm run release -- <version>",
+      "git push --follow-tags",
+      "Never run `gh release create` manually.",
+      "prints the exact body of `## [<version>]`",
+      "fails when the section is missing or empty",
+      "No date restriction applies to `--notes`.",
+      "0.x: breaking change → minor",
+      "`feat` → patch",
+      "`fix` / `perf` / security fix (`fix(security)` or `CVE`) → patch.",
+      ">=1.0.0: breaking change → major",
+      "`feat` → minor",
+      "`fix` / `perf` / security fix → patch.",
+      "If there are no release-worthy commits, do not invent a version.",
+      "`REVIEW BY HAND` automatically includes non-conventional and non-ASCII subjects.",
+      "Anything not clearly English must be rewritten or translated by a human before it enters `CHANGELOG.md`.",
+      "The GitHub Release body is the curated changelog section first, followed by GitHub-generated notes.",
+    ];
+    for (const snippet of englishChecks) expect(englishFlat).toContain(snippet);
+
+    const chineseChecks = [
+      "node scripts/release.mjs --plan",
+      "證據，不是真相",
+      "由人確認版本與整理過的英文 notes",
+      "把核准的內容合併到 `## [Unreleased]` 並先 commit",
+      "npm run release -- <version>",
+      "git push --follow-tags",
+      "絕對不要手動執行 `gh release create`",
+      "印出 `## [<version>]` 的精確內容",
+      "缺少或為空時失敗",
+      "`--notes` 沒有「今天日期」限制",
+      "0.x：breaking 版更 → minor",
+      "`feat` → patch",
+      "`fix` / `perf` / security fix",
+      "（`fix(security)` 或 `CVE`）→ patch。",
+      ">=1.0.0：breaking 變更 → major",
+      "`feat` → minor",
+      "`fix` / `perf` / security fix → patch。",
+      "如果沒有值得發版的 commit，就不要硬湊版本號。",
+      "`REVIEW BY HAND` 會自動包含非 conventional 與非 ASCII 的主旨。",
+      "任何不明確是英文的文字都必須先由人重寫或翻譯，才能進 `CHANGELOG.md`。",
+      "GitHub Release 內文會先放",
+      "整理過的 changelog 區段，再接 GitHub 自動產生的 notes。",
+    ];
+    for (const snippet of chineseChecks) expect(chineseFlat).toContain(snippet);
   });
 
   it("documents an install one-liner that matches the repo's actual visibility", () => {
@@ -201,5 +269,19 @@ describe("shipped scripts", () => {
     expect(tracked).toBe("");
     const ignore = fs.readFileSync(path.join(ROOT, ".gitignore"), "utf8");
     expect(ignore).toMatch(/^package-lock\.json$/m);
+  });
+
+  it("pins every user-facing PowerShell script to CRLF", () => {
+    const attributes = fs.readFileSync(path.join(ROOT, ".gitattributes"), "utf8");
+    for (const file of USER_FACING_PS1) {
+      expect(attributes).toContain(`${file} text eol=crlf`);
+    }
+  });
+
+  it("runs syntax checks for every shipped update entrypoint in CI", () => {
+    const workflow = fs.readFileSync(path.join(ROOT, ".github", "workflows", "ci.yml"), "utf8");
+    expect(workflow).toMatch(/for f in install\.sh get\.sh update\.sh run-bot\.sh stop-bot\.sh uninstall\.sh; do/);
+    expect(workflow).toMatch(/for f in scripts\/setup\.mjs scripts\/update\.mjs scripts\/uninstall\.mjs scripts\/release\.mjs scripts\/lib\/\*\.mjs; do/);
+    expect(workflow).toMatch(/\$files = 'install\.ps1', 'get\.ps1', 'update\.ps1', 'run-bot\.ps1', 'stop-bot\.ps1', 'uninstall\.ps1'/);
   });
 });

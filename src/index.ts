@@ -1,6 +1,9 @@
 import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { acquireSingleInstanceLock } from "./core/single-instance.js";
 import { lockPath, legacyStateDir, legacyNameWarnings } from "./core/paths.js";
+import { formatVersionInfo, readAppVersion, readCommitSha } from "./core/version.js";
 import { checkSdkCompat, sdkSelfCheck } from "./copilot/sdk.js";
 import { loadConfig } from "./config.js";
 import { DiscordCopilotApp } from "./app.js";
@@ -31,9 +34,10 @@ async function main(): Promise<void> {
 
   if (args.has("--version")) {
     const c = checkSdkCompat();
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
     console.log(
-      `discord-copilot-sdk • @github/copilot-sdk installed ${c.installed} (declared ${c.declared})` +
-        (c.ok ? "" : "  ⚠️ mismatch")
+      formatVersionInfo({ app: readAppVersion(repoRoot), commit: readCommitSha(repoRoot), sdk: c.installed }) +
+        (c.ok ? "" : `  ⚠️ SDK declared ${c.declared}`)
     );
     return;
   }

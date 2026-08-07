@@ -165,6 +165,53 @@ npm run dev
 Or, once configured, `./run-bot.ps1` / `./run-bot.sh` to start it detached and
 `./stop-bot.ps1` / `./stop-bot.sh` to stop it.
 
+## Updating
+
+Use the updater instead of re-running the installer. It preserves `.env`, stops
+residency before the bot, validates the incoming revision, rebuilds, and restores
+the previous running state **only after** setup succeeds.
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.ps1).TrimStart([char]0xFEFF)))
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/update.sh | bash
+```
+
+Run it locally for the available safeguards:
+
+```powershell
+./update.ps1 -Check                 # read-only; 0=current, 2=differs, 1=preflight refusal
+./update.ps1 -DryRun                # full plan, no fetch, stop, build, or write
+./update.ps1 -Ref refs/tags/v0.1.0  # pin an annotated or lightweight release tag
+./update.ps1 -AllInstances          # explicitly include every live local instance
+./update.ps1 -Restore               # restore state kept after a failed apply
+```
+
+```bash
+./update.sh --check
+./update.sh --dry-run
+./update.sh --ref refs/tags/v0.1.0
+./update.sh --all-instances
+./update.sh --restore
+```
+
+`--check` is suitable for monitoring: `0` means the requested ref is already
+current, `2` means it differs, and `1` means a fail-closed preflight refusal
+needs attention. A named development branch updates only by fast-forward when
+clean; a dirty, divergent, or unknown checkout is refused before downtime. An
+update also refuses when another live instance exists unless `--all-instances`
+is explicit.
+
+If setup fails after source has changed, the updater deliberately leaves the
+bot stopped and retains `~/.discord-copilot-sdk/update-state.<instance>.json`;
+fix the reported problem, then run `--restore`. On Windows, stopping a bot is a
+hard process termination, so an in-flight turn can be lost. See
+[`INSTALL.md`](INSTALL.md) for the detailed lifecycle and release policy.
+Until that restore state is resolved, a new apply is refused; `--check` and
+`--dry-run` remain available for diagnosis.
+
 ## Uninstall
 
 ```powershell
