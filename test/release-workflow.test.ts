@@ -6,6 +6,8 @@ import { describe, expect, it } from "vitest";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function readReleaseWorkflow(): string {
+  // `.gitattributes` fixes Windows checkout EOL at the source; read-time
+  // normalization still protects direct editor writes before Git re-normalizes.
   return fs.readFileSync(path.join(ROOT, ".github", "workflows", "release.yml"), "utf8").replace(/\r\n/g, "\n");
 }
 

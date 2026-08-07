@@ -278,6 +278,11 @@ describe("shipped scripts", () => {
     }
   });
 
+  it("pins workflow YAML to LF in .gitattributes", () => {
+    const attributes = fs.readFileSync(path.join(ROOT, ".gitattributes"), "utf8");
+    expect(attributes).toContain("*.yml text eol=lf");
+  });
+
   it("runs syntax checks for every shipped update entrypoint in CI", () => {
     const workflow = fs.readFileSync(path.join(ROOT, ".github", "workflows", "ci.yml"), "utf8");
     expect(workflow).toMatch(/for f in install\.sh get\.sh update\.sh run-bot\.sh stop-bot\.sh uninstall\.sh; do/);
