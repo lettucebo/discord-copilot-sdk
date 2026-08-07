@@ -393,6 +393,14 @@ round-trip、residency 腳本、uninstaller matcher 這些真正需要 Windows
 
 ### 15.5 驗證
 
+* §15.2 的人工稽核範圍是 **12 個 test 檔 / 67 個字面量**；下面這條
+  `vitest` 指令則是刻意縮成 **11 個檔 / 252 個 tests** 的 targeted rerun，
+  只重跑會在跨平台 CI 上直接驗證本次風險模型的那批 suite。
+* 被刻意省略的第 12 個檔是 `test/residency-powershell.test.ts`。它已在
+  §15.2 被逐字面量人工稽核，且其 Windows-only 行為先前已由完整 Windows
+  suite 覆蓋；本節因此不把它再塞進這條 targeted command，但 **67 / 62+5**
+  的稽核統計與 **252** 的 rerun 計數都維持不變。
+
 ```
 Set-Location C:\Source\Repos\discord-copilot-sdk-update-mechanism
 npx vitest run test/version.test.ts test/session-actor.test.ts \
@@ -432,9 +440,19 @@ npx vitest run test/version.test.ts test/session-actor.test.ts \
 
 ### 16.3 操作規則
 
-- 本機 full pass **不是** multi-platform CI 成功的證據。之後不得在 `gh pr merge`
-  前只看 local validation；必須先等 `gh pr checks --watch` 完成，再用
-  `gh run view <id> --json jobs` 確認每個 job 的 `conclusion` 都是 `success`。
+- `main` 現在的 branch-protection enforcement contract 不是只有「操作人要記得等
+  CI」：GitHub 端已要求 `strict=true`、`enforce_admins=true`，required contexts
+  **精確**為 `test (ubuntu-latest, node 20.19)`、`test (ubuntu-latest, node
+  22.12)`、`test (windows-latest, node 20.19)`、`test (windows-latest, node
+  22.12)`、`lint shell + installer scripts`。因此不論 Web UI 或 `gh pr merge`，
+  都必須等 **最新 PR head SHA** 的這五個 jobs 全綠才可 merge；這才是防止再次
+  merge-before-CI 的主要控制點。
+- 沒有把 mandatory PR reviews 當成這次 remediation 的控制點：single-maintainer
+  repo 仍以 status checks gate 為主，而不是要求額外 reviewer。
+- 本機 full pass **不是** multi-platform CI 成功的證據。`gh pr checks --watch`
+  完成後，再用 `gh run view <id> --json jobs` 逐 job 確認 `conclusion=success`
+  的流程規則仍要保留，但它現在是對 branch protection 的**冗餘 safety belt**，
+  不是唯一保護。
 - 完成報告必須明確區分 **local validation** 與 **GitHub Actions CI**，並揭露中間
   是否曾有失敗 run；不得只回報最後一次成功。
 
