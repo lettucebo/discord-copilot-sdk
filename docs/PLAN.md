@@ -403,3 +403,41 @@ npx vitest run test/version.test.ts test/session-actor.test.ts \
 # Test Files  11 passed (11)
 # Tests       252 passed (252)
 ```
+
+## 16. PR #14 提前合併事故紀錄（2026-08-07）
+
+### 16.1 已確認時間線
+
+- PR #14 的 CI 於 **2026-08-07 03:16:14 UTC** 開始。
+- `gh pr merge 14 --merge` 於 **03:16:27** 執行；當時 CI 只跑了 **13 秒**，四個
+  test matrix jobs 都還在 running。
+- merge commit **`7281e3a`** 於 **03:16:29** 到達 `main`。PR #14 原 CI 的四個
+  test jobs 隨後在 **03:16:51、03:16:55、03:17:36、03:17:38** 失敗。
+- merge commit 對應的 `main` CI run **31143847250** 也是失敗：四個 test jobs 全紅，
+  只有 `lint shell + installer scripts` success。
+- 修復 PR #15 於 **03:26:33** merge，commit **`c336672`**；其 `main` CI run
+  **31144359846** 五個 jobs 全部 success。
+
+### 16.2 根因與修復
+
+1. `test/version.test.ts` 把 Windows 字面量 `C:\\repo\\package.json` 拿去比對
+   runtime `path.join` 輸出；Ubuntu 使用 slash semantics，導致 expected value
+   錯誤。修復是讓 expected path 也用同一個 `path.join` 推導。
+2. `release-workflow.test.ts` 的 multiline regex 只接受 LF；Windows checkout
+   workflow YAML 時因 `.gitattributes` 沒有 `*.yml` 規則而得到 CRLF。修復分兩層：
+   根因修正是 pin `*.yml text eol=lf`，讀檔端再做 CRLF 正規化作 defense in
+   depth。
+
+### 16.3 操作規則
+
+- 本機 full pass **不是** multi-platform CI 成功的證據。之後不得在 `gh pr merge`
+  前只看 local validation；必須先等 `gh pr checks --watch` 完成，再用
+  `gh run view <id> --json jobs` 確認每個 job 的 `conclusion` 都是 `success`。
+- 完成報告必須明確區分 **local validation** 與 **GitHub Actions CI**，並揭露中間
+  是否曾有失敗 run；不得只回報最後一次成功。
+
+### 16.4 更正動作的邊界
+
+- 這次歷史失敗 run 不能被抹除，也不應 revert `7281e3a` 來重寫歷史；`c336672`
+  已修正缺陷。矯正措施是補文件、收斂合併規則、預防再發，而不是試圖消去既有
+  失敗紀錄。
