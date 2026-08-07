@@ -278,6 +278,34 @@ describe("extractChangelogSection", () => {
     expect(typeof releaseCore.extractChangelogSection).toBe("function");
     expect(releaseCore.extractChangelogSection?.(changelog, "1.0.0")).toBeNull();
   });
+
+  it("extracts a populated final exact dated release section with no next heading", () => {
+    expect(typeof releaseCore.extractChangelogSection).toBe("function");
+
+    const finalSectionChangelog = [
+      "# Changelog",
+      "",
+      "## [Unreleased]",
+      "",
+      "## [1.2.0] - 2026-08-01",
+      "",
+      "### Added",
+      "",
+      "- Release planning",
+      "",
+      "## [1.0.0] - 2026-06-01",
+      "",
+      "### Fixed",
+      "",
+      "- Preserve compatibility",
+      "",
+      "- Handle final section parsing",
+    ].join("\n");
+
+    expect(releaseCore.extractChangelogSection?.(finalSectionChangelog, "1.0.0")).toBe(
+      "### Fixed\n\n- Preserve compatibility\n\n- Handle final section parsing"
+    );
+  });
 });
 
 describe("parseReleaseArgs", () => {
