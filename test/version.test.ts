@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import path from "node:path";
 import {
   formatVersionInfo,
   readAppVersion,
@@ -7,8 +8,9 @@ import {
 
 describe("readAppVersion", () => {
   it("reads the app version only from this project's package metadata", () => {
-    const version = readAppVersion("C:\\repo", (file) => {
-      expect(file).toBe("C:\\repo\\package.json");
+    const repoRoot = path.join("fixture", "repo");
+    const version = readAppVersion(repoRoot, (file) => {
+      expect(file).toBe(path.join(repoRoot, "package.json"));
       return JSON.stringify({ name: "discord-copilot-sdk", version: "0.1.0" });
     });
 
