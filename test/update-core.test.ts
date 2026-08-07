@@ -6,6 +6,7 @@ import {
   classifyCheckout,
   targetInstancesStopped,
   orderUpdateSteps,
+  parsePackageVersion,
   parseLsRemote,
   parseUpdateArgs,
   planUpdate,
@@ -43,6 +44,24 @@ describe("update-core purity", () => {
     [`global.process.exitCode = 1;`],
   ])("rejects an otherwise bypassable I/O entry point: %s", (source) => {
     expect(hasForbiddenUpdateCoreEffect(source)).toBe(true);
+  });
+});
+
+describe("parsePackageVersion", () => {
+  it("reads a SemVer version only from this application's package metadata", () => {
+    expect(parsePackageVersion(JSON.stringify({ name: "discord-copilot-sdk", version: "1.2.3-beta.4+build.5" }))).toBe(
+      "1.2.3-beta.4+build.5"
+    );
+  });
+
+  it.each([
+    "{",
+    JSON.stringify({ name: "other", version: "1.2.3" }),
+    JSON.stringify({ name: "discord-copilot-sdk", version: 1 }),
+    JSON.stringify({ name: "discord-copilot-sdk", version: "not-semver" }),
+    JSON.stringify({ name: "discord-copilot-sdk", version: "1.0.0-01" }),
+  ])("fails closed for invalid package metadata: %s", (metadata) => {
+    expect(parsePackageVersion(metadata)).toBe("unknown");
   });
 });
 

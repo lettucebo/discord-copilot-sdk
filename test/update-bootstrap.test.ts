@@ -15,6 +15,8 @@ describe("update bootstraps", () => {
     expect(text).toContain("DISCORD_COPILOT_SDK_UPDATE_ROOT");
     expect(text).toContain("Invoke-RestMethod");
     expect(text).toContain(".Replace('%2F', '/')");
+    expect(text).toContain("git -C $top config --get remote.origin.url");
+    expect(text).not.toContain("remote get-url origin");
     expect(text).not.toMatch(/\|\s*iex\b/i);
   });
 
@@ -29,5 +31,7 @@ describe("update bootstraps", () => {
     expect(text).toContain("curl");
     expect(text).toContain('[ -n "${BASH_SOURCE[0]:-}" ]');
     expect(text).toContain("pwd -P");
+    expect(text).toContain("git -C \"$TOP\" config --get remote.origin.url");
+    expect(text).not.toContain("remote get-url origin");
   });
 });

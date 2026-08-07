@@ -5,6 +5,7 @@ import {
   readAppVersion,
   readCommitSha,
 } from "../src/core/version.js";
+import { parsePackageVersion } from "../scripts/lib/update-core.mjs";
 
 describe("readAppVersion", () => {
   it("reads the app version only from this project's package metadata", () => {
@@ -27,6 +28,20 @@ describe("readAppVersion", () => {
     expect(readAppVersion("C:\\repo", () => JSON.stringify({ name: "discord-copilot-sdk", version: "1.0.0-01" }))).toBe(
       "unknown"
     );
+  });
+});
+
+describe("package version contract", () => {
+  it.each([
+    JSON.stringify({ name: "discord-copilot-sdk", version: "0.1.0" }),
+    JSON.stringify({ name: "discord-copilot-sdk", version: "1.2.3-beta.4+build.5" }),
+    "{",
+    JSON.stringify({ name: "other", version: "1.2.3" }),
+    JSON.stringify({ name: "discord-copilot-sdk", version: 1 }),
+    JSON.stringify({ name: "discord-copilot-sdk", version: "not-semver" }),
+    JSON.stringify({ name: "discord-copilot-sdk", version: "1.0.0-01" }),
+  ])("matches the updater parser for package metadata %s", (metadata) => {
+    expect(parsePackageVersion(metadata)).toBe(readAppVersion("C:\\repo", () => metadata));
   });
 });
 

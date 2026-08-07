@@ -175,9 +175,29 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 
 `--check` 不寫入任何東西；要求的 ref 已等於 HEAD 時 exit `0`、不同時 `2`、fail-closed preflight 拒絕時 `1`（例如 dirty checkout 或另一個 live instance）。`--dry-run` 會顯示完整生命週期，但不 fetch、停機、建置、寫入或 checkout。短 ref 同時是 branch/tag 時優先選 branch；用 `--ref refs/tags/v0.1.0` 可消除歧義。annotated tag 比較的是 peeled commit，不是 tag object。
 
+更新器永遠會標示它檢查的 checkout。例如 source 已同步時會印出：
+
+```text
+discord-copilot-sdk 0.1.0 (00de349c47e2)
+  root C:\Users\you\discord-copilot-sdk
+  checkout branch-clean (main)
+  requested main -> refs/heads/main @ 00de349c47e2
+原始碼 HEAD 已等於 refs/heads/main，無需更新。
+```
+
+這是在報告**原始碼身分**，不是 runtime 健康檢查：exit `0` 只證明 HEAD
+符合解析後的 ref。即使 source 已同步，若有失敗更新正等待 `--restore`，
+更新器也會提出警告；過期的 build output、dependencies 或手動改過的
+checkout 仍須由操作者另外處理。
+
 更新器會拒絕 dirty 或無法辨識的 checkout。具名開發分支只有在先證明 ancestor 關係後，才用 `git merge --ff-only` 更新；bootstrap 管理的 detached checkout 則 depth-one fetch 後 detach 到 `FETCH_HEAD`。它會掃描所有 live instance lock，若有其他 instance 正在跑，必須顯式傳入 `--all-instances` 才能改動共用 source。
 
 apply 順序是：唯讀 preflight → 停常駐 → 停 bot → 移動 source → `setup.mjs --yes --skip-auth --no-residency` → 還原。既有常駐只會重新 enable/start，絕不重新 register，所以 Windows 24/7 task 不會悄悄降成登入後保活。
+
+成功的 apply 會逐 instance 報告四個階段（停止、套用原始碼、setup、還原）。
+只有更新器觀察到新的 PID 後，才會宣告重啟成功。它還原的是更新**前**的
+狀態：原本已停止的 instance 會維持停止並明講原因。`--no-restart` 也會讓
+每個 instance 保持停止，並印出可直接使用的手動啟動指令。
 
 > ⚠️ source 已變更後若 setup 失敗，更新器會刻意讓 bot 保持停止、保留 `~/.discord-copilot-sdk/update-state.<instance>.json`，並印出 `--restore` 指令。Windows 停止是硬終止，進行中的 turn 可能遺失。先查看 active thread/worktree，只有確定可中斷時才確認 guard（或使用 `--yes`）。
 > 未處理的 restore state 不能被新的 apply 覆蓋；在 `--restore` 解決前，`--check` 與 `--dry-run` 仍是安全的診斷方式。

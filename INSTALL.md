@@ -187,6 +187,23 @@ plan without fetch, stop, build, write, or checkout. Short refs prefer a branch
 over a same-named tag; use `--ref refs/tags/v0.1.0` to remove ambiguity.
 Annotated tags compare their peeled commit, not the tag object.
 
+The updater always identifies the checkout it inspected. For example, a
+current-source check prints:
+
+```text
+discord-copilot-sdk 0.1.0 (00de349c47e2)
+  root C:\Users\you\discord-copilot-sdk
+  checkout branch-clean (main)
+  requested main -> refs/heads/main @ 00de349c47e2
+Source HEAD already matches refs/heads/main; no update is needed.
+```
+
+This reports **source identity**, not a runtime health check: exit `0` proves
+only that HEAD matches the resolved ref. If a failed update is awaiting
+`--restore`, the updater says so even when the source is current; stale build
+output, dependencies, or a manually changed checkout also require separate
+operator attention.
+
 The updater refuses a dirty or unknown checkout. A named development branch
 updates only through `git merge --ff-only`, after proving ancestry; a
 bootstrap-managed detached checkout fetches depth-one then detaches at
@@ -197,6 +214,12 @@ The apply sequence is: read-only preflight → stop residency → stop bot → m
 source → `setup.mjs --yes --skip-auth --no-residency` → restore. Existing
 residency is only re-enabled/restarted; it is never re-registered, so a Windows
 24/7 task is not silently downgraded to login-keepalive.
+
+Successful applies report all four stages (stop, source, setup, restore) per
+instance. A restart is reported only after the updater observes the new PID.
+The updater restores the state that existed before the update: an instance that
+was already stopped remains stopped and says so. `--no-restart` likewise keeps
+each instance stopped and prints its exact manual start command.
 
 > ⚠️ If setup fails after source changes, the updater intentionally leaves the
 > bot stopped, preserves `~/.discord-copilot-sdk/update-state.<instance>.json`,

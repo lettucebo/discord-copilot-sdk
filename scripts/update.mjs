@@ -19,6 +19,7 @@ import { parseEnv } from "node:util";
 import {
   classifyCheckout,
   parseLsRemote,
+  parsePackageVersion,
   parseUpdateArgs,
   planUpdate,
   remoteRefSpecs,
@@ -73,6 +74,28 @@ function statePath(instance) {
   return path.join(STATE_DIR, `update-state.${instance}.json`);
 }
 
+function savedStateRoot(state) {
+  return typeof state?.repoRoot === "string" && path.isAbsolute(state.repoRoot) ? path.resolve(state.repoRoot) : null;
+}
+
+function isCurrentRepoRoot(repoRoot) {
+  if (repoRoot === null) return false;
+  return process.platform === "win32" ? repoRoot.toLowerCase() === REPO_ROOT.toLowerCase() : repoRoot === REPO_ROOT;
+}
+
+function restoreStateStatus(instance) {
+  const file = statePath(instance);
+  if (!fs.existsSync(file)) return { kind: "none", root: null };
+  try {
+    const root = savedStateRoot(JSON.parse(fs.readFileSync(file, "utf8")));
+    return { kind: isCurrentRepoRoot(root) ? "current" : "foreign", root };
+  } catch {
+    // A malformed state may belong to this checkout. Preserve the old
+    // fail-closed behavior rather than allowing a new apply to overwrite it.
+    return { kind: "unreadable", root: null };
+  }
+}
+
 function updateLockPath(instance) {
   return path.join(STATE_DIR, ...updateLockRelativePath(instance).split("/"));
 }
@@ -81,9 +104,11 @@ function ensureRepo() {
   if (requestedRoot && !path.isAbsolute(requestedRoot)) {
     throw new UpdateError("DISCORD_COPILOT_SDK_UPDATE_ROOT must be absolute");
   }
+  let packageText;
   let pkg;
   try {
-    pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
+    packageText = fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8");
+    pkg = JSON.parse(packageText);
   } catch {
     throw new UpdateError("not a readable discord-copilot-sdk checkout");
   }
@@ -95,6 +120,15 @@ function ensureRepo() {
   const normalize = (value) => value?.replace(/\.git$/, "").replace(/\/$/, "").toLowerCase();
   if (!origin || normalize(origin) !== normalize(REPO_URL)) {
     throw new UpdateError(`origin is '${origin ?? "(missing)"}', not ${REPO_URL}`);
+  }
+  return packageText;
+}
+
+function currentPackageVersion() {
+  try {
+    return parsePackageVersion(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
+  } catch {
+    return "unknown";
   }
 }
 
@@ -358,25 +392,26 @@ async function verifyStopped(instances) {
 }
 
 function restoreResidency(instance, residency, shouldRun) {
-  if (!residency.registered || !residency.enabled) return false;
+  if (!residency.registered) return { state: "not-registered", started: false };
+  if (!residency.enabled) return { state: "was-disabled", started: false };
   if (process.platform === "win32") {
     const ps = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
     const name = `discord-copilot-sdk-${instance}`;
     const commands = [`Enable-ScheduledTask -TaskName '${name}' -ErrorAction Stop`];
     if (shouldRun) commands.push(`Start-ScheduledTask -TaskName '${name}' -ErrorAction Stop`);
     runInherited(ps, ["-NoProfile", "-Command", commands.join(";")]);
-    return shouldRun;
+    return { state: "restored", started: shouldRun };
   }
   if (process.platform === "darwin") {
     const plist = path.join(os.homedir(), "Library", "LaunchAgents", `com.discord-copilot-sdk.${instance}.plist`);
     const uid = String(process.getuid?.() ?? "");
     runInherited("launchctl", ["bootstrap", `gui/${uid}`, plist]);
-    return shouldRun;
+    return { state: "restored", started: shouldRun };
   }
   const unit = `discord-copilot-sdk-${instance}.service`;
   runInherited("systemctl", ["--user", "enable", unit]);
   if (shouldRun) runInherited("systemctl", ["--user", "start", unit]);
-  return shouldRun;
+  return { state: "restored", started: shouldRun };
 }
 
 function startInstance(instance) {
@@ -392,19 +427,48 @@ function startInstance(instance) {
   });
 }
 
-async function restoreState(state) {
-  for (const entry of state.instances) {
-    const startedByResidency = restoreResidency(entry.instance, entry.residency, entry.wasRunning);
-    if (entry.wasRunning && !startedByResidency) startInstance(entry.instance);
+function startCommand(instance) {
+  const script = process.platform === "win32" ? "run-bot.ps1" : "run-bot.sh";
+  const base = path.join(REPO_ROOT, script);
+  if (process.platform === "win32") {
+    return `$env:DISCORD_COPILOT_SDK_INSTANCE_ID = '${instance}'; & '${base.replace(/'/g, "''")}'`;
   }
-  const expected = state.instances.filter((entry) => entry.wasRunning).map((entry) => entry.instance);
+  return `DISCORD_COPILOT_SDK_INSTANCE_ID=${instance} bash "${base}"`;
+}
+
+async function restoreState(state) {
+  const expected = [];
+  for (const entry of state.instances) {
+    const residency = restoreResidency(entry.instance, entry.residency, entry.wasRunning);
+    if (residency.state === "not-registered") {
+      console.log(message("updateResidencyNotRegistered", entry.instance));
+    } else if (residency.state === "was-disabled") {
+      console.log(message("updateResidencyWasDisabled", entry.instance));
+    } else {
+      console.log(message("updateResidencyRestored", entry.instance));
+    }
+    if (!entry.wasRunning) {
+      console.log(message("updateNotRunningBefore", entry.instance));
+      continue;
+    }
+    if (!residency.started) startInstance(entry.instance);
+    expected.push(entry.instance);
+  }
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
-    const live = new Set(liveInstances().map((entry) => entry.instance));
-    if (expected.every((instance) => live.has(instance))) return;
+    const live = liveInstances();
+    const byInstance = new Map(live.map((entry) => [entry.instance, entry]));
+    if (expected.every((instance) => byInstance.has(instance))) {
+      for (const instance of expected) console.log(message("updateRestarted", instance, byInstance.get(instance).pid));
+      return;
+    }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  if (expected.length) throw new UpdateError("update succeeded but the prior bot process did not restart; inspect the bot log before retrying");
+  if (expected.length) {
+    throw new UpdateError(
+      `update succeeded but these prior bot process(es) did not restart: ${expected.join(", ")}; inspect ${path.join(STATE_DIR, "logs")} before retrying`
+    );
+  }
 }
 
 function applySource(kind) {
@@ -431,7 +495,7 @@ function readSavedStates() {
     if (!match) continue;
     try {
       const state = JSON.parse(fs.readFileSync(path.join(STATE_DIR, file), "utf8"));
-      if (Array.isArray(state?.instances)) states.push({ file: path.join(STATE_DIR, file), state });
+      if (Array.isArray(state?.instances)) states.push({ file: path.join(STATE_DIR, file), instance: match[1], state });
     } catch (error) {
       throw new UpdateError(`cannot read saved update state ${file}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -442,7 +506,26 @@ function readSavedStates() {
 async function restoreSaved() {
   const saved = readSavedStates();
   if (!saved.length) throw new UpdateError("no saved failed-update state exists");
-  for (const { file, state } of saved) {
+  const matching = [];
+  const foreign = [];
+  for (const entry of saved) {
+    const root = savedStateRoot(entry.state);
+    (isCurrentRepoRoot(root) ? matching : foreign).push({ ...entry, root });
+  }
+  if (!matching.length) {
+    const first = foreign[0];
+    throw new UpdateError(
+      `no saved failed-update state exists for ${REPO_ROOT}; saved state for ${first.instance} belongs to ${first.root ?? "(missing repo root)"}`
+    );
+  }
+  console.log(message("updatePhaseRestore"));
+  for (const { instance, root } of foreign) {
+    console.log(message("updateForeignRestoreState", instance, root ?? "(missing repo root)"));
+  }
+  for (const { file, instance, state, root } of matching) {
+    const oldSha = typeof state.oldSha === "string" && /^[0-9a-f]{4,64}$/i.test(state.oldSha) ? state.oldSha.slice(0, 12) : "unknown";
+    const createdAt = typeof state.createdAt === "string" ? state.createdAt : "unknown";
+    console.log(message("updateRestoreSummary", instance, root, oldSha, createdAt));
     await restoreState(state);
     fs.rmSync(file, { force: true });
   }
@@ -456,14 +539,19 @@ async function main() {
     return;
   }
 
-  ensureRepo();
+  const packageText = ensureRepo();
   ensurePrerequisites();
   const ref = flags.ref ?? process.env.DISCORD_COPILOT_SDK_REF ?? "main";
-  const remote = remoteFor(ref);
   const local = localSha();
   const checkout = checkoutFacts();
+  console.log(message("updateSourceIdentity", parsePackageVersion(packageText), local.slice(0, 12)));
+  console.log(message("updateRoot", REPO_ROOT));
+  console.log(message("updateCheckout", checkout.kind, checkout.branch ?? "detached"));
+  const remote = remoteFor(ref);
+  if (remote) console.log(message("updateRequested", ref, remote.ref, remote.sha.slice(0, 12)));
   const instance = currentInstance();
-  const pendingRestore = fs.existsSync(statePath(instance));
+  const savedState = restoreStateStatus(instance);
+  const pendingRestore = savedState.kind === "current" || savedState.kind === "unreadable";
   const live = liveInstances();
   const otherLive = live.filter((entry) => entry.instance !== instance);
   if (otherLive.length && !flags.allInstances) {
@@ -480,12 +568,17 @@ async function main() {
     mode: flags.check ? "check" : flags.dryRun ? "dry-run" : undefined,
   });
   if (decision.action === "refuse") throw new UpdateError(`preflight refused: ${decision.reason}`);
+  if (decision.action === "apply" && savedState.kind === "foreign") {
+    throw new UpdateError(
+      `pending restore state for ${instance} belongs to ${savedState.root ?? "(missing repo root)"}; choose a distinct DISCORD_COPILOT_SDK_INSTANCE_ID`
+    );
+  }
   if (decision.action === "up-to-date") {
-    console.log(message("updateAlreadyCurrent", local.slice(0, 12)));
+    console.log(message("updateAlreadyCurrent", remote.ref));
+    if (pendingRestore) console.log(message("updatePendingRestore"));
     return;
   }
 
-  console.log(message("updateCurrentRemote", local.slice(0, 12), remote.sha.slice(0, 12), remote.ref, checkout.kind));
   if (decision.action === "check") {
     process.exitCode = 2; // useful to a monitor: an update exists, no action taken
     return;
@@ -527,20 +620,32 @@ async function main() {
     // `stop-bot` is the identity-aware lifecycle path. Do not duplicate its PID
     // trust checks here; verify afterward because its user-facing scripts return
     // success when they decline to stop a stale/reused PID.
+    console.log(message("updatePhaseStop"));
     for (const id of targetIds) stopInstance(id);
     await verifyStopped(live.filter((entry) => targetIds.includes(entry.instance)));
+    for (const entry of state.instances) {
+      if (entry.wasRunning) console.log(message("updateStopped", entry.instance, live.find((liveEntry) => liveEntry.instance === entry.instance).pid));
+      if (entry.residency.registered && entry.residency.enabled) {
+        console.log(message("updateResidencyDisabled", entry.instance));
+      }
+    }
+    console.log(message("updatePhaseSource"));
     applySource(checkout.kind);
+    console.log(message("updatePhaseSetup"));
     runSetup();
     setupSucceeded = true;
+    const now = localSha();
+    console.log(message("updateApplied", parsePackageVersion(packageText), local.slice(0, 12), currentPackageVersion(), now.slice(0, 12)));
     if (flags.noRestart) {
       if (!shouldRetainRestoreState(setupSucceeded)) fs.rmSync(statePath(instance), { force: true });
+      for (const entry of state.instances) console.log(message("updateNoRestartInstance", entry.instance, startCommand(entry.instance)));
       console.log(message("updateNoRestart"));
       return;
     }
+    console.log(message("updatePhaseRestore"));
     await restoreState(state);
     fs.rmSync(statePath(instance), { force: true });
-    const now = localSha();
-    console.log(message("updateComplete", local.slice(0, 12), now.slice(0, 12)));
+    console.log(message("updateComplete"));
   } finally {
     releaseLock();
     if (!setupSucceeded) {
