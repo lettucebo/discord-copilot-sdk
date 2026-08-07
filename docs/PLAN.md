@@ -312,13 +312,15 @@ resume 的錯誤。
 ### 15.2 稽核結果
 
 * 掃描目標：`test/*.ts` 內所有 `C:\\`（等同來源中 `C:\`）字面量。
-* 統計：**12 個 test 檔、61 個字面量**（與父任務初始 grep 結果一致）。
-  細分：`version.test.ts` 11、`session-actor.test.ts` 12、`session-store.test.ts` 11、
-  `app-stop-flow.test.ts` 4、`config-contract.test.ts` 4、`config.test.ts` 1、
-  `env-file.test.ts` 3、`repo.test.ts` 4、`residency-powershell.test.ts` 2、
-  `residency.test.ts` 4、`uninstall-core.test.ts` 4、`worktree.test.ts` 1。
+* 統計口徑改正：這裡記的是 **source literal occurrences**，不是 matching
+  lines。以 Python 對原始檔文字重算後，結果是 **12 個 test 檔、67 個
+  字面量**。細分：`version.test.ts` 11、`session-actor.test.ts` 13、
+  `session-store.test.ts` 11、`app-stop-flow.test.ts` 4、
+  `config-contract.test.ts` 4、`config.test.ts` 1、`env-file.test.ts` 6、
+  `repo.test.ts` 5、`residency-powershell.test.ts` 2、`residency.test.ts` 4、
+  `uninstall-core.test.ts` 5、`worktree.test.ts` 1。
 * 分類（每個字面量都逐一檢視，非只看檔名）：
-  * **(a) 純字面量 / 身份鍵**（55 個）：值以字串型式被存、序列化、
+  * **(a) 純字面量 / 身份鍵**（62 個）：值以字串型式被存、序列化、
     或做字典鍵查找。實際生產程式碼不會用 `path.join` / `path.resolve` /
     `path.normalize` / `path.relative` 對它做跨平台比較。
     * `version.test.ts` 全部 11：`readAppVersion` / `readCommitSha` 的
@@ -326,10 +328,15 @@ resume 的錯誤。
       `readAppVersion` 內部確實用 `path.join(repoRoot, "package.json")`
       建構檔名，但 test 已把 expected 值同樣經 `path.join` 推導，兩邊在
       任何平台都會匹配。
-    * `session-actor.test.ts` 12：`SessionActor.workingDirectory` /
-      `approvalKey` 傳入後被存回 SDK config 或作為 `ApprovalPolicy` 的
-      dict key（原碼 `src/core/approval-policy.ts:32,39,89` 直接字典查詢，
-      **絕不** 對 key 做 `path.resolve`）。
+    * `session-actor.test.ts` 13：其中 12 個是
+      `SessionActor.workingDirectory` / `approvalKey`，傳入後被存回 SDK
+      config 或作為 `ApprovalPolicy` 的 dict key（原碼
+      `src/core/approval-policy.ts:32,39,89` 直接字典查詢，**絕不** 對 key
+      做 `path.resolve`）。剩下
+      `fileName: "C:\\repo\\secrets.txt"` 是 permission-request /
+      audit-notice view fixture：測試只驗證 notice 會揭露 `secrets.txt`
+      檔名、但不回顯 secret payload；它不是 runtime working-directory /
+      approval-key fixture，也不會被 path API 正規化或 join。
     * `session-store.test.ts` 11：JSON record 的 `repoPath` / `workDir`
       欄位，`src/core/session-store.ts:174,177,348,374` 全部原樣寫入、
       原樣讀出。v1→v2 migration 也 pass-through。
@@ -339,25 +346,30 @@ resume 的錯誤。
       根本沒有 join 這些值。
     * `config-contract.test.ts` / `config.test.ts` 5：zod schema 輸入值，
       schema 本身無 I/O、無 path 運算（`src/config.ts:63-93`）。
-    * `env-file.test.ts` 3：`.env` 序列化 / 解析 round trip fixture，
+    * `env-file.test.ts` 6：`.env` 序列化 / 解析 round trip fixture，
       是位元組層 API，與 OS 無關。
     * `residency.test.ts` 4：`buildWindowsRegisterScript` 純字串
       builder 的 fixture，輸出以 substring / equality 對照。
-    * `uninstall-core.test.ts` 4：`isOurBotCommandLine` /
+    * `uninstall-core.test.ts` 5：`isOurBotCommandLine` /
       `isOurTaskDefinition` 的字串 / 正則 matcher fixture — 用真實
       Windows tasklist / schtasks 會產生的字串當輸入。
     * `worktree.test.ts` 1：註解裡的反例，並非執行碼。
-    * `repo.test.ts` 兩處：拒絕清單裡的 `"C:\\Windows"`。
-  * **(b) 平台守衛**（6 個）：字面量在 `process.platform === "win32"`
+    * `repo.test.ts` 1：拒絕清單裡的 `"C:\\Windows"` 是平台無關的拒絕輸入。
+    * `residency-powershell.test.ts` 1：BOM regression test 內
+      `"C:\\Users\\使用者測試"` 是 `.ps1` script-body fixture，測的是
+      BOM/編碼與 parse 行為，不是 runtime 路徑等式。
+  * **(b) 平台守衛**（5 個）：字面量在 `process.platform === "win32"`
     或等價的 skip / fallback 保護內。
-    * `repo.test.ts` `canonicalPath("C:\\PROGRA~1")` 兩處在
+    * `repo.test.ts` 4：`existsSync("C:\\PROGRA~1")` 與
+      `canonicalPath("C:\\PROGRA~1")` 三處都在
       `if (process.platform !== "win32" || !existsSync(...)) return;` 之後。
-    * `residency-powershell.test.ts` 2：整個檔以
-      `const isWindows = process.platform === "win32"` gate；`SystemRoot`
-      fallback 只在 Windows 執行時生效。
-    * `repo.test.ts` 第 179 行 `"C:\\Windows"` 傳入拒絕清單，行為與平台無關。
+    * `residency-powershell.test.ts` 1：`SystemRoot` fallback 的
+      `"C:\\Windows"` 只供 `describe.runIf(isWindows)` 這組 Windows-only
+      測試定位 `powershell.exe`。
   * **(c) 需要平台原生 path 運算**：**0 個**。
   * **(d) 真正的 bug**：**0 個**（父任務已修好原本那 1 個）。
+* 逐一檢視後，**0 個**剩餘字面量會流入 runtime path 輸出等式斷言；
+  本次因此只需更正文檔與稽核報告，不需要再改 feature code / tests。
 
 ### 15.3 操作規則（regression 防護）
 
