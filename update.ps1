@@ -65,7 +65,9 @@ $exitProcess = [string]::IsNullOrEmpty($MyInvocation.Line)
   $target = if ($Dir) { $Dir } elseif ($env:DISCORD_COPILOT_SDK_DIR) { $env:DISCORD_COPILOT_SDK_DIR } else { $null }
   if (-not $target) {
     $top = (& git rev-parse --show-toplevel 2>$null)
-    $origin = if ($LASTEXITCODE -eq 0 -and $top) { (& git -C $top remote get-url origin 2>$null) } else { '' }
+    # `remote get-url` expands insteadOf and can make a legitimate mirror look
+    # foreign. Compare the literal configuration, matching the updater engine.
+    $origin = if ($LASTEXITCODE -eq 0 -and $top) { (& git -C $top config --get remote.origin.url 2>$null) } else { '' }
     if ($origin -and (& $norm $origin) -eq (& $norm $repoUrl)) { $target = $top } else { $target = Join-Path $env:USERPROFILE 'discord-copilot-sdk' }
   }
 

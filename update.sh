@@ -48,7 +48,9 @@ norm() { echo "$1" | sed -e 's/\.git$//' -e 's#/$##' | tr '[:upper:]' '[:lower:]
 if [ "$TARGET_EXPLICIT" = "0" ]; then
   TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   ORIGIN=""
-  [ -n "$TOP" ] && ORIGIN="$(git -C "$TOP" remote get-url origin 2>/dev/null || true)"
+  # `remote get-url` expands insteadOf and can make a legitimate mirror look
+  # foreign. Compare the literal configuration, matching the updater engine.
+  [ -n "$TOP" ] && ORIGIN="$(git -C "$TOP" config --get remote.origin.url 2>/dev/null || true)"
   if [ -n "$ORIGIN" ] && [ "$(norm "$ORIGIN")" = "$(norm "$REPO_URL")" ]; then
     TARGET="$TOP"
   else

@@ -4,6 +4,37 @@
 
 /** @typedef {"managed" | "branch-clean" | "branch-dirty" | "unknown"} CheckoutKind */
 
+const SEMVER =
+  /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+/**
+ * Read this application's release version from already-read package metadata.
+ *
+ * The network updater downloads this pure module alongside its engine, so the
+ * parser cannot rely on a built `dist/` directory or filesystem access.
+ *
+ * @param {string} jsonText
+ * @returns {string}
+ */
+export function parsePackageVersion(jsonText) {
+  try {
+    const pkg = JSON.parse(jsonText);
+    const version = typeof pkg === "object" && pkg !== null ? pkg.version : undefined;
+    if (
+      typeof pkg !== "object" ||
+      pkg === null ||
+      pkg.name !== "discord-copilot-sdk" ||
+      typeof version !== "string" ||
+      !SEMVER.test(version)
+    ) {
+      return "unknown";
+    }
+    return version;
+  } catch {
+    return "unknown";
+  }
+}
+
 /**
  * Classify a checkout from the two facts collected by git before any mutation.
  *

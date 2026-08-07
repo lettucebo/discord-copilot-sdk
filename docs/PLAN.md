@@ -288,6 +288,8 @@ resume 的錯誤。
 
 - 採用本機 `update.ps1`／`update.sh` 加 `scripts/update.mjs` 的三階段流程：**唯讀 preflight → apply → 僅成功後 restore**。更新器在停止前檢查 origin、remote ref、checkout 形狀、多 instance、FF-only 可行性、新版設定與 active thread/worktree。
 - 網路一行形式不直接 fetch/checkout 目標；它下載最新 engine 到私有暫存目錄，讓 engine 先停常駐與 bot 再變更 source。這保留自救能力，也避免 Windows npm 覆寫 live runtime 的 EPERM。
+- 更新輸出採分階段身分／生命週期報告：在遠端比較前印出 source SemVer、SHA、絕對 root 與 checkout，解析成功後印出 requested/ref resolved SHA；成功 apply 依序報告 stop、source、setup、restore。只有 `liveInstances()` 觀察到新 PID 才宣稱重啟成功；更新前已停止的 instance 維持停止並明講。`--check` 的 `0` 僅代表 HEAD 等於要求 ref，絕不是 runtime 健康結論；若有待 `--restore` 狀態，即使 source 相同也必須警告。
+- entrypoint 與 engine 都以字面的 `git config --get remote.origin.url` 驗證 upstream，不能使用會展開 `insteadOf` 的 `git remote get-url`，以免企業 mirror 使一行命令靜默 fallback 到另一個 checkout。`--restore` 比對 state 記錄的絕對 `repoRoot`：foreign state 絕不會被執行（只警告並保留），同 root state 照常恢復；若完全沒有相符 state 則 fail-closed。若 foreign state 與 apply 使用相同 instance id，apply 也會在任何停機或寫入前拒絕，絕不能覆寫另一個 checkout 的唯一恢復紀錄。
 - dev branch 僅允許乾淨且 `merge-base --is-ancestor` 可證明的 `git merge --ff-only`；managed detached clone 用 depth-one fetch 加 `checkout --detach FETCH_HEAD`。
 - 不做 Discord `/update`：行程不能安全覆寫自己的 runtime，失敗後 Discord 也無法回報；這是 fail-closed 取捨，不是 UX 缺漏。
 - 初始版本為 SemVer `0.1.0`，`--version` 顯示 app 版號、commit 與 SDK。發版分成「規劃」與「發布」兩步：先跑 `node scripts/release.mjs --plan` 取得 version 提案、`CHANGELOG DRAFT` 與 `REVIEW BY HAND`，但那只是證據；必須由人確認版本與整理過的英文 notes，先合併進 `## [Unreleased]` 並 commit，之後才可在乾淨 tree 執行 `npm run release -- <version>` 建立 release commit 與 annotated tag。真正發布只靠 `git push --follow-tags` 觸發 workflow；workflow 先用 `node scripts/release.mjs --notes <version>` 讀取最終 `CHANGELOG.md` 區段當 release body，再附 GitHub 自動產生的 notes，不手動 `gh release create`。
@@ -298,6 +300,7 @@ resume 的錯誤。
 
 - source 移動後的完整 runtime/schema 驗證必須先 build，而 Windows build 不能與 live runtime 共存；故預檢覆蓋新版 `validate.mjs`，但 setup 在 apply 後失敗時**不**自動 restore。operator 修正後必須明確 `--restore`。
 - Windows 用硬終止停止 bot，in-flight turn 可能遺失；active-thread guard 只報告可 resume 的 thread 與髒 worktree，不能誠實地宣稱知道記憶體中的 turn 是否正在執行。
+- updater 故意還原更新前的狀態，而不是無條件啟動：原先被刻意停掉的 instance 不會在 update 後自行運行。需要強制啟動時 operator 依 updater 印出的 instance 專屬命令執行。
 
 ## 15. 平台路徑 test 字面量稽核（2026-08-07）
 

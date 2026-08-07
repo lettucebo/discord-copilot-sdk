@@ -197,12 +197,13 @@ Run it locally for the available safeguards:
 ./update.sh --restore
 ```
 
-`--check` is suitable for monitoring: `0` means the requested ref is already
-current, `2` means it differs, and `1` means a fail-closed preflight refusal
-needs attention. A named development branch updates only by fast-forward when
-clean; a dirty, divergent, or unknown checkout is refused before downtime. An
-update also refuses when another live instance exists unless `--all-instances`
-is explicit.
+`--check` is suitable for source monitoring: `0` means HEAD matches the
+requested ref, `2` means it differs, and `1` means a fail-closed preflight
+refusal needs attention. It is not a runtime health check; the output names the
+exact root, checkout, and resolved ref it inspected. A named development branch
+updates only by fast-forward when clean; a dirty, divergent, or unknown
+checkout is refused before downtime. An update also refuses when another live
+instance exists unless `--all-instances` is explicit.
 
 If setup fails after source has changed, the updater deliberately leaves the
 bot stopped and retains `~/.discord-copilot-sdk/update-state.<instance>.json`;
@@ -210,7 +211,9 @@ fix the reported problem, then run `--restore`. On Windows, stopping a bot is a
 hard process termination, so an in-flight turn can be lost. See
 [`INSTALL.md`](INSTALL.md) for the detailed lifecycle and release policy.
 Until that restore state is resolved, a new apply is refused; `--check` and
-`--dry-run` remain available for diagnosis.
+`--dry-run` remain available for diagnosis. A successful update reports each
+lifecycle phase and only calls a bot restarted after observing its new PID; a
+bot that was already stopped stays stopped and is reported as such.
 
 ## Uninstall
 
