@@ -408,9 +408,11 @@ npx vitest run test/version.test.ts test/session-actor.test.ts \
 
 ### 16.1 已確認時間線
 
-- PR #14 的 CI 於 **2026-08-07 03:16:14 UTC** 開始。
-- `gh pr merge 14 --merge` 於 **03:16:27** 執行；當時 CI 只跑了 **13 秒**，四個
-  test matrix jobs 都還在 running。
+- PR #14 的 PR-side workflow run **31143831917** 於 **2026-08-07 03:16:10 UTC**
+  建立；第一批 jobs 於 **03:16:14 UTC** 開始。
+- PR #14 於 **03:16:27 UTC** merged；當時其 PR-side run **31143831917** 只跑了
+  **13 秒**（jobs 自 **03:16:14 UTC** 起算），四個 test matrix jobs 都還在
+  running。
 - merge commit **`7281e3a`** 於 **03:16:29** 到達 `main`。PR #14 原 CI 的四個
   test jobs 隨後在 **03:16:51、03:16:55、03:17:36、03:17:38** 失敗。
 - merge commit 對應的 `main` CI run **31143847250** 也是失敗：四個 test jobs 全紅，
