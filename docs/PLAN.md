@@ -298,3 +298,166 @@ resume 的錯誤。
 
 - source 移動後的完整 runtime/schema 驗證必須先 build，而 Windows build 不能與 live runtime 共存；故預檢覆蓋新版 `validate.mjs`，但 setup 在 apply 後失敗時**不**自動 restore。operator 修正後必須明確 `--restore`。
 - Windows 用硬終止停止 bot，in-flight turn 可能遺失；active-thread guard 只報告可 resume 的 thread 與髒 worktree，不能誠實地宣稱知道記憶體中的 turn 是否正在執行。
+
+## 15. 平台路徑 test 字面量稽核（2026-08-07）
+
+### 15.1 觸發原因
+
+原 `test/version.test.ts` 把 Windows 字面量 `"C:\\repo\\package.json"` 當作
+`path.join(root, "package.json")` 的 expected value，在 Ubuntu CI 上
+`path.posix.join("C:\\repo", "package.json")` 會回 `"C:\\repo/package.json"`
+（正斜線），等式因此失敗。父任務已把 expected 也改成透過 `path.join` 推出，
+本節記錄跨全部 test 檔的完整稽核，確認沒有其他同類 bug。
+
+### 15.2 稽核結果
+
+* 掃描目標：`test/*.ts` 內所有 `C:\\`（等同來源中 `C:\`）字面量。
+* 統計口徑改正：這裡記的是 **source literal occurrences**，不是 matching
+  lines。以 Python 對原始檔文字重算後，結果是 **12 個 test 檔、67 個
+  字面量**。細分：`version.test.ts` 11、`session-actor.test.ts` 13、
+  `session-store.test.ts` 11、`app-stop-flow.test.ts` 4、
+  `config-contract.test.ts` 4、`config.test.ts` 1、`env-file.test.ts` 6、
+  `repo.test.ts` 5、`residency-powershell.test.ts` 2、`residency.test.ts` 4、
+  `uninstall-core.test.ts` 5、`worktree.test.ts` 1。
+* 分類（每個字面量都逐一檢視，非只看檔名）：
+  * **(a) 純字面量 / 身份鍵**（62 個）：值以字串型式被存、序列化、
+    或做字典鍵查找。實際生產程式碼不會用 `path.join` / `path.resolve` /
+    `path.normalize` / `path.relative` 對它做跨平台比較。
+    * `version.test.ts` 全部 11：`readAppVersion` / `readCommitSha` 的
+      `repoRoot` 參數，經注入的 `readFile` / `runGit` 直接回顯。
+      `readAppVersion` 內部確實用 `path.join(repoRoot, "package.json")`
+      建構檔名，但 test 已把 expected 值同樣經 `path.join` 推導，兩邊在
+      任何平台都會匹配。
+    * `session-actor.test.ts` 13：其中 12 個是
+      `SessionActor.workingDirectory` / `approvalKey`，傳入後被存回 SDK
+      config 或作為 `ApprovalPolicy` 的 dict key（原碼
+      `src/core/approval-policy.ts:32,39,89` 直接字典查詢，**絕不** 對 key
+      做 `path.resolve`）。剩下
+      `fileName: "C:\\repo\\secrets.txt"` 是 permission-request /
+      audit-notice view fixture：測試只驗證 notice 會揭露 `secrets.txt`
+      檔名、但不回顯 secret payload；它不是 runtime working-directory /
+      approval-key fixture，也不會被 path API 正規化或 join。
+    * `session-store.test.ts` 11：JSON record 的 `repoPath` / `workDir`
+      欄位，`src/core/session-store.ts:174,177,348,374` 全部原樣寫入、
+      原樣讀出。v1→v2 migration 也 pass-through。
+    * `app-stop-flow.test.ts` 4：fake `cfg.REPOS_ROOT` 與
+      `DiscordCopilotApp.createForTest` 第二參數 + `Session.workDir` /
+      `Session.repoPath` fixture — 這個測試路徑 (`/stop` 與圖片下載)
+      根本沒有 join 這些值。
+    * `config-contract.test.ts` / `config.test.ts` 5：zod schema 輸入值，
+      schema 本身無 I/O、無 path 運算（`src/config.ts:63-93`）。
+    * `env-file.test.ts` 6：`.env` 序列化 / 解析 round trip fixture，
+      是位元組層 API，與 OS 無關。
+    * `residency.test.ts` 4：`buildWindowsRegisterScript` 純字串
+      builder 的 fixture，輸出以 substring / equality 對照。
+    * `uninstall-core.test.ts` 5：`isOurBotCommandLine` /
+      `isOurTaskDefinition` 的字串 / 正則 matcher fixture — 用真實
+      Windows tasklist / schtasks 會產生的字串當輸入。
+    * `worktree.test.ts` 1：註解裡的反例，並非執行碼。
+    * `repo.test.ts` 1：拒絕清單裡的 `"C:\\Windows"` 是平台無關的拒絕輸入。
+    * `residency-powershell.test.ts` 1：BOM regression test 內
+      `"C:\\Users\\使用者測試"` 是 `.ps1` script-body fixture，測的是
+      BOM/編碼與 parse 行為，不是 runtime 路徑等式。
+  * **(b) 平台守衛**（5 個）：字面量在 `process.platform === "win32"`
+    或等價的 skip / fallback 保護內。
+    * `repo.test.ts` 4：`existsSync("C:\\PROGRA~1")` 與
+      `canonicalPath("C:\\PROGRA~1")` 三處都在
+      `if (process.platform !== "win32" || !existsSync(...)) return;` 之後。
+    * `residency-powershell.test.ts` 1：`SystemRoot` fallback 的
+      `"C:\\Windows"` 只供 `describe.runIf(isWindows)` 這組 Windows-only
+      測試定位 `powershell.exe`。
+  * **(c) 需要平台原生 path 運算**：**0 個**。
+  * **(d) 真正的 bug**：**0 個**（父任務已修好原本那 1 個）。
+* 逐一檢視後，**0 個**剩餘字面量會流入 runtime path 輸出等式斷言；
+  本次因此只需更正文檔與稽核報告，不需要再改 feature code / tests。
+
+### 15.3 操作規則（regression 防護）
+
+**永遠不要** 把寫死的 Windows 路徑字面量拿去跟 runtime `path.join` /
+`path.resolve` / `path.normalize` / `path.relative` 的輸出做等式比較。
+需要 expected value 時，用**同一個 platform `path` 模組**推導。Windows
+路徑字面量仍可保留、也**必須**保留在下列用途：純字串 fixture、序列化
+round trip、字典鍵、拒絕清單、`process.platform === "win32"` 之後的分支。
+本 repo 有意保留這些 fixture，一次全面禁絕 `C:\\` 字面量會把 env-file
+round-trip、residency 腳本、uninstaller matcher 這些真正需要 Windows
+輸入的測試都無謂地誤傷。
+
+### 15.4 為何刻意不新增 blanket 掃描 test
+
+觸發 CI 失敗的 error class 需要兩個事實同時成立（寫死 Windows 字面量
+**且** 等式另一側是 runtime `path.join`），純靜態 grep 無法把兩件事關聯
+起來而不誤傷像 `readCommitSha` 那樣讓字面量流過 `["-C", literal, ...]`
+再對同一個字面量斷言的合法場景。真正的 anti-regression 是 `version.test.ts`
+把 expected 改用 `path.join(repoRoot, "package.json")` 推導 — 未來若
+`readAppVersion` 又退回硬編字面量，這個斷言會在 Ubuntu CI 立刻紅。
+
+### 15.5 驗證
+
+* §15.2 的人工稽核範圍是 **12 個 test 檔 / 67 個字面量**；下面這條
+  `vitest` 指令則是刻意縮成 **11 個檔 / 252 個 tests** 的 targeted rerun，
+  只重跑會在跨平台 CI 上直接驗證本次風險模型的那批 suite。
+* 被刻意省略的第 12 個檔是 `test/residency-powershell.test.ts`。它已在
+  §15.2 被逐字面量人工稽核，且其 Windows-only 行為先前已由完整 Windows
+  suite 覆蓋；本節因此不把它再塞進這條 targeted command，但 **67 / 62+5**
+  的稽核統計與 **252** 的 rerun 計數都維持不變。
+
+```
+Set-Location C:\Source\Repos\discord-copilot-sdk-update-mechanism
+npx vitest run test/version.test.ts test/session-actor.test.ts \
+  test/session-store.test.ts test/app-stop-flow.test.ts \
+  test/config-contract.test.ts test/config.test.ts \
+  test/env-file.test.ts test/repo.test.ts test/residency.test.ts \
+  test/uninstall-core.test.ts test/worktree.test.ts
+# Test Files  11 passed (11)
+# Tests       252 passed (252)
+```
+
+## 16. PR #14 提前合併事故紀錄（2026-08-07）
+
+### 16.1 已確認時間線
+
+- PR #14 的 PR-side workflow run **31143831917** 於 **2026-08-07 03:16:10 UTC**
+  建立；第一批 jobs 於 **03:16:14 UTC** 開始。
+- PR #14 於 **03:16:27 UTC** merged；當時其 PR-side run **31143831917** 只跑了
+  **13 秒**（jobs 自 **03:16:14 UTC** 起算），四個 test matrix jobs 都還在
+  running。
+- merge commit **`7281e3a`** 於 **03:16:29** 到達 `main`。PR #14 原 CI 的四個
+  test jobs 隨後在 **03:16:51、03:16:55、03:17:36、03:17:38** 失敗。
+- merge commit 對應的 `main` CI run **31143847250** 也是失敗：四個 test jobs 全紅，
+  只有 `lint shell + installer scripts` success。
+- 修復 PR #15 於 **03:26:33** merge，commit **`c336672`**；其 `main` CI run
+  **31144359846** 五個 jobs 全部 success。
+
+### 16.2 根因與修復
+
+1. `test/version.test.ts` 把 Windows 字面量 `C:\\repo\\package.json` 拿去比對
+   runtime `path.join` 輸出；Ubuntu 使用 slash semantics，導致 expected value
+   錯誤。修復是讓 expected path 也用同一個 `path.join` 推導。
+2. `release-workflow.test.ts` 的 multiline regex 只接受 LF；Windows checkout
+   workflow YAML 時因 `.gitattributes` 沒有 `*.yml` 規則而得到 CRLF。修復分兩層：
+   根因修正是 pin `*.yml text eol=lf`，讀檔端再做 CRLF 正規化作 defense in
+   depth。
+
+### 16.3 操作規則
+
+- `main` 現在的 branch-protection enforcement contract 不是只有「操作人要記得等
+  CI」：GitHub 端已要求 `strict=true`、`enforce_admins=true`，required contexts
+  **精確**為 `test (ubuntu-latest, node 20.19)`、`test (ubuntu-latest, node
+  22.12)`、`test (windows-latest, node 20.19)`、`test (windows-latest, node
+  22.12)`、`lint shell + installer scripts`。因此不論 Web UI 或 `gh pr merge`，
+  都必須等 **最新 PR head SHA** 的這五個 jobs 全綠才可 merge；這才是防止再次
+  merge-before-CI 的主要控制點。
+- 沒有把 mandatory PR reviews 當成這次 remediation 的控制點：single-maintainer
+  repo 仍以 status checks gate 為主，而不是要求額外 reviewer。
+- 本機 full pass **不是** multi-platform CI 成功的證據。`gh pr checks --watch`
+  完成後，再用 `gh run view <id> --json jobs` 逐 job 確認 `conclusion=success`
+  的流程規則仍要保留，但它現在是對 branch protection 的**冗餘 safety belt**，
+  不是唯一保護。
+- 完成報告必須明確區分 **local validation** 與 **GitHub Actions CI**，並揭露中間
+  是否曾有失敗 run；不得只回報最後一次成功。
+
+### 16.4 更正動作的邊界
+
+- 這次歷史失敗 run 不能被抹除，也不應 revert `7281e3a` 來重寫歷史；`c336672`
+  已修正缺陷。矯正措施是補文件、收斂合併規則、預防再發，而不是試圖消去既有
+  失敗紀錄。
