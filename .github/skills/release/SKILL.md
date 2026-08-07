@@ -37,9 +37,11 @@ Applied to reachable commits since the baseline tag:
 
 If no reachable commit is release-worthy, `--plan` says so; **do not invent a version.**
 
+`fix(security)` and `fix` commits with `CVE` in the subject are classified into `### Security` but follow the same **patch** version policy as `fix`/`perf` in both current-version rows.
+
 ## CHANGELOG Mapping
 
-`draftChangelog()` groups conventional commits: `feat`→`### Added`, `fix`→`### Fixed`, `perf`→`### Performance`, `refactor`→`### Changed`, breaking→`### Changed` with a `**BREAKING:**` prefix, `security`→`### Security`; `docs`/`chore`/`build`/`ci`/`test`/`style` are suppressed. Non-conventional subjects and any subjects containing non-ASCII characters are **not** written to the draft — they appear only in `REVIEW BY HAND` because `CHANGELOG.md` is English-only (see its header comment). A human must translate or rewrite those before they enter `[Unreleased]`.
+`draftChangelog()` groups conventional commits: `feat`→`### Added`, `fix`→`### Fixed` (or `### Security` when the subject is `fix(security)` or contains `CVE`), `perf`/`refactor`→`### Changed`, `revert`→`### Removed`, breaking→`### Changed` with a `**BREAKING**` prefix; `docs`/`chore`/`build`/`ci`/`test`/`style` are suppressed. There is no standalone `security:` type — do not rely on one. `release-core` automatically routes non-conventional subjects and any subject containing non-ASCII characters to `REVIEW BY HAND` so `CHANGELOG.md` stays English-only (see its header comment). Automation does **not** catch ASCII-only non-English text (e.g. romanized or transliterated subjects); the agent and human must additionally review every drafted entry and redirect any subject that is not clearly suitable English to `REVIEW BY HAND` for rewrite or translation before it enters `[Unreleased]`.
 
 ## `--notes` (workflow + diagnostic)
 
