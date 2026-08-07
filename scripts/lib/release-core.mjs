@@ -170,7 +170,7 @@ export function draftChangelog(commits) {
 export function extractChangelogSection(changelog, version) {
   if (typeof changelog !== "string" || typeof version !== "string" || version === "") return null;
   const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const headingMatch = new RegExp(`^## \\[${escapedVersion}\\] - \\d{4}-\\d{2}-\\d{2}\\r?\\n`, "m").exec(changelog);
+  const headingMatch = new RegExp(`^## \\[${escapedVersion}\\](?:[^\\r\\n]*)\\r?\\n`, "m").exec(changelog);
   if (!headingMatch || headingMatch.index === undefined) return null;
   const bodyStart = headingMatch.index + headingMatch[0].length;
   const nextHeading = /^## /m.exec(changelog.slice(bodyStart));

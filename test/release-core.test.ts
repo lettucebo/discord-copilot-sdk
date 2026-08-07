@@ -279,6 +279,25 @@ describe("extractChangelogSection", () => {
     expect(releaseCore.extractChangelogSection?.(changelog, "1.0.0")).toBeNull();
   });
 
+  it("extracts a release section even when the heading date text is not ISO formatted", () => {
+    expect(typeof releaseCore.extractChangelogSection).toBe("function");
+
+    const datedChangelog = [
+      "# Changelog",
+      "",
+      "## [Unreleased]",
+      "",
+      "## [1.2.0] - TBD",
+      "",
+      "### Added",
+      "",
+      "- Release planning",
+      "",
+    ].join("\n");
+
+    expect(releaseCore.extractChangelogSection?.(datedChangelog, "1.2.0")).toBe("### Added\n\n- Release planning");
+  });
+
   it("extracts a populated final exact dated release section with no next heading", () => {
     expect(typeof releaseCore.extractChangelogSection).toBe("function");
 
