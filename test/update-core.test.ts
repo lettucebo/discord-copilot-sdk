@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   classifyCheckout,
+  readyMarkerMatches,
   targetInstancesStopped,
   orderUpdateSteps,
   parsePackageVersion,
@@ -213,6 +214,14 @@ describe("planUpdate", () => {
           expect(shouldRetainRestoreState(false)).toBe(true);
           expect(shouldRetainRestoreState(true)).toBe(false);
         });
+      });
+
+      it("accepts a readiness proof only for the live lock PID and instance", () => {
+        const marker = JSON.stringify({ version: 1, pid: 456, instance: "default" });
+        expect(readyMarkerMatches(marker, "default", 456)).toBe(true);
+        expect(readyMarkerMatches(marker, "default", 457)).toBe(false);
+        expect(readyMarkerMatches(marker, "work", 456)).toBe(false);
+        expect(readyMarkerMatches("{", "default", 456)).toBe(false);
       });
 
       it("detects a replacement PID for a target instance while waiting for shutdown", () => {

@@ -283,10 +283,19 @@ describe("shipped scripts", () => {
     expect(attributes).toContain("*.yml text eol=lf");
   });
 
-  it("runs syntax checks for every shipped update entrypoint in CI", () => {
+  it("runs syntax checks for every shipped lifecycle entrypoint in CI", () => {
     const workflow = fs.readFileSync(path.join(ROOT, ".github", "workflows", "ci.yml"), "utf8");
     expect(workflow).toMatch(/for f in install\.sh get\.sh update\.sh run-bot\.sh stop-bot\.sh uninstall\.sh; do/);
-    expect(workflow).toMatch(/for f in scripts\/setup\.mjs scripts\/update\.mjs scripts\/uninstall\.mjs scripts\/release\.mjs scripts\/lib\/\*\.mjs; do/);
+    expect(workflow).toMatch(/for f in scripts\/setup\.mjs scripts\/run\.mjs scripts\/update\.mjs scripts\/uninstall\.mjs scripts\/release\.mjs scripts\/lib\/\*\.mjs; do/);
     expect(workflow).toMatch(/\$files = 'install\.ps1', 'get\.ps1', 'update\.ps1', 'run-bot\.ps1', 'stop-bot\.ps1', 'uninstall\.ps1'/);
+  });
+
+  it("routes detached starts through the full-ready launcher rather than a two-second liveness probe", () => {
+    const powershell = fs.readFileSync(path.join(ROOT, "run-bot.ps1"), "utf8");
+    const shell = fs.readFileSync(path.join(ROOT, "run-bot.sh"), "utf8");
+    for (const script of [powershell, shell]) {
+      expect(script).toContain("scripts/run.mjs");
+      expect(script).not.toMatch(/(?:Start-Sleep -Seconds|sleep) 2/);
+    }
   });
 });

@@ -302,6 +302,13 @@ resume 的錯誤。
 - Windows 用硬終止停止 bot，in-flight turn 可能遺失；active-thread guard 只報告可 resume 的 thread 與髒 worktree，不能誠實地宣稱知道記憶體中的 turn 是否正在執行。
 - updater 故意還原更新前的狀態，而不是無條件啟動：原先被刻意停掉的 instance 不會在 update 後自行運行。需要強制啟動時 operator 依 updater 印出的 instance 專屬命令執行。
 
+### 14.3 Detached startup readiness（2026-08-09）
+
+- app PID lock 仍是唯一的 instance ownership 真相，且在載入 Discord／SDK runtime 前由 entry bootstrap 取得；這縮短 stale lock 被回收後到新 owner 可見之間的視窗，使 `stop-bot` 能在 startup 中辨識並停止正確的 PID。
+- `run-bot.ps1`／`run-bot.sh` 共同呼叫 `scripts/run.mjs`，不再把「child 活過兩秒」當成成功。launcher 產生一次性 256-bit token，只有 `DiscordCopilotApp.start()` 完成 Copilot、gateway、commands、reconcile 與 staging cleanup 後才原子寫入 token 對應 marker。
+- launcher 僅在 **child PID = live app lock owner = marker PID/instance** 時宣告 ready。token marker 是一次性的完成證明；成功、child failure、timeout 與 launcher 中斷都清除它。app 也寫入 per-instance current-ready marker，供 updater 驗證常駐服務恢復；它同樣必須吻合 live lock PID，graceful shutdown owner-aware 清除，故不是第二份 PID registry。
+- ready 最多等待 120 秒。逾時或 marker 不可信時只終止 launcher 自己建立的 child PID，絕不依名稱掃描或終止其他 Node process。Windows hard-stop 仍可能留下 stale app lock，下一次 app 以既有 owner-aware reclaim 回收。
+
 ## 15. 平台路徑 test 字面量稽核（2026-08-07）
 
 ### 15.1 觸發原因

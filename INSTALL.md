@@ -216,7 +216,8 @@ residency is only re-enabled/restarted; it is never re-registered, so a Windows
 24/7 task is not silently downgraded to login-keepalive.
 
 Successful applies report all four stages (stop, source, setup, restore) per
-instance. A restart is reported only after the updater observes the new PID.
+instance. A restart is reported only after the updater observes the new PID
+and its current-ready proof after Discord startup completes.
 The updater restores the state that existed before the update: an instance that
 was already stopped remains stopped and says so. `--no-restart` likewise keeps
 each instance stopped and prints its exact manual start command.
@@ -307,7 +308,7 @@ Multiple deployments: set `DISCORD_COPILOT_SDK_INSTANCE_ID` (default `default`),
 ### Start and stop by hand
 
 ```powershell
-./run-bot.ps1      # start detached (refuses if already running)
+./run-bot.ps1      # start detached; waits until Discord is ready
 ./run-bot.ps1 -Foreground
 ./stop-bot.ps1     # reads the app's own lock
 ```
@@ -317,6 +318,14 @@ Multiple deployments: set `DISCORD_COPILOT_SDK_INSTANCE_ID` (default `default`),
 ./run-bot.sh --foreground
 ./stop-bot.sh
 ```
+
+Detached start returns success only after the bot owns its instance lock and
+has completed Copilot startup, Discord login, command registration, and startup
+reconciliation. It waits for at most 120 seconds; an early exit, invalid ready
+proof, or timeout returns failure and terminates only the child it just started.
+Inspect `~/.discord-copilot-sdk/logs/run-bot.<instance>.log.err` for the
+startup error. `-Foreground` / `--foreground` keeps the process in the current
+terminal and does not use the detached-launch handshake.
 
 ---
 

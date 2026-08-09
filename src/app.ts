@@ -22,8 +22,9 @@ import {
 } from "discord.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Config } from "./config.js";
-import { acquireSingleInstanceLock, type InstanceLock } from "./core/single-instance.js";
-import { lockPath, sessionStorePath, worktreeRoot, channelRegistryPath } from "./core/paths.js";
+import type { InstanceLock } from "./core/single-instance.js";
+import { sessionStorePath, worktreeRoot, channelRegistryPath } from "./core/paths.js";
+import { clearStartupReady } from "./core/startup-ready.js";
 import { resolveReposRoot, resolveRepoWithinRoot, listRepos, isStrictlyInside, pathRelation, canonicalPathOr } from "./core/repo.js";
 import { validateBinding, describeBindingProblem, type DevMode } from "./core/binding.js";
 import { RepoProvisioner, sweepStaleStaging } from "./core/repo-provision.js";
@@ -496,8 +497,8 @@ export class DiscordCopilotApp {
     return app;
   }
 
-  /** Build and fully start the app (lock → SDK → Discord login + commands). */
-  static async start(config: Config): Promise<DiscordCopilotApp> {
+  /** Fully start after bootstrap has already acquired the instance lock. */
+  static async start(config: Config, lock: InstanceLock): Promise<DiscordCopilotApp> {
     const reposRoot = resolveReposRoot(config.REPOS_ROOT);
     const compat = checkSdkCompat();
     if (!compat.ok) {
@@ -509,7 +510,6 @@ export class DiscordCopilotApp {
           `Refusing to start the bot; run \`npm install\` to align.`
       );
     }
-    const lock = await acquireSingleInstanceLock(lockPath());
     let copilot: CopilotClient | undefined;
     let app: DiscordCopilotApp | undefined;
     try {
@@ -3658,6 +3658,7 @@ export class DiscordCopilotApp {
       /* best effort */
     }
     await this.copilot.stop().catch(() => {});
+    await clearStartupReady().catch(() => {});
     await this.lock.release().catch(() => {});
   }
 }

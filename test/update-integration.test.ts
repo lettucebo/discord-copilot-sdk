@@ -421,6 +421,9 @@ describe("git update data paths", { timeout: 60_000 }, () => {
             "fs.mkdirSync(state, { recursive: true });",
             'const lock = path.join(state, `${instance}.lock`);',
             "fs.writeFileSync(lock, String(process.pid));",
+            'const ready = path.join(state, "startup-ready");',
+            "fs.mkdirSync(ready, { recursive: true });",
+            'fs.writeFileSync(path.join(ready, `${instance}.ready.json`), JSON.stringify({ version: 1, pid: process.pid, instance }));',
             "setInterval(() => {}, 1_000);",
             "",
           ].join("\n")
