@@ -9,6 +9,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-09
+
 ### Fixed
 
 - wait for full startup readiness
