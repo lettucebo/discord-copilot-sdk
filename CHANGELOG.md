@@ -9,6 +9,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-09
+
 First published release. No earlier version was ever tagged, so this section consolidates
 everything shipped in this repository to date.
 
