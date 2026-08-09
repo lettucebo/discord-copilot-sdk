@@ -443,19 +443,19 @@ npx vitest run test/version.test.ts test/session-actor.test.ts \
 
 ### 16.3 操作規則
 
-- `main` 現在的 branch-protection enforcement contract 不是只有「操作人要記得等
-  CI」：GitHub 端已要求 `strict=true`、`enforce_admins=true`，required contexts
-  **精確**為 `test (ubuntu-latest, node 20.19)`、`test (ubuntu-latest, node
-  22.12)`、`test (windows-latest, node 20.19)`、`test (windows-latest, node
-  22.12)`、`lint shell + installer scripts`。因此不論 Web UI 或 `gh pr merge`，
-  都必須等 **最新 PR head SHA** 的這五個 jobs 全綠才可 merge；這才是防止再次
-  merge-before-CI 的主要控制點。
-- 沒有把 mandatory PR reviews 當成這次 remediation 的控制點：single-maintainer
-  repo 仍以 status checks gate 為主，而不是要求額外 reviewer。
-- 本機 full pass **不是** multi-platform CI 成功的證據。`gh pr checks --watch`
-  完成後，再用 `gh run view <id> --json jobs` 逐 job 確認 `conclusion=success`
-  的流程規則仍要保留，但它現在是對 branch protection 的**冗餘 safety belt**，
-  不是唯一保護。
+- 2026-08-09 起，maintainer 有意永久移除 `main` 的 branch protection，讓 release
+  可以依既定流程直接以 `git push --atomic --follow-tags origin main` 推送 release
+  commit 與 annotated tag。原本的 `strict=true`、`enforce_admins=true`、PR gate 與
+  五個 required contexts 均已不再是 GitHub 強制控制。
+- **接受的殘餘風險**：PR #14 的 merge-before-CI 事故證明 branch protection 是當時唯一
+  的系統性防線；移除後，`main` 可在 CI 尚未完成或已失敗時前進。`ci.yml` 仍會在
+  `push: branches: [main]` 和 PR 觸發，但只屬事後偵測，不能阻擋推送或 tag-driven
+  Release。
+- 取代控制是操作紀律，不得被誤稱為 enforcement：任何推送前必須在本機完成
+  `npm run typecheck` 與 `npm test`；推送後必須用 `gh run view <id> --json jobs`
+  確認 `test (ubuntu-latest, node 20.19)`、`test (ubuntu-latest, node 22.12)`、
+  `test (windows-latest, node 20.19)`、`test (windows-latest, node 22.12)`、
+  `lint shell + installer scripts` 五個 job 的 `conclusion=success`。
 - 完成報告必須明確區分 **local validation** 與 **GitHub Actions CI**，並揭露中間
   是否曾有失敗 run；不得只回報最後一次成功。
 
