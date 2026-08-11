@@ -189,6 +189,7 @@ describe("SessionActor config hardening", () => {
     expect(s.config["enableConfigDiscovery"]).toBe(false);
     expect(s.config["workingDirectory"]).toBe("C:\\repo");
     expect(s.config["streaming"]).toBe(true);
+    expect(s.config["reasoningSummary"]).toBe("detailed");
     for (const cb of [
       "onPermissionRequest",
       "onUserInputRequest",
@@ -748,13 +749,16 @@ describe("SessionActor abort + teardown", () => {
   it("reconfigure calls setModel with merged model/effort/context and tracks state", async () => {
     const s = await setup();
     await s.actor.reconfigure({ model: "gpt-5.4", effort: "high" });
-    expect(s.session.setModelCalls.at(-1)).toEqual({ model: "gpt-5.4", options: { reasoningEffort: "high" } });
+    expect(s.session.setModelCalls.at(-1)).toEqual({
+      model: "gpt-5.4",
+      options: { reasoningEffort: "high", reasoningSummary: "detailed" },
+    });
     expect(s.actor.config()).toEqual({ model: "gpt-5.4", effort: "high", context: undefined });
     // change only context; model+effort preserved
     await s.actor.reconfigure({ context: "long_context" });
     expect(s.session.setModelCalls.at(-1)).toEqual({
       model: "gpt-5.4",
-      options: { reasoningEffort: "high", contextTier: "long_context" },
+      options: { reasoningEffort: "high", reasoningSummary: "detailed", contextTier: "long_context" },
     });
     expect(s.actor.config()).toEqual({ model: "gpt-5.4", effort: "high", context: "long_context" });
   });
@@ -772,7 +776,10 @@ describe("SessionActor abort + teardown", () => {
     expect(s.actor.config().effort).toBe("high");
     await s.actor.reconfigure({ model: "m2", resetEffort: true });
     expect(s.actor.config()).toEqual({ model: "m2", effort: undefined, context: undefined });
-    expect(s.session.setModelCalls.at(-1)).toEqual({ model: "m2", options: {} }); // no reasoningEffort sent
+    expect(s.session.setModelCalls.at(-1)).toEqual({
+      model: "m2",
+      options: { reasoningSummary: "detailed" },
+    }); // no reasoningEffort sent
   });
 
   it("a FAILED disconnect faults the actor and never reports success on retry", async () => {
@@ -979,13 +986,14 @@ describe("SessionActor resume/create-id seam (P2)", () => {
     expect(s.resumeArgs).toBeUndefined(); // did NOT resume
   });
 
-  it("resume does NOT re-send model/contextTier — the session keeps what the user chose", async () => {
+  it("resume keeps the fixed detailed reasoning request but not user-selected model/context", async () => {
     // Otherwise a restart silently reverts a /model + /context selection to this
     // process's startup defaults, while /usage keeps echoing the cached value and
     // reports a configuration the session is not on.
     const s = await setup({ resumeSessionId: "sess-123", model: "gpt-5.4", contextTier: "long_context" });
     expect(s.resumeArgs?.cfg["model"]).toBeUndefined();
     expect(s.resumeArgs?.cfg["contextTier"]).toBeUndefined();
+    expect(s.resumeArgs?.cfg["reasoningSummary"]).toBe("detailed");
   });
 
   it("resume seeds its config from the RUNTIME, not from the startup defaults", async () => {
