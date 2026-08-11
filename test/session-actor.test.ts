@@ -349,7 +349,7 @@ describe("SessionActor permission handling", () => {
     expect(s.transport.permissions).toHaveLength(1); // carded despite both trusted (has &&)
     expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u1");
-    expect(await r).toEqual({ kind: "denied-interactively-by-user" });
+    expect(await r).toEqual({ kind: "reject" });
   });
 
   it("never auto-approves via substitution `$( )` / backticks / pipes", async () => {
@@ -426,7 +426,7 @@ describe("SessionActor permission handling", () => {
     await tick();
     expect(s.transport.permissions).toHaveLength(1); // carded — `rm` (the real exec) isn't trusted
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u");
-    expect(await r).toEqual({ kind: "denied-interactively-by-user" });
+    expect(await r).toEqual({ kind: "reject" });
   });
 
   it("does not offer session/always for a multi-executable request", async () => {
@@ -453,7 +453,7 @@ describe("SessionActor permission handling", () => {
     expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
     // A "session" decision the request never authorized must deny (not approve).
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "session", "u1");
-    expect(await result).toEqual({ kind: "denied-interactively-by-user" });
+    expect(await result).toEqual({ kind: "reject" });
     expect(s.policy.isApproved("t", "C:\\repo", ["powershell"])).toBe(false);
   });
 
@@ -473,7 +473,7 @@ describe("SessionActor permission handling", () => {
     const result = perm(s)({ kind: "shell", fullCommandText: "rm x" });
     await tick();
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u1");
-    expect(await result).toEqual({ kind: "denied-interactively-by-user" });
+    expect(await result).toEqual({ kind: "reject" });
   });
 
   it("auto-denies a non-shell permission (fail closed) with a notice", async () => {

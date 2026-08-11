@@ -3,7 +3,7 @@ import type { RenderState } from "./turn-render.js";
 /** A user's response to a permission prompt. `once`/`session`/`always` are
  *  escalating approval scopes; `deny` refuses. For shell these map to the SDK's
  *  approve-once / approve-for-session (commands) / approve-for-location
- *  (commands, persisted to the repo) / denied-interactively-by-user. */
+ *  (commands, persisted to the repo) / reject. */
 export type Decision = "once" | "session" | "always" | "deny";
 
 /** What a permission prompt shows. `summary` is the COMPLETE structured request

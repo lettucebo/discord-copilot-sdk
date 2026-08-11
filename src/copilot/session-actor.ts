@@ -25,7 +25,10 @@ const TODOS_DEBOUNCE_MS = 700;
 /** Safe-default permission result (deny). Used for timeout/abort and for
  *  permission kinds discord-copilot-sdk has no UI for (fail-closed). */
 const DENY_UNAVAILABLE = { kind: "user-not-available" } as const;
-const DENIED_BY_USER = { kind: "denied-interactively-by-user" } as const;
+/** A Discord user explicitly rejected the request. The local CLI runtime accepts
+ * `reject`, but rejects the SDK-declared `denied-interactively-by-user` variant
+ * as malformed; keeping the latter would turn every Deny click into a runtime error. */
+const REJECTED_BY_USER = { kind: "reject" } as const;
 const APPROVE_ONCE = { kind: "approve-once" } as const;
 /** Sentinel settled for an ask_user with no operator answer (timeout/abort/card
  *  failure). The handler throws on it so the ask_user tool FAILS rather than the
@@ -544,10 +547,10 @@ export class SessionActor {
    *  auto-approved before a card is shown. Fail-closed: a wider decision the
    *  request didn't authorize denies. */
   private buildDecision(nonce: string, decision: Decision): unknown {
-    if (decision === "deny") return DENIED_BY_USER;
+    if (decision === "deny") return REJECTED_BY_USER;
     if (decision === "once") return APPROVE_ONCE;
     const meta = this.pendingPerms.get(nonce);
-    if (!meta || !meta.canOfferSession || !meta.executable) return DENIED_BY_USER;
+    if (!meta || !meta.canOfferSession || !meta.executable) return REJECTED_BY_USER;
     if (decision === "session") {
       this.opts.policy.approveForSession(this.opts.sessionKey, meta.executable);
       return APPROVE_ONCE;
