@@ -545,7 +545,7 @@ skills 可見；未 commit / untracked skill 只會在 `/repo dev local` 見到�
 | junctioned user skill directory | `skill` invocation success | user-root link 可以安全支援 |
 | `excludedTools:["skill"]` | skill tool definitions = 0；builtin sub-agent 與 resume 亦為 0 | 空來源的正確 fallback |
 | 對抗性 repo skill `allowed-tools: Bash` | shell 仍觸發 `onPermissionRequest(kind:"shell")` | SDK headless path 沒有 TUI 的 auto-rule bypass |
-| deny variants | runtime 接受 `reject`，拒收 `denied-interactively-by-user` | 修正 Deny payload |
+| deny variants | runtime 接受 `reject`，拒收 SDK 宣告的互動拒絕 variant | 修正 Deny payload |
 
 `allowed-tools` 的 auto-approval 程式碼存在 CLI interactive TUI 的 React `useEffect`；它不是
 SDK session host path。不過這只是**當前版本的實測**，不能當成 sandbox 或永恆的 API 契約。
@@ -571,7 +571,7 @@ warning 會額外說明此風險。YOLO 仍是 session-local、volatile，restar
 
 ### 17.5 另一個 runtime/SDK 不一致：Deny
 
-SDK `rpc.d.ts` 宣告 `denied-interactively-by-user`，但真實 local runtime 拒收該 variant：
+SDK `rpc.d.ts` 宣告一個互動拒絕 variant，但真實 local runtime 拒收它：
 `permission host returned malformed payload`。過去 Discord Deny 雖仍 fail-closed（指令沒有執行），
 卻會向 thread 露出 runtime error。明確 Deny 現改送 `{kind:"reject"}`；timeout/abort/
 unsupported kinds 繼續送 `{kind:"user-not-available"}`。`reject` 沒有 `forceReject` 欄位，

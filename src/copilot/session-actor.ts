@@ -32,8 +32,8 @@ const TODOS_DEBOUNCE_MS = 700;
  *  permission kinds discord-copilot-sdk has no UI for (fail-closed). */
 const DENY_UNAVAILABLE = { kind: "user-not-available" } as const;
 /** A Discord user explicitly rejected the request. The local CLI runtime accepts
- * `reject`, but rejects the SDK-declared `denied-interactively-by-user` variant
- * as malformed; keeping the latter would turn every Deny click into a runtime error. */
+ * `reject`, but rejects the SDK-declared interactive-denial variant as malformed;
+ * keeping the latter would turn every Deny click into a runtime error. */
 const REJECTED_BY_USER = { kind: "reject" } as const;
 const APPROVE_ONCE = { kind: "approve-once" } as const;
 /** Sentinel settled for an ask_user with no operator answer (timeout/abort/card
