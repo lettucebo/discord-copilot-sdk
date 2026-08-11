@@ -129,6 +129,26 @@ describe("TurnRenderer", () => {
     ]);
   });
 
+  it("retains a failed tool error when completion arrives before its start event", () => {
+    const r = new TurnRenderer();
+    r.apply({
+      type: "tool_complete",
+      id: "t1",
+      status: "failed",
+      error: "permission denied",
+    });
+
+    expect(r.state().items).toEqual([
+      {
+        kind: "tool",
+        id: "t1",
+        name: "",
+        status: "failed",
+        error: "permission denied",
+      },
+    ]);
+  });
+
   it("keeps exactly matching audit entries compact without merging different commands", () => {
     const r = new TurnRenderer();
     r.addAudit("shell: git status", "⚡ `shell`: `git status`");
