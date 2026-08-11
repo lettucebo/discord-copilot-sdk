@@ -24,6 +24,21 @@ const toolDone = (toolCallId: string, success: boolean, agentId?: string) => ({
   agentId,
   data: { toolCallId, success },
 });
+const reasoningDelta = (reasoningId: string, deltaContent: string, agentId?: string) => ({
+  type: "assistant.reasoning_delta",
+  agentId,
+  data: { reasoningId, deltaContent },
+});
+const reasoning = (reasoningId: string, content: string, agentId?: string) => ({
+  type: "assistant.reasoning",
+  agentId,
+  data: { reasoningId, content },
+});
+const intent = (value: string, agentId?: string) => ({
+  type: "assistant.intent",
+  agentId,
+  data: { intent: value },
+});
 
 describe("normalizeSdkEvent", () => {
   it("maps a streaming delta from data.deltaContent (not delta/text/content)", () => {
@@ -60,6 +75,72 @@ describe("normalizeSdkEvent", () => {
       agentId: undefined,
       id: "t9",
       name: "powershell",
+      arguments: undefined,
+      possiblePaths: [],
+    });
+  });
+
+  it("preserves tool targets and a safe argument record for compact timeline display", () => {
+    const event = {
+      type: "tool.execution_start",
+      data: {
+        toolCallId: "t9",
+        toolName: "shell",
+        arguments: { command: "git status --short" },
+        shellToolInfo: {
+          hasWriteFileRedirection: false,
+          possiblePaths: ["C:\\Source\\Repos\\example"],
+        },
+      },
+    };
+    expect(normalizeSdkEvent("tool.execution_start", event)).toEqual({
+      type: "tool_start",
+      agentId: undefined,
+      id: "t9",
+      name: "shell",
+      arguments: { command: "git status --short" },
+      possiblePaths: ["C:\\Source\\Repos\\example"],
+    });
+  });
+
+  it("maps streamed and finalized reasoning from their documented data fields", () => {
+    expect(normalizeSdkEvent("assistant.reasoning_delta", reasoningDelta("r1", "Checking "))).toEqual({
+      type: "reasoning_delta",
+      agentId: undefined,
+      id: "r1",
+      text: "Checking ",
+    });
+    expect(normalizeSdkEvent("assistant.reasoning", reasoning("r1", "Checking the files."))).toEqual({
+      type: "reasoning",
+      agentId: undefined,
+      id: "r1",
+      content: "Checking the files.",
+    });
+  });
+
+  it("maps the short assistant intent for runtimes that omit raw reasoning", () => {
+    expect(normalizeSdkEvent("assistant.intent", intent("Inspecting the renderer"))).toEqual({
+      type: "intent",
+      agentId: undefined,
+      text: "Inspecting the renderer",
+    });
+  });
+
+  it("preserves a failed tool's error message for compact failure display", () => {
+    const event = {
+      type: "tool.execution_complete",
+      data: {
+        toolCallId: "t1",
+        success: false,
+        error: { message: "permission denied" },
+      },
+    };
+    expect(normalizeSdkEvent("tool.execution_complete", event)).toEqual({
+      type: "tool_complete",
+      agentId: undefined,
+      id: "t1",
+      status: "failed",
+      error: "permission denied",
     });
   });
 

@@ -4,7 +4,7 @@
 
 從任何地方（包含手機）透過 Discord 控制你的**本機 GitHub Copilot**，並保留完整的「GitHub Copilot app」體驗。
 
-`discord-copilot-sdk` 是一個 Discord bot，透過官方 [`@github/copilot-sdk`](https://www.npmjs.com/package/@github/copilot-sdk)（JSON-RPC）驅動本機 Copilot engine。每個 Discord thread 對應一個 Copilot session；bot 會把 agent 訊息、tool calls 與 todo checklist 串流進 thread，並把 permission / choice / plan prompts 呈現成 Discord **按鈕**（自由文字回答則用一般 thread 訊息），讓你可從任何裝置回應。Token 用量與即時 model/effort/context tier 可用 `/usage` 隨時查看。
+`discord-copilot-sdk` 是一個 Discord bot，透過官方 [`@github/copilot-sdk`](https://www.npmjs.com/package/@github/copilot-sdk)（JSON-RPC）驅動本機 Copilot engine。每個 Discord thread 對應一個 Copilot session；bot 會把 agent 訊息、精簡工具呼叫、預設收合的 thinking 與 todo checklist 依真實時序串流進 thread，並把 permission / choice / plan prompts 呈現成 Discord **按鈕**（自由文字回答則用一般 thread 訊息），讓你可從任何裝置回應。Token 用量與即時 model/effort/context tier 可用 `/usage` 隨時查看。
 
 > 姊妹專案：[`seam-acp`](https://github.com/lettucebo/seam-acp)。seam-acp 透過 ACP protocol 把 Discord 串到多種 agents；**discord-copilot-sdk 只支援 Copilot 且 SDK-native**，因此能提供最完整、最官方的 Copilot 體驗（native ask_user、plan approval、usage、每模型最高約 1M context 的 `contextTier: long_context`）。
 
@@ -44,7 +44,7 @@ discord-copilot-sdk v1 **僅限實驗環境**。它會**以啟動 bot 的使用�
 
 - 它是**per-session**（單一 thread）且**永不 persist**——restart 或 session recovery 都會回到 **OFF**，recovery notice 會明講；
 - 啟用只有在 Discord 確認警告後才生效，所以 reply 失敗不會讓 session 默默失去防護；
-- 每次 auto-approval 都會貼出精簡 audit notice（kind + bounded target，絕不含 payload）。Notice 是 **best effort**：approval path 不會 await 它，所以 Discord outage 會延遲或漏掉該行，不會 block tool——不要把 thread 當成保證完整的 audit log；
+- 每次 auto-approval 都會先同步 append + fsync 一筆有界紀錄（kind + target，絕不含 payload）到 `~/.discord-copilot-sdk/<instance>.audit.jsonl`，再顯示精簡 timeline 行。Discord render 是 **best effort**，但本機 log 才是權威；若 log 無法寫入，YOLO 與既有規則的自動核准都會拒絕該請求，不會在沒有稽核紀錄下執行；
 - 已經在等待中的 approval card 仍需要你的決定；
 - `ask_user` 與 exit-plan 仍會詢問——YOLO 核准的是 *permissions*，不會替你回答問題或選 plan actions；
 - `/stop` 仍優先：teardown 不論 YOLO 都 fail closed；
@@ -54,7 +54,7 @@ discord-copilot-sdk v1 **僅限實驗環境**。它會**以啟動 bot 的使用�
 
 在真實機器上實測確認（Copilot Enterprise、copilot CLI 1.0.74-1）：
 
-- 可 end-to-end 驅動**本機** session：`listModels()`、`createSession()`、`send()`、完整 event stream（`assistant.message`/`reasoning`/deltas、`tool.execution_*`、`session.usage_info`/`plan_changed`/`idle`）。discord-copilot-sdk 會 render assistant messages 與 tool calls；reasoning 刻意**不**render 到 thread。
+- 可 end-to-end 驅動**本機** session：`listModels()`、`createSession()`、`send()`、完整 event stream（`assistant.message`/`reasoning`/deltas、`tool.execution_*`、`session.usage_info`/`plan_changed`/`idle`）。discord-copilot-sdk 會 render assistant messages、依序的精簡 tool calls，以及預設收合在 Discord spoiler 後的 thinking；reasoning 的 markdown delimiters 會轉成純文字，避免破壞 spoiler。
 - Native interactive callbacks：`onPermissionRequest`、`onUserInputRequest`（ask_user）、`onExitPlanMode`、`onElicitationRequest`。
 - **`contextTier: "long_context"` 解鎖 936K effective window**（預設 200K）——raw ACP path 做不到（上限 264K）。
 
