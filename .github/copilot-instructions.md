@@ -115,11 +115,23 @@ and per-session **YOLO** mode, which approves every permission before the kind/l
 **YOLO mode is never persisted.** It is actor-local and volatile so a restart or resume always
 comes back OFF; enabling it only takes effect after Discord acknowledges the warning.
 
-**Do not re-enable the SDK flags that are off.** `enableFileHooks`, `enableConfigDiscovery`,
-`enableSkills` are `false` and `skipCustomInstructions` is `true` in both `session-actor.ts` and
-the titler in `app.ts` — each with a comment naming the bypass it closes (a repo `.github/hooks`
-file can set `resolvedByHook` and skip the Discord card entirely; instruction files load
-regardless of config discovery, so *this* file is not read by the agent the bot spawns).
+**Do not re-enable broad SDK discovery or file hooks.** `enableFileHooks` and
+`enableConfigDiscovery` stay `false`, and `skipCustomInstructions` stays `true` in
+`session-actor.ts` and the titler in `app.ts`. A repo `.github/hooks` file can set
+`resolvedByHook` and skip the Discord card entirely; broad config discovery would also load
+repo MCP settings; instruction files load regardless of config discovery, so *this* file is not
+read by the agent the bot spawns.
+
+**Skills are a deliberate, narrow exception.** `SessionActor` explicitly passes only the
+CLI-native repo roots (`.github/skills`, `.agents/skills`, `.claude/skills`) and the user root
+(`~/.copilot/skills`) according to `ENABLE_REPO_SKILLS` / `ENABLE_USER_SKILLS`; it must **not**
+set `enableConfigDiscovery:true` to do so. If no enabled root has a `SKILL.md`, it sends
+`excludedTools:["skill"]`, because CLI 1.0.71 still registers the builtin skill tool even when
+`enableSkills:false`, producing a guaranteed `Skill not found` failure. Repo skill descriptions
+are model context: never describe this as a trust boundary. A repo skill's `allowed-tools`
+frontmatter was probed against the SDK runtime and does not bypass `onPermissionRequest`, but
+YOLO removes that remaining card gate; preserve the explicit YOLO warning.
+
 `createCopilotClient` strips `DISCORD_*` / `DISCOPILOT_*` from the agent's env, and
 `useLoggedInUser: true` is hardcoded.
 

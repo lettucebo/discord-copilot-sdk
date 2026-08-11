@@ -32,7 +32,8 @@ discord-copilot-sdk v1 **僅限實驗環境**。它會**以啟動 bot 的使用�
 目前已有的緩解措施：
 
 - **逐指令核准**：每個 shell permission 都會顯示成 Discord Allow/Deny card；Allow 只有在 Discord 確認 click 後才 settle，其他 permission kind 與 interactive callback（ask_user / exit-plan / elicitation）都**fail closed**（deny/cancel）。
-- **Repo 不能重新設定 agent**：`enableFileHooks`、`enableConfigDiscovery` 與 `enableSkills` 都停用，所以受控 repo 的 `.github/hooks` 不能在你背後自動核准（"`resolvedByHook`"）指令。`skipCustomInstructions` 也啟用——SDK 不論 `enableConfigDiscovery` 都會載入 `AGENTS.md` / `.github/copilot-instructions.md`，所以沒有它時 repo 仍可帶入常駐指令。這阻止 repo **設定** agent；不是宣稱 repo *內容* 無法影響它（檔案內容與 tool output 仍會進模型）。
+- **Repo hooks、MCP 設定與 custom instructions 仍停用**：`enableFileHooks:false` 阻止受控 repo 的 `.github/hooks` 在背後以 `resolvedByHook` 自動核准指令。`enableConfigDiscovery:false` 阻止探索 `.mcp.json` / `.vscode/mcp.json`；`skipCustomInstructions:true` 仍不可少，因 SDK 不論 config discovery 都會載入 `AGENTS.md` / `.github/copilot-instructions.md`。
+- **Skills 是刻意、較窄的例外**：預設只明確載入 session repo 的 CLI 原生 skill roots：`.github/skills`、`.agents/skills`、`.claude/skills`，以及 `~/.copilot/skills`。這**不會**開啟 broad config/MCP discovery；實測 skill 的 `allowed-tools` frontmatter 也不會繞過 SDK 模式中的 Discord permission card。不過 skill 的名稱與描述即使尚未 invoke 也會進入 model context，因此 repo 作者仍可 steer agent。設 `ENABLE_REPO_SKILLS=false` 可只移除 repo skill roots、保留 user skills；`ENABLE_USER_SKILLS=false` 則相反。
 - **抗偽造 cards**：指令會被 escaped 顯示（避免 markdown/code-fence breakout），含 bidirectional/control characters 的指令會自動 deny，過長指令也會自動 deny，而不是只顯示一部分。
 - **Access gate**：只有 allow-list user id(s)、在設定的 guild + parent channel/threads 內，才能驅動 session。（這只 gate *input*；任何能讀 channel 的人都能讀 *output*——請使用私人 channel。）Secrets（`DISCORD_*`/`DISCORD_COPILOT_SDK_*`）會從 agent runtime env 移除。預設 bot 也能*讀取* server 中每個 channel；[`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) §4b 說明如何限制它能讀什麼。隱藏 slash commands 本身是另一個只能由 admin 設定的 Discord 項目，記錄在 [`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md)。
 
@@ -49,6 +50,7 @@ discord-copilot-sdk v1 **僅限實驗環境**。它會**以啟動 bot 的使用�
 - `ask_user` 與 exit-plan 仍會詢問——YOLO 核准的是 *permissions*，不會替你回答問題或選 plan actions；
 - `/stop` 仍優先：teardown 不論 YOLO 都 fail closed；
 - `/usage` 會顯示 `⚡ YOLO: ON`，讓你一眼看出。用 `/yolo mode:off` 關閉。
+- **不要在不理解風險時把 YOLO 與 repo skills 疊加**：repo skill 文字可 steer model，而 YOLO 移除了平時約束 tool use 的 Discord 核准 gate。只要 session 載入 repo skills，啟用警告就會明確指出這一點。
 
 ## 為什麼使用 SDK（已驗證）
 
@@ -63,6 +65,28 @@ discord-copilot-sdk v1 **僅限實驗環境**。它會**以啟動 bot 的使用�
 - Node.js `^20.19.0` 或 `>=22.12.0`
 - Host 上已安裝且登入 GitHub Copilot CLI（bot 使用已登入使用者）
 - Discord bot token；你的 Discord user id 在 allow-list 中
+
+### Skills 與來源開關
+
+每個新 session 都會明確載入下列 roots，同時保持 `enableConfigDiscovery:false`：
+
+| 來源 | 預設 | 開關 |
+| --- | --- | --- |
+| Repo：`.github/skills`、`.agents/skills`、`.claude/skills` | 開啟 | `ENABLE_REPO_SKILLS` |
+| User：`~/.copilot/skills` | 開啟 | `ENABLE_USER_SKILLS` |
+
+兩個開關只接受小寫 `true` / `false`；`.env` 留空會回到 `true`。若所有啟用的 root 都沒有
+`SKILL.md`，bot 會移除 `skill` tool，而非留下只會以「Skill not found」失敗的 tool。
+git worktree 只看得到已 commit 的 skill；編輯尚未 commit 的 skill 時請用 `/repo dev local`。
+
+`~/.copilot/skills` 是跨 session 共用的。任何被你核准可執行 shell 的 session 都可能寫入其中；
+請把它視為受信任的本機狀態，並只在可拋棄的 lab host 上使用。
+
+升級本機 Copilot CLI 後，請跑下列手動 acceptance probe（需要登入）：
+
+```bash
+npm run smoke:skills
+```
 
 ## 快速開始
 

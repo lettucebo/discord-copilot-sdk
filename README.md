@@ -57,13 +57,18 @@ Mitigations that **are** in place:
 - **Approve-per-command**: every shell permission is surfaced as a Discord Allow/Deny card;
   Allow is settled only after Discord acknowledges the click, and every other permission kind
   and interactive callback (ask_user / exit-plan / elicitation) **fails closed** (deny/cancel).
-- **Repo can't reconfigure the agent**: `enableFileHooks`, `enableConfigDiscovery` and
-  `enableSkills` are disabled, so a controlled-repo `.github/hooks` file can't auto-approve
-  ("`resolvedByHook`") a command behind your back. `skipCustomInstructions` is also set —
-  the SDK loads `AGENTS.md` / `.github/copilot-instructions.md` *regardless* of
-  `enableConfigDiscovery`, so without it a repo could still ship standing instructions.
-  This stops the agent being **configured** by the repo; it is not a claim that repo
-  *content* can't influence it (file contents and tool output still reach the model).
+- **Repo hooks, MCP config and custom instructions stay disabled**: `enableFileHooks:false`
+  prevents a controlled-repo `.github/hooks` file from auto-approving (`resolvedByHook`) a
+  command behind your back. `enableConfigDiscovery:false` prevents `.mcp.json` /
+  `.vscode/mcp.json` discovery, and `skipCustomInstructions:true` is still required because
+  the SDK loads `AGENTS.md` / `.github/copilot-instructions.md` regardless of config discovery.
+- **Skills are an explicit, narrower exception**: by default the bot loads only the CLI-native
+  skill roots `.github/skills`, `.agents/skills` and `.claude/skills` from the session repo,
+  plus `~/.copilot/skills`. This does **not** enable broad config/MCP discovery, and a skill's
+  `allowed-tools` frontmatter was verified not to bypass Discord permission cards in SDK mode.
+  However, a skill's name and description enter the model context even before invocation, so
+  repo authors can steer the agent. Set `ENABLE_REPO_SKILLS=false` to remove repo skill roots
+  while retaining user skills, or `ENABLE_USER_SKILLS=false` to do the reverse.
 - **Spoofing-resistant cards**: the command is shown escaped (no markdown/code-fence breakout),
   commands containing bidirectional/control characters are auto-denied, and an over-long command
   is auto-denied rather than shown partially.
@@ -99,6 +104,9 @@ card — including the kinds that normally fail closed (file writes, etc.). It e
   pick plan actions;
 - `/stop` still wins: teardown fails closed regardless of YOLO;
 - `/usage` shows `⚡ YOLO: ON` so you can tell at a glance. Turn it off with `/yolo mode:off`.
+- **Do not combine YOLO with repo skills unless you accept the risk**: repository skill text can
+  steer the model and YOLO removes the Discord approval gate that normally constrains tool use.
+  The enable warning calls this out whenever the session loaded repo skills.
 
 ## Why the SDK (verified)
 
@@ -118,6 +126,29 @@ Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-
 - Node.js `^20.19.0` or `>=22.12.0`
 - GitHub Copilot CLI installed and signed in on the host (the bot uses the logged-in user)
 - A Discord bot token; your Discord user id on the allow-list
+
+### Skills and source switches
+
+New sessions explicitly load these roots while keeping `enableConfigDiscovery:false`:
+
+| Source | Default | Switch |
+| --- | --- | --- |
+| Repo: `.github/skills`, `.agents/skills`, `.claude/skills` | on | `ENABLE_REPO_SKILLS` |
+| User: `~/.copilot/skills` | on | `ENABLE_USER_SKILLS` |
+
+Both switches accept only lowercase `true` / `false`; an empty `.env` value falls back to
+`true`. If no enabled root actually contains a `SKILL.md`, the bot removes the `skill` tool
+instead of leaving a tool that can only fail with “Skill not found.” A git worktree sees committed
+skills only; use `/repo dev local` while iterating on uncommitted skill files.
+
+`~/.copilot/skills` is shared across sessions. Any session that you approve to run shell commands
+can write there, so treat user skills as trusted local state and use a disposable lab host.
+
+After upgrading the local Copilot CLI, run the manual acceptance probe (requires login):
+
+```bash
+npm run smoke:skills
+```
 
 ## Quick start
 
