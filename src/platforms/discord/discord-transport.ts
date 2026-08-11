@@ -7,6 +7,8 @@ import {
 } from "discord.js";
 import { chunkText } from "../../core/chunk.js";
 import type { RenderState } from "../../core/turn-render.js";
+import { formatTimelineItems } from "../../core/format-timeline.js";
+import { chunkTimeline } from "../../core/timeline-chunk.js";
 import type { Decision, PermissionView, PlanView, Transport, UserInputView } from "../../core/transport.js";
 import { encodePermissionId, encodeChoiceId, encodePlanId } from "./custom-id.js";
 import { renderChunks } from "./render-chunks.js";
@@ -134,8 +136,10 @@ export class DiscordTransport implements Transport {
   private async doFlush(sessionKey: string, epoch: number): Promise<void> {
     const s = this.sessions.get(sessionKey);
     if (!s || s.epoch !== epoch || !s.latest) return; // stale turn or disposed
-    const text = formatState(s.latest);
-    const chunks = text.length ? chunkText(text, 1900) : [];
+    const chunks =
+      "items" in s.latest
+        ? chunkTimeline(formatTimelineItems(s.latest.items), 1900)
+        : legacyChunks(s.latest);
     const channel = await this.fetchThread(sessionKey);
     if (!channel) return;
     // Liveness for the whole write, not just this instant. `dispose()` only
@@ -311,6 +315,11 @@ function buttonRows(buttons: ButtonBuilder[]): ActionRowBuilder<ButtonBuilder>[]
 function truncateLabel(s: string): string {
   const t = s.replace(/\s+/g, " ").trim();
   return t.length <= 80 ? t || "(option)" : t.slice(0, 77) + "…";
+}
+
+function legacyChunks(state: RenderState): string[] {
+  const text = formatState(state);
+  return text.length ? chunkText(text, 1900) : [];
 }
 
 function formatState(state: RenderState): string {

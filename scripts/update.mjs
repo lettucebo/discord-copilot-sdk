@@ -24,6 +24,7 @@ import {
   planUpdate,
   remoteRefSpecs,
   resolveRemoteSha,
+  readyMarkerMatches,
   shouldRetainRestoreState,
   targetInstancesStopped,
   updateLockRelativePath,
@@ -244,6 +245,15 @@ function liveInstances() {
   return instances;
 }
 
+function isReadyInstance({ instance, pid }) {
+  const marker = path.join(STATE_DIR, "startup-ready", `${instance}.ready.json`);
+  try {
+    return readyMarkerMatches(fs.readFileSync(marker, "utf8"), instance, pid);
+  } catch {
+    return false;
+  }
+}
+
 function activeThreadSummary() {
   let threads = 0;
   let unreadable = 0;
@@ -457,16 +467,19 @@ async function restoreState(state) {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     const live = liveInstances();
-    const byInstance = new Map(live.map((entry) => [entry.instance, entry]));
-    if (expected.every((instance) => byInstance.has(instance))) {
-      for (const instance of expected) console.log(message("updateRestarted", instance, byInstance.get(instance).pid));
+    const ready = new Map(live.filter(isReadyInstance).map((entry) => [entry.instance, entry]));
+    if (expected.every((instance) => ready.has(instance))) {
+      for (const instance of expected) {
+        const entry = ready.get(instance);
+        if (entry) console.log(message("updateRestarted", instance, entry.pid));
+      }
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   if (expected.length) {
     throw new UpdateError(
-      `update succeeded but these prior bot process(es) did not restart: ${expected.join(", ")}; inspect ${path.join(STATE_DIR, "logs")} before retrying`
+      `update succeeded but these prior bot process(es) did not reach ready: ${expected.join(", ")}; inspect ${path.join(STATE_DIR, "logs")} before retrying`
     );
   }
 }

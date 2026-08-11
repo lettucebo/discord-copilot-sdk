@@ -76,7 +76,7 @@
 - **只操作 bot 擁有的 session id**；絕不曝露/刪除 `client.listSessions()` 任意結果。
 
 ## 5. 串流呈現（render state machine）
-鍵：`turnId/messageId/toolCallId/agentId`。累積 delta；**持久化 `assistant.message` 為權威最終**（不重複貼）；**過濾 agentId** 只呈現主回應；尾端訊息約 750–1000ms 編輯一次 + turn 末 flush；區塊約 1900 字、凍結；佇列有界（丟中間、保最終）；rate limit 交給 discord.js bucket；工具進度為一則更新中的狀態訊息；原始 reasoning 預設關 opt-in；明確 `streaming:true`。
+鍵：`turnId/messageId/toolCallId/agentId`。累積 delta；**持久化 `assistant.message` 為權威最終**（不重複貼）；**過濾 agentId** 只呈現主回應；尾端訊息約 750–1000ms 編輯一次 + turn 末 flush；區塊約 1900 字、凍結；佇列有界（丟中間、保最終）；rate limit 交給 discord.js bucket；以**依到達順序 timeline** 呈現文字／工具／系統狀態：工具為一行 dimmed subtext，thinking 以 Discord spoiler 預設收合、可點擊展開；新 session 明確請求 `reasoningSummary:"detailed"`，`/model` 切換也重送該要求；明確 `streaming:true`。
 
 ## 6. SDK Adapter（薄層）
 隔離 client/session 生命週期、正規化事件、callback 結果變體、model/context 切換、resume、remote。pin 最新版（1.0.7-preview.3）+ lockfile + 啟動相容檢查 + 對安裝 CLI 契約測試。不做多 provider 抽象。
@@ -115,6 +115,13 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 | shutdown/abort 清空 pending | `broker.test.ts`（`abort`）、`session-actor.test.ts`（`stop() ... clears pending`）、`app-stop-flow.test.ts` |
 | generation 過期 callback 不生效 | `broker.test.ts`（`stale generation`）|
 | delta/final 去重 | `transport.test.ts`（`posts once then edits`）、`turn-render.test.ts` |
+| **空 tool-only message 不產生空行** | `turn-render.test.ts`（`does not create blank timeline items...`；3 個空 message 的 8 換行回歸）|
+| **文字／工具／thinking 真實時序** | `turn-render.test.ts`（`keeps text, a tool, and post-tool text in arrival order`）、`transport.test.ts`（timeline transport render）|
+| reasoning / intent 顯示 | `normalize.test.ts`（SDK data shape）、`session-actor.test.ts`（`renders SDK intent and reasoning events...`）、`format-timeline.test.ts` |
+| Discord table 降級 / CJK 對齊 | `format-timeline.test.ts` |
+| spoiler / code-fence 邊界 | `format-timeline.test.ts`、`timeline-chunk.test.ts` |
+| 卡片跨界工具身分 | `session-actor.test.ts`（`preserves a tool's identity...`）|
+| YOLO durable audit | `audit-log.test.ts`、`session-actor.test.ts`（persist-before-approve / log failure deny）|
 | sub-agent 不交錯 | `turn-render.test.ts`（`ignores any sub-agent` / `does not let a sub-agent ... overwrite`）|
 | 未知權限變體 fail-closed | `session-actor.test.ts`（`auto-denies a non-shell permission (fail closed)`）|
 | resume 對帳四種情形 | `reconcile.test.ts`（14）+ `app-reconcile.test.ts`（9）|
@@ -125,6 +132,9 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 - **「modal 路徑」= thread 訊息自由輸入**，非 Discord modal 彈窗。行動裝置友善、無彈窗限制；freeform 能力已實作並測試（`session-actor.test.ts` `freeform message answers (wasFreeform=true)`）。不另做 Discord modal（YAGNI，非使用者需求）。
 - **Restart smoke（P2）** 的自動化部分即 `app-reconcile.test.ts`（9 個 app 層 resume 對帳情形，以 fake 驅動）+ `reconcile.test.ts`；真正的「重啟後 live 復原」已於開發時人工驗證（斷線→重啟→喚回暗號 PELICAN-77）。可跑於 CI 的 live-restart 需真實 Discord+Copilot，超出無網路 CI 範圍。
 - **安裝器測試框架**（`secure-file`/`setup-core`/`setup-integration`）屬 **P6 安裝器回歸**，另立 issue 追蹤，不計入本 §9（#8）。
+- **thinking 預設收合而非預設關閉**：使用者需要能回看 CLI 風格的判斷過程；Discord 沒有 accordion，故以 spoiler 做唯一原生的點擊展開。新 session 與 `/model` 切換明確請求 `reasoningSummary:"detailed"`。原始 reasoning 中的 ````` fence 與 `||` 會被轉為純文字，且限制 1200 字，避免 Discord code block 取消 spoiler 與跨訊息拆分的未定義行為。Runtime 沒有 reasoning 時顯示 `assistant.intent` 作短摘要。已測 runtime 的 Claude summary 可能是 opaque、無可顯示內容；GPT reasoning 模型可提供可顯示 summary，因此 UI 以 provider 實際事件為準。
+- **YOLO 稽核耐久性先於排版**：每個自動核准先同步 append + fsync `~/.discord-copilot-sdk/<instance>.audit.jsonl`，寫入失敗即拒絕；Discord timeline 行可以是 best-effort，卻不再是唯一稽核紀錄。相同 raw entry 才能折疊計數，避免被截斷的不同指令誤合併。
+- **時間軸不是不可偽造的安全 UI**：agent 仍可能在普通文字中仿造 `-#`／emoji。它不會改變 permission card 的 fail-closed 閘或 JSONL 稽核，但操作者不可把視覺樣式當成授權證據。
 
 **message 404 re-anchor 的已接受殘留（single-owner 取捨，RubberDuck R3/R4）：**
 - 偵測到 anchor 被刪除（10008 / 純 404）時，**只在該槽位補貼一則新訊息**（保留內容），**絕不刪除仍存在的其他 anchor**。因此**永不遺失、永不重複**內容。
@@ -301,6 +311,13 @@ resume 的錯誤。
 - source 移動後的完整 runtime/schema 驗證必須先 build，而 Windows build 不能與 live runtime 共存；故預檢覆蓋新版 `validate.mjs`，但 setup 在 apply 後失敗時**不**自動 restore。operator 修正後必須明確 `--restore`。
 - Windows 用硬終止停止 bot，in-flight turn 可能遺失；active-thread guard 只報告可 resume 的 thread 與髒 worktree，不能誠實地宣稱知道記憶體中的 turn 是否正在執行。
 - updater 故意還原更新前的狀態，而不是無條件啟動：原先被刻意停掉的 instance 不會在 update 後自行運行。需要強制啟動時 operator 依 updater 印出的 instance 專屬命令執行。
+
+### 14.3 Detached startup readiness（2026-08-09）
+
+- app PID lock 仍是唯一的 instance ownership 真相，且在載入 Discord／SDK runtime 前由 entry bootstrap 取得；這縮短 stale lock 被回收後到新 owner 可見之間的視窗，使 `stop-bot` 能在 startup 中辨識並停止正確的 PID。
+- `run-bot.ps1`／`run-bot.sh` 共同呼叫 `scripts/run.mjs`，不再把「child 活過兩秒」當成成功。launcher 產生一次性 256-bit token，只有 `DiscordCopilotApp.start()` 完成 Copilot、gateway、commands、reconcile 與 staging cleanup 後才原子寫入 token 對應 marker。
+- launcher 僅在 **child PID = live app lock owner = marker PID/instance** 時宣告 ready。token marker 是一次性的完成證明；成功、child failure、timeout 與 launcher 中斷都清除它。app 也寫入 per-instance current-ready marker，供 updater 驗證常駐服務恢復；它同樣必須吻合 live lock PID，graceful shutdown owner-aware 清除，故不是第二份 PID registry。
+- ready 最多等待 120 秒。逾時或 marker 不可信時只終止 launcher 自己建立的 child PID，絕不依名稱掃描或終止其他 Node process。Windows hard-stop 仍可能留下 stale app lock，下一次 app 以既有 owner-aware reclaim 回收。
 
 ## 15. 平台路徑 test 字面量稽核（2026-08-07）
 

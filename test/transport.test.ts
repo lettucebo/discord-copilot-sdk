@@ -3,6 +3,7 @@ import { DiscordTransport, sanitizeForCodeBlock } from "../src/platforms/discord
 import { hasBidiOrControls } from "../src/core/text-safety.js";
 import { decodePermissionId, decodeChoiceId, decodePlanId } from "../src/platforms/discord/custom-id.js";
 import type { Client } from "discord.js";
+import type { TimelineItem } from "../src/core/turn-render.js";
 
 class FakeMessage {
   content?: string;
@@ -54,6 +55,7 @@ function buttonIds(msg: FakeMessage): string[] {
 }
 
 const st = (assistantText: string) => ({ assistantText, tools: [] });
+const timeline = (items: TimelineItem[]) => ({ assistantText: "", tools: [], items });
 
 describe("sanitizeForCodeBlock", () => {
   it("makes triple-backtick breakout impossible while keeping visible chars", () => {
@@ -109,6 +111,31 @@ describe("DiscordTransport render/flush", () => {
     await t.flush("thread");
     expect(ch.sent).toHaveLength(2);
     expect(ch.sent[1]!.content).toContain("turn two");
+  });
+
+  it("renders timeline items in arrival order instead of appending tools after the answer", async () => {
+    const ch = new FakeChannel();
+    const t = new DiscordTransport(fakeClient(ch));
+    await t.render(
+      "thread",
+      timeline([
+        { kind: "text", text: "I will inspect it.", open: false },
+        {
+          kind: "tool",
+          id: "t1",
+          name: "read",
+          possiblePaths: ["C:\\repo\\SKILL.md"],
+          status: "completed",
+        },
+        { kind: "text", text: "The file is present.", open: false },
+      ])
+    );
+    await t.flush("thread");
+
+    expect(ch.sent).toHaveLength(1);
+    expect(ch.sent[0]!.content).toBe(
+      "I will inspect it.\n\n-# ⚙ `read` `C:\\repo\\SKILL.md` ✓\n\nThe file is present."
+    );
   });
 });
 

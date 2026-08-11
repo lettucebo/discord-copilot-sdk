@@ -121,3 +121,9 @@ export function sessionStorePath(id: string = instanceId()): string {
 export function channelRegistryPath(id: string = instanceId()): string {
   return path.join(stateDir(), `${id}.channels.json`);
 }
+
+/** Append-only audit trail for auto-approved actions. Per-instance files avoid
+ * interleaved JSONL records when two intentional bot deployments share a host. */
+export function auditLogPath(id: string = instanceId()): string {
+  return path.join(stateDir(), `${id}.audit.jsonl`);
+}

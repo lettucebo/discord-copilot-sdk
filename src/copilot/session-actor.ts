@@ -6,6 +6,7 @@ import { normalizeSdkEvent } from "./normalize.js";
 import { sanitizeForCodeBlock, sanitizeForInlineCode, hasBidiOrControls } from "../core/text-safety.js";
 import { ApprovalPolicy, commandExecutable } from "../core/approval-policy.js";
 import { projectSkillDirectories, resolveSkillDirectories } from "../core/skills.js";
+import { AuditLog, type AuditSink } from "../core/audit-log.js";
 
 const PERMISSION_TIMEOUT_MS = 5 * 60_000;
 const TURN_WATCHDOG_MS = 15 * 60_000;
@@ -19,6 +20,10 @@ const FAULT_DISCONNECT_MS = 5_000;
  *  card lives in a Discord embed description (≤4096). Beyond this we auto-deny
  *  rather than show a partial/undisplayable command. */
 const MAX_CARD_LEN = 3900;
+/** Request a displayable reasoning summary from providers that support it.
+ * Discord keeps the result collapsed, so detailed summaries remain available
+ * without turning the main thread into an expanded chain-of-thought transcript. */
+const REASONING_SUMMARY = "detailed" as const;
 /** Debounce window for the signal-only session.todos_changed event: the agent
  *  may write its todos table many times per turn, so we coalesce bursts. */
 const TODOS_DEBOUNCE_MS = 700;
@@ -58,6 +63,8 @@ export interface SessionActorOpts {
   transport: Transport;
   /** discord-copilot-sdk-side approval memory (session + persisted repo rules). */
   policy: ApprovalPolicy;
+  /** Durable record of auto-approved actions. A write failure fails YOLO closed. */
+  auditLog?: AuditSink;
   /** Session incarnation (P1: always 1; P2 resume will vary this). */
   generation?: number;
   /** P2: resume an existing SDK session by id instead of creating a new one. */
@@ -100,6 +107,9 @@ export interface BlobAttachment {
 export class SessionActor {
   private session!: CopilotSession;
   private renderer = new TurnRenderer();
+  /** True after send() accepts a prompt and until runTurn() observes its terminal outcome. */
+  private turnActive = false;
+  private readonly auditLog: AuditSink;
   private readonly generation: number;
   /** True when this actor loaded at least one skill from its controlled repo.
    *  YOLO needs this signal to warn when it removes the approval gate that
@@ -175,6 +185,7 @@ export class SessionActor {
     this.generation = opts.generation ?? 1;
     this.currentModel = opts.model;
     this.currentContext = opts.contextTier;
+    this.auditLog = opts.auditLog ?? new AuditLog();
   }
 
   static async create(client: CopilotClient, opts: SessionActorOpts): Promise<SessionActor> {
@@ -206,6 +217,7 @@ export class SessionActor {
     const config: Record<string, unknown> = {
       streaming: true, // required for delta events
       workingDirectory: this.opts.workingDirectory,
+      reasoningSummary: REASONING_SUMMARY,
       // Defense-in-depth: stop the controlled repo from influencing the agent's
       // trust boundary. enableFileHooks:false is SAFETY-critical — a repo
       // `.github/hooks` permission hook can set resolvedByHook and bypass our
@@ -268,8 +280,11 @@ export class SessionActor {
       // model/contextTier are deliberately STRIPPED here: the resumed session
       // already carries whatever the operator selected with /model, /effort and
       // /context before the restart, and re-sending this process's startup
-      // defaults would silently downgrade that choice. The real values are read
-      // back from the runtime below.
+      // defaults would silently downgrade that choice. reasoningSummary is a
+      // fixed display request with no operator-facing toggle, so preserve it:
+      // this avoids relying on whether the runtime journaled its create-time
+      // value before a session's first /model change. The real user-selected
+      // values are read back from the runtime below.
       const { model: _m, contextTier: _c, ...resumeConfig } = config;
       this.session = await c.resumeSession(this.opts.resumeSessionId, {
         ...resumeConfig,
@@ -314,6 +329,9 @@ export class SessionActor {
 
     s.on("assistant.message_delta", handle("assistant.message_delta"));
     s.on("assistant.message", handle("assistant.message"));
+    s.on("assistant.intent", handle("assistant.intent"));
+    s.on("assistant.reasoning_delta", handle("assistant.reasoning_delta"));
+    s.on("assistant.reasoning", handle("assistant.reasoning"));
     s.on("tool.execution_start", handle("tool.execution_start"));
     s.on("tool.execution_complete", handle("tool.execution_complete"));
     s.on("session.idle", () => {
@@ -322,9 +340,7 @@ export class SessionActor {
     });
     s.on("session.error", (e) => {
       const d = data(e);
-      void this.opts.transport
-        .notice(this.opts.sessionKey, `⚠️ ${str(d["message"]) || "session error"}`)
-        .catch(() => {});
+      void this.addTimelineNotice(`⚠️ ${str(d["message"]) || "session error"}`).catch(() => {});
     });
     s.on("session.usage_info", (e) => {
       const d = data(e);
@@ -361,14 +377,21 @@ export class SessionActor {
     const rendered = formatTodos(rows);
     if (rendered === this.lastTodosRender) return; // no change (also dedupes empty→empty)
     if (!rendered) {
-      // Cleared to nothing: record the empty state so a later reappearance of the
-      // SAME list posts again (A → empty → A must not be suppressed), but there's
-      // nothing to show, so don't post.
-      this.lastTodosRender = rendered;
+      // Clear an existing status projection as well as recording the empty state:
+      // leaving its last value in the timeline would make a completed task look
+      // pending forever. A → empty → A must still render again.
+      this.renderer.clearTodos();
+      try {
+        await this.opts.transport.render(this.opts.sessionKey, this.renderer.state());
+        this.lastTodosRender = rendered;
+      } catch {
+        /* leave lastTodosRender unchanged so the next event retries */
+      }
       return;
     }
     try {
-      await this.opts.transport.notice(this.opts.sessionKey, rendered);
+      this.renderer.setTodos(rendered);
+      await this.opts.transport.render(this.opts.sessionKey, this.renderer.state());
       // Mark as sent ONLY after a successful post, so a failed send retries on the
       // next event instead of being silently deduped away.
       this.lastTodosRender = rendered;
@@ -393,10 +416,14 @@ export class SessionActor {
     const effort = opts.resetEffort ? undefined : opts.effort ?? this.currentEffort;
     const context = opts.context ?? this.currentContext;
     const s = this.session as unknown as {
-      setModel(m: string, o?: { reasoningEffort?: string; contextTier?: string }): Promise<unknown>;
+      setModel(
+        m: string,
+        o?: { reasoningEffort?: string; reasoningSummary?: "detailed"; contextTier?: string }
+      ): Promise<unknown>;
     };
     await s.setModel(model, {
       ...(effort ? { reasoningEffort: effort } : {}),
+      reasoningSummary: REASONING_SUMMARY,
       ...(context ? { contextTier: context } : {}),
     });
     this.currentModel = model;
@@ -460,10 +487,12 @@ export class SessionActor {
    *  (e.g. a tool result once approved) starts in a NEW message below the card
    *  — not edited into the message created before the card. */
   private async beginInteractionCard(): Promise<void> {
-    await this.opts.transport.flush(this.opts.sessionKey).catch(() => {});
-    this.opts.transport.resetTurn(this.opts.sessionKey);
-    this.renderer = new TurnRenderer();
-  }
+     const inFlightTools = this.renderer.inFlightTools();
+     await this.opts.transport.flush(this.opts.sessionKey).catch(() => {});
+     this.opts.transport.resetTurn(this.opts.sessionKey);
+     this.renderer = new TurnRenderer();
+     this.renderer.adoptTools(inFlightTools);
+   }
 
   private async handlePermission(req: unknown): Promise<unknown> {
     const r = (req ?? {}) as Record<string, unknown>;
@@ -473,8 +502,8 @@ export class SessionActor {
     // the abort guard so the decision can't interleave with a concurrent
     // `/yolo off`, and placed before every other gate — the kind/bidi/length
     // gates all exist to protect the human reading the approval card, and under
-    // YOLO there is no card. The audit notice is best effort and must never gate
-    // the result (a Discord outage may not block tool execution).
+    // YOLO there is no card. The durable audit write DOES gate approval; only
+    // the Discord timeline render is best effort, so an outage cannot block it.
     if (this.yolo) {
       // Building the descriptor must never break the approval path (a hostile
       // request object could throw from a property getter), so it is guarded and
@@ -485,14 +514,13 @@ export class SessionActor {
       } catch {
         /* keep the generic fallback */
       }
-      this.postAudit(`⚡ YOLO auto-approved — ${detail}`);
+      if (!this.postAudit(`⚡ YOLO auto-approved — ${detail}`)) {
+        return DENY_UNAVAILABLE;
+      }
       return APPROVE_ONCE;
     }
     if (kind !== "shell") {
-      await this.opts.transport.notice(
-        this.opts.sessionKey,
-        `Auto-denied an unsupported permission (${kind}) — P1 supports shell only.`
-      );
+      await this.addTimelineNotice(`Auto-denied an unsupported permission (${kind}) — P1 supports shell only.`);
       return DENY_UNAVAILABLE;
     }
     const summary = summarizePermission(r);
@@ -501,8 +529,7 @@ export class SessionActor {
       // command and are a spoofing signal (the card would have to strip them,
       // making it differ from what actually runs). Deny outright — never
       // auto-approve a spoofing-laden command even if its executable is trusted.
-      await this.opts.transport.notice(
-        this.opts.sessionKey,
+      await this.addTimelineNotice(
         "Auto-denied: the command contains bidirectional/control characters (possible spoofing)."
       );
       return DENY_UNAVAILABLE;
@@ -526,17 +553,14 @@ export class SessionActor {
     const simple = isSimpleCommand(fullCommandText) && !namesAnotherProgram(fullCommandText);
     const allSafe = executables.length > 0 && executables.every(isSafeExecutable);
     if (simple && allSafe && this.opts.policy.isApproved(this.opts.sessionKey, this.approvalKey, executables)) {
-      await this.opts.transport.notice(
-        this.opts.sessionKey,
-        `✓ Auto-approved (existing rule): ${executables.map((e) => `\`${e}\``).join(", ")}`
-      );
+      const audit = `✓ Auto-approved (existing rule): ${executables.map((e) => `\`${e}\``).join(", ")}`;
+      if (!this.postAudit(audit)) return DENY_UNAVAILABLE;
       return APPROVE_ONCE;
     }
     if (sanitizeForCodeBlock(summary).length > MAX_CARD_LEN) {
       // Gate on the SANITIZED (display) length: escaping can expand the text,
       // and a card we can't render in full could hide a dangerous suffix.
-      await this.opts.transport.notice(
-        this.opts.sessionKey,
+      await this.addTimelineNotice(
         "Auto-denied a shell command too long to display in full for approval. " +
           "Run it from a terminal if intended."
       );
@@ -573,9 +597,7 @@ export class SessionActor {
         // than leave the SDK callback pending until the broker timeout. Guard
         // the notice so a second failure can't skip the finally cleanup below.
         this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
-        await this.opts.transport
-          .notice(this.opts.sessionKey, "Auto-denied: could not render the approval card.")
-          .catch(() => {});
+        await this.addTimelineNotice("Auto-denied: could not render the approval card.").catch(() => {});
       }
       return await promise;
     } finally {
@@ -774,6 +796,7 @@ export class SessionActor {
     // auto-denies EVERY permission of the next turn with no card and no notice.
     this.aborting = false;
     this.renderer = new TurnRenderer();
+    this.turnActive = true;
     const payload: Record<string, unknown> = { prompt };
     if (attachments.length) payload["attachments"] = attachments;
     await (this.session as unknown as { send(o: Record<string, unknown>): Promise<unknown> }).send(payload);
@@ -858,18 +881,16 @@ export class SessionActor {
    */
   async runTurn(prompt: string, watchdogMs = TURN_WATCHDOG_MS, attachments: BlobAttachment[] = []): Promise<void> {
     const idle = this.nextIdle();
-    await this.send(prompt, attachments);
-    const outcome = await this.awaitTurnEnd(idle, watchdogMs);
-    if (outcome === "watchdog") {
-      await this.opts.transport.notice(
-        this.opts.sessionKey,
-        "⏱️ Turn exceeded the time limit and was aborted."
-      );
-    } else if (outcome === "faulted") {
-      await this.opts.transport.notice(
-        this.opts.sessionKey,
-        "⚠️ Turn did not stop cleanly; the session was reset. Start a new one with /new."
-      );
+    try {
+      await this.send(prompt, attachments);
+      const outcome = await this.awaitTurnEnd(idle, watchdogMs);
+      if (outcome === "watchdog") {
+        await this.addTimelineNotice("⏱️ Turn exceeded the time limit and was aborted.");
+      } else if (outcome === "faulted") {
+        await this.addTimelineNotice("⚠️ Turn did not stop cleanly; the session was reset. Start a new one with /new.");
+      }
+    } finally {
+      this.turnActive = false;
     }
   }
 
@@ -976,17 +997,38 @@ export class SessionActor {
     return true;
   }
 
-  /** Queue an out-of-band audit/warning notice (YOLO auto-approvals, a
-   *  non-durable "Always" rule). Fire-and-forget for the caller (never awaited
-   *  on the approval path, so a Discord outage cannot gate tool execution) but
-   *  serialized per session so entries stay in order. */
-  private postAudit(text: string): void {
+  /**
+   * Persist an auto-approval before presenting it. The disk record is the
+   * authority; the Discord timeline is best effort and must never be the only
+   * trace of a YOLO action.
+   */
+  private postAudit(text: string): boolean {
+    if (!this.auditLog.append({ sessionKey: this.opts.sessionKey, text })) {
+      void this.addTimelineNotice("⚠️ Auto-denied: approval audit could not be written.").catch(() => {});
+      return false;
+    }
+    if (this.turnActive) {
+      this.renderer.addAudit(text, text);
+      void this.opts.transport.render(this.opts.sessionKey, this.renderer.state()).catch(() => {});
+      return true;
+    }
     this.auditChain = this.auditChain
       .then(() => this.opts.transport.notice(this.opts.sessionKey, text))
       .then(
         () => {},
         () => {}
       );
+    return true;
+  }
+
+  /** Keep in-turn system status next to the event that caused it. */
+  private async addTimelineNotice(text: string): Promise<void> {
+    if (!this.turnActive) {
+      await this.opts.transport.notice(this.opts.sessionKey, text);
+      return;
+    }
+    this.renderer.addNotice(text);
+    await this.opts.transport.render(this.opts.sessionKey, this.renderer.state());
   }
 
   state() {

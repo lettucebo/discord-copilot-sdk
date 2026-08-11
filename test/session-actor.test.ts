@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { SessionActor, formatTodos } from "../src/copilot/session-actor.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { ApprovalPolicy } from "../src/core/approval-policy.js";
+import type { AuditEntry, AuditSink } from "../src/core/audit-log.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Decision, PermissionView, PlanView, Transport, UserInputView } from "../src/core/transport.js";
 import type { RenderState } from "../src/core/turn-render.js";
@@ -125,6 +126,17 @@ class FakeTransport implements Transport {
   }
 }
 
+class FakeAuditLog implements AuditSink {
+  entries: AuditEntry[] = [];
+  succeeds = true;
+
+  append(entry: AuditEntry): boolean {
+    if (!this.succeeds) return false;
+    this.entries.push(entry);
+    return true;
+  }
+}
+
 interface Setup {
   actor: SessionActor;
   session: FakeSession;
@@ -132,6 +144,7 @@ interface Setup {
   broker: PendingInteractionBroker;
   policy: ApprovalPolicy;
   config: Record<string, unknown>;
+  auditLog: FakeAuditLog;
   resumeArgs?: { id: string; cfg: Record<string, unknown> };
 }
 
@@ -140,6 +153,7 @@ async function setup(extra: Record<string, unknown> = {}): Promise<Setup> {
   const transport = new FakeTransport();
   const broker = new PendingInteractionBroker();
   const policy = new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`));
+  const auditLog = new FakeAuditLog();
   let config: Record<string, unknown> = {};
   const box: { resumeArgs?: { id: string; cfg: Record<string, unknown> } } = {};
   const client = {
@@ -161,9 +175,10 @@ async function setup(extra: Record<string, unknown> = {}): Promise<Setup> {
     broker,
     transport,
     policy,
+    auditLog,
     ...extra,
   });
-  return { actor, session, transport, broker, policy, config, resumeArgs: box.resumeArgs };
+  return { actor, session, transport, broker, policy, auditLog, config, resumeArgs: box.resumeArgs };
 }
 
 // The captured permission callback (typed loosely for the test).
@@ -179,6 +194,7 @@ describe("SessionActor config hardening", () => {
     expect(s.config["excludedTools"]).toEqual(["skill"]);
     expect(s.config["workingDirectory"]).toBe("C:\\repo");
     expect(s.config["streaming"]).toBe(true);
+    expect(s.config["reasoningSummary"]).toBe("detailed");
     for (const cb of [
       "onPermissionRequest",
       "onUserInputRequest",
@@ -377,6 +393,19 @@ describe("SessionActor turn lifecycle", () => {
     expect(s.session.sent).toEqual(["hello"]);
     expect(s.transport.renders.at(-1)!.assistantText).toBe("Hi there");
   });
+
+  it("renders SDK intent and reasoning events into the timeline", async () => {
+    const s = await setup();
+    s.session.emit("assistant.intent", { data: { intent: "Inspecting the renderer" } });
+    s.session.emit("assistant.reasoning_delta", { data: { reasoningId: "r1", deltaContent: "Checking " } });
+    s.session.emit("assistant.reasoning", { data: { reasoningId: "r1", content: "Checking the event order." } });
+
+    const render = s.transport.renders.at(-1)!;
+    expect("items" in render ? render.items : []).toEqual([
+      { kind: "intent", text: "Inspecting the renderer" },
+      { kind: "reasoning", id: "r1", text: "Checking the event order.", open: false },
+    ]);
+  });
 });
 
 describe("SessionActor permission handling", () => {
@@ -390,6 +419,35 @@ describe("SessionActor permission handling", () => {
     s.transport.decision!(view.nonce, "once", "u1");
     expect(await result).toEqual({ kind: "approve-once" });
     expect(s.broker.size).toBe(0);
+  });
+
+  it("preserves a tool's identity when it completes after its permission card", async () => {
+    const s = await setup();
+    await s.actor.send("inspect");
+    s.session.emit("tool.execution_start", {
+      data: {
+        toolCallId: "t1",
+        toolName: "shell",
+        shellToolInfo: { possiblePaths: ["C:\\repo"] },
+      },
+    });
+
+    const approval = perm(s)({ kind: "shell", fullCommandText: "git status" });
+    await tick();
+    s.session.emit("tool.execution_complete", { data: { toolCallId: "t1", success: true } });
+
+    const render = s.transport.renders.at(-1)!;
+    expect("items" in render ? render.items : []).toEqual([
+      {
+        kind: "tool",
+        id: "t1",
+        name: "shell",
+        possiblePaths: ["C:\\repo"],
+        status: "completed",
+      },
+    ]);
+    s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "once", "u1");
+    await approval;
   });
 
   it("session approval records a rule and auto-approves later matching commands (no card)", async () => {
@@ -408,6 +466,12 @@ describe("SessionActor permission handling", () => {
     expect(r2).toEqual({ kind: "approve-once" });
     expect(s.transport.permissions.length).toBe(before); // no card shown
     expect(s.transport.notices.some((n) => /auto-approved/i.test(n))).toBe(true);
+    expect(s.auditLog.entries).toEqual([
+      {
+        sessionKey: "t",
+        text: expect.stringContaining("Auto-approved (existing rule)"),
+      },
+    ]);
   });
 
   it("always approval persists an executable rule for the repo", async () => {
@@ -768,13 +832,16 @@ describe("SessionActor abort + teardown", () => {
   it("reconfigure calls setModel with merged model/effort/context and tracks state", async () => {
     const s = await setup();
     await s.actor.reconfigure({ model: "gpt-5.4", effort: "high" });
-    expect(s.session.setModelCalls.at(-1)).toEqual({ model: "gpt-5.4", options: { reasoningEffort: "high" } });
+    expect(s.session.setModelCalls.at(-1)).toEqual({
+      model: "gpt-5.4",
+      options: { reasoningEffort: "high", reasoningSummary: "detailed" },
+    });
     expect(s.actor.config()).toEqual({ model: "gpt-5.4", effort: "high", context: undefined });
     // change only context; model+effort preserved
     await s.actor.reconfigure({ context: "long_context" });
     expect(s.session.setModelCalls.at(-1)).toEqual({
       model: "gpt-5.4",
-      options: { reasoningEffort: "high", contextTier: "long_context" },
+      options: { reasoningEffort: "high", reasoningSummary: "detailed", contextTier: "long_context" },
     });
     expect(s.actor.config()).toEqual({ model: "gpt-5.4", effort: "high", context: "long_context" });
   });
@@ -792,7 +859,10 @@ describe("SessionActor abort + teardown", () => {
     expect(s.actor.config().effort).toBe("high");
     await s.actor.reconfigure({ model: "m2", resetEffort: true });
     expect(s.actor.config()).toEqual({ model: "m2", effort: undefined, context: undefined });
-    expect(s.session.setModelCalls.at(-1)).toEqual({ model: "m2", options: {} }); // no reasoningEffort sent
+    expect(s.session.setModelCalls.at(-1)).toEqual({
+      model: "m2",
+      options: { reasoningSummary: "detailed" },
+    }); // no reasoningEffort sent
   });
 
   it("a FAILED disconnect faults the actor and never reports success on retry", async () => {
@@ -846,7 +916,7 @@ describe("formatTodos (P5)", () => {
 });
 
 describe("todos_changed → checklist (P5)", () => {
-  it("posts a checklist (debounced), dedupes identical state, and re-posts A→empty→A", async () => {
+  it("updates a checklist in the timeline, dedupes identical state, and re-renders A→empty→A", async () => {
     vi.useFakeTimers();
     try {
       const s = await setup();
@@ -856,19 +926,26 @@ describe("todos_changed → checklist (P5)", () => {
       ];
       s.session.emit("session.todos_changed", {});
       await vi.advanceTimersByTimeAsync(800);
-      const todoNotices = (): string[] => s.transport.notices.filter((n) => n.includes("待辦進度"));
-      expect(todoNotices().length).toBe(1);
+      const todoRenders = (): RenderState[] =>
+        s.transport.renders.filter(
+          (render): render is Extract<RenderState, { items: unknown[] }> =>
+            "items" in render && render.items.some((item) => item.kind === "todos")
+        );
+      expect(todoRenders()).toHaveLength(1);
+      expect(s.transport.notices.filter((notice) => notice.includes("待辦進度"))).toHaveLength(0);
 
       // identical state → deduped (no second post)
       s.session.emit("session.todos_changed", {});
       await vi.advanceTimersByTimeAsync(800);
-      expect(todoNotices().length).toBe(1);
+      expect(todoRenders()).toHaveLength(1);
 
       // cleared to empty (nothing posted) …
       s.session.todos = [];
       s.session.emit("session.todos_changed", {});
       await vi.advanceTimersByTimeAsync(800);
-      expect(todoNotices().length).toBe(1);
+      expect(todoRenders()).toHaveLength(1);
+      const cleared = s.transport.renders.at(-1)!;
+      expect("items" in cleared && cleared.items.some((item) => item.kind === "todos")).toBe(false);
 
       // … then the SAME list reappears → must post again (not suppressed)
       s.session.todos = [
@@ -877,31 +954,33 @@ describe("todos_changed → checklist (P5)", () => {
       ];
       s.session.emit("session.todos_changed", {});
       await vi.advanceTimersByTimeAsync(800);
-      expect(todoNotices().length).toBe(2);
+      expect(todoRenders()).toHaveLength(2);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("a failing checklist notice does not throw and retries on the next event", async () => {
+  it("a failing checklist timeline render does not throw and retries on the next event", async () => {
     vi.useFakeTimers();
     try {
       const s = await setup();
       let fail = true;
-      s.transport.notice = async (_k: string, t: string): Promise<void> => {
-        if (fail && t.includes("待辦進度")) throw new Error("send failed");
-        s.transport.notices.push(t);
+      s.transport.render = async (_k: string, render: RenderState): Promise<void> => {
+        if (fail && "items" in render && render.items.some((item) => item.kind === "todos")) {
+          throw new Error("render failed");
+        }
+        s.transport.renders.push(render);
       };
       s.session.todos = [{ title: "only", status: "pending" }];
       s.session.emit("session.todos_changed", {});
-      await vi.advanceTimersByTimeAsync(800); // notice throws → swallowed, no crash
-      expect(s.transport.notices.some((n) => n.includes("待辦進度"))).toBe(false);
+      await vi.advanceTimersByTimeAsync(800); // render throws → swallowed, no crash
+      expect(s.transport.renders).toHaveLength(0);
 
       // Not marked as sent → the next event with the SAME state retries and posts.
       fail = false;
       s.session.emit("session.todos_changed", {});
       await vi.advanceTimersByTimeAsync(800);
-      expect(s.transport.notices.some((n) => n.includes("待辦進度"))).toBe(true);
+      expect(s.transport.renders).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
@@ -1013,13 +1092,14 @@ describe("SessionActor resume/create-id seam (P2)", () => {
     expect(s.resumeArgs).toBeUndefined(); // did NOT resume
   });
 
-  it("resume does NOT re-send model/contextTier — the session keeps what the user chose", async () => {
+  it("resume keeps the fixed detailed reasoning request but not user-selected model/context", async () => {
     // Otherwise a restart silently reverts a /model + /context selection to this
     // process's startup defaults, while /usage keeps echoing the cached value and
     // reports a configuration the session is not on.
     const s = await setup({ resumeSessionId: "sess-123", model: "gpt-5.4", contextTier: "long_context" });
     expect(s.resumeArgs?.cfg["model"]).toBeUndefined();
     expect(s.resumeArgs?.cfg["contextTier"]).toBeUndefined();
+    expect(s.resumeArgs?.cfg["reasoningSummary"]).toBe("detailed");
   });
 
   it("resume seeds its config from the RUNTIME, not from the startup defaults", async () => {
@@ -1112,12 +1192,53 @@ describe("YOLO mode (per-session blanket permission approval)", () => {
       newFileContents: "SUPER_SECRET_VALUE",
       canOfferSessionApproval: true,
     });
+
     await tick();
     const note = s.transport.notices.at(-1)!;
     expect(note).toMatch(/YOLO/);
     expect(note).toContain("write");
     expect(note).toContain("secrets.txt"); // WHAT was written must be auditable
     expect(note).not.toContain("SUPER_SECRET_VALUE"); // payload never echoed
+  });
+
+  it("persists the YOLO audit before returning approval", async () => {
+    const s = await setup();
+    s.actor.setYolo(true);
+
+    await expect(perm(s)({ kind: "shell", fullCommandText: "git status" })).resolves.toEqual({
+      kind: "approve-once",
+    });
+    expect(s.auditLog.entries).toEqual([
+      {
+        sessionKey: "t",
+        text: expect.stringContaining("YOLO auto-approved"),
+      },
+    ]);
+  });
+
+  it("denies a YOLO request when its durable audit cannot be recorded", async () => {
+    const s = await setup();
+    s.auditLog.succeeds = false;
+    s.actor.setYolo(true);
+
+    await expect(perm(s)({ kind: "shell", fullCommandText: "git status" })).resolves.toEqual({
+      kind: "user-not-available",
+    });
+  });
+
+  it("adds an in-turn YOLO audit to the timeline instead of appending a tail notice", async () => {
+    const s = await setup();
+    await s.actor.send("inspect");
+    s.actor.setYolo(true);
+    await perm(s)({ kind: "shell", fullCommandText: "git status" });
+    s.session.emit("assistant.message", { data: { content: "Final answer." } });
+
+    expect(s.transport.notices).toEqual([]);
+    const render = s.transport.renders.at(-1)!;
+    expect("items" in render ? render.items : []).toEqual([
+      expect.objectContaining({ kind: "audit", count: 1 }),
+      { kind: "text", text: "Final answer.", open: false },
+    ]);
   });
 
   it("audit notice cannot be spoofed: a backtick target can't close the inline code span", async () => {

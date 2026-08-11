@@ -47,3 +47,14 @@ export function sanitizeForInlineCode(s: string, max = 200): string {
     .trim();
   return flat.length > max ? flat.slice(0, max) + "…" : flat;
 }
+
+/**
+ * Make model-produced reasoning safe inside a Discord spoiler. A nested spoiler
+ * delimiter would let the model selectively reveal forged UI, while a backtick
+ * run can turn part of the spoiler into a code block with different rendering.
+ * Reasoning is prose for this compact timeline, so preserve line breaks but
+ * render markdown delimiters as plain punctuation.
+ */
+export function sanitizeForSpoiler(s: string): string {
+  return s.replace(UNSAFE_STRIP, "").replace(/\|\|/g, "|\u200b|").replace(/`/g, "'");
+}

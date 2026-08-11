@@ -223,6 +223,30 @@ export function targetInstancesStopped(live, targets) {
   return !live.some((entry) => targetSet.has(entry.instance));
 }
 
+/**
+ * A ready marker is evidence only when it names the same live lock PID. The
+ * app lock remains ownership authority; a forced Windows stop can leave an old
+ * marker behind, which must never make updater recovery look healthy.
+ *
+ * @param {string} text
+ * @param {string} instance
+ * @param {number} pid
+ */
+export function readyMarkerMatches(text, instance, pid) {
+  try {
+    const marker = JSON.parse(text);
+    return (
+      marker !== null &&
+      typeof marker === "object" &&
+      marker.version === 1 &&
+      marker.instance === instance &&
+      marker.pid === pid
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** A restore snapshot exists only to recover from a failed setup/apply path. */
 export function shouldRetainRestoreState(setupSucceeded) {
   return !setupSucceeded;

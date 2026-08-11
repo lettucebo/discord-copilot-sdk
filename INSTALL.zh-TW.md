@@ -195,7 +195,8 @@ checkout 仍須由操作者另外處理。
 apply 順序是：唯讀 preflight → 停常駐 → 停 bot → 移動 source → `setup.mjs --yes --skip-auth --no-residency` → 還原。既有常駐只會重新 enable/start，絕不重新 register，所以 Windows 24/7 task 不會悄悄降成登入後保活。
 
 成功的 apply 會逐 instance 報告四個階段（停止、套用原始碼、setup、還原）。
-只有更新器觀察到新的 PID 後，才會宣告重啟成功。它還原的是更新**前**的
+只有更新器觀察到新的 PID，且它在 Discord 啟動完成後寫入 current-ready proof，
+才會宣告重啟成功。它還原的是更新**前**的
 狀態：原本已停止的 instance 會維持停止並明講原因。`--no-restart` 也會讓
 每個 instance 保持停止，並印出可直接使用的手動啟動指令。
 
@@ -277,7 +278,7 @@ SemVer 政策：
 ### 手動啟動／停止
 
 ```powershell
-./run-bot.ps1      # 背景啟動（已在跑就拒絕）
+./run-bot.ps1      # 背景啟動；會等到 Discord 完整 ready
 ./run-bot.ps1 -Foreground
 ./stop-bot.ps1     # 讀 app 自己寫的 lock
 ```
@@ -287,6 +288,12 @@ SemVer 政策：
 ./run-bot.sh --foreground
 ./stop-bot.sh
 ```
+
+背景啟動只有在 bot 持有自己的 instance lock，且 Copilot 啟動、Discord 登入、
+指令註冊與 startup reconcile 都完成後才會成功。它最多等待 120 秒；若提早退出、
+ready proof 無效或逾時，會以失敗結束，且只終止這次剛啟動的 child。請查看
+`~/.discord-copilot-sdk/logs/run-bot.<instance>.log.err` 取得啟動錯誤。
+`-Foreground`／`--foreground` 會讓程序留在目前終端機，不使用背景啟動 handshake。
 
 ---
 

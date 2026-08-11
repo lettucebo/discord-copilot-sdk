@@ -2,11 +2,10 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { acquireSingleInstanceLock } from "./core/single-instance.js";
+import { startBot } from "./core/bootstrap.js";
 import { lockPath, legacyStateDir, legacyNameWarnings } from "./core/paths.js";
 import { formatVersionInfo, readAppVersion, readCommitSha } from "./core/version.js";
-import { checkSdkCompat, sdkSelfCheck } from "./copilot/sdk.js";
-import { loadConfig } from "./config.js";
-import { DiscordCopilotApp } from "./app.js";
+import { publishStartupReady, startupReadyRequest } from "./core/startup-ready.js";
 
 /** Load ./.env into process.env if present (Node built-in; no dependency). */
 function loadDotEnv(): void {
@@ -33,6 +32,7 @@ async function main(): Promise<void> {
   const args = new Set(process.argv.slice(2));
 
   if (args.has("--version")) {
+    const { checkSdkCompat } = await import("./copilot/sdk.js");
     const c = checkSdkCompat();
     const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
     console.log(
@@ -46,6 +46,7 @@ async function main(): Promise<void> {
     reportLegacyNames();
     const lock = await acquireSingleInstanceLock(lockPath());
     try {
+      const { checkSdkCompat, sdkSelfCheck } = await import("./copilot/sdk.js");
       const compat = checkSdkCompat();
       if (!compat.ok) {
         console.warn(
@@ -68,8 +69,21 @@ async function main(): Promise<void> {
 
   console.log("Starting discord-copilot-sdk bot …");
   reportLegacyNames();
-  const config = loadConfig();
-  await DiscordCopilotApp.start(config);
+  const readyRequest = startupReadyRequest();
+  await startBot({
+    acquireLock: () => acquireSingleInstanceLock(lockPath()),
+    loadRuntime: async () => {
+      const [{ loadConfig }, { DiscordCopilotApp }] = await Promise.all([
+        import("./config.js"),
+        import("./app.js"),
+      ]);
+      return {
+        loadConfig,
+        start: (config, lock) => DiscordCopilotApp.start(config, lock),
+      };
+    },
+    publishReady: () => publishStartupReady(readyRequest),
+  });
   // The Discord gateway connection keeps the event loop alive; shutdown is
   // handled by the app's SIGINT/SIGTERM handlers.
 }
