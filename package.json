@@ -10,8 +10,9 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=1 --fileParallelism=false",
     "smoke:live": "npm run build && node scripts/smoke-live.mjs",
+    "smoke:skills": "npm run build && node scripts/smoke-skills.mjs",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "setup": "node scripts/setup.mjs",

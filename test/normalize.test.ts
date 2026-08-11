@@ -144,6 +144,24 @@ describe("normalizeSdkEvent", () => {
     });
   });
 
+  it("ignores malformed non-string tool error messages", () => {
+    const event = {
+      type: "tool.execution_complete",
+      data: {
+        toolCallId: "t1",
+        success: false,
+        error: { message: { untrusted: "object" } },
+      },
+    };
+
+    expect(normalizeSdkEvent("tool.execution_complete", event)).toEqual({
+      type: "tool_complete",
+      agentId: undefined,
+      id: "t1",
+      status: "failed",
+    });
+  });
+
   it("ignores unknown event types", () => {
     expect(normalizeSdkEvent("session.usage_info", { data: {} })).toBeUndefined();
   });

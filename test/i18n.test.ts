@@ -110,3 +110,12 @@ describe("update messages", () => {
     for (const lang of LANGS) expect(t(key, lang)).not.toBe(key);
   });
 });
+
+describe("skill source messages", () => {
+  it.each(["promptRepoSkills", "promptUserSkills", "errSkillSourceSwitch"])(
+    "defines the bilingual %s skill-source message",
+    (key) => {
+      for (const lang of LANGS) expect(t(key, lang)).not.toBe(key);
+    }
+  );
+});

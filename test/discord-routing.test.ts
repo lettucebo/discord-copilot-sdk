@@ -8,7 +8,13 @@ import {
   decodePlanId,
 } from "../src/platforms/discord/custom-id.js";
 import { isAuthorized, isOwner, type AuthContext, type AuthPolicy } from "../src/platforms/discord/auth.js";
-import { resolveButtonAck, decisionBindsToChannel, applyYoloToggle, approvalScopeKeys } from "../src/app.js";
+import {
+  resolveButtonAck,
+  decisionBindsToChannel,
+  applyYoloToggle,
+  approvalScopeKeys,
+  yoloOnWarning,
+} from "../src/app.js";
 
 describe("custom-id", () => {
   it("round-trips each action + nonce", () => {
@@ -201,6 +207,18 @@ describe("applyYoloToggle (ack-before-allow for blanket approval)", () => {
     expect(await enabling).toBe(false); // superseded — must NOT re-enable
     expect(c.state.on).toBe(false);
     expect(c.log).toContain("enable:superseded");
+  });
+});
+
+describe("yoloOnWarning", () => {
+  it("makes the repository-skill and YOLO risk explicit when both are active", () => {
+    expect(yoloOnWarning(true)).toMatch(/repository skills/i);
+    expect(yoloOnWarning(true)).toMatch(/YOLO/i);
+    expect(yoloOnWarning(true)).toMatch(/Discord approval gate/i);
+  });
+
+  it("does not claim repository skills when none were loaded", () => {
+    expect(yoloOnWarning(false)).not.toMatch(/repository skills/i);
   });
 });
 

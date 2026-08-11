@@ -32,6 +32,13 @@ const corpus = [
   { name: "empty DEV_GUILD_ID (shipped in .env.example) is accepted as unset", values: { ...base(), DEV_GUILD_ID: "" } },
   { name: "valid multi user ids", values: { ...base(), DISCORD_ALLOWED_USER_IDS: "111111111, 222222222" } },
   { name: "valid long_context", values: { ...base(), DEFAULT_CONTEXT_TIER: "long_context" } },
+  { name: "repo skills default", values: { ...base(), ENABLE_REPO_SKILLS: "true" } },
+  { name: "repo skills may be disabled", values: { ...base(), ENABLE_REPO_SKILLS: "false" } },
+  { name: "user skills default", values: { ...base(), ENABLE_USER_SKILLS: "true" } },
+  { name: "user skills may be disabled", values: { ...base(), ENABLE_USER_SKILLS: "false" } },
+  { name: "empty skill switches fall back to defaults", values: { ...base(), ENABLE_REPO_SKILLS: "", ENABLE_USER_SKILLS: "" } },
+  { name: "case-drifted repo skill switch is rejected", values: { ...base(), ENABLE_REPO_SKILLS: "True" } },
+  { name: "non-boolean user skill switch is rejected", values: { ...base(), ENABLE_USER_SKILLS: "yes" } },
   { name: "missing token", values: { ...base(), DISCORD_BOT_TOKEN: "" } },
   { name: "missing user ids", values: { ...base(), DISCORD_ALLOWED_USER_IDS: "" } },
   { name: "non-snowflake guild", values: { ...base(), DISCORD_GUILD_ID: "not-a-number" } },
@@ -107,6 +114,14 @@ describe("installer validators ⇄ runtime config contract", () => {
     ]) {
       expect(managed.has(k)).toBe(true);
     }
+  });
+
+  it("manages both skill source switches with a secure default", () => {
+    const skills = MANAGED_KEYS.filter(
+      (spec) => spec.key === "ENABLE_REPO_SKILLS" || spec.key === "ENABLE_USER_SKILLS"
+    );
+    expect(skills).toHaveLength(2);
+    expect(skills.map((spec) => spec.defaultValue)).toEqual(["true", "true"]);
   });
 
   it("the removed-key lists on both sides name exactly the same keys", () => {

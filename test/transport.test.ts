@@ -137,6 +137,28 @@ describe("DiscordTransport render/flush", () => {
       "I will inspect it.\n\n-# ⚙ `read` `C:\\repo\\SKILL.md` ✓\n\nThe file is present."
     );
   });
+
+  it("sanitizes failed timeline tool errors while disabling mention parsing", async () => {
+    const ch = new FakeChannel();
+    const t = new DiscordTransport(fakeClient(ch));
+    await t.render(
+      "thread",
+      timeline([
+        {
+          kind: "tool",
+          id: "t1",
+          name: "skill",
+          status: "failed",
+          error: "bad `code`\u202e\n@everyone",
+        },
+      ])
+    );
+    await t.flush("thread");
+
+    expect(ch.sent[0]!.content).toBe("-# ⚙ `skill` ✗ — bad 'code' @everyone");
+    expect(ch.sent[0]!.content).not.toMatch(/[\u202A-\u202E\u2066-\u2069]/);
+    expect(ch.sent[0]!.opts!["allowedMentions"]).toEqual({ parse: [] });
+  });
 });
 
 describe("DiscordTransport permission card", () => {

@@ -22,6 +22,9 @@ questions and exit-plan actions get Discord button UI. Every other permission ki
 - **There is no lint step for TypeScript.** CI runs `npm run typecheck` + `npm test` on
   Node 20.19 and 22.12 × Ubuntu and Windows, plus a script job: `bash -n install.sh` and
   `node --check` over `scripts/setup.mjs` and `scripts/lib/*.mjs` only.
+- **`npm test` serializes Vitest workers deliberately.** Several suites create real git
+  repositories and worktrees; parallel workers cause nondeterministic ref-lock collisions and
+  hook timeouts on CI.
 - **`npm run typecheck` is not redundant with `npm run build`.** `tsconfig.json` keeps
   `rootDir: src` so `dist/` stays clean, which leaves `test/` unchecked; `tsconfig.test.json`
   exists solely to typecheck the tests, because untyped fixtures silently drifted from the SDK's
@@ -115,11 +118,23 @@ and per-session **YOLO** mode, which approves every permission before the kind/l
 **YOLO mode is never persisted.** It is actor-local and volatile so a restart or resume always
 comes back OFF; enabling it only takes effect after Discord acknowledges the warning.
 
-**Do not re-enable the SDK flags that are off.** `enableFileHooks`, `enableConfigDiscovery`,
-`enableSkills` are `false` and `skipCustomInstructions` is `true` in both `session-actor.ts` and
-the titler in `app.ts` — each with a comment naming the bypass it closes (a repo `.github/hooks`
-file can set `resolvedByHook` and skip the Discord card entirely; instruction files load
-regardless of config discovery, so *this* file is not read by the agent the bot spawns).
+**Do not re-enable broad SDK discovery or file hooks.** `enableFileHooks` and
+`enableConfigDiscovery` stay `false`, and `skipCustomInstructions` stays `true` in
+`session-actor.ts` and the titler in `app.ts`. A repo `.github/hooks` file can set
+`resolvedByHook` and skip the Discord card entirely; broad config discovery would also load
+repo MCP settings; instruction files load regardless of config discovery, so *this* file is not
+read by the agent the bot spawns.
+
+**Skills are a deliberate, narrow exception.** `SessionActor` explicitly passes only the
+CLI-native repo roots (`.github/skills`, `.agents/skills`, `.claude/skills`) and the user root
+(`~/.copilot/skills`) according to `ENABLE_REPO_SKILLS` / `ENABLE_USER_SKILLS`; it must **not**
+set `enableConfigDiscovery:true` to do so. If no enabled root has a `SKILL.md`, it sends
+`excludedTools:["skill"]`, because CLI 1.0.71 still registers the builtin skill tool even when
+`enableSkills:false`, producing a guaranteed `Skill not found` failure. Repo skill descriptions
+are model context: never describe this as a trust boundary. A repo skill's `allowed-tools`
+frontmatter was probed against the SDK runtime and does not bypass `onPermissionRequest`, but
+YOLO removes that remaining card gate; preserve the explicit YOLO warning.
+
 `createCopilotClient` strips `DISCORD_*` / `DISCOPILOT_*` from the agent's env, and
 `useLoggedInUser: true` is hardcoded.
 

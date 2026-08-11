@@ -127,6 +127,8 @@ function config(reposRoot: string): Config {
     DEFAULT_MODEL: "claude-sonnet-5",
     DEFAULT_CONTEXT_TIER: "default",
     PERMISSION_POLICY: "ask",
+    ENABLE_REPO_SKILLS: "true",
+    ENABLE_USER_SKILLS: "true",
     REPO_CLONE_HOST_POLICY: "github",
     REPO_CLONE_ALLOWED_HOSTS: [],
     REPO_CLONE_TIMEOUT_MS: 300_000,

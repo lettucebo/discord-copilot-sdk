@@ -29,6 +29,11 @@ export function isContextTier(v) {
   return v === "default" || v === "long_context";
 }
 
+/** Exact spelling only: this mirrors src/config.ts's z.enum(["true", "false"]). */
+export function isSkillSourceSwitch(v) {
+  return v === "true" || v === "false";
+}
+
 export function isNonEmpty(v) {
   return typeof v === "string" && v.trim().length > 0;
 }
@@ -74,6 +79,8 @@ export const MANAGED_KEYS = [
   { key: "DEV_GUILD_ID", required: false, optional: true, promptKey: "promptDevGuildId", validate: (v) => v === "" || isSnowflake(v), errKey: "errSnowflake" },
   { key: "DEFAULT_MODEL", required: false, defaultValue: "claude-sonnet-5", promptKey: "promptModel", validate: isNonEmpty, errKey: "errRequired" },
   { key: "DEFAULT_CONTEXT_TIER", required: false, defaultValue: "default", promptKey: "promptContextTier", validate: isContextTier, errKey: "errContextTier" },
+  { key: "ENABLE_REPO_SKILLS", required: false, defaultValue: "true", promptKey: "promptRepoSkills", validate: isSkillSourceSwitch, errKey: "errSkillSourceSwitch" },
+  { key: "ENABLE_USER_SKILLS", required: false, defaultValue: "true", promptKey: "promptUserSkills", validate: isSkillSourceSwitch, errKey: "errSkillSourceSwitch" },
 ];
 
 /** Validate a full config object (installer view). Returns { ok, errors:[{key,errKey}] }. */

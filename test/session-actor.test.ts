@@ -8,6 +8,7 @@ import type { Decision, PermissionView, PlanView, Transport, UserInputView } fro
 import type { RenderState } from "../src/core/turn-render.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
@@ -169,6 +170,8 @@ async function setup(extra: Record<string, unknown> = {}): Promise<Setup> {
   const actor = await SessionActor.create(client, {
     sessionKey: "t",
     workingDirectory: "C:\\repo",
+    // Keep unit tests independent of the developer's actual ~/.copilot/skills.
+    skillsHomeDirectory: join(tmpdir(), `discord-copilot-sdk-no-skills-${Math.random()}`),
     broker,
     transport,
     policy,
@@ -187,6 +190,8 @@ describe("SessionActor config hardening", () => {
     const s = await setup();
     expect(s.config["enableFileHooks"]).toBe(false);
     expect(s.config["enableConfigDiscovery"]).toBe(false);
+    expect(s.config["enableSkills"]).toBe(false);
+    expect(s.config["excludedTools"]).toEqual(["skill"]);
     expect(s.config["workingDirectory"]).toBe("C:\\repo");
     expect(s.config["streaming"]).toBe(true);
     expect(s.config["reasoningSummary"]).toBe("detailed");
@@ -197,6 +202,84 @@ describe("SessionActor config hardening", () => {
       "onExitPlanModeRequest",
     ]) {
       expect(typeof s.config[cb]).toBe("function");
+    }
+  });
+
+  it("loads explicit repo and user skill roots without enabling config discovery", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dcs-session-skills-"));
+    const home = join(root, "home");
+    const repoSkills = join(root, ".github", "skills");
+    const userSkills = join(home, ".copilot", "skills");
+    try {
+      for (const dir of [join(repoSkills, "repo"), join(userSkills, "user")]) {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "SKILL.md"), "---\nname: probe\n---\n");
+      }
+
+      const s = await setup({
+        workingDirectory: root,
+        skillsHomeDirectory: home,
+        enableRepoSkills: true,
+        enableUserSkills: true,
+      });
+
+      expect(s.config["enableConfigDiscovery"]).toBe(false);
+      expect(s.config["enableSkills"]).toBe(true);
+      expect(s.config["skillDirectories"]).toEqual([repoSkills, userSkills]);
+      expect(s.config["excludedTools"]).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("removes the skill tool when every enabled skill source is empty", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dcs-session-empty-skills-"));
+    const home = join(root, "home");
+    try {
+      const s = await setup({
+        workingDirectory: root,
+        skillsHomeDirectory: home,
+        enableRepoSkills: true,
+        enableUserSkills: true,
+      });
+
+      expect(s.config["enableConfigDiscovery"]).toBe(false);
+      expect(s.config["enableSkills"]).toBe(false);
+      expect(s.config["skillDirectories"]).toBeUndefined();
+      expect(s.config["excludedTools"]).toEqual(["skill"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("records whether loaded skills include a controlled-repository source", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dcs-repo-skill-source-"));
+    const home = join(root, "home");
+    try {
+      const repoSkillDir = join(root, ".github", "skills", "repo");
+      const userSkillDir = join(home, ".copilot", "skills", "user");
+      for (const dir of [repoSkillDir, userSkillDir]) {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "SKILL.md"), "---\nname: probe\n---\n");
+      }
+
+      const repo = await setup({
+        workingDirectory: root,
+        skillsHomeDirectory: home,
+        enableRepoSkills: true,
+        enableUserSkills: false,
+      });
+      const user = await setup({
+        workingDirectory: root,
+        skillsHomeDirectory: home,
+        enableRepoSkills: false,
+        enableUserSkills: true,
+      });
+
+      expect(repo.actor.hasRepoSkills()).toBe(true);
+      expect(user.actor.hasRepoSkills()).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -413,7 +496,7 @@ describe("SessionActor permission handling", () => {
     expect(s.transport.permissions).toHaveLength(1); // carded despite both trusted (has &&)
     expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u1");
-    expect(await r).toEqual({ kind: "denied-interactively-by-user" });
+    expect(await r).toEqual({ kind: "reject" });
   });
 
   it("never auto-approves via substitution `$( )` / backticks / pipes", async () => {
@@ -490,7 +573,7 @@ describe("SessionActor permission handling", () => {
     await tick();
     expect(s.transport.permissions).toHaveLength(1); // carded — `rm` (the real exec) isn't trusted
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u");
-    expect(await r).toEqual({ kind: "denied-interactively-by-user" });
+    expect(await r).toEqual({ kind: "reject" });
   });
 
   it("does not offer session/always for a multi-executable request", async () => {
@@ -517,7 +600,7 @@ describe("SessionActor permission handling", () => {
     expect(s.transport.permissions.at(-1)!.canOfferSession).toBe(false);
     // A "session" decision the request never authorized must deny (not approve).
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "session", "u1");
-    expect(await result).toEqual({ kind: "denied-interactively-by-user" });
+    expect(await result).toEqual({ kind: "reject" });
     expect(s.policy.isApproved("t", "C:\\repo", ["powershell"])).toBe(false);
   });
 
@@ -537,7 +620,7 @@ describe("SessionActor permission handling", () => {
     const result = perm(s)({ kind: "shell", fullCommandText: "rm x" });
     await tick();
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "deny", "u1");
-    expect(await result).toEqual({ kind: "denied-interactively-by-user" });
+    expect(await result).toEqual({ kind: "reject" });
   });
 
   it("auto-denies a non-shell permission (fail closed) with a notice", async () => {
@@ -978,6 +1061,29 @@ describe("SessionActor resume/create-id seam (P2)", () => {
     // still wires the same hardened callbacks
     expect(typeof s.resumeArgs?.cfg["onPermissionRequest"]).toBe("function");
     expect(s.resumeArgs?.cfg["enableFileHooks"]).toBe(false);
+  });
+
+  it("passes explicit skill directories while resuming a session", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dcs-resume-skills-"));
+    const repoSkills = join(root, ".github", "skills");
+    try {
+      mkdirSync(join(repoSkills, "repo"), { recursive: true });
+      writeFileSync(join(repoSkills, "repo", "SKILL.md"), "---\nname: probe\n---\n");
+      const s = await setup({
+        resumeSessionId: "sess-123",
+        workingDirectory: root,
+        skillsHomeDirectory: join(root, "no-user-skills"),
+        enableRepoSkills: true,
+        enableUserSkills: false,
+      });
+
+      expect(s.resumeArgs?.cfg["enableConfigDiscovery"]).toBe(false);
+      expect(s.resumeArgs?.cfg["enableSkills"]).toBe(true);
+      expect(s.resumeArgs?.cfg["skillDirectories"]).toEqual([repoSkills]);
+      expect(s.resumeArgs?.cfg["excludedTools"]).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("createSessionId → createSession includes the reserved sessionId", async () => {

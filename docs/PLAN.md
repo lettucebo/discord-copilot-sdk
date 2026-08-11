@@ -481,3 +481,125 @@ npx vitest run test/version.test.ts test/session-actor.test.ts \
 - 這次歷史失敗 run 不能被抹除，也不應 revert `7281e3a` 來重寫歷史；`c336672`
   已修正缺陷。矯正措施是補文件、收斂合併規則、預防再發，而不是試圖消去既有
   失敗紀錄。
+
+## 17. Explicit repo/user skills，不開 broad discovery（2026-08-11）
+
+### 17.1 觸發與可重現根因
+
+Discord thread 顯示 `🔧 skill — failed`。這不是 renderer 誤報；真實 runtime 回傳
+`success:false`、`error.message = "Skill not found: brainstorming"`。
+
+對本機 CLI `1.0.71` 與 SDK `1.0.7-preview.3` 的 bundle / runtime probe 證實：
+
+1. CLI 註冊 skill tool 的 `Qvt(...)` 呼叫點只傳 `enableConfigDiscovery`，**沒有**
+   傳 `enableSkills`；因此 `XT()` 內 `enableSkills:false` 的 skills-empty short circuit
+   永遠不會走到。
+2. builtin skill root 不受 `enableConfigDiscovery:false` 影響；skill tool 仍會送給 model，
+   但未配置 roots 時清單只剩 builtin `customize-cloud-agent`。
+3. tool description 又明說「使用者明確點名但未列出的 skill 仍要 invoke」，所以 model
+   會產生必然失敗的 `Skill not found` call。
+
+因此 `enableSkills:false` **不能**當作 v1.0.71 的 skill-tool 安全控制。空來源時只能再加
+`excludedTools:["skill"]`；live probe 已驗證這會從真實 CLI catalog 移除 skill tool，
+且 shell/glob 不受影響。
+
+### 17.2 採納的設計
+
+使用者選定 repo + user skills 預設啟用，且 project roots 跟隨 CLI 原生慣例：
+
+| 根 | 預設 | 開關 |
+| --- | --- | --- |
+| `<workingDirectory>/.github/skills`、`.agents/skills`、`.claude/skills` | on | `ENABLE_REPO_SKILLS` |
+| `~/.copilot/skills` | on | `ENABLE_USER_SKILLS` |
+
+`core/skills.ts` 用同步、可測的目錄探測決定是否至少有一個 `SKILL.md`。來源有不同錯誤策略：
+user root 探測到 `EACCES` 或暫時 IO 問題時刻意 **fail-open**，避免把使用者的 skills 靜默藏起來；
+受控 repo root 在不確定時 **fail-closed**，避免把 inaccessible / 外部 link 路徑交給 CLI。
+兩者都只在確定 `ENOENT` / `ENOTDIR` 或確定空目錄時排除。候選 root 本身一律顯式傳給 SDK，
+因 live probe 已確認不存在的目錄會被 CLI 安全忽略。受控 repo root（包含 root 本身）的
+symbolic link 不跟隨，且 candidate 的 canonical `realpath` 必須仍在 canonical worktree 內，
+所以 `.github` / `.agents` / `.claude` 的**父層** junction 也不能逃到外部；user root 會以
+`stat` / `realpath` 跟隨有效連結並有 cycle guard，支援 dotfiles 管理的 linked skill。兩個分支
+都由真實 CLI probe 驗證。由於 CLI 會跟隨 repo root **內部**的 child link，repo scan 是
+all-or-nothing：找到任一 link（即使同 root 另有合法 `SKILL.md`）就拒絕整個 root，避免
+`ENABLE_USER_SKILLS=false` 被 repo link 指向 user / 外部 skill 而繞過。
+
+`SessionActor.init()` 是 create 與 resume 共用的唯一組態點；三個 app actor 建立路徑
+（`/new`、`/repo` rebind、startup resume）都只把兩個 config switch 傳進去，避免某一路
+在 restart 後改變信任邊界。worktree 在 actor 建立前已 checkout，因此已 commit 的 repo
+skills 可見；未 commit / untracked skill 只會在 `/repo dev local` 見到。
+
+**禁止**把 `enableConfigDiscovery` 改成 true。SDK 文件明定 broad discovery 同時會找
+`.mcp.json` / `.vscode/mcp.json`；對不可信 repo 這等於讓它提供 MCP server 設定。explicit
+`skillDirectories` 已在 live probe 證明能載入 repo skill，無須打開那個面。
+
+### 17.3 真實 runtime 證據與保留控制
+
+| Probe | 結果 | 結論 |
+| --- | --- | --- |
+| `enableSkills:false` vs `true`、discovery off | 都只廣告 1 個 builtin；`brainstorming` failed | 此 CLI 版本忽略該 flag |
+| discovery on | repo 13 skills 可呼叫，但 MCP discovery 也開 | 不可採用 |
+| explicit repo dirs + discovery off | 13 repo + 1 builtin，`git-commit` success | 採用的窄路徑 |
+| explicit user dir + discovery off | 22 user + 1 builtin，`brainstorming` success | user source 可獨立保留 |
+| nested repo `SKILL.md` | `skill` invocation success | scanner 的 recursive 探測與 CLI 一致 |
+| junctioned user skill directory | `skill` invocation success | user-root link 可以安全支援 |
+| `excludedTools:["skill"]` | skill tool definitions = 0；builtin sub-agent 與 resume 亦為 0 | 空來源的正確 fallback |
+| 對抗性 repo skill `allowed-tools: Bash` | shell 仍觸發 `onPermissionRequest(kind:"shell")` | SDK headless path 沒有 TUI 的 auto-rule bypass |
+| deny variants | runtime 接受 `reject`，拒收 SDK 宣告的互動拒絕 variant | 修正 Deny payload |
+
+`allowed-tools` 的 auto-approval 程式碼存在 CLI interactive TUI 的 React `useEffect`；它不是
+SDK session host path。不過這只是**當前版本的實測**，不能當成 sandbox 或永恆的 API 契約。
+
+### 17.4 明確放寬與已接受的殘留風險
+
+這項設計**刻意放寬**「repo 不會影響 agent context」：skill 的 name / description 在 tool
+definition 中常駐，即使 skill 未 invoke，也能 prompt-inject model。仍維持的控制：
+
+- `enableFileHooks:false`：repo hook 無法以 `resolvedByHook` 繞過 Discord card。
+- `enableConfigDiscovery:false`：repo MCP settings 不會載入。
+- `skipCustomInstructions:true`：`AGENTS.md` / `copilot-instructions.md` 仍不載入。
+- 所有 shell permissions 仍由 Discord card 決定；tool failure detail 顯示到 Discord 前經
+  `sanitizeForInlineCode`，且所有 send path 保留 `allowedMentions:{parse:[]}`。
+
+**YOLO + repo skills 是最高風險組合**：repo skill text 可 steer model，而 YOLO 會移除最後的
+Discord permission card。actor 因此追蹤是否真的載入 repo skill，`/yolo mode:on` 的 ack
+warning 會額外說明此風險。YOLO 仍是 session-local、volatile，restart/resume 會回到 OFF。
+
+`~/.copilot/skills` 是跨 session 的共享狀態；任何你允許執行 shell 的 session 都可能寫入它，
+進而植入另一個 user-skills session。path disjointness 無法解決這件事；接受的緩解只有預設
+可關閉、lab-only 機器與文件揭露。
+
+### 17.5 另一個 runtime/SDK 不一致：Deny
+
+SDK `rpc.d.ts` 宣告一個互動拒絕 variant，但真實 local runtime 拒收它：
+`permission host returned malformed payload`。過去 Discord Deny 雖仍 fail-closed（指令沒有執行），
+卻會向 thread 露出 runtime error。明確 Deny 現改送 `{kind:"reject"}`；timeout/abort/
+unsupported kinds 繼續送 `{kind:"user-not-available"}`。`reject` 沒有 `forceReject` 欄位，
+不會強殺整個 turn。fake SDK 無法抓這類 schema drift，因此 live smoke 是必要防線。
+
+### 17.6 否決方案
+
+1. **永遠移除 skill tool**：能消除紅字，但使用者明確需要 repo-level skills，故否決。
+2. **打開 `enableConfigDiscovery:true`**：會同時載入不可信 repo 的 MCP config，故否決。
+3. **接受任意 `SKILL_DIRECTORIES` path**：可指回 controlled repo 或其他不受信任位置，故否決；
+   root 是固定的 CLI-native locations。
+4. **用 `disabledSkills` 名稱 blocklist**：無法表達「全部移除」，且新 skill 會漏接，故否決。
+5. **空來源仍保留 tool**：重現原始必然失敗，故否決。
+
+### 17.7 測試與操作對照
+
+| 風險 / 行為 | 覆蓋 |
+| --- | --- |
+| roots、空目錄、nested `SKILL.md`、repo/user links、IO fail-open | `test/skills.test.ts` |
+| create / resume config、empty ⇒ `excludedTools`、repo-source tracking | `test/session-actor.test.ts` |
+| startup resume 真的傳來源開關 | `test/app-reconcile.test.ts` |
+| strict switch + blank ⇒ default、installer/runtime parity | `test/config.test.ts`、`test/config-contract.test.ts` |
+| installer bilingual keys | `test/i18n.test.ts` |
+| error message normalize → render → Discord sanitization | `test/normalize.test.ts`、`test/turn-render.test.ts`、`test/transport.test.ts` |
+| YOLO repo-skill warning | `test/discord-routing.test.ts` |
+| npm live-smoke command | `test/shipped-scripts.test.ts` |
+
+`npm run smoke:skills` 是**手動** acceptance probe，會在臨時 git repo 以真實登入 runtime 驗證：
+explicit repo skill 載入、empty source 真的移除 tool、`allowed-tools` 不繞過 permission host、
+`reject` 被 runtime 接受、nested repo / linked user skill 是否可載入，以及 resume 是否套用
+explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次升級 Copilot CLI 必跑。
