@@ -63,6 +63,8 @@ const MESSAGES = {
     promptDevGuildId: "開發用 Guild ID（可選，填了可即時註冊斜線指令）",
     promptModel: "預設模型",
     promptContextTier: "context 層級（default / long_context）",
+    promptRepoSkills: "預設載入 repo 內的 skills（true / false；repo 作者可影響 agent context）",
+    promptUserSkills: "預設載入 ~/.copilot/skills（true / false）",
     errRequired: "此為必填項目。",
     errSnowflake: "必須是 Discord 雪花 ID（5–25 位數字）。",
     errUserIds: "必須是逗號分隔的雪花 ID，至少一個。",
@@ -80,6 +82,7 @@ const MESSAGES = {
     errBotRunning:
       "bot 正在執行中，無法安裝（npm 會需要覆寫它正在使用的檔案）。請先執行 ./stop-bot.ps1（或 ./stop-bot.sh）再重跑安裝器。執行中的 PID：",
     errContextTier: "只能是 default 或 long_context。",
+    errSkillSourceSwitch: "只能是 true 或 false（須小寫）。",
     repoLabWarn: "提醒：這些 repo 會被 agent 直接修改，請確定它們是可拋棄的。",
     writingEnv: "寫入 .env…",
     migratedKeys: "已自動轉換舊設定：",
@@ -172,6 +175,8 @@ const MESSAGES = {
     promptDevGuildId: "Dev guild ID (optional; enables instant slash-command registration)",
     promptModel: "Default model",
     promptContextTier: "Context tier (default / long_context)",
+    promptRepoSkills: "Load repository skills by default (true / false; repo authors can influence agent context)",
+    promptUserSkills: "Load ~/.copilot/skills by default (true / false)",
     errRequired: "This field is required.",
     errSnowflake: "Must be a Discord snowflake id (5–25 digits).",
     errUserIds: "Must be comma-separated snowflake ids, at least one.",
@@ -192,6 +197,7 @@ const MESSAGES = {
     errBotRunning:
       "The bot is running, so this install cannot proceed (npm would have to overwrite files it holds open). Run ./stop-bot.sh (or ./stop-bot.ps1) first, then re-run the installer. Running PID: ",
     errContextTier: "Must be 'default' or 'long_context'.",
+    errSkillSourceSwitch: "Must be lowercase 'true' or 'false'.",
     repoLabWarn: "Note: the agent edits these repos directly — make sure they're disposable.",
     writingEnv: "Writing .env…",
     migratedKeys: "Migrated old settings: ",

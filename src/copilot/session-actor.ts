@@ -5,6 +5,7 @@ import type { Decision, Transport } from "../core/transport.js";
 import { normalizeSdkEvent } from "./normalize.js";
 import { sanitizeForCodeBlock, sanitizeForInlineCode, hasBidiOrControls } from "../core/text-safety.js";
 import { ApprovalPolicy, commandExecutable } from "../core/approval-policy.js";
+import { projectSkillDirectories, resolveSkillDirectories } from "../core/skills.js";
 
 const PERMISSION_TIMEOUT_MS = 5 * 60_000;
 const TURN_WATCHDOG_MS = 15 * 60_000;
@@ -64,6 +65,14 @@ export interface SessionActorOpts {
   /** P2: caller-assigned id for a NEW session (reserve-before-create), so a crash
    *  between reserve and create leaves a resumable/identifiable id on disk. */
   createSessionId?: string;
+  /** Enable skills found in the controlled repository's three CLI-native roots.
+   *  Defaults to true; the app's config switch can disable this source alone. */
+  enableRepoSkills?: boolean;
+  /** Enable skills owned by the logged-in Copilot user. Defaults to true. */
+  enableUserSkills?: boolean;
+  /** Test seam for the logged-in user's home directory. Never sourced from .env:
+   *  making this user-controlled would let it point back at the controlled repo. */
+  skillsHomeDirectory?: string;
 }
 
 /** A raw-bytes attachment for send() — Discord images become blobs (P5). */
@@ -92,12 +101,20 @@ export class SessionActor {
   private session!: CopilotSession;
   private renderer = new TurnRenderer();
   private readonly generation: number;
+  /** True when this actor loaded at least one skill from its controlled repo.
+   *  YOLO needs this signal to warn when it removes the approval gate that
+   *  normally constrains model steering from those skill descriptions. */
+  private repoSkillsLoaded = false;
   /** The generation this actor was created with — the fence a broker settle is
    *  checked against. Exposed so the app can register its OWN pending
    *  interactions (the repo-rebind confirmation) on this session's broker with
    *  the same fence the actor uses. */
   generationOf(): number {
     return this.generation;
+  }
+  /** Whether this session loaded a controlled-repository skill source. */
+  hasRepoSkills(): boolean {
+    return this.repoSkillsLoaded;
   }
   /** See `SessionActorOpts.approvalKey`. */
   private get approvalKey(): string {
@@ -167,6 +184,25 @@ export class SessionActor {
   }
 
   private async init(client: CopilotClient): Promise<void> {
+    const includeRepoSkills = this.opts.enableRepoSkills ?? true;
+    const includeUserSkills = this.opts.enableUserSkills ?? true;
+    const repoSkillDirectories = resolveSkillDirectories({
+      workingDirectory: this.opts.workingDirectory,
+      includeRepoSkills,
+      includeUserSkills: false,
+      homeDirectory: this.opts.skillsHomeDirectory,
+    });
+    const userSkillDirectories = resolveSkillDirectories({
+      workingDirectory: this.opts.workingDirectory,
+      includeRepoSkills: false,
+      includeUserSkills,
+      homeDirectory: this.opts.skillsHomeDirectory,
+    });
+    const skillDirectories = [...repoSkillDirectories, ...userSkillDirectories];
+    this.repoSkillsLoaded = repoSkillDirectories.some((directory) =>
+      projectSkillDirectories(this.opts.workingDirectory).includes(directory)
+    );
+    const hasSkills = skillDirectories.length > 0;
     const config: Record<string, unknown> = {
       streaming: true, // required for delta events
       workingDirectory: this.opts.workingDirectory,
@@ -174,11 +210,22 @@ export class SessionActor {
       // trust boundary. enableFileHooks:false is SAFETY-critical — a repo
       // `.github/hooks` permission hook can set resolvedByHook and bypass our
       // Discord approval entirely (SDK session.js short-circuits before
-      // onPermissionRequest). Config/skill discovery are disabled for the same
-      // reason (a repo shouldn't reconfigure the agent).
+      // onPermissionRequest). Broad config discovery stays disabled: it would
+      // load a controlled repo's MCP configuration as well as skills.
       enableFileHooks: false,
       enableConfigDiscovery: false,
-      enableSkills: false,
+      // Explicit skill roots deliberately widen the context boundary without
+      // loading repo MCP config. A skill's text may steer the model, but shell
+      // permissions still route through Discord; only YOLO removes that gate.
+      //
+      // CLI 1.0.71 still registers the skill tool when enableSkills:false if it
+      // finds a builtin skill. With no usable source, excludedTools is therefore
+      // necessary: an empty skill list otherwise invites a guaranteed
+      // "Skill not found" tool failure. SDK documents excludedTools as default-
+      // agent scoped; builtin subagents were probed to inherit this exclusion.
+      ...(hasSkills
+        ? { enableSkills: true, skillDirectories }
+        : { enableSkills: false, excludedTools: ["skill"] }),
       // enableConfigDiscovery:false is NOT sufficient. The SDK states that
       // "custom instruction files (.github/copilot-instructions.md, AGENTS.md,
       // etc.) are always loaded from the working directory regardless of this

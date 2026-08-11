@@ -11,6 +11,13 @@ const optionalSnowflake = z.preprocess(
   (v) => (v === "" ? undefined : v),
   snowflake.optional()
 );
+/** .default() only handles undefined, not an empty value from `.env`. These
+ * switches must treat `KEY=` as unset or the installer/runtime contract splits:
+ * the installer accepts an optional blank key while the runtime would reject it. */
+const skillSourceSwitch = z.preprocess(
+  (v) => (v === "" ? undefined : v),
+  z.enum(["true", "false"]).default("true")
+);
 
 /**
  * discord-copilot-sdk config schema (v1, lab-only). Parsed from environment variables.
@@ -95,6 +102,10 @@ export const ConfigSchema = z.object({
   DEFAULT_MODEL: nonBlank("DEFAULT_MODEL must not be blank").default("claude-sonnet-5"),
   DEFAULT_CONTEXT_TIER: z.enum(["default", "long_context"]).default("default"),
   PERMISSION_POLICY: z.enum(["ask"]).default("ask"),
+  /** Explicit roots let a controlled repo supply skills without enabling broad
+   * config/MCP discovery. Each source is independently switchable. */
+  ENABLE_REPO_SKILLS: skillSourceSwitch,
+  ENABLE_USER_SKILLS: skillSourceSwitch,
   /** Which hosts `/repo clone` may fetch from. `github` (default) is the only
    *  value that needs no further thought; `allowlist` requires naming hosts.
    *  There is deliberately no "any public host" option — hostname text alone

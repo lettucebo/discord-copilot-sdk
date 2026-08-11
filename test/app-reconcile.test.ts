@@ -79,6 +79,8 @@ const cfg = {
   DEFAULT_MODEL: "claude-sonnet-5",
   DEFAULT_CONTEXT_TIER: "default",
   PERMISSION_POLICY: "ask",
+  ENABLE_REPO_SKILLS: "false",
+  ENABLE_USER_SKILLS: "false",
 } as unknown as Parameters<typeof DiscordCopilotApp.createForTest>[0];
 
 class FakeTransport implements Transport {
@@ -507,6 +509,32 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
       const byId = Object.fromEntries(resumeCalls.map((c) => [c.id, c.cfg["workingDirectory"]]));
       expect(byId["s-1"]).toBe(wt);
       expect(byId["s-2"]).toBe(REPO);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(wt, { recursive: true, force: true });
+    }
+  });
+
+  it("passes disabled skill sources into a resumed actor even when its worktree has a skill", async () => {
+    const f = tmpFile();
+    const wt = join(`${stateDir()}-worktrees`, `skill-source-${Math.random().toString(36).slice(2)}`);
+    try {
+      const skillDir = join(wt, ".github", "skills", "probe");
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(join(skillDir, "SKILL.md"), "---\nname: probe\n---\n");
+      resumeCalls.length = 0;
+      const store = new SessionStore(f);
+      store.reserve(bind({ sessionId: "s-skill", workDir: wt, branch: "copilot/t-skill" }));
+      store.commit("t1");
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+
+      await reconcile(app, async () => "valid");
+
+      const call = resumeCalls.find((entry) => entry.id === "s-skill")?.cfg;
+      expect(call?.["enableConfigDiscovery"]).toBe(false);
+      expect(call?.["enableSkills"]).toBe(false);
+      expect(call?.["excludedTools"]).toEqual(["skill"]);
+      expect(call?.["skillDirectories"]).toBeUndefined();
     } finally {
       rmSync(f, { force: true });
       rmSync(wt, { recursive: true, force: true });

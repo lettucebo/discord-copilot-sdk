@@ -16,6 +16,8 @@ describe("parseConfig", () => {
     expect(c.DEFAULT_MODEL).toBe("claude-sonnet-5");
     expect(c.DEFAULT_CONTEXT_TIER).toBe("default");
     expect(c.PERMISSION_POLICY).toBe("ask");
+    expect(c.ENABLE_REPO_SKILLS).toBe("true");
+    expect(c.ENABLE_USER_SKILLS).toBe("true");
     expect(c.REPO_CLONE_HOST_POLICY).toBe("github");
     expect(c.REPO_CLONE_ALLOWED_HOSTS).toEqual([]);
     expect(c.REPO_CLONE_TIMEOUT_MS).toBe(300_000);
@@ -39,6 +41,31 @@ describe("parseConfig", () => {
 
   it("rejects an unknown context tier", () => {
     expect(() => parseConfig({ ...base, DEFAULT_CONTEXT_TIER: "ultra" })).toThrowError(/DEFAULT_CONTEXT_TIER/);
+  });
+
+  it("parses independent skill-source switches and treats empty values as defaults", () => {
+    const disabledRepo = parseConfig({ ...base, ENABLE_REPO_SKILLS: "false" });
+    expect(disabledRepo.ENABLE_REPO_SKILLS).toBe("false");
+    expect(disabledRepo.ENABLE_USER_SKILLS).toBe("true");
+
+    const blank = parseConfig({
+      ...base,
+      ENABLE_REPO_SKILLS: "",
+      ENABLE_USER_SKILLS: "",
+    });
+    expect(blank.ENABLE_REPO_SKILLS).toBe("true");
+    expect(blank.ENABLE_USER_SKILLS).toBe("true");
+  });
+
+  it("rejects invalid or case-drifted skill-source switch values", () => {
+    for (const value of ["True", "yes", "0"]) {
+      expect(() => parseConfig({ ...base, ENABLE_REPO_SKILLS: value })).toThrowError(
+        /ENABLE_REPO_SKILLS/
+      );
+      expect(() => parseConfig({ ...base, ENABLE_USER_SKILLS: value })).toThrowError(
+        /ENABLE_USER_SKILLS/
+      );
+    }
   });
 
   it("REJECTS a removed key rather than ignoring it", () => {

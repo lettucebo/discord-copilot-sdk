@@ -346,6 +346,22 @@ export async function applyYoloToggle(
   return ctl.enableIfCurrent(epoch); // superseded by a later toggle ⇒ no-op
 }
 
+/** Full acknowledgement text shown before enabling YOLO. Repository skill
+ * descriptions are controlled-repo text in the model context; spell out that
+ * YOLO removes the human approval boundary that normally constrains this risk. */
+export function yoloOnWarning(repoSkillsLoaded: boolean): string {
+  return (
+    "⚠️ **YOLO ON for this thread** — every permission request is auto-approved with **no prompt**, " +
+    "including file writes and other kinds that are normally refused. Tools run as your OS user with no sandbox.\n" +
+    "• Any approval card already waiting still needs your decision.\n" +
+    "• This is **not** persisted: a restart or session recovery resets it to OFF.\n" +
+    (repoSkillsLoaded
+      ? "• ⚠️ This session loaded repository skills. Their text can steer the agent, and YOLO removes the Discord approval gate that normally constrains that risk.\n"
+      : "") +
+    "• Turn it off with `/yolo mode:off`."
+  );
+}
+
 /**
  * Composition root: owns the single-instance lock, the Copilot SDK client, the
  * Discord gateway connection, and the per-thread SessionActor map. Wires the
@@ -444,6 +460,16 @@ export class DiscordCopilotApp {
       allowedUserIds: this.allowedUserIds,
       guildId: this.config.DISCORD_GUILD_ID,
       parentChannelIds: this.channels.enabledSet(),
+    };
+  }
+
+  /** Keep every SessionActor creation path on the same skill-source policy.
+   *  Duplicating these conversions at /new, /repo rebind and resume would let a
+   *  restart silently load a different trust boundary than a fresh session. */
+  private skillSourceOptions(): { enableRepoSkills: boolean; enableUserSkills: boolean } {
+    return {
+      enableRepoSkills: this.config.ENABLE_REPO_SKILLS === "true",
+      enableUserSkills: this.config.ENABLE_USER_SKILLS === "true",
     };
   }
 
@@ -1230,6 +1256,7 @@ export class DiscordCopilotApp {
           policy: this.approvals,
           generation,
           createSessionId: sessionId,
+          ...this.skillSourceOptions(),
         });
       } catch (err) {
         // Create failed. The RPC may or may not have created the assigned id, so
@@ -2284,6 +2311,7 @@ export class DiscordCopilotApp {
         policy: this.approvals,
         generation,
         createSessionId: sessionId,
+        ...this.skillSourceOptions(),
       });
     } catch (err) {
       // The OLD session is still live and registered — nothing has been swapped
@@ -2846,6 +2874,7 @@ export class DiscordCopilotApp {
         policy: this.approvals,
         generation: rec.generation,
         resumeSessionId: rec.sessionId,
+        ...this.skillSourceOptions(),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -3165,12 +3194,7 @@ export class DiscordCopilotApp {
       return;
     }
     const on = interaction.options.getString("mode", true) === "on";
-    const warning =
-      "⚠️ **YOLO ON for this thread** — every permission request is auto-approved with **no prompt**, " +
-      "including file writes and other kinds that are normally refused. Tools run as your OS user with no sandbox.\n" +
-      "• Any approval card already waiting still needs your decision.\n" +
-      "• This is **not** persisted: a restart or session recovery resets it to OFF.\n" +
-      "• Turn it off with `/yolo mode:off`.";
+    const warning = yoloOnWarning(session.actor.hasRepoSkills());
     await applyYoloToggle(
       on,
       () =>
