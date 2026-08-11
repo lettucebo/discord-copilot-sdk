@@ -151,7 +151,12 @@ describe("detached launcher core", () => {
     const failed = [first, second].filter((result) => result.status === "rejected");
     expect(ready).toHaveLength(1);
     expect(failed).toHaveLength(1);
-    expect(String(failed[0]?.reason)).toMatch(/exited before ready/i);
+    // Both losers are fail-closed. Depending on which child removes the stale
+    // lock last, the loser either exits before readiness or publishes a marker
+    // after another child has acquired the lock.
+    expect(String(failed[0]?.reason)).toMatch(
+      /exited before ready|published ready without owning its instance lock/i
+    );
 
     const pid = ready[0]?.value.pid;
     expect(pid).toBeDefined();

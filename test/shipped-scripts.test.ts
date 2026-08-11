@@ -28,6 +28,13 @@ function relativeMarkdownLinks(text: string): string[] {
 const USER_FACING_PS1 = ["install.ps1", "get.ps1", "update.ps1", "run-bot.ps1", "stop-bot.ps1", "uninstall.ps1"];
 
 describe("shipped scripts", () => {
+  it("serializes the full Vitest suite because git-heavy fixtures share host resources", () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
+      scripts?: Record<string, string>;
+    };
+    expect(pkg.scripts?.test).toBe("vitest run --maxWorkers=1 --fileParallelism=false");
+  });
+
   it("exposes the live skill smoke through the documented npm command", () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
       scripts?: Record<string, string>;

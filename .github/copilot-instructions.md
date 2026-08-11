@@ -22,6 +22,9 @@ questions and exit-plan actions get Discord button UI. Every other permission ki
 - **There is no lint step for TypeScript.** CI runs `npm run typecheck` + `npm test` on
   Node 20.19 and 22.12 × Ubuntu and Windows, plus a script job: `bash -n install.sh` and
   `node --check` over `scripts/setup.mjs` and `scripts/lib/*.mjs` only.
+- **`npm test` serializes Vitest workers deliberately.** Several suites create real git
+  repositories and worktrees; parallel workers cause nondeterministic ref-lock collisions and
+  hook timeouts on CI.
 - **`npm run typecheck` is not redundant with `npm run build`.** `tsconfig.json` keeps
   `rootDir: src` so `dist/` stays clean, which leaves `test/` unchecked; `tsconfig.test.json`
   exists solely to typecheck the tests, because untyped fixtures silently drifted from the SDK's
