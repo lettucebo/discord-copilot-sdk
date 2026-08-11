@@ -7,8 +7,8 @@ experience — from anywhere, including your phone.
 
 `discord-copilot-sdk` is a Discord bot that drives the local Copilot engine through the official
 [`@github/copilot-sdk`](https://www.npmjs.com/package/@github/copilot-sdk) (JSON-RPC). Each
-Discord thread maps to a Copilot session; the bot streams the agent's messages, tool calls and
-todo checklists into the thread, and surfaces permission / choice / plan prompts as Discord
+Discord thread maps to a Copilot session; the bot streams an ordered timeline of the agent's
+messages, compact tool calls, collapsed thinking and todo checklists into the thread, and surfaces permission / choice / plan prompts as Discord
 **buttons** (plus plain thread messages for free-text answers) that you respond to from any
 device. Token usage and the live model/effort/context tier are available on demand via
 `/usage`.
@@ -90,10 +90,11 @@ card — including the kinds that normally fail closed (file writes, etc.). It e
   resets it to **OFF**, and the recovery notice says so;
 - enabling it takes effect **only after Discord acknowledges the warning**, so a failed reply can't
   leave a session silently unguarded;
-- every auto-approval posts a compact audit notice (kind + bounded target, never the payload).
-  The notice is **best effort**: it is never awaited on the approval path, so a Discord outage
-  delays or drops the line rather than blocking the tool — do not treat the thread as a
-  guaranteed-complete audit log;
+- every auto-approval first appends and fsyncs a bounded record (kind + target, never the
+  payload) to `~/.discord-copilot-sdk/<instance>.audit.jsonl`, then renders a compact timeline entry.
+  A Discord render is best effort, but the on-disk log is authoritative; if it cannot be
+  written, YOLO and existing-rule auto-approvals deny that request rather than run without an
+  audit trail;
 - an approval card that was **already waiting** still needs your decision;
 - `ask_user` and exit-plan still ask — YOLO approves *permissions*, it does not answer questions or
   pick plan actions;
@@ -106,8 +107,9 @@ Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-
 
 - Drives a **local** session end-to-end: `listModels()`, `createSession()`, `send()`, full
   event stream (`assistant.message`/`reasoning`/deltas, `tool.execution_*`,
-  `session.usage_info`/`plan_changed`/`idle`). discord-copilot-sdk renders assistant messages and
-  tool calls; reasoning is intentionally **not** rendered into the thread.
+  `session.usage_info`/`plan_changed`/`idle`). discord-copilot-sdk renders assistant messages,
+  compact in-order tool calls, and thinking collapsed behind Discord spoilers. Reasoning markdown
+  delimiters are rendered as plain text so they cannot break the spoiler.
 - Native interactive callbacks: `onPermissionRequest`, `onUserInputRequest` (ask_user),
   `onExitPlanMode`, `onElicitationRequest`.
 - **`contextTier: "long_context"` unlocks a 936K effective window** (200K default) — something

@@ -10,7 +10,10 @@ import type { NormEvent } from "../core/turn-render.js";
  *    `data` — reading it from `data` defeats sub-agent filtering.
  *  - `assistant.message_delta` text is `data.deltaContent` (streaming chunk).
  *  - `assistant.message` final text is `data.content`.
- *  - tool events carry `data.toolCallId` + `data.toolName`; completion carries
+ *  - reasoning carries `data.content` / `data.deltaContent` plus `reasoningId`;
+ *    assistant.intent is a concise fallback when raw reasoning is unavailable.
+ *  - tool events carry `data.toolCallId` + `data.toolName`, with target hints
+ *    under `data.shellToolInfo.possiblePaths`; completion carries
  *    `data.success: boolean` (there is no `status` field).
  *
  * Pure and exported so a unit test can feed real event envelopes through it.
@@ -24,20 +27,42 @@ export function normalizeSdkEvent(type: string, event: unknown): NormEvent | und
       return { type: "message_delta", agentId, text: str(d["deltaContent"]) };
     case "assistant.message":
       return { type: "message", agentId, content: str(d["content"]) };
+    case "assistant.reasoning_delta":
+      return {
+        type: "reasoning_delta",
+        agentId,
+        id: str(d["reasoningId"]),
+        text: str(d["deltaContent"]),
+      };
+    case "assistant.reasoning":
+      return {
+        type: "reasoning",
+        agentId,
+        id: str(d["reasoningId"]),
+        content: str(d["content"]),
+      };
+    case "assistant.intent":
+      return { type: "intent", agentId, text: str(d["intent"]) };
     case "tool.execution_start":
       return {
         type: "tool_start",
         agentId,
         id: str(d["toolCallId"]),
         name: str(d["toolName"]),
+        arguments: record(d["arguments"]),
+        possiblePaths: possiblePaths(d["shellToolInfo"]),
+        description: description(d["toolDescription"]),
       };
-    case "tool.execution_complete":
+    case "tool.execution_complete": {
+      const error = errorMessage(d["error"]);
       return {
         type: "tool_complete",
         agentId,
         id: str(d["toolCallId"]),
         status: d["success"] === false ? "failed" : "completed",
+        ...(error ? { error } : {}),
       };
+    }
     default:
       return undefined;
   }
@@ -45,4 +70,25 @@ export function normalizeSdkEvent(type: string, event: unknown): NormEvent | und
 
 function str(v: unknown): string {
   return typeof v === "string" ? v : "";
+}
+
+function record(v: unknown): Record<string, unknown> | undefined {
+  return v !== null && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : undefined;
+}
+
+function possiblePaths(v: unknown): string[] {
+  const paths = record(v)?.["possiblePaths"];
+  return Array.isArray(paths) ? paths.filter((path): path is string => typeof path === "string") : [];
+}
+
+function description(v: unknown): string | undefined {
+  const value = record(v)?.["description"];
+  return typeof value === "string" ? value : undefined;
+}
+
+function errorMessage(v: unknown): string | undefined {
+  const message = record(v)?.["message"];
+  return typeof message === "string" ? message : undefined;
 }

@@ -7,6 +7,7 @@ import {
   LEGACY_STATE_DIR_NAME,
   LEGACY_ENV_PREFIX,
   STATE_DIR_NAME,
+  auditLogPath,
   stateDir,
   worktreeRoot,
 } from "../src/core/paths.js";
@@ -71,6 +72,12 @@ describe("worktreeRoot (trust-boundary sibling)", () => {
     const rel = path.relative(stateDir(), worktreeRoot());
     expect(rel.startsWith("..")).toBe(true);
     expect(path.dirname(worktreeRoot())).toBe(path.dirname(stateDir()));
+  });
+
+  describe("auditLogPath", () => {
+    it("scopes audit files to the logical instance to prevent concurrent JSONL writers", () => {
+      expect(auditLogPath("work")).toBe(path.join(stateDir(), "work.audit.jsonl"));
+    });
   });
 
   it("derives its name from the state dir name, so the two cannot drift apart", () => {
