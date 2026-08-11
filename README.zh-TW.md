@@ -54,7 +54,7 @@ discord-copilot-sdk v1 **僅限實驗環境**。它會**以啟動 bot 的使用�
 
 在真實機器上實測確認（Copilot Enterprise、copilot CLI 1.0.74-1）：
 
-- 可 end-to-end 驅動**本機** session：`listModels()`、`createSession()`、`send()`、完整 event stream（`assistant.message`/`reasoning`/deltas、`tool.execution_*`、`session.usage_info`/`plan_changed`/`idle`）。discord-copilot-sdk 會 render assistant messages、依序的精簡 tool calls，以及預設收合在 Discord spoiler 後的 thinking；reasoning 的 markdown delimiters 會轉成純文字，避免破壞 spoiler。
+- 可 end-to-end 驅動**本機** session：`listModels()`、`createSession()`、`send()`、完整 event stream（`assistant.message`/`reasoning`/deltas、`tool.execution_*`、`session.usage_info`/`plan_changed`/`idle`）。discord-copilot-sdk 會 render assistant messages、依序的精簡 tool calls，以及預設收合在 Discord spoiler 後的 thinking；reasoning 的 markdown delimiters 會轉成純文字，避免破壞 spoiler。新 session 會請求 detailed reasoning summary；在已測 runtime 中，Claude 可能只提供 opaque summary 而無可顯示內容，GPT reasoning 模型則提供可顯示的 summary。
 - Native interactive callbacks：`onPermissionRequest`、`onUserInputRequest`（ask_user）、`onExitPlanMode`、`onElicitationRequest`。
 - **`contextTier: "long_context"` 解鎖 936K effective window**（預設 200K）——raw ACP path 做不到（上限 264K）。
 

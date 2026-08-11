@@ -76,7 +76,7 @@
 - **只操作 bot 擁有的 session id**；絕不曝露/刪除 `client.listSessions()` 任意結果。
 
 ## 5. 串流呈現（render state machine）
-鍵：`turnId/messageId/toolCallId/agentId`。累積 delta；**持久化 `assistant.message` 為權威最終**（不重複貼）；**過濾 agentId** 只呈現主回應；尾端訊息約 750–1000ms 編輯一次 + turn 末 flush；區塊約 1900 字、凍結；佇列有界（丟中間、保最終）；rate limit 交給 discord.js bucket；以**依到達順序 timeline** 呈現文字／工具／系統狀態：工具為一行 dimmed subtext，thinking 以 Discord spoiler 預設收合、可點擊展開；明確 `streaming:true`。
+鍵：`turnId/messageId/toolCallId/agentId`。累積 delta；**持久化 `assistant.message` 為權威最終**（不重複貼）；**過濾 agentId** 只呈現主回應；尾端訊息約 750–1000ms 編輯一次 + turn 末 flush；區塊約 1900 字、凍結；佇列有界（丟中間、保最終）；rate limit 交給 discord.js bucket；以**依到達順序 timeline** 呈現文字／工具／系統狀態：工具為一行 dimmed subtext，thinking 以 Discord spoiler 預設收合、可點擊展開；新 session 明確請求 `reasoningSummary:"detailed"`，`/model` 切換也重送該要求；明確 `streaming:true`。
 
 ## 6. SDK Adapter（薄層）
 隔離 client/session 生命週期、正規化事件、callback 結果變體、model/context 切換、resume、remote。pin 最新版（1.0.7-preview.3）+ lockfile + 啟動相容檢查 + 對安裝 CLI 契約測試。不做多 provider 抽象。
@@ -132,7 +132,7 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 - **「modal 路徑」= thread 訊息自由輸入**，非 Discord modal 彈窗。行動裝置友善、無彈窗限制；freeform 能力已實作並測試（`session-actor.test.ts` `freeform message answers (wasFreeform=true)`）。不另做 Discord modal（YAGNI，非使用者需求）。
 - **Restart smoke（P2）** 的自動化部分即 `app-reconcile.test.ts`（9 個 app 層 resume 對帳情形，以 fake 驅動）+ `reconcile.test.ts`；真正的「重啟後 live 復原」已於開發時人工驗證（斷線→重啟→喚回暗號 PELICAN-77）。可跑於 CI 的 live-restart 需真實 Discord+Copilot，超出無網路 CI 範圍。
 - **安裝器測試框架**（`secure-file`/`setup-core`/`setup-integration`）屬 **P6 安裝器回歸**，另立 issue 追蹤，不計入本 §9（#8）。
-- **thinking 預設收合而非預設關閉**：使用者需要能回看 CLI 風格的判斷過程；Discord 沒有 accordion，故以 spoiler 做唯一原生的點擊展開。原始 reasoning 中的 ````` fence 與 `||` 會被轉為純文字，且限制 1200 字，避免 Discord code block 取消 spoiler 與跨訊息拆分的未定義行為。Runtime 沒有 reasoning 時顯示 `assistant.intent` 作短摘要。
+- **thinking 預設收合而非預設關閉**：使用者需要能回看 CLI 風格的判斷過程；Discord 沒有 accordion，故以 spoiler 做唯一原生的點擊展開。新 session 與 `/model` 切換明確請求 `reasoningSummary:"detailed"`。原始 reasoning 中的 ````` fence 與 `||` 會被轉為純文字，且限制 1200 字，避免 Discord code block 取消 spoiler 與跨訊息拆分的未定義行為。Runtime 沒有 reasoning 時顯示 `assistant.intent` 作短摘要。已測 runtime 的 Claude summary 可能是 opaque、無可顯示內容；GPT reasoning 模型可提供可顯示 summary，因此 UI 以 provider 實際事件為準。
 - **YOLO 稽核耐久性先於排版**：每個自動核准先同步 append + fsync `~/.discord-copilot-sdk/<instance>.audit.jsonl`，寫入失敗即拒絕；Discord timeline 行可以是 best-effort，卻不再是唯一稽核紀錄。相同 raw entry 才能折疊計數，避免被截斷的不同指令誤合併。
 - **時間軸不是不可偽造的安全 UI**：agent 仍可能在普通文字中仿造 `-#`／emoji。它不會改變 permission card 的 fail-closed 閘或 JSONL 稽核，但操作者不可把視覺樣式當成授權證據。
 

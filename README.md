@@ -109,7 +109,10 @@ Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-
   event stream (`assistant.message`/`reasoning`/deltas, `tool.execution_*`,
   `session.usage_info`/`plan_changed`/`idle`). discord-copilot-sdk renders assistant messages,
   compact in-order tool calls, and thinking collapsed behind Discord spoilers. Reasoning markdown
-  delimiters are rendered as plain text so they cannot break the spoiler.
+  delimiters are rendered as plain text so they cannot break the spoiler. New sessions request
+  detailed reasoning summaries; providers that keep summaries opaque (such as Claude in the
+  tested runtime) may still produce no displayable thinking, while GPT reasoning models provide
+  visible summaries.
 - Native interactive callbacks: `onPermissionRequest`, `onUserInputRequest` (ask_user),
   `onExitPlanMode`, `onElicitationRequest`.
 - **`contextTier: "long_context"` unlocks a 936K effective window** (200K default) — something

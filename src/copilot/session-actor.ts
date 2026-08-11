@@ -19,6 +19,10 @@ const FAULT_DISCONNECT_MS = 5_000;
  *  card lives in a Discord embed description (≤4096). Beyond this we auto-deny
  *  rather than show a partial/undisplayable command. */
 const MAX_CARD_LEN = 3900;
+/** Request a displayable reasoning summary from providers that support it.
+ * Discord keeps the result collapsed, so detailed summaries remain available
+ * without turning the main thread into an expanded chain-of-thought transcript. */
+const REASONING_SUMMARY = "detailed" as const;
 /** Debounce window for the signal-only session.todos_changed event: the agent
  *  may write its todos table many times per turn, so we coalesce bursts. */
 const TODOS_DEBOUNCE_MS = 700;
@@ -174,6 +178,7 @@ export class SessionActor {
     const config: Record<string, unknown> = {
       streaming: true, // required for delta events
       workingDirectory: this.opts.workingDirectory,
+      reasoningSummary: REASONING_SUMMARY,
       // Defense-in-depth: stop the controlled repo from influencing the agent's
       // trust boundary. enableFileHooks:false is SAFETY-critical — a repo
       // `.github/hooks` permission hook can set resolvedByHook and bypass our
@@ -225,8 +230,11 @@ export class SessionActor {
       // model/contextTier are deliberately STRIPPED here: the resumed session
       // already carries whatever the operator selected with /model, /effort and
       // /context before the restart, and re-sending this process's startup
-      // defaults would silently downgrade that choice. The real values are read
-      // back from the runtime below.
+      // defaults would silently downgrade that choice. reasoningSummary is a
+      // fixed display request with no operator-facing toggle, so preserve it:
+      // this avoids relying on whether the runtime journaled its create-time
+      // value before a session's first /model change. The real user-selected
+      // values are read back from the runtime below.
       const { model: _m, contextTier: _c, ...resumeConfig } = config;
       this.session = await c.resumeSession(this.opts.resumeSessionId, {
         ...resumeConfig,
@@ -358,10 +366,14 @@ export class SessionActor {
     const effort = opts.resetEffort ? undefined : opts.effort ?? this.currentEffort;
     const context = opts.context ?? this.currentContext;
     const s = this.session as unknown as {
-      setModel(m: string, o?: { reasoningEffort?: string; contextTier?: string }): Promise<unknown>;
+      setModel(
+        m: string,
+        o?: { reasoningEffort?: string; reasoningSummary?: "detailed"; contextTier?: string }
+      ): Promise<unknown>;
     };
     await s.setModel(model, {
       ...(effort ? { reasoningEffort: effort } : {}),
+      reasoningSummary: REASONING_SUMMARY,
       ...(context ? { contextTier: context } : {}),
     });
     this.currentModel = model;
