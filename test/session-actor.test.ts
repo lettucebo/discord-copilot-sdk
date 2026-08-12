@@ -746,6 +746,167 @@ describe("SessionActor permission handling", () => {
       }
     });
 
+    it("releases the gate when stop overtakes a stalled pre-card resolver", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-stop-stalled-resolver-"));
+      const target = join(root, "artifact.txt");
+      let releaseLstat: (() => void) | undefined;
+      let first: Promise<unknown> | undefined;
+      let lstatSpy: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        const originalLstat = fs.lstat;
+        let markLstatStarted!: () => void;
+        const lstatStarted = new Promise<void>((resolve) => {
+          markLstatStarted = resolve;
+        });
+        const stalledLstat = new Promise<void>((resolve) => {
+          releaseLstat = resolve;
+        });
+        lstatSpy = vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
+          if (String(args[0]) !== target) return originalLstat(...args);
+          markLstatStarted();
+          await stalledLstat;
+          return originalLstat(...args);
+        });
+
+        first = requestFilePermission(s, { path: "artifact.txt" }, "stop-stalled-resolver");
+        await lstatStarted;
+        await expect(s.actor.stop()).resolves.toBe(true);
+
+        // The stale resolver remains hung, but its old owner must not block a
+        // fresh turn or produce a card once it is finally released.
+        lstatSpy.mockRestore();
+        await s.actor.send("begin a fresh turn");
+        const before = s.transport.permissions.length;
+        const later = requestFilePermission(s, { path: "artifact.txt" }, "after-stop-resolver");
+        const view = await latestFilePermission(s, before);
+        s.transport.deliverDecision(view.nonce, "once", "u1");
+        await expect(later).resolves.toEqual({ kind: "approve-once" });
+
+        if (!releaseLstat) throw new Error("stalled resolver was never reached");
+        releaseLstat();
+        await expect(first).resolves.toEqual({ kind: "user-not-available" });
+        expect(s.transport.permissions).toHaveLength(before + 1);
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "stop-stalled-resolver")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+        expect(s.transport.sentFiles).toHaveLength(0);
+      } finally {
+        releaseLstat?.();
+        lstatSpy?.mockRestore();
+        await Promise.allSettled([first].filter((request): request is Promise<unknown> => request !== undefined));
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("releases the gate on stop while card setup stalls and never shows the stale card", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-stop-stalled-card-"));
+      let releaseFlush: (() => void) | undefined;
+      let first: Promise<unknown> | undefined;
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        const originalFlush = s.transport.flush.bind(s.transport);
+        let markFlushStarted!: () => void;
+        const flushStarted = new Promise<void>((resolve) => {
+          markFlushStarted = resolve;
+        });
+        const stalledFlush = new Promise<void>((resolve) => {
+          releaseFlush = resolve;
+        });
+        s.transport.flush = async (): Promise<void> => {
+          markFlushStarted();
+          await stalledFlush;
+        };
+
+        first = requestFilePermission(s, { path: "artifact.txt" }, "stop-stalled-card");
+        await flushStarted;
+        await expect(s.actor.stop()).resolves.toBe(true);
+
+        const stillPending = Symbol("still-pending");
+        const stopped = await Promise.race([
+          first,
+          new Promise<typeof stillPending>((resolve) => setTimeout(() => resolve(stillPending), 100)),
+        ]);
+        expect(stopped).toEqual({ kind: "user-not-available" });
+
+        s.transport.flush = originalFlush;
+        if (!releaseFlush) throw new Error("stalled flush was never reached");
+        releaseFlush();
+        await tick();
+        expect(s.transport.permissions).toHaveLength(0);
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "stop-stalled-card")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+        expect(s.transport.sentFiles).toHaveLength(0);
+
+        await s.actor.send("begin a fresh turn");
+        const before = s.transport.permissions.length;
+        const later = requestFilePermission(s, { path: "artifact.txt" }, "after-stop-stall");
+        const view = await latestFilePermission(s, before);
+        s.transport.deliverDecision(view.nonce, "once", "u1");
+        await expect(later).resolves.toEqual({ kind: "approve-once" });
+      } finally {
+        releaseFlush?.();
+        await Promise.allSettled([first].filter((request): request is Promise<unknown> => request !== undefined));
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("releases the gate after timeout while card presentation stalls", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-timeout-stalled-card-"));
+      let releaseCard: (() => void) | undefined;
+      let first: Promise<unknown> | undefined;
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        vi.useFakeTimers();
+        const s = await setup({ workingDirectory: root });
+        const originalShowPermission = s.transport.showPermission.bind(s.transport);
+        const stalledCard = new Promise<void>((resolve) => {
+          releaseCard = resolve;
+        });
+        s.transport.showPermission = async (view: PermissionView): Promise<void> => {
+          await originalShowPermission(view);
+          await stalledCard;
+        };
+
+        const before = s.transport.permissions.length;
+        first = requestFilePermission(s, { path: "artifact.txt" }, "timeout-stalled-card");
+        await latestFilePermission(s, before);
+
+        const stillPending = Symbol("still-pending");
+        await vi.advanceTimersByTimeAsync(5 * 60_000);
+        const timedOut = Promise.race([
+          first,
+          new Promise<typeof stillPending>((resolve) => setTimeout(() => resolve(stillPending), 1)),
+        ]);
+        await vi.advanceTimersByTimeAsync(1);
+        await expect(timedOut).resolves.toEqual({ kind: "user-not-available" });
+
+        s.transport.showPermission = originalShowPermission;
+        const laterBefore = s.transport.permissions.length;
+        const later = requestFilePermission(s, { path: "artifact.txt" }, "after-timeout-stall");
+        const laterCard = await latestFilePermission(s, laterBefore);
+        s.transport.deliverDecision(laterCard.nonce, "once", "u1");
+        await expect(later).resolves.toEqual({ kind: "approve-once" });
+
+        if (!releaseCard) throw new Error("stalled card was never reached");
+        releaseCard();
+        await vi.runAllTicks();
+        expect(s.transport.permissions).toHaveLength(laterBefore + 1);
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "timeout-stalled-card")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+        expect(s.transport.sentFiles).toHaveLength(0);
+      } finally {
+        releaseCard?.();
+        vi.useRealTimers();
+        await Promise.allSettled([first].filter((request): request is Promise<unknown> => request !== undefined));
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it("fails if the artifact changes after approval and never uploads the replacement", async () => {
       const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-mutate-"));
       try {
@@ -766,17 +927,21 @@ describe("SessionActor permission handling", () => {
     it("rejects an equal-size replacement whose metadata fingerprint was restored", async () => {
       const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-content-mutate-"));
       const originalOpen = fs.open;
+      const originalStat = fs.stat;
       const stableStat = {
         isFile: () => true,
         size: 8,
-        dev: 1,
-        ino: 2,
         mtimeMs: 3,
       };
       const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
         const handle = await originalOpen(...args);
+        const actualStat = await originalStat(args[0]!);
+        const actualIdentity = await originalStat(args[0]!, { bigint: true });
         // Models a same-size in-place rewrite with the original stat tuple restored.
-        return Object.assign(handle, { stat: async () => stableStat }) as typeof handle;
+        return Object.assign(handle, {
+          stat: async (options?: { bigint?: boolean }) =>
+            options?.bigint ? actualIdentity : { ...stableStat, dev: actualStat.dev, ino: actualStat.ino },
+        }) as typeof handle;
       });
       try {
         const target = writeArtifact(root, "artifact.txt", "original");

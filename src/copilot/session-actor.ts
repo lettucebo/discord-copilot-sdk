@@ -222,8 +222,9 @@ export class SessionActor {
    * permission card validated its immutable metadata and content digest. */
   private readonly approvedFileDeliveries = new Map<string, ApprovedFileDelivery>();
   /** Bounds pre-card reads and prevents multiple pending cards from retaining
-   * up to 8 MiB each. Cleared only by the owner callback's finalizer. */
-  private fileDeliveryPermissionInFlight = false;
+   * up to 8 MiB each. A lifecycle boundary drops this owner immediately; an
+   * old callback can only release its own token, never a later request's gate. */
+  private fileDeliveryPermissionOwner?: symbol;
   /** Incremented whenever a pending approval becomes stale (new turn/teardown). */
   private fileApprovalEpoch = 0;
   private successfulFileDeliveriesThisTurn = 0;
@@ -597,6 +598,29 @@ export class SessionActor {
   private clearFileDeliveryApprovals(): void {
     this.fileApprovalEpoch++;
     this.approvedFileDeliveries.clear();
+    this.fileDeliveryPermissionOwner = undefined;
+  }
+
+  private acquireFileDeliveryPermissionGate(): symbol | undefined {
+    if (this.fileDeliveryPermissionOwner) return undefined;
+    const owner = Symbol("file-delivery-permission");
+    this.fileDeliveryPermissionOwner = owner;
+    return owner;
+  }
+
+  private releaseFileDeliveryPermissionGate(owner: symbol): void {
+    if (this.fileDeliveryPermissionOwner === owner) {
+      this.fileDeliveryPermissionOwner = undefined;
+    }
+  }
+
+  private fileDeliveryPermissionIsCurrent(owner: symbol, turnEpoch: number): boolean {
+    return (
+      this.fileDeliveryPermissionOwner === owner &&
+      this.lifecycle === "active" &&
+      !this.aborting &&
+      turnEpoch === this.fileApprovalEpoch
+    );
   }
 
   private fileDeliveryIsCurrent(approval: ApprovedFileDelivery): boolean {
@@ -613,8 +637,10 @@ export class SessionActor {
   private async validateFileDeliveryApproval(
     requestedPath: string,
     comment: string | undefined,
-    turnEpoch: number
+    turnEpoch: number,
+    owner: symbol
   ): Promise<ApprovedFileDelivery | undefined> {
+    if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) return undefined;
     let resolved: Awaited<ReturnType<typeof resolveOutboundFile>>;
     try {
       resolved = await resolveOutboundFile(this.opts.workingDirectory, requestedPath, {
@@ -622,20 +648,18 @@ export class SessionActor {
         maxBytes: MAX_DISCORD_UPLOAD_BYTES,
       });
     } catch {
-      void this.addTimelineNotice("Auto-denied: the requested file could not be validated.").catch(() => {});
+      if (this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) {
+        void this.addTimelineNotice("Auto-denied: the requested file could not be validated.").catch(() => {});
+      }
       return undefined;
     }
     if (!resolved.ok) {
-      void this.addTimelineNotice("Auto-denied: the requested file is not eligible for agent delivery.").catch(() => {});
+      if (this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) {
+        void this.addTimelineNotice("Auto-denied: the requested file is not eligible for agent delivery.").catch(() => {});
+      }
       return undefined;
     }
-    if (
-      this.lifecycle !== "active" ||
-      this.aborting ||
-      turnEpoch !== this.fileApprovalEpoch
-    ) {
-      return undefined;
-    }
+    if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) return undefined;
 
     const { fingerprint, digest, displayName, size } = resolved.file;
     return {
@@ -649,6 +673,60 @@ export class SessionActor {
     };
   }
 
+  /** File cards need their own fenced presentation path: a stalled flush must
+   * not reset a newer turn after stop/timeout has already released its gate. */
+  private async beginFileDeliveryInteractionCard(owner: symbol, turnEpoch: number): Promise<boolean> {
+    if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) return false;
+    const inFlightTools = this.renderer.inFlightTools();
+    await this.opts.transport.flush(this.opts.sessionKey).catch(() => {});
+    if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) return false;
+    this.opts.transport.resetTurn(this.opts.sessionKey);
+    this.renderer = new TurnRenderer();
+    this.renderer.adoptTools(inFlightTools);
+    return true;
+  }
+
+  /** Card delivery is deliberately detached from the broker wait. Discord can
+   * hang while a stop or permission timeout must still settle and free the gate. */
+  private async presentFileDeliveryPermissionCard(
+    nonce: string,
+    approval: ApprovedFileDelivery,
+    owner: symbol,
+    turnEpoch: number
+  ): Promise<void> {
+    try {
+      if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) {
+        this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
+        return;
+      }
+      if (!(await this.beginFileDeliveryInteractionCard(owner, turnEpoch))) {
+        this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
+        return;
+      }
+      if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) {
+        this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
+        return;
+      }
+      await this.opts.transport.showPermission({
+        nonce,
+        sessionKey: this.opts.sessionKey,
+        kind: "custom-tool",
+        summary: fileDeliverySummary(approval.displayName, approval.size, approval.comment),
+        supported: true,
+        canOfferSession: false,
+        scopeCommands: [],
+      });
+      if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) {
+        this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
+      }
+    } catch {
+      this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
+      if (this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) {
+        void this.addTimelineNotice("Auto-denied: could not render the file-delivery approval card.").catch(() => {});
+      }
+    }
+  }
+
   private async handleFileDeliveryPermission(r: Record<string, unknown>): Promise<unknown> {
     const toolCallId = typeof r["toolCallId"] === "string" && r["toolCallId"].length > 0 ? r["toolCallId"] : undefined;
     const args = parseFileDeliveryArgs(r["args"]);
@@ -656,17 +734,17 @@ export class SessionActor {
       await this.addTimelineNotice("Auto-denied an invalid file-delivery request.");
       return DENY_UNAVAILABLE;
     }
-    if (this.fileDeliveryPermissionInFlight) {
+    const owner = this.acquireFileDeliveryPermissionGate();
+    if (!owner) {
       void this.addTimelineNotice("Auto-denied: another file-delivery approval is already pending.").catch(() => {});
       return DENY_UNAVAILABLE;
     }
-    this.fileDeliveryPermissionInFlight = true;
     try {
       // A runtime retry with the same id must never inherit an older approval.
       this.approvedFileDeliveries.delete(toolCallId);
       const turnEpoch = this.fileApprovalEpoch;
-      const approval = await this.validateFileDeliveryApproval(args.path, args.comment, turnEpoch);
-      if (!approval) return DENY_UNAVAILABLE;
+      const approval = await this.validateFileDeliveryApproval(args.path, args.comment, turnEpoch, owner);
+      if (!approval || !this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) return DENY_UNAVAILABLE;
 
       const { nonce, promise } = this.opts.broker.register<unknown>({
         sessionKey: this.opts.sessionKey,
@@ -677,37 +755,13 @@ export class SessionActor {
       });
       this.pendingPerms.set(nonce, { executable: "", canOfferSession: false });
       try {
-        try {
-          await this.beginInteractionCard();
-          if (
-            this.lifecycle !== "active" ||
-            this.aborting ||
-            turnEpoch !== this.fileApprovalEpoch
-          ) {
-            this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
-          } else {
-            await this.opts.transport.showPermission({
-              nonce,
-              sessionKey: this.opts.sessionKey,
-              kind: "custom-tool",
-              summary: fileDeliverySummary(approval.displayName, approval.size, approval.comment),
-              supported: true,
-              canOfferSession: false,
-              scopeCommands: [],
-            });
-          }
-        } catch {
+        void this.presentFileDeliveryPermissionCard(nonce, approval, owner, turnEpoch).catch(() => {
           this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
-          void this.addTimelineNotice("Auto-denied: could not render the file-delivery approval card.").catch(() => {});
-        }
+        });
 
         const decision = await promise;
-        if (
-          approvedOnce(decision) &&
-          this.lifecycle === "active" &&
-          !this.aborting &&
-          turnEpoch === this.fileApprovalEpoch
-        ) {
+        if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) return DENY_UNAVAILABLE;
+        if (approvedOnce(decision)) {
           this.approvedFileDeliveries.set(toolCallId, approval);
         }
         return decision;
@@ -715,7 +769,7 @@ export class SessionActor {
         this.pendingPerms.delete(nonce);
       }
     } finally {
-      this.fileDeliveryPermissionInFlight = false;
+      this.releaseFileDeliveryPermissionGate(owner);
     }
   }
 

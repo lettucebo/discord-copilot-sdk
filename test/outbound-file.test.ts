@@ -187,17 +187,21 @@ describe("resolveOutboundFile", () => {
     const root = makeRoot();
     const abs = write(root, "artifact.txt", "original");
     const originalOpen = fsPromises.open;
+    const originalStat = fsPromises.stat;
     const stableStat = {
       isFile: () => true,
       size: 8,
-      dev: 1,
-      ino: 2,
       mtimeMs: 3,
     };
     const openSpy = vi.spyOn(fsPromises, "open").mockImplementation(async (...args) => {
       const handle = await originalOpen(...args);
+      const actualStat = await originalStat(args[0]!);
+      const actualIdentity = await originalStat(args[0]!, { bigint: true });
       // Model an in-place equal-size rewrite that restored the stat tuple.
-      return Object.assign(handle, { stat: async () => stableStat }) as typeof handle;
+      return Object.assign(handle, {
+        stat: async (options?: { bigint?: boolean }) =>
+          options?.bigint ? actualIdentity : { ...stableStat, dev: actualStat.dev, ino: actualStat.ino },
+      }) as typeof handle;
     });
 
     try {
@@ -246,23 +250,110 @@ describe("resolveOutboundFile", () => {
     }
   });
 
+  it("rejects a reparse-like final candidate before opening it", async () => {
+    const root = makeRoot();
+    const target = write(root, "artifact.txt", "artifact");
+    const originalLstat = fsPromises.lstat;
+    const openSpy = vi.spyOn(fsPromises, "open");
+    const lstatSpy = vi.spyOn(fsPromises, "lstat").mockImplementation(async (...args) => {
+      if (path.resolve(String(args[0])) === path.resolve(target)) {
+        return {
+          isSymbolicLink: () => true,
+          isFile: () => false,
+        } as Awaited<ReturnType<typeof fsPromises.lstat>>;
+      }
+      return originalLstat(...args);
+    });
+
+    try {
+      await expect(resolveOutboundFile(root, "artifact.txt", { maxBytes: 64, policy: "agent" })).resolves.toEqual({
+        ok: false,
+        reason: "not-regular-file",
+      });
+      expect(openSpy).not.toHaveBeenCalled();
+    } finally {
+      lstatSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("refuses an opened handle when a post-open canonicalization shows an outside swap", async () => {
+    const root = makeRoot();
+    const target = write(root, "artifact.txt", "inside");
+    const outsideRoot = makeRoot();
+    const outside = write(outsideRoot, "artifact.txt", "outside");
+    const originalOpen = fsPromises.open;
+    const originalRealpath = fsPromises.realpath;
+    let opened = false;
+    const openSpy = vi.spyOn(fsPromises, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      opened = true; // The attacker swaps the name after this handle bound the old file.
+      return handle;
+    });
+    const realpathSpy = vi.spyOn(fsPromises, "realpath").mockImplementation(async (...args) => {
+      if (opened && path.resolve(String(args[0])) === path.resolve(target)) return outside;
+      return originalRealpath(...args);
+    });
+
+    try {
+      await expect(resolveOutboundFile(root, "artifact.txt", { maxBytes: 64, policy: "agent" })).resolves.toEqual({
+        ok: false,
+        reason: "outside-workdir",
+      });
+      expect(openSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      realpathSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("refuses an opened handle when post-open path identity differs", async () => {
+    const root = makeRoot();
+    const target = write(root, "artifact.txt", "inside");
+    const originalStat = fsPromises.stat;
+    const statSpy = vi.spyOn(fsPromises, "stat").mockImplementation(async (...args) => {
+      const stat = await originalStat(...args);
+      if (path.resolve(String(args[0])) !== path.resolve(target)) return stat;
+      return {
+        ...stat,
+        ino: typeof stat.ino === "bigint" ? stat.ino + 1n : stat.ino + 1024,
+      } as typeof stat;
+    });
+
+    try {
+      await expect(resolveOutboundFile(root, "artifact.txt", { maxBytes: 64, policy: "agent" })).resolves.toEqual({
+        ok: false,
+        reason: "unreadable",
+      });
+      expect(statSpy).toHaveBeenCalled();
+    } finally {
+      statSpy.mockRestore();
+    }
+  });
+
   it("maps handle read permission failures to unreadable", async () => {
     const root = makeRoot();
-    write(root, "denied.txt", "secret");
+    const target = write(root, "denied.txt", "secret");
     const denied = Object.assign(new Error("permission denied"), { code: "EACCES" as const });
+    const candidateStat = await fsPromises.stat(target);
+    const candidateIdentity = await fsPromises.stat(target, { bigint: true });
 
     const readFile = vi.fn(async () => {
       throw denied;
     });
 
     const close = vi.fn(async () => undefined);
-    const stat = vi.fn(async () => ({
-      isFile: () => true,
-      size: 6,
-      dev: 1,
-      ino: 2,
-      mtimeMs: 3,
-    }));
+    const stat = vi.fn(async (options?: { bigint?: boolean }) =>
+      options?.bigint
+        ? candidateIdentity
+        : {
+            isFile: () => true,
+            size: 6,
+            dev: candidateStat.dev,
+            ino: candidateStat.ino,
+            mtimeMs: 3,
+          }
+    );
 
     const openSpy = vi.spyOn(fsPromises, "open").mockResolvedValue({
       stat,
@@ -275,7 +366,7 @@ describe("resolveOutboundFile", () => {
 
       expect(result).toEqual({ ok: false, reason: "unreadable" });
       expect(openSpy).toHaveBeenCalledTimes(1);
-      expect(stat).toHaveBeenCalledTimes(1);
+      expect(stat).toHaveBeenCalledTimes(2);
       expect(readFile).toHaveBeenCalledTimes(1);
       expect(close).toHaveBeenCalledTimes(1);
     } finally {
