@@ -642,4 +642,4 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | --- | --- |
 | `/channel enable` 缺權限診斷包含 `Attach Files` | `test/app-channels.test.ts` |
 | 所有 attachment sends 都 suppress mentions | `test/transport.test.ts` |
-| `discord_send_file` Allow once / Deny、YOLO fast deny、root/content/digest 綁定、endpoint truth、late cancellation 不算成功 | `test/session-actor.test.ts`、`test/app-file.test.ts`（若後續拆分檔案，仍需保持此對照） |
+| `discord_send_file` Allow once / Deny、YOLO fast deny、root/content/digest 綁定、endpoint truth、late cancellation 不算成功 | `test/session-actor.test.ts`、`test/app-file-command.test.ts` |
