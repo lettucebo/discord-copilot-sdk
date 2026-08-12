@@ -24,6 +24,9 @@ class FakeChannel {
   sent: FakeMessage[] = [];
   private seq = 0;
   private byId = new Map<string, FakeMessage>();
+  sendCalls = 0;
+  sendGate?: Promise<void>;
+  afterSend?: (message: FakeMessage) => void;
   permissionsForResult:
     | { has(flag: bigint): boolean }
     | null
@@ -44,18 +47,24 @@ class FakeChannel {
     return this.permissionsForResult;
   }
   async send(o: Record<string, unknown>): Promise<FakeMessage> {
+    this.sendCalls++;
+    if (this.sendGate) await this.sendGate;
     if (this.sendError !== undefined) throw this.sendError;
     const m = new FakeMessage(`m${++this.seq}`);
     m.content = o["content"] as string;
     m.opts = o;
     this.sent.push(m);
     this.byId.set(m.id, m);
+    this.afterSend?.(m);
     return m;
   }
 }
 
-function fakeClient(channel: FakeChannel): Client {
-  return { channels: { fetch: async () => channel } } as unknown as Client;
+function fakeClient(
+  channel: FakeChannel,
+  fetch: () => Promise<FakeChannel | null> = async (): Promise<FakeChannel> => channel
+): Client {
+  return { channels: { fetch } } as unknown as Client;
 }
 
 function buttonIds(msg: FakeMessage): string[] {
@@ -474,6 +483,57 @@ describe("DiscordTransport sendFile", () => {
     const t = new DiscordTransport({ channels: { fetch: async () => null } } as unknown as Client);
 
     await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({ ok: false, reason: "unavailable" });
+  });
+
+  it("cancels before fetching when the delivery is no longer current", async () => {
+    const ch = new FakeChannel();
+    const fetch = vi.fn(async (): Promise<FakeChannel> => ch);
+    const t = new DiscordTransport(fakeClient(ch, fetch));
+
+    await expect(
+      t.sendFile("thread", outboundFile(), undefined, { canSend: () => false })
+    ).resolves.toEqual({ ok: false, reason: "cancelled" });
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(ch.sendCalls).toBe(0);
+  });
+
+  it("does not send when currentness flips while the thread fetch is pending", async () => {
+    const ch = new FakeChannel();
+    let releaseFetch!: () => void;
+    const fetchGate = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    const fetch = vi.fn(async (): Promise<FakeChannel> => {
+      await fetchGate;
+      return ch;
+    });
+    const t = new DiscordTransport(fakeClient(ch, fetch));
+    let current = true;
+
+    const sending = t.sendFile("thread", outboundFile(), undefined, { canSend: () => current });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    current = false;
+    releaseFetch();
+
+    await expect(sending).resolves.toEqual({ ok: false, reason: "cancelled" });
+    expect(ch.sendCalls).toBe(0);
+  });
+
+  it("deletes a late attachment and reports cancellation when currentness flips after send", async () => {
+    const ch = new FakeChannel();
+    let current = true;
+    ch.afterSend = () => {
+      current = false;
+    };
+    const t = new DiscordTransport(fakeClient(ch));
+
+    await expect(
+      t.sendFile("thread", outboundFile(), undefined, { canSend: () => current })
+    ).resolves.toEqual({ ok: false, reason: "cancelled" });
+
+    expect(ch.sent).toHaveLength(1);
+    expect(ch.sent[0]!.deleted).toBe(true);
   });
 
   it("fails closed on missing Attach Files permission and posts one deduplicated Chinese notice", async () => {

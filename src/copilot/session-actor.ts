@@ -876,11 +876,22 @@ export class SessionActor {
 
     let sent: SendFileResult;
     try {
-      sent = await this.opts.transport.sendFile(this.opts.sessionKey, file, approval.comment);
+      sent = await this.opts.transport.sendFile(this.opts.sessionKey, file, approval.comment, {
+        canSend: () => this.fileDeliveryIsCurrent(approval),
+      });
     } catch {
+      if (!this.fileDeliveryIsCurrent(approval)) {
+        return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
+      }
       return fileDeliveryFailure("Discord file delivery failed before the upload could be confirmed.");
     }
+    if (!this.fileDeliveryIsCurrent(approval)) {
+      return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
+    }
     if (!sent.ok) {
+      if (sent.reason === "cancelled") {
+        return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
+      }
       return fileDeliveryFailure(`Discord file delivery failed: ${sent.reason}.`);
     }
 

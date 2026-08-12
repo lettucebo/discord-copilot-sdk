@@ -3,7 +3,7 @@ import { DiscordCopilotApp } from "../src/app.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
 import type { CopilotClient } from "@github/copilot-sdk";
-import type { Transport } from "../src/core/transport.js";
+import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { tmpdir } from "node:os";
 import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
@@ -86,7 +86,7 @@ const cfg = {
 class FakeTransport implements Transport {
   notices: string[] = [];
   async render(): Promise<void> {}
-  async sendFile(): Promise<{ ok: true } | { ok: false; reason: "no-attach-permission" | "too-large" | "blocked" | "unavailable" | "transient" }> {
+  async sendFile(..._args: Parameters<Transport["sendFile"]>): Promise<SendFileResult> {
     return { ok: false, reason: "unavailable" };
   }
   async showPermission(): Promise<void> {}

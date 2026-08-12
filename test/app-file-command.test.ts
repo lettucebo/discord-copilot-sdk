@@ -16,7 +16,7 @@ import {
   type ResolveOutboundFileResult,
 } from "../src/core/outbound-file.js";
 import { SessionStore } from "../src/core/session-store.js";
-import type { SendFileResult, Transport } from "../src/core/transport.js";
+import type { SendFileOptions, SendFileResult, Transport } from "../src/core/transport.js";
 
 const OWNER = "u1";
 const OTHER = "u2";
@@ -25,11 +25,21 @@ const PARENT = "c1";
 const THREAD = "t1";
 
 class FakeTransport implements Transport {
-  sentFiles: Array<{ key: string; file: OutboundFile; note?: string }> = [];
+  sentFiles: Array<{ key: string; file: OutboundFile; note?: string; options?: SendFileOptions }> = [];
   sendFileResult: SendFileResult = { ok: true };
   async render(): Promise<void> {}
-  async sendFile(sessionKey: string, file: OutboundFile, note?: string): Promise<SendFileResult> {
-    this.sentFiles.push({ key: sessionKey, file, note });
+  async sendFile(
+    sessionKey: string,
+    file: OutboundFile,
+    note?: string,
+    options?: SendFileOptions
+  ): Promise<SendFileResult> {
+    this.sentFiles.push({
+      key: sessionKey,
+      file,
+      ...(note === undefined ? {} : { note }),
+      ...(options === undefined ? {} : { options }),
+    });
     return this.sendFileResult;
   }
   async showPermission(): Promise<void> {}
@@ -362,6 +372,41 @@ describe("/file", () => {
 
     expect(interaction.edits).toEqual(["檔案已解析，但傳送到 Discord 失敗。"]);
     expect(resolver.resolveFileForDelivery).toHaveBeenCalledWith("report.txt", "operator");
+    expect(transport.sentFiles).toHaveLength(1);
+  });
+
+  it("reports a cancelled transport delivery without claiming the attachment was sent", async () => {
+    const transport = new FakeTransport();
+    transport.sendFileResult = { ok: false, reason: "cancelled" };
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as CopilotClient,
+      transport,
+      new SessionStore(storeFile),
+      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+    );
+    const workDir = path.join(reposRoot, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const filePath = path.join(workDir, "report.txt");
+    writeFileSync(filePath, "hello");
+    const resolver = actorResolving({
+      ok: true,
+      file: {
+        absPath: filePath,
+        displayName: "report.txt",
+        size: 5,
+        fingerprint: "artifact-identity:5:1",
+        digest: "sha256:test",
+        bytes: Buffer.from("hello"),
+      },
+    });
+    sessionsOf(app).set(THREAD, session(workDir, resolver.actor));
+    const interaction = slash({ pathValue: "report.txt" });
+
+    await invokeInteraction(app, interaction);
+
+    expect(interaction.edits).toEqual(["檔案傳送已取消。"]);
     expect(transport.sentFiles).toHaveLength(1);
   });
 });

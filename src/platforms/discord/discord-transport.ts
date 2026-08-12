@@ -15,6 +15,7 @@ import type {
   Decision,
   PermissionView,
   PlanView,
+  SendFileOptions,
   SendFileResult,
   Transport,
   UserInputView,
@@ -230,8 +231,15 @@ export class DiscordTransport implements Transport {
     await channel.send({ embeds: [embed], components: [row], ...NO_MENTIONS });
   }
 
-  async sendFile(sessionKey: string, file: OutboundFile, note?: string): Promise<SendFileResult> {
+  async sendFile(
+    sessionKey: string,
+    file: OutboundFile,
+    note?: string,
+    options?: SendFileOptions
+  ): Promise<SendFileResult> {
+    if (!canSendFile(options)) return { ok: false, reason: "cancelled" };
     const channel = await this.fetchThread(sessionKey);
+    if (!canSendFile(options)) return { ok: false, reason: "cancelled" };
     if (!channel) return { ok: false, reason: "unavailable" };
 
     const permission = this.getAttachPermission(channel);
@@ -242,11 +250,20 @@ export class DiscordTransport implements Transport {
 
     try {
       const content = typeof note === "string" ? note.slice(0, 1900) : undefined;
-      await channel.send({
+      const payload = {
         ...(content ? { content } : {}),
         files: [new AttachmentBuilder(file.bytes, { name: file.displayName })],
         ...NO_MENTIONS,
-      });
+      };
+      if (!canSendFile(options)) return { ok: false, reason: "cancelled" };
+      const message = await channel.send(payload);
+      if (!canSendFile(options)) {
+        // A turn can end while Discord accepts the attachment. Start deletion
+        // without making cleanup availability decide whether the caller learns
+        // the delivery was cancelled.
+        void message.delete().catch(() => {});
+        return { ok: false, reason: "cancelled" };
+      }
       return { ok: true };
     } catch (error: unknown) {
       return this.classifySendFileError(error);
@@ -375,6 +392,15 @@ export class DiscordTransport implements Transport {
 
 function isDiscordLikeError(error: unknown): error is DiscordLikeError {
   return typeof error === "object" && error !== null;
+}
+
+/** Treat a throwing lifecycle predicate as stale rather than risking an upload. */
+function canSendFile(options: SendFileOptions | undefined): boolean {
+  try {
+    return options?.canSend?.() ?? true;
+  } catch {
+    return false;
+  }
 }
 
 function isPlatformBlockedUploadError(error: DiscordLikeError): boolean {

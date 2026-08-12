@@ -8,6 +8,7 @@ import type {
   Decision,
   PermissionView,
   PlanView,
+  SendFileOptions,
   SendFileResult,
   Transport,
   UserInputView,
@@ -85,9 +86,11 @@ class FakeTransport implements Transport {
   userInputs: UserInputView[] = [];
   plans: PlanView[] = [];
   notices: string[] = [];
-  sentFiles: Array<{ sessionKey: string; file: OutboundFile; note?: string }> = [];
+  sentFiles: Array<{ sessionKey: string; file: OutboundFile; note?: string; options?: SendFileOptions }> = [];
   sendFileResult: SendFileResult = { ok: true };
   fileOperations: string[] = [];
+  sendFileGate?: Promise<void>;
+  sendFileStarted?: () => void;
   private permissionWaiters: Array<{ after: number; resolve: (view: PermissionView) => void }> = [];
   decision?: (nonce: string, decision: Decision, userId: string) => void;
   choice?: (nonce: string, index: number, userId: string) => void;
@@ -98,10 +101,18 @@ class FakeTransport implements Transport {
   async sendFile(
     sessionKey: string,
     file: OutboundFile,
-    note?: string
+    note?: string,
+    options?: SendFileOptions
   ): Promise<SendFileResult> {
     this.fileOperations.push("sendFile");
-    this.sentFiles.push({ sessionKey, file, ...(note === undefined ? {} : { note }) });
+    this.sentFiles.push({
+      sessionKey,
+      file,
+      ...(note === undefined ? {} : { note }),
+      ...(options === undefined ? {} : { options }),
+    });
+    this.sendFileStarted?.();
+    if (this.sendFileGate) await this.sendFileGate;
     return this.sendFileResult;
   }
   async flush(): Promise<void> {
@@ -1080,6 +1091,93 @@ describe("SessionActor permission handling", () => {
         expect(result.resultType).toBe("failure");
         expect(result.error).toMatch(/blocked/i);
         expect(s.transport.sentFiles).toHaveLength(1);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      ["a newer user turn", async (s: Setup): Promise<void> => s.actor.send("begin a newer turn")],
+      ["stop", async (s: Setup): Promise<void> => {
+        await s.actor.stop();
+      }],
+      ["disconnect", async (s: Setup): Promise<void> => {
+        await s.actor.disconnect();
+      }],
+    ] as const)(
+      "returns a failure rather than stale upload success when %s starts during a delayed transport send",
+      async (_boundary, invalidate) => {
+        const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-delayed-send-"));
+        try {
+          writeArtifact(root, "artifact.txt", "artifact");
+          const s = await setup({ workingDirectory: root });
+          await approveFilePermission(s, { path: "artifact.txt" }, "delayed-send");
+
+          let releaseSend!: () => void;
+          const sendGate = new Promise<void>((resolve) => {
+            releaseSend = resolve;
+          });
+          let markStarted!: () => void;
+          const sendStarted = new Promise<void>((resolve) => {
+            markStarted = resolve;
+          });
+          s.transport.sendFileGate = sendGate;
+          s.transport.sendFileStarted = markStarted;
+
+          const delivery = invokeFileDelivery(s, { path: "artifact.txt" }, "delayed-send");
+          await sendStarted;
+          await invalidate(s);
+          releaseSend();
+
+          await expect(delivery).resolves.toMatchObject({
+            resultType: "failure",
+            error: expect.stringMatching(/cancelled/i),
+          });
+          expect(s.transport.sentFiles[0]!.options?.canSend).toBeTypeOf("function");
+          expect(s.transport.sentFiles[0]!.options?.canSend?.()).toBe(false);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      }
+    );
+
+    it("does not consume the new turn quota when a delayed upload becomes stale", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-stale-send-quota-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        await approveFilePermission(s, { path: "artifact.txt" }, "stale-send");
+
+        let releaseSend!: () => void;
+        const sendGate = new Promise<void>((resolve) => {
+          releaseSend = resolve;
+        });
+        let markStarted!: () => void;
+        const sendStarted = new Promise<void>((resolve) => {
+          markStarted = resolve;
+        });
+        s.transport.sendFileGate = sendGate;
+        s.transport.sendFileStarted = markStarted;
+        const stale = invokeFileDelivery(s, { path: "artifact.txt" }, "stale-send");
+        await sendStarted;
+        await s.actor.send("begin the next turn");
+        releaseSend();
+        await expect(stale).resolves.toMatchObject({ resultType: "failure" });
+
+        s.transport.sendFileGate = undefined;
+        s.transport.sendFileStarted = undefined;
+        for (let index = 1; index <= 3; index++) {
+          const toolCallId = `fresh-turn-${index}`;
+          await approveFilePermission(s, { path: "artifact.txt" }, toolCallId);
+          await expect(invokeFileDelivery(s, { path: "artifact.txt" }, toolCallId)).resolves.toMatchObject({
+            resultType: "success",
+          });
+        }
+        await approveFilePermission(s, { path: "artifact.txt" }, "fresh-turn-4");
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "fresh-turn-4")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+        expect(s.transport.sentFiles).toHaveLength(4);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

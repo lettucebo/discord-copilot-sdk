@@ -34,7 +34,12 @@ export interface Transport {
   /** Render/refresh a session's assistant output + tool statuses. */
   render(sessionKey: string, state: RenderState): Promise<void>;
   /** Send a validated outbound file to the session's owning surface. */
-  sendFile(sessionKey: string, file: OutboundFile, note?: string): Promise<SendFileResult>;
+  sendFile(
+    sessionKey: string,
+    file: OutboundFile,
+    note?: string,
+    options?: SendFileOptions
+  ): Promise<SendFileResult>;
   /** Present a permission prompt; the transport later delivers the decision via
    *  the handler registered with `onDecision`. */
   showPermission(view: PermissionView): Promise<void>;
@@ -74,9 +79,18 @@ export interface Transport {
   dispose(sessionKey: string): void;
 }
 
+/** Optional lifecycle fence for an outbound attachment. */
+export interface SendFileOptions {
+  /** Return false when the caller's approved delivery is no longer current. */
+  canSend?: () => boolean;
+}
+
 export type SendFileResult =
   | { ok: true }
-  | { ok: false; reason: "no-attach-permission" | "too-large" | "blocked" | "unavailable" | "transient" };
+  | {
+      ok: false;
+      reason: "no-attach-permission" | "too-large" | "blocked" | "unavailable" | "transient" | "cancelled";
+    };
 
 /** ask_user prompt: a question with optional multiple-choice buttons; freeform
  *  answers arrive as a normal thread message when `allowFreeform`. */

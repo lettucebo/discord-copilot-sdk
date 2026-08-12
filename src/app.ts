@@ -3350,7 +3350,9 @@ export class DiscordCopilotApp {
     }
     const sent = await this.transport.sendFile(interaction.channelId, resolved.file);
     if (!sent.ok) {
-      await interaction.editReply({ content: "檔案已解析，但傳送到 Discord 失敗。" });
+      await interaction.editReply({
+        content: sent.reason === "cancelled" ? "檔案傳送已取消。" : "檔案已解析，但傳送到 Discord 失敗。",
+      });
       return;
     }
     await interaction.editReply({ content: "已將檔案傳送到這個討論串。" });

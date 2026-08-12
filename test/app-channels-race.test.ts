@@ -10,7 +10,7 @@ import type { Config } from "../src/config.js";
 import type { Binding, BindingDeps, BindingVerdict } from "../src/core/binding.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
 import { SessionStore } from "../src/core/session-store.js";
-import type { Transport } from "../src/core/transport.js";
+import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { removeWorktreeIfClean, worktreeBranch, worktreePath } from "../src/core/worktree.js";
 import { worktreeRoot } from "../src/core/paths.js";
 
@@ -30,7 +30,7 @@ let cleanupBranch: string | undefined;
 
 class FakeTransport implements Transport {
   async render(): Promise<void> {}
-  async sendFile(): Promise<{ ok: true } | { ok: false; reason: "no-attach-permission" | "too-large" | "blocked" | "unavailable" | "transient" }> {
+  async sendFile(..._args: Parameters<Transport["sendFile"]>): Promise<SendFileResult> {
     return { ok: false, reason: "unavailable" };
   }
   async showPermission(): Promise<void> {}

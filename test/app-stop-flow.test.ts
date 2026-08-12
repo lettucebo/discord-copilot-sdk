@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { DiscordCopilotApp, type Session } from "../src/app.js";
 import type { CopilotClient } from "@github/copilot-sdk";
-import type { Transport } from "../src/core/transport.js";
+import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 
 /**
@@ -45,7 +45,7 @@ class FakeActor {
 class FakeTransport implements Transport {
   notices: string[] = [];
   async render(): Promise<void> {}
-  async sendFile(): Promise<{ ok: true } | { ok: false; reason: "no-attach-permission" | "too-large" | "blocked" | "unavailable" | "transient" }> {
+  async sendFile(..._args: Parameters<Transport["sendFile"]>): Promise<SendFileResult> {
     return { ok: false, reason: "unavailable" };
   }
   async showPermission(): Promise<void> {}
