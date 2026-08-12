@@ -149,7 +149,15 @@ interface StaleRebindActor {
   cleanupPlan: () => Promise<{ ok: boolean; tail: string }>;
   /** Concurrent `/end`, normal rebind completion and shutdown must join ONE
    * teardown attempt rather than issue duplicate SDK disconnects. */
-  disconnecting?: Promise<{ confirmed: boolean; tail: string }>;
+  disconnecting?: Promise<StaleRebindTeardown>;
+}
+
+interface StaleRebindTeardown {
+  confirmed: boolean;
+  /** A confirmed SDK disconnect is not enough to claim completion: the
+   * worktree and durable ownership row must also be reconciled. */
+  cleaned: boolean;
+  tail: string;
 }
 
 /** The subset of an SDK session the throwaway titler uses. */
@@ -1651,9 +1659,16 @@ export class DiscordCopilotApp {
       // path. Touching `reclaim(threadId, old...)` here would delete or retire
       // that target row by thread id and lose the exact old pointer we just
       // proved stopped. The companion cleanup owns only the old incarnation.
-      const outcome = await pendingOld.cleanupPlan();
+      const tracked = this.staleRebindActors.get(pendingOld.actor) === pendingOld;
+      let outcome: StaleRebindTeardown;
+      if (tracked) {
+        outcome = await this.disconnectStaleRebindActor(pendingOld);
+      } else {
+        const cleanup = await pendingOld.cleanupPlan();
+        outcome = { confirmed: true, cleaned: cleanup.ok, tail: cleanup.tail };
+      }
       await interaction.editReply(
-        `${outcome.ok ? "✅" : "⚠️"} 這個 session 已結束。${outcome.tail}`
+        `${outcome.confirmed && outcome.cleaned ? "✅" : "⚠️"} 這個 session 已結束。${outcome.tail}`
       );
       return;
     }
@@ -2583,9 +2598,12 @@ export class DiscordCopilotApp {
 
   /** Persist and strongly retain an actor that has already failed a disconnect
    * attempt. The durable row uses existing `blocked` semantics, so reconcile
-   * cannot accidentally resume this old conversation. */
-  private retainStaleRebindActor(entry: StaleRebindActor, reason = "rebind-teardown-unconfirmed"): void {
-    if (!this.store.retainStaleRebind(entry.binding, reason)) {
+   * cannot accidentally resume this old conversation. Callers that would
+   * otherwise remove or restore its primary reservation must use the returned
+   * result as a durability gate. */
+  private retainStaleRebindActor(entry: StaleRebindActor, reason = "rebind-teardown-unconfirmed"): boolean {
+    const persisted = this.store.retainStaleRebind(entry.binding, reason);
+    if (!persisted) {
       // The pre-swap intent was persisted before this method is reachable for
       // an old actor. Keep the root in memory even if a reason refresh loses a
       // transient disk race; silently releasing it would be worse.
@@ -2593,6 +2611,7 @@ export class DiscordCopilotApp {
     }
     this.staleRebindActors.set(entry.actor, entry);
     this.scheduleStaleRebindRetry(entry);
+    return persisted;
   }
 
   private scheduleStaleRebindRetry(entry: StaleRebindActor): void {
@@ -2625,9 +2644,9 @@ export class DiscordCopilotApp {
    * the `blocked` durable row and strong actor/root reference both remain. */
   private async disconnectStaleRebindActor(
     entry: StaleRebindActor
-  ): Promise<{ confirmed: boolean; tail: string }> {
+  ): Promise<StaleRebindTeardown> {
     if (entry.disconnecting) return entry.disconnecting;
-    const attempt = (async (): Promise<{ confirmed: boolean; tail: string }> => {
+    const attempt = (async (): Promise<StaleRebindTeardown> => {
       try {
         await withTimeout(entry.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
       } catch {
@@ -2635,11 +2654,17 @@ export class DiscordCopilotApp {
           console.warn(`rebind: could not mark stale actor ${entry.binding.sessionId} unconfirmed`);
         }
         this.staleRebindActors.set(entry.actor, entry);
-        return { confirmed: false, tail: "\n⚠️ 無法確認舊的 runtime 已關閉，建議稍後重啟 bot。" };
+        return {
+          confirmed: false,
+          cleaned: false,
+          tail: "\n⚠️ 無法確認舊的 runtime 已關閉，建議稍後重啟 bot。",
+        };
       }
       const cleanup = await entry.cleanupPlan();
-      if (this.staleRebindActors.get(entry.actor) === entry) this.staleRebindActors.delete(entry.actor);
-      return { confirmed: true, tail: cleanup.tail };
+      if (cleanup.ok && this.staleRebindActors.get(entry.actor) === entry) {
+        this.staleRebindActors.delete(entry.actor);
+      }
+      return { confirmed: true, cleaned: cleanup.ok, tail: cleanup.tail };
     })();
     entry.disconnecting = attempt;
     try {
@@ -2721,6 +2746,7 @@ export class DiscordCopilotApp {
      * `/end` is the winner, not a failed rebind rollback. */
     const abandonEndedRebind = async (): Promise<string> => {
       let replacementClosed = true;
+      let replacementDurablyRetained = true;
       if (replacementActor) {
         try {
           await withTimeout(replacementActor.disconnect(), TEARDOWN_TIMEOUT_MS);
@@ -2729,7 +2755,7 @@ export class DiscordCopilotApp {
           // Retain the actor and root fence until a retry can CONFIRM teardown;
           // do not let a timed-out `/end` turn it into an invisible writer.
           if (replacementBinding) {
-            this.retainStaleRebindActor(
+            replacementDurablyRetained = this.retainStaleRebindActor(
               this.staleRebindActor(replacementActor, replacementBinding, true)
             );
           } else {
@@ -2737,16 +2763,30 @@ export class DiscordCopilotApp {
             // after reserve has produced its immutable binding. Do not close a
             // root we cannot durably describe.
             console.warn("rebind: replacement actor lost its durable binding before teardown");
+            replacementDurablyRetained = false;
           }
         }
       } else {
         await trustedRoot?.close().catch(() => {});
       }
-      if (reservedIdentity) {
+      // If the terminal stale row could not be written, the target reservation
+      // is the only crash-surviving pointer to this possibly-live replacement.
+      // Never remove it until teardown is durably represented elsewhere.
+      if (reservedIdentity && (replacementClosed || replacementDurablyRetained)) {
         this.store.removeIfCurrent(threadId, reservedIdentity.sessionId, reservedIdentity.generation);
+      } else if (reservedIdentity) {
+        console.warn(
+          `rebind: retaining target reservation ${reservedIdentity.sessionId} as fallback after stale ownership write failure`
+        );
       }
       releaseTargetLease();
       if (replacementClosed) await undoWorktree();
+      if (!replacementClosed && !replacementDurablyRetained) {
+        return (
+          `${endedRebind}\n` +
+          "⚠️ 無法持久化新 runtime 的終止記錄；目標 session 記錄已保留為安全屏障，未完成清理。請重啟 bot 或稍後重試。"
+        );
+      }
       return endedRebind;
     };
 
@@ -2909,6 +2949,7 @@ export class DiscordCopilotApp {
     if (!ownsOldSession()) return abandonEndedRebind();
     if (!this.store.commit(threadId)) {
       let replacementClosed = true;
+      let replacementDurablyRetained = true;
       try {
         await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS);
       } catch {
@@ -2918,16 +2959,30 @@ export class DiscordCopilotApp {
         // target worktree. Otherwise a live SDK process could become invisible
         // while its working directory is deleted underneath it.
         if (replacementBinding) {
-          this.retainStaleRebindActor(this.staleRebindActor(actor, replacementBinding, true));
+          replacementDurablyRetained = this.retainStaleRebindActor(
+            this.staleRebindActor(actor, replacementBinding, true)
+          );
         } else {
           console.warn("rebind: commit-failed replacement lost its durable binding before teardown");
+          replacementDurablyRetained = false;
         }
       }
       if (!ownsOldSession()) return abandonEndedRebind();
-      const rollback = this.store.restoreIfCurrent(previous, sessionId, generation);
-      if (rollback.ok) {
-        this.pendingRebindOlds.delete(session);
-        this.store.removeStaleRebind(previous.threadId, previous.sessionId, previous.generation);
+      // A failed terminal-row write leaves the target reservation as the only
+      // durable pointer to the replacement. Restoring `previous` would erase
+      // it, so hold that primary barrier until a confirmed retry can clean it.
+      const holdTargetReservation = !replacementClosed && !replacementDurablyRetained;
+      let rollback = { ok: false, quotaAdvanced: false };
+      if (!holdTargetReservation) {
+        rollback = this.store.restoreIfCurrent(previous, sessionId, generation);
+        if (rollback.ok) {
+          this.pendingRebindOlds.delete(session);
+          this.store.removeStaleRebind(previous.threadId, previous.sessionId, previous.generation);
+        }
+      } else {
+        console.warn(
+          `rebind: retaining target reservation ${sessionId} as fallback after stale ownership write failure`
+        );
       }
       if (rollback.ok && !rollback.quotaAdvanced) restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
@@ -2939,7 +2994,9 @@ export class DiscordCopilotApp {
           : "\n⚠️ 為避免覆寫較新的檔案配額，原 session 的檔案傳送保持停用。") +
         (replacementClosed
           ? ""
-          : "\n⚠️ 無法確認新 runtime 已停止；目標 worktree 暫時保留，會在確認停止後再清理。")
+          : holdTargetReservation
+            ? "\n⚠️ 無法持久化新 runtime 的終止記錄；目標 session 記錄已保留為安全屏障，未完成清理。請重啟 bot 或稍後重試。"
+            : "\n⚠️ 無法確認新 runtime 已停止；目標 worktree 暫時保留，會在確認停止後再清理。")
       );
     }
 

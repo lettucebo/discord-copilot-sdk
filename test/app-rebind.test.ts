@@ -455,6 +455,46 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     }
   });
 
+  it("keeps the target reservation as a durable barrier when replacement retention cannot persist", async () => {
+    const { app, store, actor } = harness();
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    const originalCreate = SessionActor.create;
+    const originalRetain = store.retainStaleRebind.bind(store);
+    let replacementDisconnect: ReturnType<typeof vi.spyOn> | undefined;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation(async (client, options) => {
+      const replacement = await originalCreate(client, options);
+      replacementDisconnect = vi
+        .spyOn(replacement, "disconnect")
+        .mockRejectedValue(new Error("replacement runtime remains live"));
+      return replacement;
+    });
+    const commitSpy = vi.spyOn(store, "commit").mockReturnValue(false);
+    const retainSpy = vi.spyOn(store, "retainStaleRebind").mockImplementation((binding, reason) => {
+      if (reason === "rebind-teardown-unconfirmed" && binding.sessionId !== "s1") return false;
+      return originalRetain(binding, reason);
+    });
+
+    try {
+      const out = await applyRebind(app, { repoPath: repoB, devMode: "worktree" });
+
+      expect(out).toMatch(/安全屏障/);
+      expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
+      expect(store.get("t1")).toMatchObject({ repoPath: repoB, state: "creating" });
+      expect(store.get("t1")?.sessionId).not.toBe("s1");
+      expect(new SessionStore(storeFile).get("t1")).toMatchObject({ repoPath: repoB, state: "creating" });
+      expect(staleRebindActors(app).size).toBe(1);
+      expect(fs.existsSync(targetWorktree)).toBe(true);
+    } finally {
+      retainSpy.mockRestore();
+      replacementDisconnect?.mockResolvedValue(undefined);
+      await retryStaleRebinds(app);
+      commitSpy.mockRestore();
+      createSpy.mockRestore();
+      await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
   it("suspends old file delivery before rebinding and restores it only after a failed rollback", async () => {
     const { app, actor, store } = harness({ createFails: true });
     expect(store.reserveFileDeliveryBytes("t1", "s1", 1, 0, 17)).toBe(true);
@@ -915,6 +955,57 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     }
   });
 
+  it("/end keeps the target reservation when its replacement cannot persist terminal ownership", async () => {
+    const { app, store } = harness();
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    const originalCreate = SessionActor.create;
+    const originalRetain = store.retainStaleRebind.bind(store);
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    let replacementCreated!: () => void;
+    const replacementCreatedPromise = new Promise<void>((resolve) => {
+      replacementCreated = resolve;
+    });
+    let replacementDisconnect: ReturnType<typeof vi.spyOn> | undefined;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation(async (client, options) => {
+      const replacement = await originalCreate(client, options);
+      replacementDisconnect = vi
+        .spyOn(replacement, "disconnect")
+        .mockRejectedValue(new Error("replacement runtime remains live"));
+      replacementCreated();
+      await createGate;
+      return replacement;
+    });
+    const retainSpy = vi.spyOn(store, "retainStaleRebind").mockImplementation((binding, reason) => {
+      if (reason === "rebind-teardown-unconfirmed" && binding.sessionId !== "s1") return false;
+      return originalRetain(binding, reason);
+    });
+
+    try {
+      const rebinding = applyRebind(app, { repoPath: repoB, devMode: "worktree" });
+      await replacementCreatedPromise;
+      await endThread(app);
+      releaseCreate();
+
+      await expect(rebinding).resolves.toMatch(/安全屏障/);
+      expect(sessions(app).get("t1")).toBeUndefined();
+      expect(store.get("t1")).toMatchObject({ repoPath: repoB, state: "creating" });
+      expect(new SessionStore(storeFile).get("t1")).toMatchObject({ repoPath: repoB, state: "creating" });
+      expect(staleRebindActors(app).size).toBe(1);
+      expect(fs.existsSync(targetWorktree)).toBe(true);
+    } finally {
+      retainSpy.mockRestore();
+      replacementDisconnect?.mockResolvedValue(undefined);
+      await retryStaleRebinds(app);
+      createSpy.mockRestore();
+      releaseCreate?.();
+      await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
   it("/end invalidates a rebind after its map swap so it cannot recreate the session", async () => {
     const { app, store, actor } = harness();
     const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
@@ -1058,6 +1149,63 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       expect(staleRebinds(store)).toEqual([]);
       expect(fs.existsSync(oldWt)).toBe(false);
     } finally {
+      if (cleanupApp) await sessions(cleanupApp).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(oldWt), { recursive: true, force: true });
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
+  it("forgets a pre-swap stale retry tracker only after a later /end confirms teardown and cleanup", async () => {
+    const wtRoot = `${path.join(os.homedir(), ".discord-copilot-sdk")}-worktrees`;
+    const oldWt = path.join(wtRoot, `rebind-pre-swap-retry-${Date.now()}`, "t1");
+    const branch = "copilot/t-t1";
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    await addWorktree(repoA, oldWt, branch);
+    const originalCreate = SessionActor.create;
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    let replacementCreated!: () => void;
+    const replacementCreatedPromise = new Promise<void>((resolve) => {
+      replacementCreated = resolve;
+    });
+    let cleanupApp: DiscordCopilotApp | undefined;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation(async (client, options) => {
+      const replacement = await originalCreate(client, options);
+      replacementCreated();
+      await createGate;
+      return replacement;
+    });
+
+    try {
+      const { app, store, actor } = harness({ devMode: "worktree" });
+      cleanupApp = app;
+      const oldRecord = store.get("t1")!;
+      expect(store.restore({ ...oldRecord, workDir: oldWt, branch, devMode: "worktree" })).toBe(true);
+      const old = sessions(app).get("t1")!;
+      old.workDir = oldWt;
+      old.branch = branch;
+      actor.disconnectFails = true;
+
+      const rebinding = applyRebind(app, { repoPath: repoB, devMode: "worktree" });
+      await replacementCreatedPromise;
+      await endThread(app);
+      expect(staleRebindActors(app).has(actor as unknown as SessionActor)).toBe(true);
+
+      actor.disconnectFails = false;
+      await endThread(app);
+
+      expect(staleRebindActors(app).has(actor as unknown as SessionActor)).toBe(false);
+      expect(fs.existsSync(oldWt)).toBe(false);
+      releaseCreate();
+      await expect(rebinding).resolves.toMatch(/已結束/);
+      expect(sessions(app).get("t1")).toBeUndefined();
+      expect(store.get("t1")).toBeUndefined();
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+    } finally {
+      createSpy.mockRestore();
+      releaseCreate?.();
       if (cleanupApp) await sessions(cleanupApp).get("t1")?.actor.disconnect().catch(() => {});
       fs.rmSync(path.dirname(oldWt), { recursive: true, force: true });
       fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
