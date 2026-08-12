@@ -1,6 +1,7 @@
 import path from "node:path";
 import os from "node:os";
 import {
+  linkSync,
   mkdtempSync,
   mkdirSync,
   rmSync,
@@ -15,6 +16,25 @@ import {
 import { captureTrustedRoot } from "../src/core/secure-open.js";
 
 const roots: string[] = [];
+
+function supportsHardLinks(): boolean {
+  const probeRoot = mkdtempSync(path.join(os.tmpdir(), "dcs-hardlink-probe-"));
+  try {
+    const source = path.join(probeRoot, "source.txt");
+    writeFileSync(source, "probe");
+    linkSync(source, path.join(probeRoot, "linked.txt"));
+    return true;
+  } catch (error) {
+    const code =
+      typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
+    if (code === "ENOSYS" || code === "ENOTSUP" || code === "EOPNOTSUPP") return false;
+    throw error;
+  } finally {
+    rmSync(probeRoot, { recursive: true, force: true });
+  }
+}
+
+const hardLinksSupported = supportsHardLinks();
 
 function makeRoot(): string {
   const root = mkdtempSync(path.join(os.tmpdir(), "dcs-outbound-file-"));
@@ -108,6 +128,19 @@ describe("resolveOutboundFile", () => {
     });
 
     expect(result).toEqual({ ok: false, reason: "outside-workdir" });
+  });
+
+  it.skipIf(!hardLinksSupported)("refuses an externally reachable hard-linked candidate without returning bytes", async () => {
+    const root = makeRoot();
+    const outsideRoot = makeRoot();
+    const outside = write(outsideRoot, "secret.txt", "external bytes");
+    const candidate = path.join(root, "artifact.txt");
+    linkSync(outside, candidate);
+
+    const result = await resolveForTest(root, candidate, { maxBytes: 64, policy: "agent" });
+
+    expect(result).toEqual({ ok: false, reason: "unreadable" });
+    expect(result).not.toHaveProperty("file");
   });
 
   it("refuses .git internals including a linked-worktree git file", async () => {

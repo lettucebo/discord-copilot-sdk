@@ -66,6 +66,8 @@ export interface SecureOpenedFile {
   finalPath: string;
   regular: boolean;
   size: number;
+  /** Handle-derived count of directory entries for this candidate file. */
+  linkCount: number;
   identity: string;
   modifiedAt: string;
   read(): Promise<Buffer>;
@@ -123,12 +125,14 @@ const POSIX_O_NOFOLLOW_DARWIN = 0x100;
 const POSIX_O_NONBLOCK_DARWIN = 0x4;
 
 export const LINUX_POSIX_OPEN_FLAGS = {
+  root: POSIX_O_RDONLY | POSIX_O_NONBLOCK_LINUX | POSIX_O_DIRECTORY_LINUX | POSIX_O_CLOEXEC_LINUX,
   intermediate:
     POSIX_O_RDONLY | POSIX_O_DIRECTORY_LINUX | POSIX_O_NOFOLLOW_LINUX | POSIX_O_CLOEXEC_LINUX,
   leaf: POSIX_O_RDONLY | POSIX_O_NOFOLLOW_LINUX | POSIX_O_NONBLOCK_LINUX | POSIX_O_CLOEXEC_LINUX,
 } as const;
 
 const DARWIN_POSIX_OPEN_FLAGS = {
+  root: POSIX_O_RDONLY | POSIX_O_NONBLOCK_DARWIN | POSIX_O_DIRECTORY_DARWIN | POSIX_O_CLOEXEC_DARWIN,
   intermediate:
     POSIX_O_RDONLY | POSIX_O_DIRECTORY_DARWIN | POSIX_O_NOFOLLOW_DARWIN | POSIX_O_CLOEXEC_DARWIN,
   leaf: POSIX_O_RDONLY | POSIX_O_NOFOLLOW_DARWIN | POSIX_O_NONBLOCK_DARWIN | POSIX_O_CLOEXEC_DARWIN,
@@ -283,7 +287,7 @@ export interface PosixDirectoryHandle {
 
 /** Test injection for the raw descriptors that openat returns. */
 export interface PosixBackendDependencies {
-  openDirectory?(trustedRoot: string): Promise<PosixDirectoryHandle>;
+  openDirectory?(trustedRoot: string, flags: number): Promise<PosixDirectoryHandle>;
   finalPath?(fd: number): Promise<string>;
   fstat?(fd: number): Promise<PosixStat>;
   read?(
@@ -298,12 +302,13 @@ export interface PosixBackendDependencies {
 
 interface PosixFileMetadata {
   size: number;
+  linkCount: number;
   identity: string;
   modifiedAt: string;
 }
 
 interface PosixOperations {
-  openDirectory(trustedRoot: string): Promise<PosixDirectoryHandle>;
+  openDirectory(trustedRoot: string, flags: number): Promise<PosixDirectoryHandle>;
   finalPath(fd: number): Promise<string>;
   fstat(fd: number): Promise<PosixStat>;
   read(
@@ -317,6 +322,7 @@ interface PosixOperations {
 }
 
 interface PosixOpenFlags {
+  root: number;
   intermediate: number;
   leaf: number;
 }
@@ -327,10 +333,13 @@ const closeRawFdAsync = promisify(closeRawFd);
 
 function defaultPosixOperations(
   defaultFinalPath: (fd: number) => Promise<string>,
+  flags: PosixOpenFlags,
   dependencies: PosixBackendDependencies
 ): PosixOperations {
   return {
-    openDirectory: dependencies.openDirectory ?? (async (trustedRoot) => fs.open(trustedRoot, "r")),
+    openDirectory:
+      dependencies.openDirectory ??
+      (async (trustedRoot, rootFlags) => fs.open(trustedRoot, requiredPosixRootOpenFlags(flags.root, rootFlags))),
     finalPath: dependencies.finalPath ?? defaultFinalPath,
     fstat: dependencies.fstat ?? (async (fd) => (await fstatRawFdAsync(fd)) as unknown as PosixStat),
     read:
@@ -339,6 +348,18 @@ function defaultPosixOperations(
         (await readRawFdAsync(fd, buffer, offset, length, position)) as unknown as PosixRawReadResult),
     close: dependencies.close ?? (async (fd) => closeRawFdAsync(fd)),
   };
+}
+
+/**
+ * A string "r" open can block forever on a FIFO substituted for the trusted
+ * root before fstat can reject it. Require the fixed native numeric flags;
+ * an unsupported flag makes fs.open fail closed rather than downgrading.
+ */
+function requiredPosixRootOpenFlags(expected: number, requested: number): number {
+  if (!Number.isSafeInteger(expected) || expected < 0 || requested !== expected) {
+    throw refusal("unreadable", "Required POSIX trusted-root open flags are unavailable.");
+  }
+  return requested;
 }
 
 function posixFd(value: unknown): number | undefined {
@@ -409,6 +430,13 @@ function assertPosixHandleLinked(stat: PosixStat): void {
   }
 }
 
+function posixCandidateLinkCount(stat: PosixStat): number {
+  if (typeof stat.nlink !== "number" || !Number.isSafeInteger(stat.nlink) || stat.nlink !== 1) {
+    throw refusal("unreadable", "The POSIX candidate is externally reachable or deleted.");
+  }
+  return stat.nlink;
+}
+
 function stablePosixStatField(value: unknown): string {
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
   if (typeof value === "bigint") return String(value);
@@ -416,11 +444,12 @@ function stablePosixStatField(value: unknown): string {
 }
 
 function posixFileMetadata(stat: PosixStat): PosixFileMetadata {
-  assertPosixHandleLinked(stat);
   if (!stat.isFile()) throw refusal("not-regular-file");
+  const linkCount = posixCandidateLinkCount(stat);
   if (!validSize(stat.size)) throw refusal("unreadable", "The POSIX handle has an invalid file size.");
   return {
     size: stat.size,
+    linkCount,
     identity: `${stablePosixStatField(stat.dev)}:${stablePosixStatField(stat.ino)}`,
     modifiedAt: stablePosixStatField(stat.mtimeMs),
   };
@@ -467,6 +496,7 @@ async function readPosixBounded(
   const after = posixFileMetadata(await operations.fstat(fd));
   if (
     after.size !== metadata.size ||
+    after.linkCount !== metadata.linkCount ||
     after.identity !== metadata.identity ||
     after.modifiedAt !== metadata.modifiedAt
   ) {
@@ -534,6 +564,7 @@ async function openPosixCandidate(
       finalPath,
       regular: true,
       size: metadata.size,
+      linkCount: metadata.linkCount,
       identity: metadata.identity,
       modifiedAt: metadata.modifiedAt,
       read: () => readPosixBounded(leafFd as number, metadata, operations),
@@ -560,7 +591,7 @@ function createPosixBackend(
   defaultFinalPath: (fd: number) => Promise<string>,
   dependencies: PosixBackendDependencies = {}
 ): SecureOpenBackend {
-  const operations = defaultPosixOperations(defaultFinalPath, dependencies);
+  const operations = defaultPosixOperations(defaultFinalPath, flags, dependencies);
   return {
     async open(): Promise<SecureOpenedFile> {
       throw refusal("unreadable", "POSIX candidates must be opened relative to the trusted root descriptor.");
@@ -575,7 +606,7 @@ function createPosixBackend(
       };
 
       try {
-        handle = await operations.openDirectory(trustedRoot);
+        handle = await operations.openDirectory(trustedRoot, flags.root);
         const rootFd = posixFd(handle.fd);
         if (rootFd === undefined) {
           throw refusal("unreadable", "The trusted POSIX root did not provide a usable descriptor.");
@@ -932,6 +963,16 @@ function win32FileIdentity(fileInformation: Record<string, unknown>): { identity
   };
 }
 
+function win32CandidateMetadata(
+  fileInformation: Record<string, unknown>
+): { identity: string; modifiedAt: string; linkCount: number } {
+  const linkCount = asUint32(fileInformation["nNumberOfLinks"]);
+  if (linkCount !== 1) {
+    throw refusal("unreadable", "The Win32 candidate is externally reachable or deleted.");
+  }
+  return { ...win32FileIdentity(fileInformation), linkCount };
+}
+
 async function openWindows(candidate: string): Promise<SecureOpenedFile> {
   const api = await loadWin32Api();
   const handle = asWin32Handle(
@@ -966,13 +1007,14 @@ async function openWindows(candidate: string): Promise<SecureOpenedFile> {
     if (!asBoolean(api.getFileSizeEx(handle, sizeOut))) throw win32Error(api, "unreadable");
     const size = asSafeNonnegativeInteger(sizeOut[0]);
     if (size === undefined) throw refusal("unreadable", "The Win32 handle has an invalid file size.");
-    const { identity, modifiedAt } = win32FileIdentity(fileInformation);
+    const { identity, modifiedAt, linkCount } = win32CandidateMetadata(fileInformation);
     const finalPath = win32FinalPath(api, handle);
 
     return {
       finalPath,
       regular: true,
       size,
+      linkCount,
       identity,
       modifiedAt,
       async read(): Promise<Buffer> {
@@ -1134,6 +1176,9 @@ export async function secureOpen(
       throw refusal("outside-root", "The opened handle resolves outside the trusted root.");
     }
     if (!opened.regular) throw refusal("not-regular-file");
+    if (opened.linkCount !== 1) {
+      throw refusal("unreadable", "The candidate handle is externally reachable or deleted.");
+    }
     if (!validSize(opened.size)) throw refusal("unreadable", "The opened handle has an invalid file size.");
     if (opened.size === 0) throw refusal("empty-file");
     if (opened.size > options.maxBytes) throw refusal("too-large");

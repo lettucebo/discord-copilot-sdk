@@ -194,6 +194,7 @@ describe("secureOpen", () => {
           finalPath: candidate,
           regular: true,
           size: 6,
+          linkCount: 1,
           identity: "candidate-handle",
           modifiedAt: "candidate-time",
           read,
@@ -254,6 +255,7 @@ describe("secureOpen", () => {
           finalPath: candidate,
           regular: true,
           size: 6,
+          linkCount: 1,
           identity: "candidate-handle",
           modifiedAt: "candidate-time",
           read,
@@ -303,6 +305,7 @@ describe("secureOpen", () => {
           finalPath: candidate,
           regular: true,
           size: 6,
+          linkCount: 1,
           identity: "candidate-handle",
           modifiedAt: "candidate-time",
           read,
@@ -346,6 +349,7 @@ describe("secureOpen", () => {
       finalPath: candidate,
       regular: true,
       size: 6,
+      linkCount: 1,
       identity: "case-distinct-sibling",
       modifiedAt: "case-distinct-time",
       read,
@@ -372,6 +376,7 @@ describe("secureOpen", () => {
         finalPath: candidate,
         regular: true,
         size: 6,
+        linkCount: 1,
         identity: "candidate-handle",
         modifiedAt: "candidate-time",
         read,
@@ -411,6 +416,7 @@ describe("secureOpen", () => {
       finalPath: outside,
       regular: true,
       size: 7,
+      linkCount: 1,
       identity: "external-handle",
       modifiedAt: "external-time",
       read,
@@ -433,6 +439,7 @@ describe("secureOpen", () => {
       finalPath: target,
       regular: true,
       size: 6,
+      linkCount: 1,
       identity: "inside-handle",
       modifiedAt: "inside-time",
       read,
@@ -486,6 +493,34 @@ describe("secureOpen", () => {
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
     expect(load.mock.calls.map(([soname]) => soname)).toEqual(linuxLibcCandidates("arm64"));
+  });
+
+  it("passes nonblocking directory flags to a trusted-root open and refuses a non-directory replacement", async () => {
+    const root = "/trusted-worktree";
+    const expectedRootFlags = 0x800 | 0x1_0000 | 0x8_0000;
+    const close = vi.fn(async () => undefined);
+    const openDirectory = vi.fn(async (_trustedRoot: string, _flags?: number) => ({
+      fd: 31,
+      close,
+    }));
+    const backend = createLinuxBackend(
+      {
+        openat: () => {
+          throw new Error("a non-directory root must not resolve a candidate");
+        },
+      },
+      {
+        openDirectory,
+        finalPath: async () => root,
+        fstat: async () => posixStat({ file: true, ino: 31, nlink: 1 }),
+      }
+    );
+
+    await expect(captureTrustedRoot(root, posixHandlePathDependencies(backend))).rejects.toMatchObject({
+      reason: "unreadable",
+    } satisfies Partial<SecureOpenError>);
+    expect(openDirectory).toHaveBeenCalledWith(root, expectedRootFlags);
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   it("opens a POSIX candidate component-by-component from the trusted root fd after pathname ABA replacement", async () => {
