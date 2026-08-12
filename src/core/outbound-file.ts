@@ -119,8 +119,13 @@ export async function resolveOutboundFile(
     if (stat.size === 0) return { ok: false, reason: "empty-file" };
     if (stat.size > options.maxBytes) return { ok: false, reason: "too-large" };
 
-    const bytes = Buffer.alloc(stat.size);
-    await handle.read(bytes, 0, stat.size, 0);
+    const bytes = await handle.readFile();
+    if (bytes.byteLength !== stat.size) {
+      return { ok: false, reason: "unreadable" };
+    }
+    if (bytes.byteLength > options.maxBytes) {
+      return { ok: false, reason: "too-large" };
+    }
     return {
       ok: true,
       file: {

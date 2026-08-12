@@ -6,11 +6,9 @@ import {
   rmSync,
   symlinkSync,
   writeFileSync,
-  readFileSync,
-  openSync,
-  closeSync,
+  promises as fsPromises,
 } from "node:fs";
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import {
   resolveOutboundFile,
   DISCORD_BLOCKED_EXECUTABLE_EXTENSIONS,
@@ -184,20 +182,36 @@ describe("resolveOutboundFile", () => {
     expect(second.file.fingerprint).not.toBe(first.file.fingerprint);
   });
 
-  it("refuses unreadable or missing paths", async () => {
+  it("refuses a size-raced file when the bytes no longer match the handle stat", async () => {
+    const root = makeRoot();
+    const abs = write(root, "race.txt", "abcdef");
+    let truncated = false;
+
+    const readOnce = vi.fn(async function (this: { readFile: () => Promise<Buffer> }) {
+      if (!truncated) {
+        truncated = true;
+        writeFileSync(abs, "abc");
+      }
+      return Buffer.from("abc");
+    });
+
+    try {
+      const originalOpen = fsPromises.open;
+      vi.spyOn(fsPromises, "open").mockImplementation(async (...args) => {
+        const handle = await originalOpen(...args);
+        return Object.assign(handle, { readFile: readOnce }) as typeof handle;
+      });
+      const result = await resolveOutboundFile(root, "race.txt", { maxBytes: 64, policy: "agent" });
+      expect(result).toEqual({ ok: false, reason: "unreadable" });
+      expect(readOnce).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("refuses missing paths", async () => {
     const root = makeRoot();
     const missing = await resolveOutboundFile(root, "ghost.txt", { maxBytes: 64, policy: "agent" });
     expect(missing).toEqual({ ok: false, reason: "not-found" });
-
-    const locked = write(root, "locked.txt", "x");
-    if (process.platform === "win32") {
-      const fd = openSync(locked, "r+");
-      try {
-        const unreadable = await resolveOutboundFile(root, "locked.txt", { maxBytes: 64, policy: "agent" });
-        expect(["ok", "unreadable"]).toContain(unreadable.ok ? "ok" : unreadable.reason);
-      } finally {
-        closeSync(fd);
-      }
-    }
   });
 });
