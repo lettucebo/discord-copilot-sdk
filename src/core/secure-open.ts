@@ -69,6 +69,8 @@ export interface SecureOpenBackend {
 /** Test-only dependency injection for the OS-handle boundary. */
 export interface SecureOpenDependencies {
   backend?: SecureOpenBackend;
+  /** Test-only lexical grammar for fake handle paths; production always uses the native default. */
+  pathMode?: "win32" | "posix";
 }
 
 const WIN32_FILE_TYPE_DISK = 1;
@@ -111,8 +113,12 @@ function trimTrailingSeparators(value: string, pathApi: typeof path.posix): stri
  * opened handle. Calling realpath here would recreate the pathname race that
  * this module exists to eliminate.
  */
-function normalizeHandlePath(value: string): string | undefined {
-  if (process.platform === "win32") {
+function defaultHandlePathMode(): "win32" | "posix" {
+  return process.platform === "win32" ? "win32" : "posix";
+}
+
+function normalizeHandlePath(value: string, pathMode: "win32" | "posix"): string | undefined {
+  if (pathMode === "win32") {
     let normalized = value;
     if (normalized.slice(0, 8).toUpperCase() === "\\\\?\\UNC\\") {
       normalized = `\\\\${normalized.slice(8)}`;
@@ -127,35 +133,33 @@ function normalizeHandlePath(value: string): string | undefined {
   return path.posix.isAbsolute(normalized) ? normalized : undefined;
 }
 
-function relativePathInsideCanonical(finalPath: string, canonicalRoot: string): string | undefined {
-  const normalizedFinal = normalizeHandlePath(finalPath);
-  const normalizedRoot = normalizeHandlePath(canonicalRoot);
+function relativePathInsideCanonical(
+  finalPath: string,
+  canonicalRoot: string,
+  pathMode: "win32" | "posix"
+): string | undefined {
+  const normalizedFinal = normalizeHandlePath(finalPath, pathMode);
+  const normalizedRoot = normalizeHandlePath(canonicalRoot, pathMode);
   if (!normalizedFinal || !normalizedRoot) return undefined;
 
-  const pathApi = process.platform === "win32" ? path.win32 : path.posix;
-  const comparedFinal = process.platform === "win32" ? normalizedFinal.toLowerCase() : normalizedFinal;
-  const comparedRoot = process.platform === "win32" ? normalizedRoot.toLowerCase() : normalizedRoot;
-  const relative = pathApi.relative(comparedRoot, comparedFinal);
-  if (
-    relative === "" ||
-    relative === "." ||
-    relative === ".." ||
-    relative.startsWith(`..${pathApi.sep}`) ||
-    pathApi.isAbsolute(relative)
-  ) {
-    return undefined;
-  }
-  return relative;
+  const pathApi = pathMode === "win32" ? path.win32 : path.posix;
+  // path.win32.relative case-folds even when Windows directories are configured
+  // case-sensitive. Handle-derived paths must match exactly at a segment boundary.
+  const rootPrefix = normalizedRoot.endsWith(pathApi.sep) ? normalizedRoot : `${normalizedRoot}${pathApi.sep}`;
+  const relative = normalizedFinal.startsWith(rootPrefix) ? normalizedFinal.slice(rootPrefix.length) : "";
+  return relative || undefined;
 }
 
-function normalizedFinalPath(value: string): string {
-  const normalized = normalizeHandlePath(value);
+function normalizedFinalPath(value: string, pathMode: "win32" | "posix"): string {
+  const normalized = normalizeHandlePath(value, pathMode);
   if (!normalized) throw refusal("unreadable", "The opened handle did not provide an absolute final path.");
   return normalized;
 }
 
 function equivalentHandlePaths(left: string, right: string): boolean {
-  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+  // Windows can make siblings case-distinct, so two root-handle paths must
+  // agree exactly before the candidate is trusted.
+  return left === right;
 }
 
 function validSize(value: number): boolean {
@@ -655,6 +659,7 @@ export async function secureOpen(
   if (!validSize(options.maxBytes)) throw refusal("unreadable", "The file size limit is invalid.");
 
   const backend = dependencies.backend ?? defaultBackend();
+  const pathMode = dependencies.pathMode ?? defaultHandlePathMode();
   let openedRoot: SecureOpenedDirectory | undefined;
   let opened: SecureOpenedFile | undefined;
   try {
@@ -662,19 +667,19 @@ export async function secureOpen(
     if (!openedRoot.directory) {
       throw refusal("unreadable", "The trusted root handle is not a directory.");
     }
-    const initialRoot = normalizedFinalPath(openedRoot.finalPath);
+    const initialRoot = normalizedFinalPath(openedRoot.finalPath, pathMode);
 
     opened = await backend.open(candidate);
     const revalidatedRoot = await openedRoot.revalidate();
     if (!revalidatedRoot.directory) {
       throw refusal("unreadable", "The trusted root handle is no longer a directory.");
     }
-    const canonicalRoot = normalizedFinalPath(revalidatedRoot.finalPath);
+    const canonicalRoot = normalizedFinalPath(revalidatedRoot.finalPath, pathMode);
     if (!equivalentHandlePaths(initialRoot, canonicalRoot)) {
       throw refusal("unreadable", "The trusted root changed while the candidate was being opened.");
     }
-    const finalPath = normalizedFinalPath(opened.finalPath);
-    const relativePath = relativePathInsideCanonical(finalPath, canonicalRoot);
+    const finalPath = normalizedFinalPath(opened.finalPath, pathMode);
+    const relativePath = relativePathInsideCanonical(finalPath, canonicalRoot, pathMode);
     if (!relativePath) {
       throw refusal("outside-root", "The opened handle resolves outside the trusted root.");
     }

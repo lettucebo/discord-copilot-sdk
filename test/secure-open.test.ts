@@ -8,6 +8,7 @@ import {
   secureOpen,
   win32CreateFileFlags,
   type SecureOpenBackend,
+  type SecureOpenDependencies,
   type SecureOpenedFile,
 } from "../src/core/secure-open.js";
 
@@ -39,6 +40,12 @@ function fakeBackend(opened: SecureOpenedFile): SecureOpenBackend {
       close: async () => undefined,
     })),
   };
+}
+
+function win32HandlePathDependencies(
+  backend: SecureOpenBackend
+): SecureOpenDependencies {
+  return { backend, pathMode: "win32" };
 }
 
 afterEach(() => {
@@ -205,6 +212,67 @@ describe("secureOpen", () => {
       reason: "outside-root",
     } satisfies Partial<SecureOpenError>);
     expect(events).toEqual(["root", "candidate"]);
+    expect(read).not.toHaveBeenCalled();
+    expect(closeCandidate).toHaveBeenCalledTimes(1);
+    expect(closeRoot).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a case-distinct Win32 handle path sibling", async () => {
+    const root = String.raw`C:\work\Repo`;
+    const candidate = String.raw`C:\work\repo\secret.txt`;
+    const read = vi.fn(async () => Buffer.from("secret"));
+    const close = vi.fn(async () => undefined);
+    const backend = fakeBackend({
+      finalPath: candidate,
+      regular: true,
+      size: 6,
+      identity: "case-distinct-sibling",
+      modifiedAt: "case-distinct-time",
+      read,
+      close,
+    });
+
+    await expect(
+      secureOpen(candidate, root, { maxBytes: 64 }, win32HandlePathDependencies(backend))
+    ).rejects.toMatchObject({
+      reason: "outside-root",
+    } satisfies Partial<SecureOpenError>);
+    expect(read).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a revalidated Win32 root whose handle path differs only by case", async () => {
+    const root = String.raw`C:\work\Repo`;
+    const candidate = String.raw`C:\work\Repo\artifact.txt`;
+    const read = vi.fn(async () => Buffer.from("inside"));
+    const closeCandidate = vi.fn(async () => undefined);
+    const closeRoot = vi.fn(async () => undefined);
+    const backend: SecureOpenBackend = {
+      open: vi.fn(async () => ({
+        finalPath: candidate,
+        regular: true,
+        size: 6,
+        identity: "candidate-handle",
+        modifiedAt: "candidate-time",
+        read,
+        close: closeCandidate,
+      })),
+      openDirectory: vi.fn(async () => ({
+        finalPath: root,
+        directory: true,
+        revalidate: async () => ({
+          finalPath: String.raw`C:\work\repo`,
+          directory: true,
+        }),
+        close: closeRoot,
+      })),
+    };
+
+    await expect(
+      secureOpen(candidate, root, { maxBytes: 64 }, win32HandlePathDependencies(backend))
+    ).rejects.toMatchObject({
+      reason: "unreadable",
+    } satisfies Partial<SecureOpenError>);
     expect(read).not.toHaveBeenCalled();
     expect(closeCandidate).toHaveBeenCalledTimes(1);
     expect(closeRoot).toHaveBeenCalledTimes(1);
