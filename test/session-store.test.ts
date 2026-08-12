@@ -357,6 +357,117 @@ describe("SessionStore — durable file delivery quota", () => {
     expect(new SessionStore(f).get("t1")?.fileDeliveryBytes).toBe(25);
   });
 
+  it("atomically restores the original record and clears paired stale rows from a matching fallback reservation", () => {
+    const f = tmpFile();
+    const store = new SessionStore(f);
+    expect(store.reserve(bind("t1", { sessionId: "old", generation: 1, fileDeliveryBytes: 17 }))).toBe(true);
+    expect(store.commit("t1")).toBe(true);
+    const original = store.get("t1")!;
+    expect(store.retainStaleRebind(original, "rebind-cleanup-pending")).toBe(true);
+    expect(store.reserve(bind("t1", { sessionId: "target", generation: 2, fileDeliveryBytes: 17 }))).toBe(true);
+    const target = { threadId: "t1", sessionId: "target", generation: 2 };
+    expect(
+      store.retainStaleRebind(store.get("t1")!, "rebind-teardown-unconfirmed")
+    ).toBe(true);
+
+    expect(
+      store.reconcileFallbackPrimary(target, {
+        kind: "restore",
+        original,
+        staleRebinds: [
+          target,
+          { threadId: "t1", sessionId: original.sessionId, generation: original.generation },
+        ],
+      })
+    ).toEqual({ ok: true, quotaAdvanced: false });
+
+    expect(store.get("t1")).toMatchObject({
+      sessionId: "old",
+      generation: 1,
+      state: "active",
+      fileDeliveryBytes: 17,
+    });
+    expect(store.staleRebinds()).toEqual([]);
+    expect(new SessionStore(f).get("t1")).toMatchObject({ sessionId: "old", generation: 1, state: "active" });
+    expect(new SessionStore(f).staleRebinds()).toEqual([]);
+  });
+
+  it("leaves the primary fallback and stale tracker rows untouched when its target identity no longer matches", () => {
+    const f = tmpFile();
+    const store = new SessionStore(f);
+    expect(store.reserve(bind("t1", { sessionId: "old", generation: 1 }))).toBe(true);
+    expect(store.commit("t1")).toBe(true);
+    const original = store.get("t1")!;
+    expect(store.retainStaleRebind(original, "rebind-cleanup-pending")).toBe(true);
+    expect(store.reserve(bind("t1", { sessionId: "newer", generation: 3 }))).toBe(true);
+    const stale = { threadId: "t1", sessionId: original.sessionId, generation: original.generation };
+
+    expect(
+      store.reconcileFallbackPrimary(
+        { threadId: "t1", sessionId: "target", generation: 2 },
+        { kind: "restore", original, staleRebinds: [stale] }
+      )
+    ).toEqual({ ok: false, quotaAdvanced: false });
+
+    expect(store.get("t1")).toMatchObject({ sessionId: "newer", generation: 3, state: "creating" });
+    expect(store.staleRebinds()).toEqual([expect.objectContaining(stale)]);
+    expect(new SessionStore(f).get("t1")).toMatchObject({ sessionId: "newer", generation: 3 });
+    expect(new SessionStore(f).staleRebinds()).toEqual([expect.objectContaining(stale)]);
+  });
+
+  it("leaves the fallback and stale rows unchanged when atomic reconciliation cannot persist", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dcs-store-fallback-persist-"));
+    const f = join(dir, "s.json");
+    const store = new SessionStore(f);
+    try {
+      expect(store.reserve(bind("t1", { sessionId: "old", generation: 1 }))).toBe(true);
+      expect(store.commit("t1")).toBe(true);
+      const original = store.get("t1")!;
+      expect(store.retainStaleRebind(original, "rebind-cleanup-pending")).toBe(true);
+      expect(store.reserve(bind("t1", { sessionId: "target", generation: 2 }))).toBe(true);
+      const target = { threadId: "t1", sessionId: "target", generation: 2 };
+
+      rmSync(f, { force: true });
+      mkdirSync(f);
+      expect(
+        store.reconcileFallbackPrimary(target, {
+          kind: "restore",
+          original,
+          staleRebinds: [
+            target,
+            { threadId: "t1", sessionId: original.sessionId, generation: original.generation },
+          ],
+        })
+      ).toEqual({ ok: false, quotaAdvanced: false });
+
+      expect(store.get("t1")).toMatchObject({ sessionId: "target", generation: 2, state: "creating" });
+      expect(store.staleRebinds()).toEqual([
+        expect.objectContaining({ sessionId: "old", generation: 1, state: "blocked" }),
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("removes a matching fallback reservation without restoring the original record", () => {
+    const f = tmpFile();
+    const store = new SessionStore(f);
+    expect(store.reserve(bind("t1", { sessionId: "old", generation: 1 }))).toBe(true);
+    expect(store.commit("t1")).toBe(true);
+    const original = store.get("t1")!;
+    expect(store.reserve(bind("t1", { sessionId: "target", generation: 2 }))).toBe(true);
+    const target = { threadId: "t1", sessionId: "target", generation: 2 };
+
+    expect(store.reconcileFallbackPrimary(target, { kind: "remove", staleRebinds: [target] })).toEqual({
+      ok: true,
+      quotaAdvanced: false,
+    });
+
+    expect(store.get("t1")).toBeUndefined();
+    expect(store.staleRebinds()).toEqual([]);
+    expect(new SessionStore(f).get("t1")).toBeUndefined();
+  });
+
   it("fails closed if a persisted v4 row later loses its reserved byte total", () => {
     const f = tmpFile();
     writeFileSync(

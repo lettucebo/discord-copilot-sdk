@@ -68,6 +68,32 @@ export interface ConditionalRestoreResult {
   quotaAdvanced: boolean;
 }
 
+/** Immutable identity for either a primary reservation or a stale-rebind row.
+ * A Discord thread id alone is mutable during rebind and is never a sufficient
+ * ownership check. */
+export interface SessionIdentity {
+  threadId: string;
+  sessionId: string;
+  generation: number;
+}
+
+/** The only two safe resolutions for a primary `creating` row retained as the
+ * fallback pointer for an unconfirmed replacement actor. */
+export type FallbackPrimaryAction =
+  | {
+      kind: "restore";
+      original: SessionRecord;
+      /** Stale rows paired with this recovery transaction. They are removed
+       * only when the target primary reservation still matches. */
+      staleRebinds: SessionIdentity[];
+    }
+  | {
+      kind: "remove";
+      /** The replacement's terminal row, if it was later persisted during a
+       * retry, must disappear with its fallback primary reservation. */
+      staleRebinds: SessionIdentity[];
+    };
+
 interface StoreFile {
   schemaVersion: number;
   generationHighWater: number;
@@ -343,6 +369,70 @@ export class SessionStore {
     return { ok, quotaAdvanced };
   }
 
+  /** Reconcile the primary fallback pointer left by a replacement whose
+   * terminal stale row could not be persisted. The expected target must still
+   * be the exact `creating` reservation: otherwise a newer incarnation may own
+   * the mutable thread slot, and this method leaves every row untouched.
+   *
+   * Primary and stale-row changes share one persist-first `mutate()` call. A
+   * failed write therefore preserves both the fallback barrier and every
+   * durable tracker, rather than half-completing teardown. */
+  reconcileFallbackPrimary(
+    expectedTarget: SessionIdentity,
+    action: FallbackPrimaryAction
+  ): ConditionalRestoreResult {
+    if (
+      !isSessionIdentity(expectedTarget) ||
+      !Array.isArray(action.staleRebinds) ||
+      !action.staleRebinds.every(
+        (identity) =>
+          isSessionIdentity(identity) && identity.threadId === expectedTarget.threadId
+      )
+    ) {
+      return { ok: false, quotaAdvanced: false };
+    }
+    const current = this.sessions.get(expectedTarget.threadId);
+    if (
+      !current ||
+      current.sessionId !== expectedTarget.sessionId ||
+      current.generation !== expectedTarget.generation ||
+      current.state !== "creating"
+    ) {
+      return { ok: false, quotaAdvanced: false };
+    }
+    if (
+      action.kind === "restore" &&
+      (!isSessionIdentity(action.original) ||
+        action.original.threadId !== expectedTarget.threadId ||
+        !isFileDeliveryBytes(action.original.fileDeliveryBytes))
+    ) {
+      return { ok: false, quotaAdvanced: false };
+    }
+
+    const fileDeliveryBytes =
+      action.kind === "restore"
+        ? Math.max(action.original.fileDeliveryBytes, current.fileDeliveryBytes)
+        : 0;
+    const quotaAdvanced =
+      action.kind === "restore" && fileDeliveryBytes !== action.original.fileDeliveryBytes;
+    const ok = this.mutate((m, highWater, stale) => {
+      if (action.kind === "restore") {
+        m.set(expectedTarget.threadId, {
+          ...this.toRecord({ ...action.original, fileDeliveryBytes }),
+          state: action.original.state,
+          ...(action.original.reason ? { reason: action.original.reason } : {}),
+        });
+      } else {
+        m.delete(expectedTarget.threadId);
+      }
+      for (const identity of action.staleRebinds) {
+        stale.delete(staleRebindKey(identity.threadId, identity.sessionId, identity.generation));
+      }
+      return highWater;
+    });
+    return { ok, quotaAdvanced: ok && quotaAdvanced };
+  }
+
   private toRecord(b: SessionBinding): SessionRecord {
     return {
       schemaVersion: SCHEMA_VERSION,
@@ -490,6 +580,17 @@ export class SessionStore {
 
 function isFileDeliveryBytes(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isSessionIdentity(value: SessionIdentity): boolean {
+  return (
+    typeof value.threadId === "string" &&
+    value.threadId.length > 0 &&
+    typeof value.sessionId === "string" &&
+    value.sessionId.length > 0 &&
+    Number.isSafeInteger(value.generation) &&
+    value.generation >= 1
+  );
 }
 
 /** Parse a versioned multi-session file or a bare v1 record, or undefined if neither. */

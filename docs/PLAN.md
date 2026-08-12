@@ -678,7 +678,14 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   bounded disconnect promise：`/end` 即使已清 replacement，也會處理舊 incarnation；確認後只在 rebind
   preflight 曾證明可清、且 `removeWorktreeIfClean` 再次證明安全時移除 worktree。若仍未確認，terminal
   pointer 留在 store，restart 的 `/sessions`／startup leftovers 報告與後續 `/end` 都能看見它；不會把
-  possibly-live root/worktree 變成無記錄物件。
+  possibly-live root/worktree 變成無記錄物件。若 replacement 的 terminal stale row 寫入失敗，tracker
+  另持有目標 `creating` reservation 的完整 immutable identity，連同「原 session 仍為 current 時可 restore
+  的 record snapshot」或「`/end` 已勝出時只可 remove」計畫；必須先確認 disconnect、再安全清 worktree，
+  才以同一 persist-first CAS 同步 reconcile primary fallback 與 paired stale rows。identity mismatch 或寫入
+  失敗時兩者與 actor ownership 都保留，並封鎖新 rebind，不能把 target `creating` row 當成一般 previous
+  session。`/end` 在第一個 await 前把 restore 計畫翻成 remove，且會 retry 已追蹤的 fallback；restore
+  成功才移除 pre-swap `/end` routing marker，避免下一次 `/end` 留下會 restart 的 primary row；沒有 live
+  map entry 的後續 `/end` 也必須先 retry tracker，未成功對帳時不可走 generic stale-record reaper 刪掉 fallback。
 - **faulted actor 的 Windows root lock**：fault path 的 bounded disconnect 只限制等待時間，不能在
   SDK 尚未確認終止時關閉 retained root。actor 維持 faulted（不能 prompt／送檔），root 作為
   rename/delete fence 留在原處；同一個或稍後 retry 的 disconnect 一旦真的 resolve，才 close 一次
@@ -722,7 +729,7 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | Windows `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root-relative inline-code card path、同 basename 路徑辨別、U+200B 拒絕、root/content/digest/path 綁定、endpoint truth、late cancellation 不算成功；非 Windows 無 tool 且 `/file` 拒絕 | `test/outbound-file.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
 | 24 MiB 持久化保守預留、舊 record 遷移、session-id + generation CAS、rebind fence/單調 rollback、YOLO/abort rollback 不永久停用 `/file`、restart total、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
 | `/file` resolve/send interleaving（end、rebind-style replacement）不可附件或成功回覆 | `test/app-file-command.test.ts`、`test/transport.test.ts` |
-| `/end` 穿插 rebind 的 binding、replacement actor、map-swap 三階段都不能復活 map／record／worktree；commit rollback 的 unconfirmed replacement 會 retain/retry，若 terminal stale row 寫入失敗則 target reservation 必須留作 durable barrier、不可 restore/remove；post-swap old actor／root/worktree 有 durable stale pointer、`/end` 會擁有兩個 incarnation；pre-swap failed `/end` 的後續成功 retry 必須在 teardown/cleanup 後移除 tracker，且 pre-swap rollback end race 不遺失 old pointer | `test/app-rebind.test.ts`、`test/session-store.test.ts` |
+| `/end` 穿插 rebind 的 binding、replacement actor、map-swap 三階段都不能復活 map／record／worktree；commit rollback 的 unconfirmed replacement 會 retain/retry，terminal stale row 寫入失敗時 target reservation 先作 durable barrier，確認 teardown + worktree cleanup 後只以 target identity CAS restore live original 或在 `/end` 勝出時 remove、並同步移除 paired stale rows；CAS／寫入失敗保留 barrier/tracker、封鎖新 rebind，restart 不 resume fallback creating row；`/end` 會擁有兩個 incarnation 並 retry 已追蹤 fallback，沒有 live map 的後續 `/end` 也不得 generic-reap 未對帳 barrier，restore 後的下一次 `/end` 不可留下 primary row | `test/app-rebind.test.ts`、`test/session-store.test.ts`、`test/app-reconcile.test.ts` |
 | faulted/hung SDK disconnect 保留 root lock，確認終止後只 close 一次且 actor 仍拒絕 prompt／送檔 | `test/session-actor.test.ts` |
 | 已送出後 delete reject/timeout 的 `retraction-unconfirmed`、thread warning、transport `ok` 後才 stale 的可見性警告、actor failure 與 `/file` 誠實訊息 | `test/transport.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
 | v4 container mixed/downgraded row fail-closed；非 Windows 不診斷 Attach Files；YOLO 普通卡與撤銷檔案卡文字一致 | `test/session-store.test.ts`、`test/app-channels.test.ts`、`test/file-delivery-docs.test.ts` |

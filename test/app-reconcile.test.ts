@@ -494,6 +494,35 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     }
   });
 
+  it("does not resume a fallback creating reservation or resurrect its old session", async () => {
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      expect(store.reserve(bind({ sessionId: "old", generation: 1 }))).toBe(true);
+      expect(store.commit("t1")).toBe(true);
+      const original = store.get("t1")!;
+      expect(store.retainStaleRebind(original, "rebind-cleanup-pending")).toBe(true);
+      // This is the primary barrier left when the replacement's own terminal
+      // stale row could not persist. It is not a resumable conversation.
+      expect(store.reserve(bind({ sessionId: "fallback-target", generation: 2 }))).toBe(true);
+
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      await reconcile(app, async () => "valid");
+
+      expect(store.get("t1")).toMatchObject({
+        sessionId: "fallback-target",
+        generation: 2,
+        state: "orphaned",
+      });
+      expect(sessionsOf(app).has("t1")).toBe(false);
+      expect(store.staleRebinds()).toEqual([
+        expect.objectContaining({ sessionId: "old", generation: 1, state: "blocked" }),
+      ]);
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
   it("no record → fresh, nothing registered", async () => {
     const f = tmpFile();
     try {

@@ -455,7 +455,7 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     }
   });
 
-  it("keeps the target reservation as a durable barrier when replacement retention cannot persist", async () => {
+  it("reconciles a fallback reservation back to the live original only after the stale actor teardown confirms", async () => {
     const { app, store, actor } = harness();
     const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
     const originalCreate = SessionActor.create;
@@ -483,7 +483,158 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       expect(store.get("t1")?.sessionId).not.toBe("s1");
       expect(new SessionStore(storeFile).get("t1")).toMatchObject({ repoPath: repoB, state: "creating" });
       expect(staleRebindActors(app).size).toBe(1);
+      expect([...staleRebindActors(app).values()][0]).toMatchObject({
+        fallbackPrimary: {
+          action: "restore",
+          expectedTarget: {
+            threadId: "t1",
+            sessionId: store.get("t1")?.sessionId,
+            generation: store.get("t1")?.generation,
+          },
+          original: { sessionId: "s1", generation: 1 },
+        },
+      });
       expect(fs.existsSync(targetWorktree)).toBe(true);
+      expect(await blocker(app, sessions(app).get("t1")!, { repoPath: repoB, devMode: "local" })).toMatch(
+        /安全屏障|清理/
+      );
+
+      await vi.waitFor(() => expect(replacementDisconnect).toHaveBeenCalledTimes(2));
+      replacementDisconnect!.mockResolvedValue(undefined);
+      await retryStaleRebinds(app);
+      expect(replacementDisconnect).toHaveBeenCalledTimes(3);
+
+      expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
+      expect(store.get("t1")).toMatchObject({ sessionId: "s1", repoPath: repoA, state: "active" });
+      expect(new SessionStore(storeFile).get("t1")).toMatchObject({ sessionId: "s1", repoPath: repoA, state: "active" });
+      expect(staleRebinds(store)).toEqual([]);
+      expect(staleRebindActors(app).size).toBe(0);
+      expect(actor.resumeFileDeliveryCalls).toEqual([1]);
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+
+      // Reconciliation is no longer an in-flight rebind. A later `/end` must
+      // reclaim the restored primary record, not take the stale pre-swap path
+      // and leave an active row that would resurrect on restart.
+      await endThread(app);
+      expect(sessions(app).get("t1")).toBeUndefined();
+      expect(store.get("t1")).toBeUndefined();
+    } finally {
+      retainSpy.mockRestore();
+      replacementDisconnect?.mockResolvedValue(undefined);
+      await retryStaleRebinds(app);
+      commitSpy.mockRestore();
+      createSpy.mockRestore();
+      await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
+  it("keeps fallback ownership when conditional reconciliation cannot persist", async () => {
+    const { app, store, actor } = harness();
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    const originalCreate = SessionActor.create;
+    const originalRetain = store.retainStaleRebind.bind(store);
+    let replacementDisconnect: ReturnType<typeof vi.spyOn> | undefined;
+    let reconcileSpy: { mockRestore(): void } | undefined;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation(async (client, options) => {
+      const replacement = await originalCreate(client, options);
+      replacementDisconnect = vi
+        .spyOn(replacement, "disconnect")
+        .mockRejectedValue(new Error("replacement runtime remains live"));
+      return replacement;
+    });
+    const commitSpy = vi.spyOn(store, "commit").mockReturnValue(false);
+    const retainSpy = vi.spyOn(store, "retainStaleRebind").mockImplementation((binding, reason) => {
+      if (reason === "rebind-teardown-unconfirmed" && binding.sessionId !== "s1") return false;
+      return originalRetain(binding, reason);
+    });
+
+    try {
+      await expect(applyRebind(app, { repoPath: repoB, devMode: "worktree" })).resolves.toMatch(/安全屏障/);
+      const fallback = store.get("t1")!;
+      reconcileSpy = vi
+        .spyOn(store, "reconcileFallbackPrimary")
+        .mockReturnValue({ ok: false, quotaAdvanced: false });
+      replacementDisconnect!.mockResolvedValue(undefined);
+
+      await retryStaleRebinds(app);
+
+      expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
+      expect(store.get("t1")).toMatchObject({
+        sessionId: fallback.sessionId,
+        generation: fallback.generation,
+        state: "creating",
+      });
+      expect(staleRebindActors(app).size).toBe(1);
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+
+      // Once `/end` wins, a second `/end` reaches endStaleRecord(). It must
+      // retry the retained actor and refuse to reap the fallback primary while
+      // the conditional persistence failure still owns that barrier.
+      await endThread(app);
+      expect(sessions(app).get("t1")).toBeUndefined();
+      expect(store.get("t1")).toMatchObject({
+        sessionId: fallback.sessionId,
+        generation: fallback.generation,
+        state: "creating",
+      });
+      await endThread(app);
+      expect(store.get("t1")).toMatchObject({
+        sessionId: fallback.sessionId,
+        generation: fallback.generation,
+        state: "creating",
+      });
+      expect(staleRebindActors(app).size).toBe(1);
+
+      reconcileSpy.mockRestore();
+      reconcileSpy = undefined;
+      await retryStaleRebinds(app);
+      expect(staleRebindActors(app).size).toBe(0);
+      expect(store.get("t1")).toBeUndefined();
+    } finally {
+      reconcileSpy?.mockRestore();
+      retainSpy.mockRestore();
+      replacementDisconnect?.mockResolvedValue(undefined);
+      await retryStaleRebinds(app);
+      commitSpy.mockRestore();
+      createSpy.mockRestore();
+      await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
+  it("/end retries an already-tracked fallback as removal after it wins", async () => {
+    const { app, store } = harness();
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    const originalCreate = SessionActor.create;
+    const originalRetain = store.retainStaleRebind.bind(store);
+    let replacementDisconnect: ReturnType<typeof vi.spyOn> | undefined;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation(async (client, options) => {
+      const replacement = await originalCreate(client, options);
+      replacementDisconnect = vi
+        .spyOn(replacement, "disconnect")
+        .mockRejectedValue(new Error("replacement runtime remains live"));
+      return replacement;
+    });
+    const commitSpy = vi.spyOn(store, "commit").mockReturnValue(false);
+    const retainSpy = vi.spyOn(store, "retainStaleRebind").mockImplementation((binding, reason) => {
+      if (reason === "rebind-teardown-unconfirmed" && binding.sessionId !== "s1") return false;
+      return originalRetain(binding, reason);
+    });
+
+    try {
+      await expect(applyRebind(app, { repoPath: repoB, devMode: "worktree" })).resolves.toMatch(/安全屏障/);
+      expect(staleRebindActors(app).size).toBe(1);
+      await vi.waitFor(() => expect(replacementDisconnect).toHaveBeenCalledTimes(2));
+      replacementDisconnect!.mockResolvedValue(undefined);
+
+      await endThread(app);
+
+      expect(sessions(app).get("t1")).toBeUndefined();
+      expect(store.get("t1")).toBeUndefined();
+      expect(staleRebinds(store)).toEqual([]);
+      expect(staleRebindActors(app).size).toBe(0);
+      expect(fs.existsSync(targetWorktree)).toBe(false);
     } finally {
       retainSpy.mockRestore();
       replacementDisconnect?.mockResolvedValue(undefined);
@@ -955,7 +1106,7 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     }
   });
 
-  it("/end keeps the target reservation when its replacement cannot persist terminal ownership", async () => {
+  it("/end removes a fallback reservation after confirmed replacement teardown without resurrecting the ended session", async () => {
     const { app, store } = harness();
     const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
     const originalCreate = SessionActor.create;
@@ -995,6 +1146,16 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       expect(new SessionStore(storeFile).get("t1")).toMatchObject({ repoPath: repoB, state: "creating" });
       expect(staleRebindActors(app).size).toBe(1);
       expect(fs.existsSync(targetWorktree)).toBe(true);
+
+      replacementDisconnect!.mockResolvedValue(undefined);
+      await retryStaleRebinds(app);
+
+      expect(sessions(app).get("t1")).toBeUndefined();
+      expect(store.get("t1")).toBeUndefined();
+      expect(new SessionStore(storeFile).get("t1")).toBeUndefined();
+      expect(staleRebinds(store)).toEqual([]);
+      expect(staleRebindActors(app).size).toBe(0);
+      expect(fs.existsSync(targetWorktree)).toBe(false);
     } finally {
       retainSpy.mockRestore();
       replacementDisconnect?.mockResolvedValue(undefined);

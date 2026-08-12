@@ -37,7 +37,7 @@ import { RepoProvisioner, sweepStaleStaging } from "./core/repo-provision.js";
 import { gitDiffSummary } from "./core/git.js";
 import { downloadBounded } from "./core/download.js";
 import type { OutboundRefusal } from "./core/outbound-file.js";
-import { SessionStore, type SessionRecord } from "./core/session-store.js";
+import { SessionStore, type SessionIdentity, type SessionRecord } from "./core/session-store.js";
 import {
   planReconcile,
   classifyResumeError,
@@ -135,6 +135,24 @@ export interface Session {
   hasRunTurn: boolean;
 }
 
+/** Fallback-primary reconciliation is needed only when terminal stale ownership
+ * could not persist. The target is the exact `creating` reservation retained
+ * as the crash-surviving barrier; thread id alone would let a later rebind
+ * restore or remove the wrong incarnation. */
+interface FallbackPrimaryReconciliationPlan {
+  expectedTarget: SessionIdentity;
+  /** A failed rebind restores this immutable snapshot only while its original
+   * actor is still the current, non-ended session. `/end` flips this to remove
+   * before it awaits any teardown, so a late retry cannot resurrect it. */
+  action: "restore" | "remove";
+  original?: SessionRecord;
+  canRestore?: () => boolean;
+  /** Drops the pre-swap `/end` routing marker only after the primary restore
+   * is durable, so a later `/end` reclaims the restored primary row normally. */
+  afterRestore?: () => void;
+  resumeFileDelivery?: () => void;
+}
+
 /** One old SDK incarnation detached by a rebind. The actor remains strongly
  * referenced until its disconnect resolves, because its retained trusted root
  * is the Windows rename/delete fence for the worktree it was using. */
@@ -147,6 +165,10 @@ interface StaleRebindActor {
   /** Runs only after a confirmed disconnect; it rechecks worktree safety before
    * deleting anything, then removes the paired terminal store record. */
   cleanupPlan: () => Promise<{ ok: boolean; tail: string }>;
+  /** Present only when the primary target reservation had to stand in for a
+   * stale row that could not be written. Ownership stays retained until this
+   * conditional plan durably completes. */
+  fallbackPrimary?: FallbackPrimaryReconciliationPlan;
   /** Concurrent `/end`, normal rebind completion and shutdown must join ONE
    * teardown attempt rather than issue duplicate SDK disconnects. */
   disconnecting?: Promise<StaleRebindTeardown>;
@@ -1624,6 +1646,11 @@ export class DiscordCopilotApp {
     // suspended in git or SDK work while this actor remains in the map; without
     // this fence it could later reserve and install a replacement after `/end`.
     this.endedSessions.add(session);
+    // A replacement whose stale row could not persist may be held solely by a
+    // target `creating` reservation. Change its retry plan before the first
+    // await: `/end` wins, so a later confirmed replacement teardown may remove
+    // that exact reservation but must never restore this session's record.
+    this.markFallbackPrimaryEnded(threadId);
     // Once rebind has reserved its durable old-incarnation companion, `/end`
     // must finish that companion rather than treating the mutable main record
     // (which may already be the target reservation) as if it described this
@@ -1667,8 +1694,19 @@ export class DiscordCopilotApp {
         const cleanup = await pendingOld.cleanupPlan();
         outcome = { confirmed: true, cleaned: cleanup.ok, tail: cleanup.tail };
       }
+      // A failed pre-swap replacement may already be tracked behind the target
+      // primary reservation. `/end` changed its plan to removal above; retry it
+      // now that the command has won, rather than leaving an already-confirmed
+      // target actor waiting for some unrelated later lifecycle event.
+      await this.retryStaleRebindActorsForThread(threadId);
+      const fallbackPending = [...this.staleRebindActors.values()].some(
+        (entry) => entry.threadId === threadId && entry.fallbackPrimary !== undefined
+      );
       await interaction.editReply(
-        `${outcome.confirmed && outcome.cleaned ? "✅" : "⚠️"} 這個 session 已結束。${outcome.tail}`
+        `${outcome.confirmed && outcome.cleaned ? "✅" : "⚠️"} 這個 session 已結束。${outcome.tail}` +
+          (fallbackPending
+            ? "\n⚠️ replacement 的安全屏障仍未能安全對帳；其 actor 擁有權與記錄均已保留，請稍後重試。"
+            : "")
       );
       return;
     }
@@ -1747,7 +1785,8 @@ export class DiscordCopilotApp {
    * thread→replacement record: the two can coexist after a map swap. */
   private async reclaimStaleRebind(
     binding: SessionRecord,
-    preflightClean: boolean
+    preflightClean: boolean,
+    removeRecord = true
   ): Promise<{ ok: boolean; tail: string }> {
     let tail = "";
     if (binding.branch && binding.workDir !== binding.repoPath) {
@@ -1778,6 +1817,11 @@ export class DiscordCopilotApp {
         };
       }
     }
+    // A fallback primary must be reconciled with this stale row in ONE store
+    // mutation. Removing the stale half first would turn a later CAS/write
+    // failure into an actor whose only durable barrier no longer says why it
+    // exists.
+    if (!removeRecord) return { ok: true, tail };
     if (!this.store.removeStaleRebind(binding.threadId, binding.sessionId, binding.generation)) {
       return {
         ok: false,
@@ -1832,6 +1876,25 @@ export class DiscordCopilotApp {
     interaction: ChatInputCommandInteraction,
     threadId: string
   ): Promise<void> {
+    const hasFallbackOwnership = (): boolean =>
+      [...this.staleRebindActors.values()].some(
+        (entry) => entry.threadId === threadId && entry.fallbackPrimary !== undefined
+      );
+    // A confirmed replacement can still be retained only because its primary
+    // fallback CAS/write failed. Do not let a later `/end` with no live map
+    // entry reap that barrier: retry the owned actor first and refuse while the
+    // conditional reconciliation remains unresolved.
+    if (hasFallbackOwnership()) {
+      await this.retryStaleRebindActorsForThread(threadId);
+      if (hasFallbackOwnership()) {
+        await interaction.reply({
+          content:
+            "⚠️ replacement 的安全屏障仍未能安全對帳；其 actor 擁有權與記錄均已保留，請稍後重試或重啟 bot。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+    }
     const rec = this.store.get(threadId);
     const stale = this.store.staleRebindsForThread(threadId);
     if (!rec && stale.length) {
@@ -2453,6 +2516,20 @@ export class DiscordCopilotApp {
     session: Session,
     target: { repoPath: string; devMode: DevMode }
   ): Promise<string | undefined> {
+    if (
+      [...this.staleRebindActors.values()].some(
+        (entry) => entry.threadId === threadId && entry.fallbackPrimary !== undefined
+      )
+    ) {
+      return "⚠️ 前一次改綁的安全屏障仍在清理／對帳中。為避免把目標建立預留誤認為舊 session，請稍後再試。";
+    }
+    // The in-memory tracker is intentionally not restart-durable: it owns a
+    // local actor/root. If a process ends before reconciliation, the retained
+    // primary `creating` row is still a fail-closed barrier rather than a valid
+    // predecessor for another rebind.
+    if (this.store.get(threadId)?.state === "creating") {
+      return "⚠️ 這個討論串有未完成的 session 建立預留，無法安全改綁。請先處理／結束該預留後再試。";
+    }
     if (session.running) {
       return "⏳ 這個 session 正在執行中。請等它結束，或先用 `/stop`，再改綁。";
     }
@@ -2588,12 +2665,59 @@ export class DiscordCopilotApp {
     preflightClean: boolean
   ): StaleRebindActor {
     const immutableBinding = { ...binding };
-    return {
+    let entry!: StaleRebindActor;
+    entry = {
       actor,
       threadId: immutableBinding.threadId,
       binding: immutableBinding,
-      cleanupPlan: () => this.reclaimStaleRebind(immutableBinding, preflightClean),
+      // A fallback plan is installed only after the stale-row write fails.
+      // Read it at cleanup time rather than capturing its initial absence:
+      // otherwise a later confirmed retry would delete that row before the
+      // primary fallback can be atomically reconciled.
+      cleanupPlan: () =>
+        this.reclaimStaleRebind(immutableBinding, preflightClean, entry.fallbackPrimary === undefined),
     };
+    return entry;
+  }
+
+  private fallbackPrimaryPlan(
+    target: SessionRecord,
+    original?: SessionRecord,
+    canRestore?: () => boolean,
+    afterRestore?: () => void,
+    resumeFileDelivery?: () => void
+  ): FallbackPrimaryReconciliationPlan {
+    return {
+      expectedTarget: {
+        threadId: target.threadId,
+        sessionId: target.sessionId,
+        generation: target.generation,
+      },
+      action: original ? "restore" : "remove",
+      ...(original
+        ? {
+            original: { ...original },
+            canRestore,
+            afterRestore,
+            resumeFileDelivery,
+          }
+        : {}),
+    };
+  }
+
+  /** `/end` wins before it awaits either actor. Any fallback tracker created
+   * by the failed rebind must therefore remove its exact target reservation,
+   * never restore the old record after the command has ended it. */
+  private markFallbackPrimaryEnded(threadId: string): void {
+    for (const entry of this.staleRebindActors.values()) {
+      const fallback = entry.fallbackPrimary;
+      if (!fallback || entry.threadId !== threadId) continue;
+      fallback.action = "remove";
+      fallback.original = undefined;
+      fallback.canRestore = undefined;
+      fallback.afterRestore = undefined;
+      fallback.resumeFileDelivery = undefined;
+    }
   }
 
   /** Persist and strongly retain an actor that has already failed a disconnect
@@ -2601,13 +2725,18 @@ export class DiscordCopilotApp {
    * cannot accidentally resume this old conversation. Callers that would
    * otherwise remove or restore its primary reservation must use the returned
    * result as a durability gate. */
-  private retainStaleRebindActor(entry: StaleRebindActor, reason = "rebind-teardown-unconfirmed"): boolean {
+  private retainStaleRebindActor(
+    entry: StaleRebindActor,
+    reason = "rebind-teardown-unconfirmed",
+    fallbackPrimary?: FallbackPrimaryReconciliationPlan
+  ): boolean {
     const persisted = this.store.retainStaleRebind(entry.binding, reason);
     if (!persisted) {
       // The pre-swap intent was persisted before this method is reachable for
       // an old actor. Keep the root in memory even if a reason refresh loses a
       // transient disk race; silently releasing it would be worse.
       console.warn(`rebind: could not persist stale actor ${entry.binding.sessionId} (${reason})`);
+      if (fallbackPrimary) entry.fallbackPrimary = fallbackPrimary;
     }
     this.staleRebindActors.set(entry.actor, entry);
     this.scheduleStaleRebindRetry(entry);
@@ -2639,6 +2768,64 @@ export class DiscordCopilotApp {
     for (const entry of entries) await this.retryStaleRebindActor(entry.actor);
   }
 
+  /** Complete the primary side of a fallback only after the actor is confirmed
+   * gone and its worktree cleanup plan succeeded. A mismatch or write failure
+   * deliberately leaves both the target barrier and this actor tracker in
+   * place: neither a newer record nor a possibly-live runtime is ours to drop. */
+  private reconcileFallbackPrimary(entry: StaleRebindActor): { ok: boolean; tail: string } {
+    const fallback = entry.fallbackPrimary;
+    if (!fallback) return { ok: true, tail: "" };
+
+    if (fallback.action === "restore" && (!fallback.original || !fallback.canRestore?.())) {
+      // This catches `/end` even if it raced immediately before this retry.
+      // Removing is safe only under the target CAS; restoring is not.
+      fallback.action = "remove";
+      fallback.original = undefined;
+      fallback.canRestore = undefined;
+      fallback.afterRestore = undefined;
+      fallback.resumeFileDelivery = undefined;
+    }
+
+    const targetStale: SessionIdentity = {
+      threadId: entry.binding.threadId,
+      sessionId: entry.binding.sessionId,
+      generation: entry.binding.generation,
+    };
+    const result =
+      fallback.action === "restore" && fallback.original
+        ? this.store.reconcileFallbackPrimary(fallback.expectedTarget, {
+            kind: "restore",
+            original: fallback.original,
+            staleRebinds: [
+              targetStale,
+              {
+                threadId: fallback.original.threadId,
+                sessionId: fallback.original.sessionId,
+                generation: fallback.original.generation,
+              },
+            ],
+          })
+        : this.store.reconcileFallbackPrimary(fallback.expectedTarget, {
+            kind: "remove",
+            staleRebinds: [targetStale],
+          });
+    if (!result.ok) {
+      console.warn(
+        `rebind: fallback primary ${fallback.expectedTarget.sessionId} did not conditionally reconcile; retaining barrier and actor ownership`
+      );
+      return {
+        ok: false,
+        tail:
+          "\n⚠️ 已確認 replacement runtime 停止，但無法安全對帳其建立預留；安全屏障與清理擁有權均保留，請稍後重試。",
+      };
+    }
+    if (fallback.action === "restore") {
+      fallback.afterRestore?.();
+      if (!result.quotaAdvanced) fallback.resumeFileDelivery?.();
+    }
+    return { ok: true, tail: "" };
+  }
+
   /** Make exactly one bounded disconnect attempt for a stale incarnation. On
    * success its cleanup plan rechecks the worktree before deletion; on failure
    * the `blocked` durable row and strong actor/root reference both remain. */
@@ -2661,10 +2848,12 @@ export class DiscordCopilotApp {
         };
       }
       const cleanup = await entry.cleanupPlan();
-      if (cleanup.ok && this.staleRebindActors.get(entry.actor) === entry) {
+      const fallback = cleanup.ok ? this.reconcileFallbackPrimary(entry) : { ok: true, tail: "" };
+      const cleaned = cleanup.ok && fallback.ok;
+      if (cleaned && this.staleRebindActors.get(entry.actor) === entry) {
         this.staleRebindActors.delete(entry.actor);
       }
-      return { confirmed: true, cleaned: cleanup.ok, tail: cleanup.tail };
+      return { confirmed: true, cleaned, tail: `${cleanup.tail}${fallback.tail}` };
     })();
     entry.disconnecting = attempt;
     try {
@@ -2756,7 +2945,11 @@ export class DiscordCopilotApp {
           // do not let a timed-out `/end` turn it into an invisible writer.
           if (replacementBinding) {
             replacementDurablyRetained = this.retainStaleRebindActor(
-              this.staleRebindActor(replacementActor, replacementBinding, true)
+              this.staleRebindActor(replacementActor, replacementBinding, true),
+              "rebind-teardown-unconfirmed",
+              // `/end` already claimed the old session. If persistence fails,
+              // retry may remove only this exact target reservation.
+              this.fallbackPrimaryPlan(replacementBinding)
             );
           } else {
             // This should be unreachable: a replacement actor is created only
@@ -2960,7 +3153,22 @@ export class DiscordCopilotApp {
         // while its working directory is deleted underneath it.
         if (replacementBinding) {
           replacementDurablyRetained = this.retainStaleRebindActor(
-            this.staleRebindActor(actor, replacementBinding, true)
+            this.staleRebindActor(actor, replacementBinding, true),
+            "rebind-teardown-unconfirmed",
+            // The old actor is still current here. If this terminal row cannot
+            // persist, a later confirmed retry may restore only this snapshot
+            // under the target reservation's exact CAS.
+            this.fallbackPrimaryPlan(
+              replacementBinding,
+              previous,
+              ownsOldSession,
+              () => {
+                if (oldStale && this.pendingRebindOlds.get(session) === oldStale) {
+                  this.pendingRebindOlds.delete(session);
+                }
+              },
+              restoreOldFileDelivery
+            )
           );
         } else {
           console.warn("rebind: commit-failed replacement lost its durable binding before teardown");
