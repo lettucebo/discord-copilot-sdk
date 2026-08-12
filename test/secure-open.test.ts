@@ -3,6 +3,7 @@ import os from "node:os";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  createDarwinBackend,
   SecureOpenError,
   secureOpen,
   win32CreateFileFlags,
@@ -54,7 +55,7 @@ describe("secureOpen", () => {
     const result = await secureOpen(target, root, { maxBytes: 1024 });
 
     expect(result).toMatchObject({
-      finalPath: target,
+      finalPath: process.platform === "darwin" ? expect.stringMatching(/report\.txt$/) : target,
       size: 12,
       bytes: Buffer.from("inside bytes"),
       identity: expect.any(String),
@@ -261,19 +262,83 @@ describe("secureOpen", () => {
     expect(win32CreateFileFlags("directory") & backupSemantics).toBe(backupSemantics);
   });
 
-  it.runIf(process.platform === "linux")("rejects an actual symlink escape from the Linux handle target", async () => {
+  it("derives Darwin candidate and root proofs from their still-open FileHandle descriptors", async () => {
     const root = makeRoot();
-    const outsideRoot = makeRoot();
-    write(outsideRoot, "loot.txt", "outside");
-    const link = path.join(root, "escape");
-    symlinkSync(outsideRoot, link, "dir");
+    const target = write(root, "artifact.txt", "inside");
+    const calls: Array<{ fd: number; command: number; capacity: number }> = [];
+    const backend = createDarwinBackend({
+      fcntl(fd, command, output) {
+        calls.push({ fd, command, capacity: output.byteLength });
+        const finalPath = calls.length === 2 ? "/trusted-root/artifact.txt" : "/trusted-root";
+        output.write(finalPath, "utf8");
+        output[Buffer.byteLength(finalPath)] = 0;
+        return 0;
+      },
+    });
 
-    await expect(secureOpen(path.join(link, "loot.txt"), root, { maxBytes: 64 })).rejects.toMatchObject({
-      reason: "outside-root",
+    const openedRoot = await backend.openDirectory(root);
+    let opened: SecureOpenedFile | undefined;
+    try {
+      opened = await backend.open(target);
+      const revalidated = await openedRoot.revalidate();
+
+      expect(opened.finalPath).toBe("/trusted-root/artifact.txt");
+      expect(opened.regular).toBe(true);
+      expect(opened.size).toBe(6);
+      await expect(opened.read()).resolves.toEqual(Buffer.from("inside"));
+      expect(revalidated).toEqual({ finalPath: "/trusted-root", directory: true });
+
+      const [initialRoot, candidate, revalidatedRoot] = calls;
+      if (!initialRoot || !candidate || !revalidatedRoot) throw new Error("Darwin fcntl calls were incomplete");
+      expect(calls).toHaveLength(3);
+      expect(initialRoot.fd).toBe(revalidatedRoot.fd);
+      expect(candidate.fd).not.toBe(initialRoot.fd);
+      expect(calls.map(({ command }) => command)).toEqual([50, 50, 50]);
+      expect(calls.every(({ capacity }) => capacity >= 1024)).toBe(true);
+    } finally {
+      await opened?.close();
+      await openedRoot.close();
+    }
+  });
+
+  it("fails closed when Darwin F_GETPATH cannot prove an opened handle path", async () => {
+    const root = makeRoot();
+    const target = write(root, "artifact.txt", "inside");
+    const backend = createDarwinBackend({
+      fcntl: () => -1,
+    });
+
+    await expect(backend.open(target)).rejects.toMatchObject({
+      reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
   });
 
-  it.skipIf(process.platform === "linux" || process.platform === "win32")(
+  it.runIf(process.platform === "linux" || process.platform === "darwin")(
+    "rejects an actual symlink escape from the kernel handle target",
+    async () => {
+      const root = makeRoot();
+      const outsideRoot = makeRoot();
+      write(outsideRoot, "loot.txt", "outside");
+      const link = path.join(root, "escape");
+      symlinkSync(outsideRoot, link, "dir");
+
+      await expect(secureOpen(path.join(link, "loot.txt"), root, { maxBytes: 64 })).rejects.toMatchObject({
+        reason: "outside-root",
+      } satisfies Partial<SecureOpenError>);
+    }
+  );
+
+  it.runIf(process.platform === "darwin")("opens a real artifact through Darwin F_GETPATH", async () => {
+    const root = makeRoot();
+    const target = write(root, "artifact.txt", "inside");
+
+    await expect(secureOpen(target, root, { maxBytes: 64 })).resolves.toMatchObject({
+      relativePath: "artifact.txt",
+      bytes: Buffer.from("inside"),
+    });
+  });
+
+  it.skipIf(process.platform === "linux" || process.platform === "win32" || process.platform === "darwin")(
     "fails closed where no handle-bound backend exists",
     async () => {
       const root = makeRoot();

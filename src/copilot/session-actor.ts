@@ -675,11 +675,24 @@ export class SessionActor {
 
   /** File cards need their own fenced presentation path: a stalled flush must
    * not reset a newer turn after stop/timeout has already released its gate. */
-  private async beginFileDeliveryInteractionCard(owner: symbol, turnEpoch: number): Promise<boolean> {
+  private async beginFileDeliveryPermissionCard(owner: symbol, turnEpoch: number): Promise<boolean> {
     if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) return false;
     const inFlightTools = this.renderer.inFlightTools();
     await this.opts.transport.flush(this.opts.sessionKey).catch(() => {});
     if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) return false;
+    this.opts.transport.resetTurn(this.opts.sessionKey);
+    this.renderer = new TurnRenderer();
+    this.renderer.adoptTools(inFlightTools);
+    return true;
+  }
+
+  /** A file upload can wait on flush while a new turn or teardown supersedes it.
+   *  Check the approval immediately after that await, before touching the
+   *  renderer or transport state belonging to the newer turn. */
+  private async beginFileDeliveryInteractionCard(approval: ApprovedFileDelivery): Promise<boolean> {
+    await this.opts.transport.flush(this.opts.sessionKey).catch(() => {});
+    if (!this.fileDeliveryIsCurrent(approval)) return false;
+    const inFlightTools = this.renderer.inFlightTools();
     this.opts.transport.resetTurn(this.opts.sessionKey);
     this.renderer = new TurnRenderer();
     this.renderer.adoptTools(inFlightTools);
@@ -699,7 +712,7 @@ export class SessionActor {
         this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
         return;
       }
-      if (!(await this.beginFileDeliveryInteractionCard(owner, turnEpoch))) {
+      if (!(await this.beginFileDeliveryPermissionCard(owner, turnEpoch))) {
         this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
         return;
       }
@@ -839,8 +852,7 @@ export class SessionActor {
       return fileDeliveryFailure("File delivery limit reached; the file was not delivered.");
     }
 
-    await this.beginInteractionCard();
-    if (!this.fileDeliveryIsCurrent(approval)) {
+    if (!(await this.beginFileDeliveryInteractionCard(approval)) || !this.fileDeliveryIsCurrent(approval)) {
       return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
     }
 

@@ -80,6 +80,8 @@ const WIN32_FILE_ATTRIBUTE_NORMAL = 0x80;
 const WIN32_FILE_FLAG_BACKUP_SEMANTICS = 0x0200_0000;
 const WIN32_MAX_PATH_CHARS = 32_768;
 const WIN32_MAX_READ_CHUNK = 0xffff_ffff;
+const DARWIN_F_GETPATH = 50;
+const DARWIN_MAXPATHLEN = 1024;
 
 export function win32CreateFileFlags(target: "candidate" | "directory"): number {
   return WIN32_FILE_ATTRIBUTE_NORMAL | (target === "directory" ? WIN32_FILE_FLAG_BACKUP_SEMANTICS : 0);
@@ -209,6 +211,116 @@ const linuxBackend: SecureOpenBackend = {
       await handle.close();
       throw error;
     }
+  },
+};
+
+/** Direct libc boundary for Darwin's descriptor-to-path proof. */
+export interface DarwinFcntl {
+  fcntl(fd: number, command: number, output: Buffer): unknown;
+}
+
+let darwinFcntlPromise: Promise<DarwinFcntl> | undefined;
+
+async function loadDarwinFcntl(): Promise<DarwinFcntl> {
+  if (!darwinFcntlPromise) {
+    darwinFcntlPromise = (async () => {
+      const koffi = (await import("koffi")).default;
+      const libSystem = koffi.load("/usr/lib/libSystem.B.dylib");
+      return {
+        fcntl: rawCall(libSystem.func("fcntl", "int", ["int", "int", "void *"])),
+      };
+    })();
+  }
+  return darwinFcntlPromise;
+}
+
+function darwinFinalPath(api: DarwinFcntl, fd: number): string {
+  // Darwin bsd/sys/fcntl.h defines F_GETPATH (50) for a MAXPATHLEN buffer on this fd.
+  const buffer = Buffer.alloc(DARWIN_MAXPATHLEN);
+  const result = api.fcntl(fd, DARWIN_F_GETPATH, buffer);
+  if (result !== 0 && result !== 0n) {
+    throw refusal("unreadable", "Darwin F_GETPATH could not prove the opened handle path.");
+  }
+  const terminator = buffer.indexOf(0);
+  if (terminator <= 0) {
+    throw refusal("unreadable", "Darwin F_GETPATH returned an invalid handle path.");
+  }
+  const finalPath = buffer.subarray(0, terminator).toString("utf8");
+  if (!path.posix.isAbsolute(finalPath) || finalPath.endsWith(" (deleted)")) {
+    throw refusal("unreadable", "Darwin F_GETPATH did not return a live absolute handle path.");
+  }
+  return finalPath;
+}
+
+function assertDarwinHandleLinked(nlink: number): void {
+  if (!Number.isSafeInteger(nlink) || nlink < 1) {
+    throw refusal("unreadable", "The Darwin handle was deleted before its containment could be proved.");
+  }
+}
+
+async function openDarwin(candidate: string, api: DarwinFcntl): Promise<SecureOpenedFile> {
+  const handle = await fs.open(candidate, "r");
+  try {
+    const finalPath = darwinFinalPath(api, handle.fd);
+    const stat = await handle.stat();
+    assertDarwinHandleLinked(stat.nlink);
+    return {
+      finalPath,
+      regular: stat.isFile(),
+      size: stat.size,
+      identity: `${stat.dev}:${stat.ino}`,
+      modifiedAt: String(stat.mtimeMs),
+      read: () => handle.readFile(),
+      close: () => handle.close(),
+    };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+async function darwinDirectoryProof(api: DarwinFcntl, handle: Awaited<ReturnType<typeof fs.open>>): Promise<SecureDirectoryProof> {
+  const finalPath = darwinFinalPath(api, handle.fd);
+  const stat = await handle.stat();
+  assertDarwinHandleLinked(stat.nlink);
+  return {
+    finalPath,
+    directory: stat.isDirectory(),
+  };
+}
+
+async function openDarwinDirectory(trustedRoot: string, api: DarwinFcntl): Promise<SecureOpenedDirectory> {
+  const handle = await fs.open(trustedRoot, "r");
+  try {
+    const initial = await darwinDirectoryProof(api, handle);
+    if (!initial.directory) {
+      throw refusal("unreadable", "The Darwin trusted-root handle is not a directory.");
+    }
+    return {
+      ...initial,
+      revalidate: () => darwinDirectoryProof(api, handle),
+      close: () => handle.close(),
+    };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+/** Testable Darwin backend; production loads libSystem directly below. */
+export function createDarwinBackend(api: DarwinFcntl): SecureOpenBackend {
+  return {
+    open: (candidate) => openDarwin(candidate, api),
+    openDirectory: (trustedRoot) => openDarwinDirectory(trustedRoot, api),
+  };
+}
+
+const darwinBackend: SecureOpenBackend = {
+  async open(candidate: string): Promise<SecureOpenedFile> {
+    return openDarwin(candidate, await loadDarwinFcntl());
+  },
+  async openDirectory(trustedRoot: string): Promise<SecureOpenedDirectory> {
+    return openDarwinDirectory(trustedRoot, await loadDarwinFcntl());
   },
 };
 
@@ -518,6 +630,7 @@ const windowsBackend: SecureOpenBackend = {
 
 function defaultBackend(): SecureOpenBackend {
   if (process.platform === "linux") return linuxBackend;
+  if (process.platform === "darwin") return darwinBackend;
   if (process.platform === "win32") return windowsBackend;
   return {
     async open(): Promise<SecureOpenedFile> {

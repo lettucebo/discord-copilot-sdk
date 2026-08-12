@@ -748,34 +748,34 @@ describe("SessionActor permission handling", () => {
 
     it("releases the gate when stop overtakes a stalled pre-card resolver", async () => {
       const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-stop-stalled-resolver-"));
-      let releaseRealpath: (() => void) | undefined;
+      let releaseValidation: (() => void) | undefined;
       let first: Promise<unknown> | undefined;
-      let realpathSpy: ReturnType<typeof vi.spyOn> | undefined;
       try {
         writeArtifact(root, "artifact.txt", "artifact");
         const s = await setup({ workingDirectory: root });
-        const originalRealpath = fs.realpath;
-        let markRealpathStarted!: () => void;
-        const realpathStarted = new Promise<void>((resolve) => {
-          markRealpathStarted = resolve;
+        type FileApprovalValidator = (...args: unknown[]) => Promise<unknown>;
+        const actor = s.actor as unknown as { validateFileDeliveryApproval: FileApprovalValidator };
+        const originalValidate = actor.validateFileDeliveryApproval.bind(s.actor) as FileApprovalValidator;
+        let markValidationStarted!: () => void;
+        const validationStarted = new Promise<void>((resolve) => {
+          markValidationStarted = resolve;
         });
-        const stalledRealpath = new Promise<void>((resolve) => {
-          releaseRealpath = resolve;
+        const stalledValidation = new Promise<void>((resolve) => {
+          releaseValidation = resolve;
         });
-        realpathSpy = vi.spyOn(fs, "realpath").mockImplementation(async (...args) => {
-          if (String(args[0]) !== root) return originalRealpath(...args);
-          markRealpathStarted();
-          await stalledRealpath;
-          return originalRealpath(...args);
-        });
+        actor.validateFileDeliveryApproval = async (...args): Promise<unknown> => {
+          markValidationStarted();
+          await stalledValidation;
+          return originalValidate(...args);
+        };
 
         first = requestFilePermission(s, { path: "artifact.txt" }, "stop-stalled-resolver");
-        await realpathStarted;
+        await validationStarted;
         await expect(s.actor.stop()).resolves.toBe(true);
 
         // The stale resolver remains hung, but its old owner must not block a
         // fresh turn or produce a card once it is finally released.
-        realpathSpy.mockRestore();
+        actor.validateFileDeliveryApproval = originalValidate;
         await s.actor.send("begin a fresh turn");
         const before = s.transport.permissions.length;
         const later = requestFilePermission(s, { path: "artifact.txt" }, "after-stop-resolver");
@@ -783,8 +783,8 @@ describe("SessionActor permission handling", () => {
         s.transport.deliverDecision(view.nonce, "once", "u1");
         await expect(later).resolves.toEqual({ kind: "approve-once" });
 
-        if (!releaseRealpath) throw new Error("stalled resolver was never reached");
-        releaseRealpath();
+        if (!releaseValidation) throw new Error("stalled resolver was never reached");
+        releaseValidation();
         await expect(first).resolves.toEqual({ kind: "user-not-available" });
         expect(s.transport.permissions).toHaveLength(before + 1);
         await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "stop-stalled-resolver")).resolves.toMatchObject({
@@ -792,8 +792,7 @@ describe("SessionActor permission handling", () => {
         });
         expect(s.transport.sentFiles).toHaveLength(0);
       } finally {
-        releaseRealpath?.();
-        realpathSpy?.mockRestore();
+        releaseValidation?.();
         await Promise.allSettled([first].filter((request): request is Promise<unknown> => request !== undefined));
         rmSync(root, { recursive: true, force: true });
       }
@@ -959,10 +958,9 @@ describe("SessionActor permission handling", () => {
       }
     });
 
-    it("fails closed before another 8 MiB file is resolved and releases the gate after settlement", async () => {
+    it("fails closed before another 8 MiB approval is created and releases the gate after settlement", async () => {
       const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-concurrent-"));
       const s = await setup({ workingDirectory: root });
-      const realpathSpy = vi.spyOn(fs, "realpath");
       let first: Promise<unknown> | undefined;
       let second: Promise<unknown> | undefined;
       try {
@@ -981,7 +979,6 @@ describe("SessionActor permission handling", () => {
         ]);
         expect(secondResult).toEqual({ kind: "user-not-available" });
         expect(s.transport.permissions).toHaveLength(before + 1);
-        expect(realpathSpy).toHaveBeenCalledTimes(1);
 
         s.transport.deliverDecision(firstCard.nonce, "deny", "u1");
         await expect(first).resolves.toEqual({ kind: "reject" });
@@ -989,13 +986,11 @@ describe("SessionActor permission handling", () => {
         const laterBefore = s.transport.permissions.length;
         const later = requestFilePermission(s, { path: "second.zip" }, "later-large-file");
         const laterCard = await latestFilePermission(s, laterBefore);
-        expect(realpathSpy).toHaveBeenCalledTimes(2);
         s.transport.deliverDecision(laterCard.nonce, "once", "u1");
         await expect(later).resolves.toEqual({ kind: "approve-once" });
       } finally {
         await s.actor.stop();
         await Promise.allSettled([first, second].filter((request): request is Promise<unknown> => request !== undefined));
-        realpathSpy.mockRestore();
         rmSync(root, { recursive: true, force: true });
       }
     });
@@ -1141,7 +1136,67 @@ describe("SessionActor permission handling", () => {
       }
     });
 
-    it("rechecks abort/lifecycle state after the attachment fence before sending", async () => {
+    it("does not upload when resetTurn invalidates an approved file delivery", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-reset-invalidation-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        await approveFilePermission(s, { path: "artifact.txt" }, "fenced-file");
+        const originalResetTurn = s.transport.resetTurn.bind(s.transport);
+        s.transport.resetTurn = (): void => {
+          originalResetTurn();
+          void s.actor.stop();
+        };
+
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "fenced-file")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+        expect(s.transport.sentFiles).toHaveLength(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("does not reset a newer turn when file delivery becomes stale during its flush fence", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-newer-turn-fence-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        await approveFilePermission(s, { path: "artifact.txt" }, "fenced-file");
+
+        let releaseFlush: (() => void) | undefined;
+        let flushStarted: (() => void) | undefined;
+        const flushGate = new Promise<void>((resolve) => {
+          releaseFlush = resolve;
+        });
+        const started = new Promise<void>((resolve) => {
+          flushStarted = resolve;
+        });
+        const operationStart = s.transport.fileOperations.length;
+        s.transport.flush = async (): Promise<void> => {
+          s.transport.fileOperations.push("flush");
+          flushStarted?.();
+          await flushGate;
+        };
+
+        const invocation = invokeFileDelivery(s, { path: "artifact.txt" }, "fenced-file");
+        await started;
+        await s.actor.send("start a newer user turn");
+        s.session.emit("assistant.message_delta", { data: { deltaContent: "newer output" } });
+        const newerState = s.actor.state();
+        expect(newerState.assistantText).toBe("newer output");
+        releaseFlush?.();
+
+        await expect(invocation).resolves.toMatchObject({ resultType: "failure" });
+        expect(s.transport.fileOperations.slice(operationStart)).toEqual(["flush"]);
+        expect(s.transport.sentFiles).toHaveLength(0);
+        expect(s.actor.state()).toEqual(newerState);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("does not reset render state or upload when stop invalidates file delivery during its flush fence", async () => {
       const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-abort-fence-"));
       try {
         writeArtifact(root, "artifact.txt", "artifact");
@@ -1156,18 +1211,62 @@ describe("SessionActor permission handling", () => {
         const started = new Promise<void>((resolve) => {
           flushStarted = resolve;
         });
+        const operationStart = s.transport.fileOperations.length;
         s.transport.flush = async (): Promise<void> => {
+          s.transport.fileOperations.push("flush");
           flushStarted?.();
           await flushGate;
         };
 
+        s.session.emit("assistant.message_delta", { data: { deltaContent: "pre-stop output" } });
+        const priorState = s.actor.state();
         const invocation = invokeFileDelivery(s, { path: "artifact.txt" }, "fenced-file");
         await started;
         await s.actor.stop();
         releaseFlush?.();
 
         await expect(invocation).resolves.toMatchObject({ resultType: "failure" });
+        expect(s.transport.fileOperations.slice(operationStart)).toEqual(["flush"]);
         expect(s.transport.sentFiles).toHaveLength(0);
+        expect(s.actor.state()).toEqual(priorState);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("does not reset render state or upload when disconnect invalidates file delivery during its flush fence", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-disconnect-fence-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        await approveFilePermission(s, { path: "artifact.txt" }, "fenced-file");
+
+        let releaseFlush: (() => void) | undefined;
+        let flushStarted: (() => void) | undefined;
+        const flushGate = new Promise<void>((resolve) => {
+          releaseFlush = resolve;
+        });
+        const started = new Promise<void>((resolve) => {
+          flushStarted = resolve;
+        });
+        const operationStart = s.transport.fileOperations.length;
+        s.transport.flush = async (): Promise<void> => {
+          s.transport.fileOperations.push("flush");
+          flushStarted?.();
+          await flushGate;
+        };
+
+        s.session.emit("assistant.message_delta", { data: { deltaContent: "pre-disconnect output" } });
+        const priorState = s.actor.state();
+        const invocation = invokeFileDelivery(s, { path: "artifact.txt" }, "fenced-file");
+        await started;
+        await s.actor.disconnect();
+        releaseFlush?.();
+
+        await expect(invocation).resolves.toMatchObject({ resultType: "failure" });
+        expect(s.transport.fileOperations.slice(operationStart)).toEqual(["flush"]);
+        expect(s.transport.sentFiles).toHaveLength(0);
+        expect(s.actor.state()).toEqual(priorState);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
