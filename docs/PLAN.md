@@ -627,12 +627,19 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 - **content digest / endpoint truth**：送出前先固定內容與 digest；成功與否以 Discord 端點回應為準。即使取消發生在送出接近完成時，也只能回報 endpoint 真實結果，不得樂觀宣稱成功。
 - **YOLO fast deny**：`discord_send_file` 在 YOLO 下不是「自動允許」，而是立即拒絕並告知改走 `/file`。這是刻意把 outbound file capability 排除在 YOLO 的風險接受之外。
 - **allow-once only**：agent 路徑沒有 repo/session 級常駐授權；每次送檔都重新決定。
+- **持久化的保守預留配額**：agent `discord_send_file` 的 24 MiB 總量屬於邏輯 Discord thread 的
+  `SessionStore` record；舊 record 遷移為 0。實際呼叫 Discord 前，actor 必須以 persist-first
+  compare-and-reserve 寫入下一個總量，且 stale actor 無法覆寫較新的總量；寫入失敗即不送檔。
+  因此重啟、resume 與 rebind 都不能重開配額。
 - **mentions suppression**：所有 attachment sends 都必須保留 `allowedMentions:{parse:[]}`，避免 agent 藉檔案說明或 UI 路徑 ping 人。
 
 ### 18.4 平台事實與殘留風險
 
 - **8 MiB 上限**：以 Discord 實際上傳上限為準；超過即拒絕。
-- **取消不是回溯刪除保證**：若取消發生在 endpoint 已接近完成時，檔案可能短暫可見；但這種 late visibility **不得**被報告成成功，也不得算入成功計數。
+- **取消不是回溯刪除保證**：若取消發生在 endpoint 已接近完成時，檔案可能短暫可見；這種 late visibility **不得**被報告成成功，也不得算入每回合的成功送檔計數。
+- **保守可用性取捨**：24 MiB 是送出前已持久化的預留總量，不是「Discord 回應成功」後才計的 bytes。
+  transport 失敗、取消或 late deletion 仍消耗預留額度；不做 fragile rollback，以免 crash/restart
+  使同一 thread 反覆重開配額。代價是未成功的送檔也可能耗盡該 thread 的剩餘額度。
 - **thread visibility / CDN expiry**：檔案一旦成功送出，誰看得到由 Discord thread 權限決定；附件 CDN 存續時間與快取失效屬平台行為，本程式只能如實揭露，不能保證立即失效。
 - **best-effort late deletion / platform availability**：若後續清理由 Discord API 或平台狀態限制而失敗，只能 best effort 嘗試並誠實回報；不能把未刪除說成已收回。
 
@@ -643,3 +650,5 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | `/channel enable` 缺權限診斷包含 `Attach Files` | `test/app-channels.test.ts` |
 | 所有 attachment sends 都 suppress mentions | `test/transport.test.ts` |
 | `discord_send_file` Allow once / Deny、YOLO fast deny、root/content/digest 綁定、endpoint truth、late cancellation 不算成功 | `test/session-actor.test.ts`、`test/app-file-command.test.ts` |
+| 24 MiB 持久化保守預留、舊 record 遷移、CAS stale-actor fence、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
+| session dispose 後可重新顯示一次 Attach Files 缺權限提示 | `test/transport.test.ts` |

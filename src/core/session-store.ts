@@ -8,8 +8,9 @@ export type SessionState = "creating" | "active" | "orphaned" | "blocked";
 
 /** v1 stored ONE bare record at the top level. v2 stores many, plus a
  *  generation high-water mark. v3 adds `devMode`, because it can no longer be
- *  inferred (see `asRecord`). Older files are migrated on read. */
-const SCHEMA_VERSION = 3;
+ *  inferred (see `asRecord`). v4 adds the conservatively reserved file-delivery
+ *  byte total. Older files are migrated on read. */
+const SCHEMA_VERSION = 4;
 
 export interface SessionRecord {
   schemaVersion: number;
@@ -28,6 +29,10 @@ export interface SessionRecord {
   /** How this session gets its working directory. See `asRecord` for why this
    *  is persisted rather than inferred from `branch`. */
   devMode: DevMode;
+  /** Bytes durably reserved for agent-initiated attachment delivery in this
+   *  logical Discord thread. Reservations are intentionally not rolled back
+   *  after a transport failure, so a restart cannot reopen this quota. */
+  fileDeliveryBytes: number;
   /** Git branch checked out in `workDir`, when it is a worktree we created. */
   branch?: string;
   state: SessionState;
@@ -46,6 +51,9 @@ export interface SessionBinding {
   parentChannelId: string;
   workDir: string;
   devMode: DevMode;
+  /** Omit only for a fresh logical thread; it starts with zero reserved bytes.
+   *  Rebind must explicitly carry the prior record's total forward. */
+  fileDeliveryBytes?: number;
   branch?: string;
 }
 
@@ -111,6 +119,7 @@ export class SessionStore {
   /** Reserve a session as `creating` BEFORE createSession, using a caller-assigned
    *  session id. Returns durability. */
   reserve(b: SessionBinding): boolean {
+    if (!isFileDeliveryBytes(b.fileDeliveryBytes ?? 0)) return false;
     return this.mutate((m, hw) => {
       m.set(b.threadId, { ...this.toRecord(b), state: "creating" });
       return Math.max(hw, b.generation);
@@ -124,6 +133,27 @@ export class SessionStore {
     return this.mutate((m, hw) => {
       const cur = m.get(threadId)!;
       m.set(threadId, { ...cur, state: "active", updatedAt: Date.now() });
+      return hw;
+    });
+  }
+
+  /** Atomically compare-and-reserve the next total for agent file delivery.
+   *  This is persist-first: false means the in-memory total was NOT changed,
+   *  so callers must fail closed before any attachment leaves the process. The
+   *  expected total fences a stale actor left briefly alive during rebind. */
+  reserveFileDeliveryBytes(threadId: string, expectedTotal: number, nextTotal: number): boolean {
+    if (
+      !isFileDeliveryBytes(expectedTotal) ||
+      !isFileDeliveryBytes(nextTotal) ||
+      nextTotal <= expectedTotal
+    ) {
+      return false;
+    }
+    const current = this.sessions.get(threadId);
+    if (!current || current.fileDeliveryBytes !== expectedTotal) return false;
+    return this.mutate((m, hw) => {
+      const record = m.get(threadId)!;
+      m.set(threadId, { ...record, fileDeliveryBytes: nextTotal, updatedAt: Date.now() });
       return hw;
     });
   }
@@ -176,6 +206,7 @@ export class SessionStore {
       parentChannelId: b.parentChannelId,
       workDir: b.workDir,
       devMode: b.devMode,
+      fileDeliveryBytes: b.fileDeliveryBytes ?? 0,
       ...(b.branch ? { branch: b.branch } : {}),
       state: "active",
       updatedAt: Date.now(),
@@ -292,7 +323,11 @@ export class SessionStore {
   }
 }
 
-/** Parse either a v2 store file or a bare v1 record, or undefined if neither. */
+function isFileDeliveryBytes(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Parse a versioned multi-session file or a bare v1 record, or undefined if neither. */
 function readRecords(v: unknown): { sessions: SessionRecord[]; highWater: number } | undefined {
   if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
   const o = v as Record<string, unknown>;
@@ -387,6 +422,19 @@ function asRecord(v: unknown): SessionRecord | undefined {
         : "local";
   if (devMode === undefined) return undefined;
   const reason = str("reason");
+  const rawFileDeliveryBytes = r["fileDeliveryBytes"];
+  // A missing field is a migration ONLY for records written before v4. A v4+
+  // record that omits or corrupts its quota must fail closed rather than reopen
+  // a thread's attachment budget after a hand edit or torn upgrade.
+  const fileDeliveryBytes =
+    rawFileDeliveryBytes === undefined
+      ? schemaVersion < SCHEMA_VERSION
+        ? 0
+        : undefined
+      : isFileDeliveryBytes(rawFileDeliveryBytes)
+        ? rawFileDeliveryBytes
+        : undefined;
+  if (fileDeliveryBytes === undefined) return undefined;
 
   return {
     schemaVersion,
@@ -398,6 +446,7 @@ function asRecord(v: unknown): SessionRecord | undefined {
     parentChannelId,
     workDir,
     devMode,
+    fileDeliveryBytes,
     ...(branch ? { branch } : {}),
     state,
     ...(reason ? { reason } : {}),

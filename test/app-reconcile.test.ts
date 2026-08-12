@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterAll, afterEach } from "vitest";
 import { DiscordCopilotApp } from "../src/app.js";
-import type { SessionActor } from "../src/copilot/session-actor.js";
+import { SessionActor, type SessionActorOpts } from "../src/copilot/session-actor.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
 import type { CopilotClient } from "@github/copilot-sdk";
@@ -271,6 +271,32 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       expect(classifiedParent).toBe("c1");
       expect(transport.notices.some((n) => n.includes("復原"))).toBe(true);
     } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
+  it("passes a resumed record's durable file quota and store callback to its actor", async () => {
+    const f = tmpFile();
+    const seen: SessionActorOpts[] = [];
+    const originalCreate = SessionActor.create;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation((client, options, dependencies) => {
+      seen.push(options);
+      return originalCreate(client, options, dependencies);
+    });
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ fileDeliveryBytes: 17 }));
+      store.commit("t1");
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+
+      await reconcile(app, async () => "valid");
+
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.initialFileDeliveryBytes).toBe(17);
+      expect(seen[0]!.reserveFileDeliveryBytes(18, 17)).toBe(true);
+      expect(store.get("t1")?.fileDeliveryBytes).toBe(18);
+    } finally {
+      createSpy.mockRestore();
       rmSync(f, { force: true });
     }
   });

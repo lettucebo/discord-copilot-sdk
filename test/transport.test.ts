@@ -556,6 +556,21 @@ describe("DiscordTransport sendFile", () => {
     expect(ch.sent[0]!.opts!["allowedMentions"]).toEqual({ parse: [] });
   });
 
+  it("forgets an Attach Files notice when its session is disposed", async () => {
+    const ch = new FakeChannel();
+    ch.permissionsForResult = { has: () => false };
+    const t = new DiscordTransport(fakeClient(ch));
+
+    await t.sendFile("thread", outboundFile());
+    await t.sendFile("thread", outboundFile());
+    expect(ch.sent).toHaveLength(1);
+
+    t.dispose("thread");
+    await t.sendFile("thread", outboundFile());
+
+    expect(ch.sent).toHaveLength(2);
+  });
+
   it.each([
     [50013, "no-attach-permission"],
     [40005, "too-large"],

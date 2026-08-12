@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +11,7 @@ import { addWorktree } from "../src/core/worktree.js";
 import { canonicalPathOr } from "../src/core/repo.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
 import type { CopilotClient } from "@github/copilot-sdk";
+import { SessionActor, type SessionActorOpts } from "../src/copilot/session-actor.js";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import type { DevMode } from "../src/core/binding.js";
 
@@ -369,6 +370,28 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     expect(out).toMatch(/全新的對話/);
     expect(sessions(app).get("t1")?.hasRunTurn).toBe(false);
     expect(sessions(app).get("t1")?.repoPath).toBe(repoB);
+  });
+
+  it("preserves and wires the durable file quota when rebinding the thread", async () => {
+    const { app, store } = harness();
+    expect(store.reserveFileDeliveryBytes("t1", 0, 17)).toBe(true);
+    const seen: SessionActorOpts[] = [];
+    const originalCreate = SessionActor.create;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation((client, options, dependencies) => {
+      seen.push(options);
+      return originalCreate(client, options, dependencies);
+    });
+    try {
+      const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+
+      expect(out).toMatch(/已改綁/);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.initialFileDeliveryBytes).toBe(17);
+      expect(seen[0]!.reserveFileDeliveryBytes(18, 17)).toBe(true);
+      expect(store.get("t1")?.fileDeliveryBytes).toBe(18);
+    } finally {
+      createSpy.mockRestore();
+    }
   });
 
   it("preserves a secondary parent channel in the rebound durable record", async () => {

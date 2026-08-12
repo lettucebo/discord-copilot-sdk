@@ -345,6 +345,7 @@ export class DiscordTransport implements Transport {
     const s = this.sessions.get(sessionKey);
     if (s?.timer) clearTimeout(s.timer);
     this.sessions.delete(sessionKey);
+    this.attachNoticeSessions.delete(sessionKey);
   }
 
   private async fetchThread(id: string): Promise<MinimalTextChannel | undefined> {

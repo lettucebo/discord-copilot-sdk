@@ -118,6 +118,10 @@ function approvedOnce(result: unknown): boolean {
   return isRecord(result) && result["kind"] === "approve-once";
 }
 
+function isFileDeliveryByteTotal(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 function fileDeliveryFailure(text: string): ToolResultObject {
   return { resultType: "failure", textResultForLlm: text, error: text };
 }
@@ -146,6 +150,13 @@ export interface SessionActorOpts {
   transport: Transport;
   /** discord-copilot-sdk-side approval memory (session + persisted repo rules). */
   policy: ApprovalPolicy;
+  /** Bytes already durably reserved by this logical Discord thread before this
+   *  actor was created or resumed. */
+  initialFileDeliveryBytes: number;
+  /** Atomically persist a next reservation for this logical thread only when
+   *  its durable total still equals `expectedCurrent`. A false result must
+   *  prevent the attachment send. */
+  reserveFileDeliveryBytes(nextTotal: number, expectedCurrent: number): boolean;
   /** Durable record of auto-approved actions. A write failure fails YOLO closed. */
   auditLog?: AuditSink;
   /** Session incarnation (P1: always 1; P2 resume will vary this). */
@@ -243,9 +254,11 @@ export class SessionActor {
   /** Incremented whenever a pending approval becomes stale (new turn/teardown). */
   private fileApprovalEpoch = 0;
   private successfulFileDeliveriesThisTurn = 0;
-  private successfulFileDeliveryBytes = 0;
-  /** Serializes sends so a concurrent pair cannot both pass a quota that is
-   * intentionally counted only after Discord confirms success. */
+  /** Per-logical-thread durable quota mirrored locally after each successful
+   *  reservation. It is never reset at a turn boundary. */
+  private fileDeliveryBytes: number;
+  /** Serializes sends so a concurrent pair cannot reserve from the same stale
+   *  total and each believe it fits the durable quota. */
   private fileDeliveryChain: Promise<void> = Promise.resolve();
   /** True while a /stop abort is in flight — new permissions fail closed. */
   private aborting = false;
@@ -295,6 +308,10 @@ export class SessionActor {
     this.currentModel = opts.model;
     this.currentContext = opts.contextTier;
     this.auditLog = opts.auditLog ?? new AuditLog();
+    if (!isFileDeliveryByteTotal(opts.initialFileDeliveryBytes)) {
+      throw new Error("initial file delivery byte total is invalid");
+    }
+    this.fileDeliveryBytes = opts.initialFileDeliveryBytes;
   }
 
   static async create(
@@ -898,14 +915,32 @@ export class SessionActor {
     if (!this.fileDeliveryIsCurrent(approval)) {
       return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
     }
+    const expectedFileDeliveryBytes = this.fileDeliveryBytes;
+    const nextFileDeliveryBytes = expectedFileDeliveryBytes + file.size;
     if (
       this.successfulFileDeliveriesThisTurn >= FILE_DELIVERY_TURN_LIMIT ||
-      this.successfulFileDeliveryBytes + file.size > FILE_DELIVERY_SESSION_BYTE_LIMIT
+      nextFileDeliveryBytes > FILE_DELIVERY_SESSION_BYTE_LIMIT
     ) {
       return fileDeliveryFailure("File delivery limit reached; the file was not delivered.");
     }
 
     if (!(await this.beginFileDeliveryInteractionCard(approval)) || !this.fileDeliveryIsCurrent(approval)) {
+      return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
+    }
+    let reserved = false;
+    try {
+      reserved = this.opts.reserveFileDeliveryBytes(nextFileDeliveryBytes, expectedFileDeliveryBytes) === true;
+    } catch {
+      reserved = false;
+    }
+    if (!reserved) {
+      return fileDeliveryFailure("File delivery could not reserve its durable quota; the file was not delivered.");
+    }
+    this.fileDeliveryBytes = nextFileDeliveryBytes;
+    // Deliberately do NOT roll this back after a transport failure, cancellation,
+    // or late deletion: conservative availability prevents a crash/restart from
+    // reopening the thread's quota and is safer than a fragile compensating write.
+    if (!this.fileDeliveryIsCurrent(approval)) {
       return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
     }
 
@@ -929,9 +964,7 @@ export class SessionActor {
       }
       return fileDeliveryFailure(`Discord file delivery failed: ${sent.reason}.`);
     }
-
     this.successfulFileDeliveriesThisTurn++;
-    this.successfulFileDeliveryBytes += file.size;
     return {
       resultType: "success",
       textResultForLlm: "The file was delivered to the Discord thread.",

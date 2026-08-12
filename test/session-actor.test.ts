@@ -281,6 +281,13 @@ async function setup(
   const auditLog = new FakeAuditLog();
   let config: Record<string, unknown> = {};
   const box: { resumeArgs?: { id: string; cfg: Record<string, unknown> } } = {};
+  let persistedFileDeliveryBytes =
+    typeof extra["initialFileDeliveryBytes"] === "number" ? extra["initialFileDeliveryBytes"] : 0;
+  const reserveFileDeliveryBytes = (nextTotal: number, expectedCurrent = persistedFileDeliveryBytes): boolean => {
+    if (expectedCurrent !== persistedFileDeliveryBytes || nextTotal <= expectedCurrent) return false;
+    persistedFileDeliveryBytes = nextTotal;
+    return true;
+  };
   const client = {
     createSession: async (cfg: Record<string, unknown>) => {
       config = cfg;
@@ -303,6 +310,8 @@ async function setup(
       transport,
       policy,
       auditLog,
+      initialFileDeliveryBytes: persistedFileDeliveryBytes,
+      reserveFileDeliveryBytes,
       ...extra,
     },
     dependencies
@@ -629,6 +638,8 @@ describe("SessionActor trusted roots", () => {
         broker: new PendingInteractionBroker(),
         transport: new FakeTransport(),
         policy: new ApprovalPolicy(join(tmpdir(), `dcs-test-approvals-${Math.random()}.json`)),
+        initialFileDeliveryBytes: 0,
+        reserveFileDeliveryBytes: () => true,
       })
     ).rejects.toThrow();
 
@@ -733,6 +744,8 @@ describe("SessionActor trusted roots", () => {
           broker: new PendingInteractionBroker(),
           transport: new FakeTransport(),
           policy: new ApprovalPolicy(join(tmpdir(), `dcs-test-approvals-${Math.random()}.json`)),
+          initialFileDeliveryBytes: 0,
+          reserveFileDeliveryBytes: () => true,
         },
         retained.dependencies
       )
@@ -1350,7 +1363,7 @@ describe("SessionActor permission handling", () => {
     it("does not consume the new turn quota when a delayed upload becomes stale", async () => {
       const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-stale-send-quota-"));
       try {
-        writeArtifact(root, "artifact.txt", "artifact");
+        writeArtifact(root, "artifact.txt", "x");
         const s = await setup({ workingDirectory: root });
         await approveFilePermission(s, { path: "artifact.txt" }, "stale-send");
 
@@ -1424,6 +1437,123 @@ describe("SessionActor permission handling", () => {
           invokeFileDelivery(byteLimited, { path: "small.txt" }, "over-session-bytes")
         ).resolves.toMatchObject({ resultType: "failure" });
         expect(byteLimited.transport.sentFiles).toHaveLength(3);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("honors the persisted quota when resuming an SDK session", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-resume-quota-"));
+      try {
+        writeArtifact(root, "artifact.txt", "x");
+        const reserveFileDeliveryBytes = vi.fn(() => true);
+        const s = await setup({
+          workingDirectory: root,
+          resumeSessionId: "persisted-sdk-session",
+          initialFileDeliveryBytes: 24 * 1024 * 1024,
+          reserveFileDeliveryBytes,
+        });
+
+        await approveFilePermission(s, { path: "artifact.txt" }, "over-persisted-quota");
+        await expect(
+          invokeFileDelivery(s, { path: "artifact.txt" }, "over-persisted-quota")
+        ).resolves.toMatchObject({ resultType: "failure" });
+
+        expect(s.resumeArgs?.id).toBe("persisted-sdk-session");
+        expect(reserveFileDeliveryBytes).not.toHaveBeenCalled();
+        expect(s.transport.sentFiles).toHaveLength(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("durably reserves the next total before sending an approved file", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-reserve-order-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const operations: string[] = [];
+        let s!: Setup;
+        const reserveFileDeliveryBytes = vi.fn((nextTotal: number) => {
+          expect(s.transport.sentFiles).toHaveLength(0);
+          operations.push(`reserve:${nextTotal}`);
+          return true;
+        });
+        s = await setup({
+          workingDirectory: root,
+          initialFileDeliveryBytes: 10,
+          reserveFileDeliveryBytes,
+        });
+        s.transport.sendFileStarted = () => operations.push("send");
+
+        await approveFilePermission(s, { path: "artifact.txt" }, "reserve-before-send");
+        await expect(
+          invokeFileDelivery(s, { path: "artifact.txt" }, "reserve-before-send")
+        ).resolves.toMatchObject({ resultType: "success" });
+
+        expect(reserveFileDeliveryBytes).toHaveBeenCalledExactlyOnceWith(18, 10);
+        expect(operations).toEqual(["reserve:18", "send"]);
+        expect(s.transport.sentFiles).toHaveLength(1);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("fails closed when durable file quota reservation fails", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-reserve-fails-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const reserveFileDeliveryBytes = vi.fn(() => false);
+        const s = await setup({
+          workingDirectory: root,
+          initialFileDeliveryBytes: 4,
+          reserveFileDeliveryBytes,
+        });
+
+        await approveFilePermission(s, { path: "artifact.txt" }, "reserve-fails");
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "reserve-fails")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+
+        expect(reserveFileDeliveryBytes).toHaveBeenCalledExactlyOnceWith(12, 4);
+        expect(s.transport.sentFiles).toHaveLength(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps failed and cancelled uploads in the durable reservation total", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-reserve-consume-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const reserveFileDeliveryBytes = vi.fn(() => true);
+        const s = await setup({
+          workingDirectory: root,
+          initialFileDeliveryBytes: 5,
+          reserveFileDeliveryBytes,
+        });
+
+        await approveFilePermission(s, { path: "artifact.txt" }, "transport-failure");
+        s.transport.sendFileResult = { ok: false, reason: "blocked" };
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "transport-failure")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+
+        await approveFilePermission(s, { path: "artifact.txt" }, "transport-cancelled");
+        s.transport.sendFileResult = { ok: false, reason: "cancelled" };
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "transport-cancelled")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+
+        await approveFilePermission(s, { path: "artifact.txt" }, "transport-success");
+        s.transport.sendFileResult = { ok: true };
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "transport-success")).resolves.toMatchObject({
+          resultType: "success",
+        });
+
+        expect(reserveFileDeliveryBytes).toHaveBeenNthCalledWith(1, 13, 5);
+        expect(reserveFileDeliveryBytes).toHaveBeenNthCalledWith(2, 21, 13);
+        expect(reserveFileDeliveryBytes).toHaveBeenNthCalledWith(3, 29, 21);
+        expect(s.transport.sentFiles).toHaveLength(3);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -2351,6 +2481,8 @@ describe("SessionActor resume/create-id seam (P2)", () => {
       broker: new PendingInteractionBroker(),
       transport: new FakeTransport(),
       policy: new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`)),
+      initialFileDeliveryBytes: 0,
+      reserveFileDeliveryBytes: () => true,
       resumeSessionId: "sess-123",
       model: "gpt-5.4", // the startup default — must NOT win
       contextTier: "default",

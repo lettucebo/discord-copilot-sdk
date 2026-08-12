@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { ChannelType, type ChatInputCommandInteraction } from "discord.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import { DiscordCopilotApp } from "../src/app.js";
+import { SessionActor, type SessionActorOpts } from "../src/copilot/session-actor.js";
 import type { Config } from "../src/config.js";
 import type { Binding, BindingDeps, BindingVerdict } from "../src/core/binding.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
@@ -22,6 +23,7 @@ const UNRELATED = "50000";
 const FIXTURES = join(process.cwd(), ".test-fixtures-app-channels-race");
 const RACE_THREAD_ID = `channel-race-reserve-fence-${process.pid}`;
 const UNRELATED_RACE_THREAD_ID = `channel-race-unrelated-mutation-${process.pid}`;
+const QUOTA_THREAD_ID = `channel-race-file-quota-${process.pid}`;
 const run = promisify(execFile);
 
 let cleanupRepo: string | undefined;
@@ -55,6 +57,21 @@ class FakeTransport implements Transport {
   async flush(): Promise<void> {}
   resetTurn(): void {}
   dispose(): void {}
+}
+
+function fakeCopilot(): CopilotClient {
+  return {
+    async createSession() {
+      return {
+        sessionId: "new-session",
+        on(): void {},
+        async send(): Promise<void> {},
+        async abort(): Promise<void> {},
+        async disconnect(): Promise<void> {},
+        rpc: { plan: { readSqlTodosWithDependencies: async () => ({ rows: [], dependencies: [] }) } },
+      };
+    },
+  } as unknown as CopilotClient;
 }
 
 interface FakeSlash {
@@ -334,6 +351,52 @@ describe("/new channel-registry epoch fence", { timeout: 60_000 }, () => {
       expect(interaction.edits.join("\n")).not.toContain("這期間被停用了，沒有建立 session");
       expect(interaction.edits.join("\n")).toContain("已回復");
     } finally {
+      await cleanupKnownWorktree();
+    }
+  });
+
+  it("starts a new thread with a zero durable file quota and a store-backed reservation callback", async () => {
+    const reposRoot = join(FIXTURES, "repos");
+    const repoPath = await makeRepo();
+    const registry = new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels.json"));
+    expect(registry.enable(SECONDARY, OWNER)).toBe(true);
+    const store = new SessionStore(join(FIXTURES, "sessions.json"));
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      fakeCopilot(),
+      new FakeTransport(),
+      store,
+      registry
+    );
+    const branch = worktreeBranch(QUOTA_THREAD_ID);
+    const expectedWorktree = worktreePath(worktreeRoot(), repoPath, QUOTA_THREAD_ID);
+    cleanupRepo = repoPath;
+    cleanupWorktree = expectedWorktree;
+    cleanupBranch = branch;
+    const fakeThread = { id: QUOTA_THREAD_ID, delete: async (): Promise<void> => {} };
+    const seen: SessionActorOpts[] = [];
+    const originalCreate = SessionActor.create;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation((client, options, dependencies) => {
+      seen.push(options);
+      return originalCreate(client, options, dependencies);
+    });
+    try {
+      patchChannelFetch(app, async () => ({
+        type: ChannelType.GuildText,
+        threads: { create: async () => fakeThread },
+      }));
+      patchBindingCheck(app, async () => ({ ok: true }));
+
+      await cmdNew(app, asInteraction(slash()));
+
+      expect(store.get(QUOTA_THREAD_ID)?.fileDeliveryBytes).toBe(0);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.initialFileDeliveryBytes).toBe(0);
+      expect(seen[0]!.reserveFileDeliveryBytes(1, 0)).toBe(true);
+      expect(store.get(QUOTA_THREAD_ID)?.fileDeliveryBytes).toBe(1);
+    } finally {
+      createSpy.mockRestore();
       await cleanupKnownWorktree();
     }
   });

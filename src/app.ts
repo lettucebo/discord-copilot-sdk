@@ -63,6 +63,7 @@ import {
   SessionActor,
   type BlobAttachment,
   type SessionActorCreateDependencies,
+  type SessionActorOpts,
   formatTodos,
 } from "./copilot/session-actor.js";
 import { ApprovalPolicy } from "./core/approval-policy.js";
@@ -512,6 +513,20 @@ export class DiscordCopilotApp {
     return {
       enableRepoSkills: this.config.ENABLE_REPO_SKILLS === "true",
       enableUserSkills: this.config.ENABLE_USER_SKILLS === "true",
+    };
+  }
+
+  /** Keep every actor tied to the record that owns its logical Discord thread.
+   *  The callback is deliberately required even in createForTest, so no actor
+   *  can send attachments against an in-memory-only quota. */
+  private fileDeliveryQuotaOptions(
+    threadId: string,
+    initialFileDeliveryBytes: number
+  ): Pick<SessionActorOpts, "initialFileDeliveryBytes" | "reserveFileDeliveryBytes"> {
+    return {
+      initialFileDeliveryBytes,
+      reserveFileDeliveryBytes: (nextTotal, expectedCurrent) =>
+        this.store.reserveFileDeliveryBytes(threadId, expectedCurrent, nextTotal),
     };
   }
 
@@ -1212,6 +1227,7 @@ export class DiscordCopilotApp {
       // runtime session nobody knows about.
       const sessionId = randomUUID();
       const generation = this.store.nextGeneration();
+      const fileDeliveryBytes = 0;
 
       // Every new session is isolated. `local` is reachable only through an
       // explicit `/repo dev local` in the thread — a config key that made it the
@@ -1283,6 +1299,7 @@ export class DiscordCopilotApp {
         parentChannelId,
         workDir,
         devMode,
+        fileDeliveryBytes,
         branch,
       });
       if (!reserved) {
@@ -1304,6 +1321,7 @@ export class DiscordCopilotApp {
           policy: this.approvals,
           generation,
           createSessionId: sessionId,
+          ...this.fileDeliveryQuotaOptions(thread.id, fileDeliveryBytes),
           ...this.skillSourceOptions(),
         }, this.actorCreateDependencies);
       } catch (err) {
@@ -2323,6 +2341,9 @@ export class DiscordCopilotApp {
     const sessionId = randomUUID();
     const generation = this.store.nextGeneration();
     const previous = this.store.get(threadId);
+    // A rebind replaces the SDK conversation but not the Discord thread that
+    // owns this outbound capability, so retain its conservative quota.
+    const fileDeliveryBytes = previous?.fileDeliveryBytes ?? 0;
     const reserved = this.store.reserve({
       threadId,
       sessionId,
@@ -2337,6 +2358,7 @@ export class DiscordCopilotApp {
       parentChannelId: session.parentChannelId,
       workDir,
       devMode: target.devMode,
+      fileDeliveryBytes,
       branch,
     });
     if (!reserved) {
@@ -2359,6 +2381,7 @@ export class DiscordCopilotApp {
         policy: this.approvals,
         generation,
         createSessionId: sessionId,
+        ...this.fileDeliveryQuotaOptions(threadId, fileDeliveryBytes),
         ...this.skillSourceOptions(),
       }, this.actorCreateDependencies);
     } catch (err) {
@@ -2922,6 +2945,7 @@ export class DiscordCopilotApp {
         policy: this.approvals,
         generation: rec.generation,
         resumeSessionId: rec.sessionId,
+        ...this.fileDeliveryQuotaOptions(rec.threadId, rec.fileDeliveryBytes),
         ...this.skillSourceOptions(),
       }, this.actorCreateDependencies);
     } catch (err) {

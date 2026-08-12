@@ -180,9 +180,109 @@ describe("SessionStore — v1 migration", () => {
     const s = new SessionStore(f);
     s.reserve(bind("new-thread", { generation: s.nextGeneration() }));
     const onDisk = JSON.parse(readFileSync(f, "utf8")) as { schemaVersion: number; sessions: unknown[] };
-    expect(onDisk.schemaVersion).toBe(3);
+    expect(onDisk.schemaVersion).toBe(4);
     expect(onDisk.sessions).toHaveLength(2);
     expect(new SessionStore(f).get("old-thread")?.sessionId).toBe("old-sess");
+  });
+});
+
+describe("SessionStore — durable file delivery quota", () => {
+  it("defaults a new record and migrates a pre-quota record to zero bytes", () => {
+    const freshFile = tmpFile();
+    const fresh = new SessionStore(freshFile);
+    expect(fresh.reserve(bind("fresh"))).toBe(true);
+    expect(fresh.get("fresh")?.fileDeliveryBytes).toBe(0);
+    expect(new SessionStore(freshFile).get("fresh")?.fileDeliveryBytes).toBe(0);
+
+    const legacyFile = tmpFile();
+    writeFileSync(
+      legacyFile,
+      JSON.stringify({
+        schemaVersion: 3,
+        generationHighWater: 1,
+        sessions: [
+          {
+            schemaVersion: 3,
+            threadId: "legacy",
+            sessionId: "s-legacy",
+            generation: 1,
+            repoPath: "C:\\repo",
+            guildId: "g1",
+            parentChannelId: "p1",
+            workDir: "C:\\repo",
+            devMode: "local",
+            state: "active",
+            updatedAt: 1,
+          },
+        ],
+      }),
+      "utf8"
+    );
+    const legacy = new SessionStore(legacyFile);
+    expect(legacy.isCorrupt()).toBe(false);
+    expect(legacy.get("legacy")?.fileDeliveryBytes).toBe(0);
+    expect(legacy.commit("legacy")).toBe(true);
+    expect(JSON.parse(readFileSync(legacyFile, "utf8")).sessions[0].fileDeliveryBytes).toBe(0);
+  });
+
+  it("rejects a malformed persisted byte total rather than resetting it to zero", () => {
+    const f = tmpFile();
+    writeFileSync(
+      f,
+      JSON.stringify({
+        schemaVersion: 3,
+        generationHighWater: 1,
+        sessions: [
+          {
+            schemaVersion: 3,
+            threadId: "t1",
+            sessionId: "s1",
+            generation: 1,
+            repoPath: "C:\\repo",
+            guildId: "g1",
+            parentChannelId: "p1",
+            workDir: "C:\\repo",
+            devMode: "local",
+            state: "active",
+            updatedAt: 1,
+            fileDeliveryBytes: "not-a-byte-total",
+          },
+        ],
+      }),
+      "utf8"
+    );
+
+    const store = new SessionStore(f);
+    expect(store.isCorrupt()).toBe(true);
+    expect(store.all()).toEqual([]);
+  });
+
+  it("persists a compare-and-set file delivery reservation", () => {
+    const f = tmpFile();
+    const store = new SessionStore(f);
+    expect(store.reserve(bind("t1"))).toBe(true);
+    expect(store.reserveFileDeliveryBytes("t1", 0, 42)).toBe(true);
+    expect(store.get("t1")?.fileDeliveryBytes).toBe(42);
+    expect(new SessionStore(f).get("t1")?.fileDeliveryBytes).toBe(42);
+    expect(store.reserveFileDeliveryBytes("t1", 0, 50)).toBe(false);
+    expect(store.reserveFileDeliveryBytes("t1", 42, 41)).toBe(false);
+    expect(store.get("t1")?.fileDeliveryBytes).toBe(42);
+  });
+
+  it("keeps the prior byte total in memory when its durable reservation fails", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dcs-store-quota-ro-"));
+    const f = join(dir, "s.json");
+    const store = new SessionStore(f);
+    expect(store.reserve(bind("t1"))).toBe(true);
+    expect(store.reserveFileDeliveryBytes("t1", 0, 10)).toBe(true);
+    rmSync(f, { force: true });
+    mkdirSync(f);
+    try {
+      expect(store.reserveFileDeliveryBytes("t1", 10, 20)).toBe(false);
+      expect(store.get("t1")?.fileDeliveryBytes).toBe(10);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
