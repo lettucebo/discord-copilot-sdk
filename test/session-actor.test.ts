@@ -16,7 +16,7 @@ import type { RenderState } from "../src/core/turn-render.js";
 import { MAX_DISCORD_UPLOAD_BYTES, type OutboundFile } from "../src/core/outbound-file.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, promises as fs, rmSync, writeFileSync } from "node:fs";
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
@@ -714,6 +714,38 @@ describe("SessionActor permission handling", () => {
       }
     });
 
+    it("releases the validation gate when a failed card's notice cannot finish", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-card-failure-gate-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        const originalShowPermission = s.transport.showPermission.bind(s.transport);
+        const originalNotice = s.transport.notice.bind(s.transport);
+        s.transport.showPermission = async (): Promise<void> => {
+          throw new Error("thread unavailable");
+        };
+        s.transport.notice = async (): Promise<void> => new Promise<void>(() => {});
+
+        const first = requestFilePermission(s, { path: "artifact.txt" }, "stuck-card");
+        const stillPending = Symbol("still-pending");
+        const firstResult = await Promise.race([
+          first,
+          new Promise<typeof stillPending>((resolve) => setTimeout(() => resolve(stillPending), 100)),
+        ]);
+        expect(firstResult).toEqual({ kind: "user-not-available" });
+
+        s.transport.showPermission = originalShowPermission;
+        s.transport.notice = originalNotice;
+        const before = s.transport.permissions.length;
+        const later = requestFilePermission(s, { path: "artifact.txt" }, "after-stuck-card");
+        const card = await latestFilePermission(s, before);
+        s.transport.deliverDecision(card.nonce, "once", "u1");
+        await expect(later).resolves.toEqual({ kind: "approve-once" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it("fails if the artifact changes after approval and never uploads the replacement", async () => {
       const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-mutate-"));
       try {
@@ -727,6 +759,79 @@ describe("SessionActor permission handling", () => {
         });
         expect(s.transport.sentFiles).toHaveLength(0);
       } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects an equal-size replacement whose metadata fingerprint was restored", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-content-mutate-"));
+      const originalOpen = fs.open;
+      const stableStat = {
+        isFile: () => true,
+        size: 8,
+        dev: 1,
+        ino: 2,
+        mtimeMs: 3,
+      };
+      const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+        const handle = await originalOpen(...args);
+        // Models a same-size in-place rewrite with the original stat tuple restored.
+        return Object.assign(handle, { stat: async () => stableStat }) as typeof handle;
+      });
+      try {
+        const target = writeArtifact(root, "artifact.txt", "original");
+        const s = await setup({ workingDirectory: root });
+        await approveFilePermission(s, { path: "artifact.txt" }, "metadata-preserved-file");
+
+        writeFileSync(target, "replaced");
+
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "metadata-preserved-file")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+        expect(s.transport.sentFiles).toHaveLength(0);
+      } finally {
+        openSpy.mockRestore();
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("fails closed before another 8 MiB file is resolved and releases the gate after settlement", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-concurrent-"));
+      const s = await setup({ workingDirectory: root });
+      const openSpy = vi.spyOn(fs, "open");
+      let first: Promise<unknown> | undefined;
+      let second: Promise<unknown> | undefined;
+      try {
+        writeArtifact(root, "first.zip", Buffer.alloc(MAX_DISCORD_UPLOAD_BYTES, 1));
+        writeArtifact(root, "second.zip", Buffer.alloc(MAX_DISCORD_UPLOAD_BYTES, 2));
+
+        const before = s.transport.permissions.length;
+        first = requestFilePermission(s, { path: "first.zip" }, "first-large-file");
+        const firstCard = await latestFilePermission(s, before);
+
+        second = requestFilePermission(s, { path: "second.zip" }, "second-large-file");
+        const stillPending = Symbol("still-pending");
+        const secondResult = await Promise.race([
+          second,
+          new Promise<typeof stillPending>((resolve) => setTimeout(() => resolve(stillPending), 100)),
+        ]);
+        expect(secondResult).toEqual({ kind: "user-not-available" });
+        expect(s.transport.permissions).toHaveLength(before + 1);
+        expect(openSpy).toHaveBeenCalledTimes(1);
+
+        s.transport.deliverDecision(firstCard.nonce, "deny", "u1");
+        await expect(first).resolves.toEqual({ kind: "reject" });
+
+        const laterBefore = s.transport.permissions.length;
+        const later = requestFilePermission(s, { path: "second.zip" }, "later-large-file");
+        const laterCard = await latestFilePermission(s, laterBefore);
+        expect(openSpy).toHaveBeenCalledTimes(2);
+        s.transport.deliverDecision(laterCard.nonce, "once", "u1");
+        await expect(later).resolves.toEqual({ kind: "approve-once" });
+      } finally {
+        await s.actor.stop();
+        await Promise.allSettled([first, second].filter((request): request is Promise<unknown> => request !== undefined));
+        openSpy.mockRestore();
         rmSync(root, { recursive: true, force: true });
       }
     });

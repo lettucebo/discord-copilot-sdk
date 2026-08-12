@@ -1,5 +1,6 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 import { isStrictlyInside } from "./repo.js";
 import { hasBidiOrControls, sanitizeForInlineCode } from "./text-safety.js";
 
@@ -10,6 +11,9 @@ export interface OutboundFile {
   displayName: string;
   size: number;
   fingerprint: string;
+  /** Present on files produced by resolveOutboundFile; optional so transport
+   * fixtures and adapters that never validate content remain source-compatible. */
+  digest?: string;
   bytes: Buffer;
 }
 
@@ -24,7 +28,11 @@ export type OutboundRefusal =
   | "unsafe-filename"
   | "disallowed-extension";
 
-export type ResolveOutboundFileResult = { ok: true; file: OutboundFile } | { ok: false; reason: OutboundRefusal };
+export interface ValidatedOutboundFile extends OutboundFile {
+  digest: string;
+}
+
+export type ResolveOutboundFileResult = { ok: true; file: ValidatedOutboundFile } | { ok: false; reason: OutboundRefusal };
 
 export interface ResolveOutboundFileOptions {
   maxBytes: number;
@@ -134,6 +142,7 @@ export async function resolveOutboundFile(
         displayName,
         size: stat.size,
         fingerprint: fingerprintFromStat(stat),
+        digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
         bytes,
       },
     };

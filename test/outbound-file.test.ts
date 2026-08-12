@@ -53,6 +53,7 @@ describe("resolveOutboundFile", () => {
         displayName: "report.txt",
         size: 12,
         fingerprint: expect.any(String),
+        digest: "sha256:6dce0a4409fabc637beaa80f9a1d36e0528575f6201c4834d02f6ec7e421fd66",
         bytes: Buffer.from("hello report"),
       },
     });
@@ -180,6 +181,42 @@ describe("resolveOutboundFile", () => {
     if (!second.ok) return;
 
     expect(second.file.fingerprint).not.toBe(first.file.fingerprint);
+  });
+
+  it("changes digest for equal-size bytes even when the metadata fingerprint is restored", async () => {
+    const root = makeRoot();
+    const abs = write(root, "artifact.txt", "original");
+    const originalOpen = fsPromises.open;
+    const stableStat = {
+      isFile: () => true,
+      size: 8,
+      dev: 1,
+      ino: 2,
+      mtimeMs: 3,
+    };
+    const openSpy = vi.spyOn(fsPromises, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      // Model an in-place equal-size rewrite that restored the stat tuple.
+      return Object.assign(handle, { stat: async () => stableStat }) as typeof handle;
+    });
+
+    try {
+      const first = await resolveOutboundFile(root, "artifact.txt", { maxBytes: 64, policy: "agent" });
+      expect(first.ok).toBe(true);
+      if (!first.ok) return;
+
+      writeFileSync(abs, "replaced");
+
+      const second = await resolveOutboundFile(root, "artifact.txt", { maxBytes: 64, policy: "agent" });
+      expect(second.ok).toBe(true);
+      if (!second.ok) return;
+
+      expect(second.file.fingerprint).toBe(first.file.fingerprint);
+      expect(second.file.digest).not.toBe(first.file.digest);
+      expect(second.file.bytes).toEqual(Buffer.from("replaced"));
+    } finally {
+      openSpy.mockRestore();
+    }
   });
 
   it("refuses a size-raced file when the bytes no longer match the handle stat", async () => {
