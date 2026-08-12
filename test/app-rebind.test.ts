@@ -12,7 +12,6 @@ import { canonicalPathOr } from "../src/core/repo.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Transport } from "../src/core/transport.js";
-import type { OutboundFile } from "../src/core/outbound-file.js";
 import type { DevMode } from "../src/core/binding.js";
 
 const run = promisify(execFile);

@@ -9,7 +9,6 @@ import { PendingInteractionBroker } from "../src/core/broker.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import type { Transport } from "../src/core/transport.js";
-import type { OutboundFile } from "../src/core/outbound-file.js";
 import { isAuthorized, type AuthPolicy } from "../src/platforms/discord/auth.js";
 
 const OWNER = "10000";

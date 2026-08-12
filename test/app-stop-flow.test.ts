@@ -4,7 +4,6 @@ import { AddressInfo } from "node:net";
 import { DiscordCopilotApp, type Session } from "../src/app.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Transport } from "../src/core/transport.js";
-import type { OutboundFile } from "../src/core/outbound-file.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 
 /**

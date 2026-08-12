@@ -419,6 +419,38 @@ describe("DiscordTransport ask_user / plan cards", () => {
     expect(textPosted).toContain("S".repeat(5000)); // ENTIRE summary present across chunks
     expect(ch.sent.some((m) => m.opts && (m.opts as Record<string, unknown>)["embeds"])).toBe(true); // card posted
   });
+
+  it("sendFile classifies Discord blocked-upload failures as blocked", async () => {
+    const ch = new FakeChannel();
+    ch.sendError = new Error("This upload has been blocked by Discord");
+    const t = new DiscordTransport(fakeClient(ch));
+
+    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({ ok: false, reason: "blocked" });
+  });
+
+  it("sendFile converts ordinary channel.send failures into transient without throwing", async () => {
+    const ch = new FakeChannel();
+    ch.sendError = new Error("socket hang up");
+    const t = new DiscordTransport(fakeClient(ch));
+
+    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({ ok: false, reason: "transient" });
+  });
+
+  it("sendFile returns blocked for representative platform-blocked upload errors", async () => {
+    const ch = new FakeChannel();
+    ch.sendError = new Error("Cannot send this file because Discord has flagged it for upload restrictions.");
+    const t = new DiscordTransport(fakeClient(ch));
+
+    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({ ok: false, reason: "blocked" });
+  });
+
+  it("sendFile returns transient when channel.send fails with an ordinary error", async () => {
+    const ch = new FakeChannel();
+    ch.sendError = new Error("socket hang up");
+    const t = new DiscordTransport(fakeClient(ch));
+
+    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({ ok: false, reason: "transient" });
+  });
 });
 
 describe("DiscordTransport sendFile", () => {
