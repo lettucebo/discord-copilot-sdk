@@ -1,5 +1,11 @@
 import path from "node:path";
-import { promises as fs } from "node:fs";
+import {
+  close as closeRawFd,
+  fstat as fstatRawFd,
+  promises as fs,
+  read as readRawFd,
+} from "node:fs";
+import { promisify } from "node:util";
 
 export type SecureOpenRefusal =
   | "not-found"
@@ -57,6 +63,10 @@ export interface SecureDirectoryProof {
 
 /** A trusted root that can be proven again without reopening its pathname. */
 export interface SecureOpenedDirectory extends SecureDirectoryProof {
+  /** Present only on POSIX roots; it is the descriptor used for openat traversal. */
+  readonly fd?: number;
+  /** POSIX candidates must be opened below this proof, never by their pathname. */
+  openCandidate?(candidate: string, maxBytes: number): Promise<SecureOpenedFile>;
   revalidate(): Promise<SecureDirectoryProof>;
   close(): Promise<void>;
 }
@@ -84,6 +94,27 @@ const WIN32_MAX_PATH_CHARS = 32_768;
 const WIN32_MAX_READ_CHUNK = 0xffff_ffff;
 const DARWIN_F_GETPATH = 50;
 const DARWIN_MAXPATHLEN = 1024;
+const POSIX_O_RDONLY = 0;
+const POSIX_O_CLOEXEC_LINUX = 0x8_0000;
+const POSIX_O_DIRECTORY_LINUX = 0x1_0000;
+const POSIX_O_NOFOLLOW_LINUX = 0x2_0000;
+const POSIX_O_NONBLOCK_LINUX = 0x800;
+const POSIX_O_CLOEXEC_DARWIN = 0x1_000000;
+const POSIX_O_DIRECTORY_DARWIN = 0x1_00000;
+const POSIX_O_NOFOLLOW_DARWIN = 0x100;
+const POSIX_O_NONBLOCK_DARWIN = 0x4;
+
+export const LINUX_POSIX_OPEN_FLAGS = {
+  intermediate:
+    POSIX_O_RDONLY | POSIX_O_DIRECTORY_LINUX | POSIX_O_NOFOLLOW_LINUX | POSIX_O_CLOEXEC_LINUX,
+  leaf: POSIX_O_RDONLY | POSIX_O_NOFOLLOW_LINUX | POSIX_O_NONBLOCK_LINUX | POSIX_O_CLOEXEC_LINUX,
+} as const;
+
+const DARWIN_POSIX_OPEN_FLAGS = {
+  intermediate:
+    POSIX_O_RDONLY | POSIX_O_DIRECTORY_DARWIN | POSIX_O_NOFOLLOW_DARWIN | POSIX_O_CLOEXEC_DARWIN,
+  leaf: POSIX_O_RDONLY | POSIX_O_NOFOLLOW_DARWIN | POSIX_O_NONBLOCK_DARWIN | POSIX_O_CLOEXEC_DARWIN,
+} as const;
 
 export function win32CreateFileFlags(target: "candidate" | "directory"): number {
   return WIN32_FILE_ATTRIBUTE_NORMAL | (target === "directory" ? WIN32_FILE_FLAG_BACKUP_SEMANTICS : 0);
@@ -166,6 +197,353 @@ function validSize(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
+export interface PosixNativeApi {
+  openat(dirFd: number, component: string, flags: number): unknown;
+  errno?(): unknown;
+}
+
+export interface PosixStat {
+  dev: unknown;
+  ino: unknown;
+  mtimeMs: unknown;
+  nlink: unknown;
+  size: number;
+  isDirectory(): boolean;
+  isFile(): boolean;
+}
+
+export interface PosixRawReadResult {
+  bytesRead: unknown;
+  buffer: unknown;
+}
+
+export interface PosixDirectoryHandle {
+  readonly fd: number;
+  close(): Promise<void>;
+}
+
+/** Test injection for the raw descriptors that openat returns. */
+export interface PosixBackendDependencies {
+  openDirectory?(trustedRoot: string): Promise<PosixDirectoryHandle>;
+  finalPath?(fd: number): Promise<string>;
+  fstat?(fd: number): Promise<PosixStat>;
+  read?(
+    fd: number,
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number | null
+  ): Promise<PosixRawReadResult>;
+  close?(fd: number): Promise<void>;
+}
+
+interface PosixFileMetadata {
+  size: number;
+  identity: string;
+  modifiedAt: string;
+}
+
+interface PosixOperations {
+  openDirectory(trustedRoot: string): Promise<PosixDirectoryHandle>;
+  finalPath(fd: number): Promise<string>;
+  fstat(fd: number): Promise<PosixStat>;
+  read(
+    fd: number,
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number | null
+  ): Promise<PosixRawReadResult>;
+  close(fd: number): Promise<void>;
+}
+
+interface PosixOpenFlags {
+  intermediate: number;
+  leaf: number;
+}
+
+const fstatRawFdAsync = promisify(fstatRawFd);
+const readRawFdAsync = promisify(readRawFd);
+const closeRawFdAsync = promisify(closeRawFd);
+
+function defaultPosixOperations(
+  defaultFinalPath: (fd: number) => Promise<string>,
+  dependencies: PosixBackendDependencies
+): PosixOperations {
+  return {
+    openDirectory: dependencies.openDirectory ?? (async (trustedRoot) => fs.open(trustedRoot, "r")),
+    finalPath: dependencies.finalPath ?? defaultFinalPath,
+    fstat: dependencies.fstat ?? (async (fd) => (await fstatRawFdAsync(fd)) as unknown as PosixStat),
+    read:
+      dependencies.read ??
+      (async (fd, buffer, offset, length, position) =>
+        (await readRawFdAsync(fd, buffer, offset, length, position)) as unknown as PosixRawReadResult),
+    close: dependencies.close ?? (async (fd) => closeRawFdAsync(fd)),
+  };
+}
+
+function posixFd(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function posixErrno(api: PosixNativeApi): number | undefined {
+  const value = api.errno?.();
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function openPosixAt(api: PosixNativeApi, dirFd: number, component: string, flags: number): number {
+  let opened: unknown;
+  try {
+    opened = api.openat(dirFd, component, flags);
+  } catch {
+    throw refusal("unreadable", "POSIX openat failed.");
+  }
+  const fd = posixFd(opened);
+  if (fd !== undefined) return fd;
+
+  const errno = posixErrno(api);
+  if (errno === 2) throw refusal("not-found", "POSIX openat could not find the requested component.");
+  // O_NOFOLLOW can report ELOOP; O_DIRECTORY can report ENOTDIR for that
+  // same symlink. Neither may be retried through a pathname.
+  if (errno === 20 || errno === 40) {
+    throw refusal("outside-root", "POSIX openat refused a non-directory or symbolic-link component.");
+  }
+  throw refusal("unreadable", "POSIX openat did not return a usable descriptor.");
+}
+
+function lexicalPosixComponents(candidate: string, originalRoot: string): string[] {
+  const pathApi = path.posix;
+  const absolute = pathApi.isAbsolute(candidate);
+  const raw = absolute ? candidate.slice(1) : candidate;
+  const rawComponents = raw.split("/");
+  if (
+    rawComponents.length === 0 ||
+    rawComponents.some((component) => component.length === 0 || component === "." || component === "..")
+  ) {
+    throw refusal("outside-root", "The candidate path contains an unsafe lexical component.");
+  }
+
+  const relative = absolute ? pathApi.relative(pathApi.resolve(originalRoot), pathApi.resolve(candidate)) : candidate;
+  if (
+    relative.length === 0 ||
+    relative === "." ||
+    relative === ".." ||
+    relative.startsWith("../") ||
+    pathApi.isAbsolute(relative)
+  ) {
+    throw refusal("outside-root", "The candidate path is lexically outside the requested worktree.");
+  }
+
+  const components = relative.split("/");
+  if (
+    components.length === 0 ||
+    components.some((component) => component.length === 0 || component === "." || component === "..")
+  ) {
+    throw refusal("outside-root", "The candidate path cannot be represented as safe lookup components.");
+  }
+  return components;
+}
+
+function assertPosixHandleLinked(stat: PosixStat): void {
+  if (typeof stat.nlink !== "number" || !Number.isSafeInteger(stat.nlink) || stat.nlink < 1) {
+    throw refusal("unreadable", "The POSIX handle was deleted before its containment could be proved.");
+  }
+}
+
+function stablePosixStatField(value: unknown): string {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "bigint") return String(value);
+  throw refusal("unreadable", "The POSIX handle did not provide stable file metadata.");
+}
+
+function posixFileMetadata(stat: PosixStat): PosixFileMetadata {
+  assertPosixHandleLinked(stat);
+  if (!stat.isFile()) throw refusal("not-regular-file");
+  if (!validSize(stat.size)) throw refusal("unreadable", "The POSIX handle has an invalid file size.");
+  return {
+    size: stat.size,
+    identity: `${stablePosixStatField(stat.dev)}:${stablePosixStatField(stat.ino)}`,
+    modifiedAt: stablePosixStatField(stat.mtimeMs),
+  };
+}
+
+async function posixDirectoryProof(
+  handle: PosixDirectoryHandle,
+  operations: PosixOperations
+): Promise<SecureDirectoryProof> {
+  const finalPath = await operations.finalPath(handle.fd);
+  const stat = await operations.fstat(handle.fd);
+  assertPosixHandleLinked(stat);
+  return {
+    finalPath,
+    directory: stat.isDirectory(),
+  };
+}
+
+async function readPosixBounded(
+  fd: number,
+  metadata: PosixFileMetadata,
+  operations: PosixOperations
+): Promise<Buffer> {
+  const bytes = Buffer.allocUnsafe(metadata.size);
+  let offset = 0;
+  while (offset < metadata.size) {
+    const length = metadata.size - offset;
+    const result = await operations.read(fd, bytes, offset, length, null);
+    const bytesRead = result?.bytesRead;
+    if (
+      !result ||
+      result.buffer !== bytes ||
+      typeof bytesRead !== "number" ||
+      !Number.isSafeInteger(bytesRead) ||
+      bytesRead <= 0 ||
+      bytesRead > length
+    ) {
+      throw refusal("unreadable", "The POSIX descriptor changed while it was being read.");
+    }
+    offset += bytesRead;
+  }
+
+  const after = posixFileMetadata(await operations.fstat(fd));
+  if (
+    after.size !== metadata.size ||
+    after.identity !== metadata.identity ||
+    after.modifiedAt !== metadata.modifiedAt
+  ) {
+    throw refusal("unreadable", "The POSIX descriptor changed while it was being read.");
+  }
+  return bytes;
+}
+
+async function openPosixCandidate(
+  api: PosixNativeApi,
+  operations: PosixOperations,
+  flags: PosixOpenFlags,
+  rootFd: number,
+  candidate: string,
+  originalRoot: string,
+  maxBytes: number
+): Promise<SecureOpenedFile> {
+  if (!validSize(maxBytes)) throw refusal("unreadable", "The file size limit is invalid.");
+  const components = lexicalPosixComponents(candidate, originalRoot);
+  let currentFd = rootFd;
+  let ownsCurrent = false;
+  let leafFd: number | undefined;
+  let leafClosed = false;
+
+  const releaseCurrent = async (): Promise<void> => {
+    if (!ownsCurrent) return;
+    const fd = currentFd;
+    ownsCurrent = false;
+    await operations.close(fd);
+  };
+  const closeLeaf = async (): Promise<void> => {
+    if (leafFd === undefined || leafClosed) return;
+    leafClosed = true;
+    await operations.close(leafFd);
+  };
+
+  try {
+    for (const component of components.slice(0, -1)) {
+      const nextFd = openPosixAt(api, currentFd, component, flags.intermediate);
+      try {
+        await releaseCurrent();
+      } catch (error) {
+        try {
+          await operations.close(nextFd);
+        } catch {
+          // The predecessor close was attempted once; do not retry either fd.
+        }
+        throw error;
+      }
+      currentFd = nextFd;
+      ownsCurrent = true;
+    }
+
+    const leaf = components.at(-1);
+    if (!leaf) throw refusal("outside-root", "The candidate has no leaf component.");
+    leafFd = openPosixAt(api, currentFd, leaf, flags.leaf);
+    await releaseCurrent();
+
+    const metadata = posixFileMetadata(await operations.fstat(leafFd));
+    if (metadata.size === 0) throw refusal("empty-file");
+    if (metadata.size > maxBytes) throw refusal("too-large");
+    const finalPath = await operations.finalPath(leafFd);
+
+    return {
+      finalPath,
+      regular: true,
+      size: metadata.size,
+      identity: metadata.identity,
+      modifiedAt: metadata.modifiedAt,
+      read: () => readPosixBounded(leafFd as number, metadata, operations),
+      close: closeLeaf,
+    };
+  } catch (error) {
+    try {
+      await closeLeaf();
+    } catch {
+      // The original refusal is more useful; no descriptor is retried.
+    }
+    try {
+      await releaseCurrent();
+    } catch {
+      // The original refusal is more useful; no descriptor is retried.
+    }
+    throw error;
+  }
+}
+
+function createPosixBackend(
+  api: PosixNativeApi,
+  flags: PosixOpenFlags,
+  defaultFinalPath: (fd: number) => Promise<string>,
+  dependencies: PosixBackendDependencies = {}
+): SecureOpenBackend {
+  const operations = defaultPosixOperations(defaultFinalPath, dependencies);
+  return {
+    async open(): Promise<SecureOpenedFile> {
+      throw refusal("unreadable", "POSIX candidates must be opened relative to the trusted root descriptor.");
+    },
+    async openDirectory(trustedRoot: string): Promise<SecureOpenedDirectory> {
+      let handle: PosixDirectoryHandle | undefined;
+      let rootClosed = false;
+      const closeRoot = async (): Promise<void> => {
+        if (!handle || rootClosed) return;
+        rootClosed = true;
+        await handle.close();
+      };
+
+      try {
+        handle = await operations.openDirectory(trustedRoot);
+        const rootFd = posixFd(handle.fd);
+        if (rootFd === undefined) {
+          throw refusal("unreadable", "The trusted POSIX root did not provide a usable descriptor.");
+        }
+        const initial = await posixDirectoryProof(handle, operations);
+        if (!initial.directory) {
+          throw refusal("unreadable", "The POSIX trusted-root handle is not a directory.");
+        }
+        return {
+          ...initial,
+          fd: rootFd,
+          revalidate: () => posixDirectoryProof(handle as PosixDirectoryHandle, operations),
+          openCandidate: (candidate, maxBytes) =>
+            openPosixCandidate(api, operations, flags, rootFd, candidate, trustedRoot, maxBytes),
+          close: closeRoot,
+        };
+      } catch (error) {
+        try {
+          await closeRoot();
+        } catch {
+          // The root has already been marked closed; do not retry it.
+        }
+        throw error;
+      }
+    },
+  };
+}
+
 async function linuxFinalPath(fd: number): Promise<string> {
   const finalPath = await fs.readlink(`/proc/self/fd/${fd}`);
   if (finalPath.endsWith(" (deleted)")) {
@@ -174,52 +552,50 @@ async function linuxFinalPath(fd: number): Promise<string> {
   return finalPath;
 }
 
-const linuxBackend: SecureOpenBackend = {
-  async open(candidate: string): Promise<SecureOpenedFile> {
-    const handle = await fs.open(candidate, "r");
-    try {
-      const finalPath = await linuxFinalPath(handle.fd);
-      const stat = await handle.stat();
+type RawPosixCall = (...args: readonly unknown[]) => unknown;
+
+function posixRawCall(value: unknown): RawPosixCall {
+  if (typeof value !== "function") throw refusal("unreadable", "A required POSIX API entry point is unavailable.");
+  return value as unknown as RawPosixCall;
+}
+
+let linuxApiPromise: Promise<PosixNativeApi> | undefined;
+
+async function loadLinuxApi(): Promise<PosixNativeApi> {
+  if (!linuxApiPromise) {
+    linuxApiPromise = (async () => {
+      const koffi = (await import("koffi")).default;
+      const libc = koffi.load("libc.so.6");
+      const openat = posixRawCall(libc.func("openat", "int", ["int", "str", "int"]));
+      const errno = posixRawCall(koffi.errno);
       return {
-        finalPath,
-        regular: stat.isFile(),
-        size: stat.size,
-        identity: `${stat.dev}:${stat.ino}`,
-        modifiedAt: String(stat.mtimeMs),
-        read: () => handle.readFile(),
-        close: () => handle.close(),
+        openat: (dirFd, component, flags) => openat(dirFd, component, flags),
+        errno: () => errno(),
       };
-    } catch (error) {
-      await handle.close();
-      throw error;
-    }
+    })();
+  }
+  return linuxApiPromise;
+}
+
+/** Testable Linux backend; production loads libc directly below. */
+export function createLinuxBackend(
+  api: PosixNativeApi,
+  dependencies: PosixBackendDependencies = {}
+): SecureOpenBackend {
+  return createPosixBackend(api, LINUX_POSIX_OPEN_FLAGS, linuxFinalPath, dependencies);
+}
+
+const linuxBackend: SecureOpenBackend = {
+  async open(): Promise<SecureOpenedFile> {
+    throw refusal("unreadable", "POSIX candidates must be opened relative to the trusted root descriptor.");
   },
   async openDirectory(trustedRoot: string): Promise<SecureOpenedDirectory> {
-    const handle = await fs.open(trustedRoot, "r");
-    try {
-      const revalidate = async (): Promise<SecureDirectoryProof> => {
-        const finalPath = await linuxFinalPath(handle.fd);
-        const stat = await handle.stat();
-        return {
-          finalPath,
-          directory: stat.isDirectory(),
-        };
-      };
-      const initial = await revalidate();
-      return {
-        ...initial,
-        revalidate,
-        close: () => handle.close(),
-      };
-    } catch (error) {
-      await handle.close();
-      throw error;
-    }
+    return createLinuxBackend(await loadLinuxApi()).openDirectory(trustedRoot);
   },
 };
 
-/** Direct libc boundary for Darwin's descriptor-to-path proof. */
-export interface DarwinFcntl {
+/** Direct libSystem boundary for Darwin's descriptor-to-path proof and openat traversal. */
+export interface DarwinFcntl extends PosixNativeApi {
   fcntl(fd: number, command: number, output: Buffer): unknown;
 }
 
@@ -230,8 +606,13 @@ async function loadDarwinFcntl(): Promise<DarwinFcntl> {
     darwinFcntlPromise = (async () => {
       const koffi = (await import("koffi")).default;
       const libSystem = koffi.load("/usr/lib/libSystem.B.dylib");
+      const fcntl = posixRawCall(libSystem.func("fcntl", "int", ["int", "int", "void *"]));
+      const openat = posixRawCall(libSystem.func("openat", "int", ["int", "str", "int"]));
+      const errno = posixRawCall(koffi.errno);
       return {
-        fcntl: rawCall(libSystem.func("fcntl", "int", ["int", "int", "void *"])),
+        fcntl: (fd, command, output) => fcntl(fd, command, output),
+        openat: (dirFd, component, flags) => openat(dirFd, component, flags),
+        errno: () => errno(),
       };
     })();
   }
@@ -256,75 +637,20 @@ function darwinFinalPath(api: DarwinFcntl, fd: number): string {
   return finalPath;
 }
 
-function assertDarwinHandleLinked(nlink: number): void {
-  if (!Number.isSafeInteger(nlink) || nlink < 1) {
-    throw refusal("unreadable", "The Darwin handle was deleted before its containment could be proved.");
-  }
-}
-
-async function openDarwin(candidate: string, api: DarwinFcntl): Promise<SecureOpenedFile> {
-  const handle = await fs.open(candidate, "r");
-  try {
-    const finalPath = darwinFinalPath(api, handle.fd);
-    const stat = await handle.stat();
-    assertDarwinHandleLinked(stat.nlink);
-    return {
-      finalPath,
-      regular: stat.isFile(),
-      size: stat.size,
-      identity: `${stat.dev}:${stat.ino}`,
-      modifiedAt: String(stat.mtimeMs),
-      read: () => handle.readFile(),
-      close: () => handle.close(),
-    };
-  } catch (error) {
-    await handle.close();
-    throw error;
-  }
-}
-
-async function darwinDirectoryProof(api: DarwinFcntl, handle: Awaited<ReturnType<typeof fs.open>>): Promise<SecureDirectoryProof> {
-  const finalPath = darwinFinalPath(api, handle.fd);
-  const stat = await handle.stat();
-  assertDarwinHandleLinked(stat.nlink);
-  return {
-    finalPath,
-    directory: stat.isDirectory(),
-  };
-}
-
-async function openDarwinDirectory(trustedRoot: string, api: DarwinFcntl): Promise<SecureOpenedDirectory> {
-  const handle = await fs.open(trustedRoot, "r");
-  try {
-    const initial = await darwinDirectoryProof(api, handle);
-    if (!initial.directory) {
-      throw refusal("unreadable", "The Darwin trusted-root handle is not a directory.");
-    }
-    return {
-      ...initial,
-      revalidate: () => darwinDirectoryProof(api, handle),
-      close: () => handle.close(),
-    };
-  } catch (error) {
-    await handle.close();
-    throw error;
-  }
-}
-
 /** Testable Darwin backend; production loads libSystem directly below. */
-export function createDarwinBackend(api: DarwinFcntl): SecureOpenBackend {
-  return {
-    open: (candidate) => openDarwin(candidate, api),
-    openDirectory: (trustedRoot) => openDarwinDirectory(trustedRoot, api),
-  };
+export function createDarwinBackend(
+  api: DarwinFcntl,
+  dependencies: PosixBackendDependencies = {}
+): SecureOpenBackend {
+  return createPosixBackend(api, DARWIN_POSIX_OPEN_FLAGS, async (fd) => darwinFinalPath(api, fd), dependencies);
 }
 
 const darwinBackend: SecureOpenBackend = {
-  async open(candidate: string): Promise<SecureOpenedFile> {
-    return openDarwin(candidate, await loadDarwinFcntl());
+  async open(): Promise<SecureOpenedFile> {
+    throw refusal("unreadable", "POSIX candidates must be opened relative to the trusted root descriptor.");
   },
   async openDirectory(trustedRoot: string): Promise<SecureOpenedDirectory> {
-    return openDarwinDirectory(trustedRoot, await loadDarwinFcntl());
+    return createDarwinBackend(await loadDarwinFcntl()).openDirectory(trustedRoot);
   },
 };
 
@@ -669,7 +995,9 @@ export async function secureOpen(
     }
     const initialRoot = normalizedFinalPath(openedRoot.finalPath, pathMode);
 
-    opened = await backend.open(candidate);
+    opened = openedRoot.openCandidate
+      ? await openedRoot.openCandidate(candidate, options.maxBytes)
+      : await backend.open(candidate);
     const revalidatedRoot = await openedRoot.revalidate();
     if (!revalidatedRoot.directory) {
       throw refusal("unreadable", "The trusted root handle is no longer a directory.");

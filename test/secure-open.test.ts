@@ -4,6 +4,8 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createDarwinBackend,
+  createLinuxBackend,
+  LINUX_POSIX_OPEN_FLAGS,
   SecureOpenError,
   secureOpen,
   win32CreateFileFlags,
@@ -46,6 +48,30 @@ function win32HandlePathDependencies(
   backend: SecureOpenBackend
 ): SecureOpenDependencies {
   return { backend, pathMode: "win32" };
+}
+
+function posixHandlePathDependencies(
+  backend: SecureOpenBackend
+): SecureOpenDependencies {
+  return { backend, pathMode: "posix" };
+}
+
+function posixStat(options: {
+  directory?: boolean;
+  file?: boolean;
+  size?: number;
+  ino?: number;
+  nlink?: number;
+}) {
+  return {
+    dev: 1,
+    ino: options.ino ?? 1,
+    mtimeMs: 1,
+    nlink: options.nlink ?? 1,
+    size: options.size ?? 0,
+    isDirectory: () => options.directory === true,
+    isFile: () => options.file === true,
+  };
 }
 
 afterEach(() => {
@@ -330,53 +356,276 @@ describe("secureOpen", () => {
     expect(win32CreateFileFlags("directory") & backupSemantics).toBe(backupSemantics);
   });
 
+  it("opens a POSIX candidate component-by-component from the trusted root fd after pathname ABA replacement", async () => {
+    const root = "/trusted-worktree";
+    const candidate = "/trusted-worktree/nested/artifact.txt";
+    const rootHandle = {
+      fd: 41,
+      close: vi.fn(async () => undefined),
+    };
+    const openat = vi.fn((dirFd: number, component: string) => {
+      if (dirFd === 41 && component === "nested") return 42;
+      if (dirFd === 42 && component === "artifact.txt") return 43;
+      throw new Error(`unexpected pathname lookup for ${dirFd}:${component}`);
+    });
+    const fstat = vi.fn(async (fd: number) => {
+      if (fd === 41) return posixStat({ directory: true, ino: 41, nlink: 2 });
+      if (fd === 43) return posixStat({ file: true, size: 6, ino: 43 });
+      throw new Error(`unexpected fstat fd ${fd}`);
+    });
+    const read = vi.fn(async (_fd: number, buffer: Buffer, offset: number, length: number) => {
+      buffer.write("inside", offset, length, "utf8");
+      return { bytesRead: length, buffer };
+    });
+    const close = vi.fn(async () => undefined);
+    const backend = createLinuxBackend(
+      {
+        openat,
+        errno: () => 40,
+      },
+      {
+        openDirectory: vi.fn(async () => rootHandle),
+        finalPath: async (fd) => (fd === 41 ? root : candidate),
+        fstat,
+        read,
+        close,
+      }
+    );
+
+    const result = await secureOpen(candidate, root, { maxBytes: 64 }, posixHandlePathDependencies(backend));
+
+    expect(result.bytes).toEqual(Buffer.from("inside"));
+    expect(openat).toHaveBeenNthCalledWith(1, 41, "nested", LINUX_POSIX_OPEN_FLAGS.intermediate);
+    expect(openat).toHaveBeenNthCalledWith(2, 42, "artifact.txt", LINUX_POSIX_OPEN_FLAGS.leaf);
+    expect(close).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledWith(42);
+    expect(close).toHaveBeenCalledWith(43);
+    expect(rootHandle.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an intermediate POSIX symlink without reading a candidate fd", async () => {
+    const root = "/trusted-worktree";
+    const read = vi.fn();
+    const openat = vi.fn(() => -1);
+    const backend = createLinuxBackend(
+      {
+        openat,
+        errno: () => 40,
+      },
+      {
+        openDirectory: async () => ({
+          fd: 51,
+          close: async () => undefined,
+        }),
+        finalPath: async () => root,
+        fstat: async () => posixStat({ directory: true, ino: 51, nlink: 2 }),
+        read,
+        close: async () => undefined,
+      }
+    );
+
+    await expect(
+      secureOpen(
+        "/trusted-worktree/escape/loot.txt",
+        root,
+        { maxBytes: 64 },
+        posixHandlePathDependencies(backend)
+      )
+    ).rejects.toMatchObject({
+      reason: "outside-root",
+    } satisfies Partial<SecureOpenError>);
+    expect(openat).toHaveBeenCalledTimes(1);
+    expect(openat).toHaveBeenCalledWith(51, "escape", LINUX_POSIX_OPEN_FLAGS.intermediate);
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("closes a newly opened intermediate fd once if closing its predecessor fails", async () => {
+    const root = "/trusted-worktree";
+    const close = vi.fn(async (fd: number) => {
+      if (fd === 102) throw new Error("simulated close failure");
+    });
+    const backend = createLinuxBackend(
+      {
+        openat: (dirFd, component) => {
+          if (dirFd === 101 && component === "first") return 102;
+          if (dirFd === 102 && component === "second") return 103;
+          throw new Error(`unexpected openat ${dirFd}:${component}`);
+        },
+        errno: () => 40,
+      },
+      {
+        openDirectory: async () => ({
+          fd: 101,
+          close: async () => undefined,
+        }),
+        finalPath: async () => root,
+        fstat: async () => posixStat({ directory: true, ino: 101, nlink: 2 }),
+        read: async (_fd, buffer, _offset, length) => ({ bytesRead: length, buffer }),
+        close,
+      }
+    );
+
+    await expect(
+      secureOpen(`${root}/first/second/file.txt`, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
+    ).rejects.toMatchObject({
+      reason: "unreadable",
+    } satisfies Partial<SecureOpenError>);
+    expect(close).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledWith(102);
+    expect(close).toHaveBeenCalledWith(103);
+  });
+
+  it("opens a POSIX leaf nonblocking and rejects a FIFO before any read", async () => {
+    const root = "/trusted-worktree";
+    const read = vi.fn();
+    const close = vi.fn(async () => undefined);
+    const openat = vi.fn(() => 62);
+    const backend = createLinuxBackend(
+      {
+        openat,
+        errno: () => 40,
+      },
+      {
+        openDirectory: async () => ({
+          fd: 61,
+          close: async () => undefined,
+        }),
+        finalPath: async (fd) => (fd === 61 ? root : `${root}/pipe`),
+        fstat: async (fd) =>
+          fd === 61
+            ? posixStat({ directory: true, ino: 61, nlink: 2 })
+            : posixStat({ ino: 62 }),
+        read,
+        close,
+      }
+    );
+
+    await expect(
+      secureOpen(`${root}/pipe`, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
+    ).rejects.toMatchObject({
+      reason: "not-regular-file",
+    } satisfies Partial<SecureOpenError>);
+    expect(openat).toHaveBeenCalledWith(61, "pipe", LINUX_POSIX_OPEN_FLAGS.leaf);
+    expect(LINUX_POSIX_OPEN_FLAGS.leaf & 0x800).toBe(0x800);
+    expect(LINUX_POSIX_OPEN_FLAGS.leaf & 0x40).toBe(0);
+    expect(read).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledWith(62);
+  });
+
+  it("bounds raw POSIX reads to the statted size when a candidate grows", async () => {
+    const root = "/trusted-worktree";
+    let candidateStatCalls = 0;
+    const read = vi.fn(async (_fd: number, buffer: Buffer, offset: number, length: number) => {
+      buffer.fill(0x61, offset, offset + length);
+      return { bytesRead: length, buffer };
+    });
+    const backend = createLinuxBackend(
+      {
+        openat: () => 72,
+        errno: () => 40,
+      },
+      {
+        openDirectory: async () => ({
+          fd: 71,
+          close: async () => undefined,
+        }),
+        finalPath: async (fd) => (fd === 71 ? root : `${root}/growing.txt`),
+        fstat: async (fd) => {
+          if (fd === 71) return posixStat({ directory: true, ino: 71, nlink: 2 });
+          candidateStatCalls += 1;
+          return posixStat({ file: true, size: candidateStatCalls === 1 ? 4 : 5, ino: 72 });
+        },
+        read,
+        close: async () => undefined,
+      }
+    );
+
+    await expect(
+      secureOpen(`${root}/growing.txt`, root, { maxBytes: 4 }, posixHandlePathDependencies(backend))
+    ).rejects.toMatchObject({
+      reason: "unreadable",
+    } satisfies Partial<SecureOpenError>);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read).toHaveBeenCalledWith(72, expect.any(Buffer), 0, 4, null);
+    expect((read.mock.calls[0]?.[1] as Buffer).byteLength).toBe(4);
+  });
+
   it("derives Darwin candidate and root proofs from their still-open FileHandle descriptors", async () => {
     const root = makeRoot();
     const target = write(root, "artifact.txt", "inside");
     const calls: Array<{ fd: number; command: number; capacity: number }> = [];
-    const backend = createDarwinBackend({
-      fcntl(fd, command, output) {
-        calls.push({ fd, command, capacity: output.byteLength });
-        const finalPath = calls.length === 2 ? "/trusted-root/artifact.txt" : "/trusted-root";
-        output.write(finalPath, "utf8");
-        output[Buffer.byteLength(finalPath)] = 0;
-        return 0;
+    const backend = createDarwinBackend(
+      {
+        fcntl(fd, command, output) {
+          calls.push({ fd, command, capacity: output.byteLength });
+          const finalPath = fd === 82 ? "/trusted-root/artifact.txt" : "/trusted-root";
+          output.write(finalPath, "utf8");
+          output[Buffer.byteLength(finalPath)] = 0;
+          return 0;
+        },
+        openat: () => 82,
+        errno: () => 40,
       },
+      {
+        openDirectory: async () => ({
+          fd: 81,
+          close: async () => undefined,
+        }),
+        fstat: async (fd) =>
+          fd === 81
+            ? posixStat({ directory: true, ino: 81, nlink: 2 })
+            : posixStat({ file: true, size: 6, ino: 82 }),
+        read: async (_fd, buffer, offset, length) => {
+          buffer.write("inside", offset, length, "utf8");
+          return { bytesRead: length, buffer };
+        },
+        close: async () => undefined,
+      }
+    );
+
+    await expect(
+      secureOpen(target, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
+    ).resolves.toMatchObject({
+      finalPath: "/trusted-root/artifact.txt",
+      size: 6,
+      bytes: Buffer.from("inside"),
     });
 
-    const openedRoot = await backend.openDirectory(root);
-    let opened: SecureOpenedFile | undefined;
-    try {
-      opened = await backend.open(target);
-      const revalidated = await openedRoot.revalidate();
-
-      expect(opened.finalPath).toBe("/trusted-root/artifact.txt");
-      expect(opened.regular).toBe(true);
-      expect(opened.size).toBe(6);
-      await expect(opened.read()).resolves.toEqual(Buffer.from("inside"));
-      expect(revalidated).toEqual({ finalPath: "/trusted-root", directory: true });
-
-      const [initialRoot, candidate, revalidatedRoot] = calls;
-      if (!initialRoot || !candidate || !revalidatedRoot) throw new Error("Darwin fcntl calls were incomplete");
-      expect(calls).toHaveLength(3);
-      expect(initialRoot.fd).toBe(revalidatedRoot.fd);
-      expect(candidate.fd).not.toBe(initialRoot.fd);
-      expect(calls.map(({ command }) => command)).toEqual([50, 50, 50]);
-      expect(calls.every(({ capacity }) => capacity >= 1024)).toBe(true);
-    } finally {
-      await opened?.close();
-      await openedRoot.close();
-    }
+    const [initialRoot, candidate, revalidatedRoot] = calls;
+    if (!initialRoot || !candidate || !revalidatedRoot) throw new Error("Darwin fcntl calls were incomplete");
+    expect(calls).toHaveLength(3);
+    expect(initialRoot.fd).toBe(revalidatedRoot.fd);
+    expect(candidate.fd).not.toBe(initialRoot.fd);
+    expect(calls.map(({ command }) => command)).toEqual([50, 50, 50]);
+    expect(calls.every(({ capacity }) => capacity >= 1024)).toBe(true);
   });
 
   it("fails closed when Darwin F_GETPATH cannot prove an opened handle path", async () => {
     const root = makeRoot();
     const target = write(root, "artifact.txt", "inside");
-    const backend = createDarwinBackend({
-      fcntl: () => -1,
-    });
+    const backend = createDarwinBackend(
+      {
+        fcntl: () => -1,
+        openat: () => 92,
+        errno: () => 40,
+      },
+      {
+        openDirectory: async () => ({
+          fd: 91,
+          close: async () => undefined,
+        }),
+        fstat: async (fd) =>
+          fd === 91
+            ? posixStat({ directory: true, ino: 91, nlink: 2 })
+            : posixStat({ file: true, size: 6, ino: 92 }),
+        read: async (_fd, buffer, _offset, length) => ({ bytesRead: length, buffer }),
+        close: async () => undefined,
+      }
+    );
 
-    await expect(backend.open(target)).rejects.toMatchObject({
+    await expect(
+      secureOpen(target, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
+    ).rejects.toMatchObject({
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
   });
@@ -395,6 +644,16 @@ describe("secureOpen", () => {
       } satisfies Partial<SecureOpenError>);
     }
   );
+
+  it.runIf(process.platform === "linux")("opens a real artifact through Linux openat", async () => {
+    const root = makeRoot();
+    const target = write(root, "artifact.txt", "inside");
+
+    await expect(secureOpen(target, root, { maxBytes: 64 })).resolves.toMatchObject({
+      relativePath: "artifact.txt",
+      bytes: Buffer.from("inside"),
+    });
+  });
 
   it.runIf(process.platform === "darwin")("opens a real artifact through Darwin F_GETPATH", async () => {
     const root = makeRoot();
