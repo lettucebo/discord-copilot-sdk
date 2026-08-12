@@ -50,9 +50,14 @@ export interface SecureOpenedFile {
 }
 
 /** Metadata sourced from one still-open trusted-root directory handle. */
-export interface SecureOpenedDirectory {
+export interface SecureDirectoryProof {
   finalPath: string;
   directory: boolean;
+}
+
+/** A trusted root that can be proven again without reopening its pathname. */
+export interface SecureOpenedDirectory extends SecureDirectoryProof {
+  revalidate(): Promise<SecureDirectoryProof>;
   close(): Promise<void>;
 }
 
@@ -75,6 +80,10 @@ const WIN32_FILE_ATTRIBUTE_NORMAL = 0x80;
 const WIN32_FILE_FLAG_BACKUP_SEMANTICS = 0x0200_0000;
 const WIN32_MAX_PATH_CHARS = 32_768;
 const WIN32_MAX_READ_CHUNK = 0xffff_ffff;
+
+export function win32CreateFileFlags(target: "candidate" | "directory"): number {
+  return WIN32_FILE_ATTRIBUTE_NORMAL | (target === "directory" ? WIN32_FILE_FLAG_BACKUP_SEMANTICS : 0);
+}
 
 function refusal(reason: SecureOpenRefusal, message?: string): SecureOpenError {
   return new SecureOpenError(reason, message);
@@ -143,6 +152,10 @@ function normalizedFinalPath(value: string): string {
   return normalized;
 }
 
+function equivalentHandlePaths(left: string, right: string): boolean {
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
 function validSize(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
 }
@@ -178,11 +191,18 @@ const linuxBackend: SecureOpenBackend = {
   async openDirectory(trustedRoot: string): Promise<SecureOpenedDirectory> {
     const handle = await fs.open(trustedRoot, "r");
     try {
-      const finalPath = await linuxFinalPath(handle.fd);
-      const stat = await handle.stat();
+      const revalidate = async (): Promise<SecureDirectoryProof> => {
+        const finalPath = await linuxFinalPath(handle.fd);
+        const stat = await handle.stat();
+        return {
+          finalPath,
+          directory: stat.isDirectory(),
+        };
+      };
+      const initial = await revalidate();
       return {
-        finalPath,
-        directory: stat.isDirectory(),
+        ...initial,
+        revalidate,
         close: () => handle.close(),
       };
     } catch (error) {
@@ -376,7 +396,7 @@ async function openWindows(candidate: string): Promise<SecureOpenedFile> {
       WIN32_FILE_SHARE_READ,
       null,
       WIN32_OPEN_EXISTING,
-      WIN32_FILE_ATTRIBUTE_NORMAL | WIN32_FILE_FLAG_BACKUP_SEMANTICS,
+      win32CreateFileFlags("candidate"),
       null
     )
   );
@@ -439,6 +459,24 @@ async function openWindows(candidate: string): Promise<SecureOpenedFile> {
   }
 }
 
+function win32DirectoryProof(api: Win32Api, handle: Win32Handle): SecureDirectoryProof {
+  if (asUint32(api.getFileType(handle)) !== WIN32_FILE_TYPE_DISK) {
+    throw refusal("unreadable", "The Win32 trusted-root handle is not a disk directory.");
+  }
+
+  const fileInformation: Record<string, unknown> = {};
+  if (!asBoolean(api.getFileInformationByHandle(handle, fileInformation))) {
+    throw win32Error(api, "unreadable");
+  }
+  const attributes = asUint32(fileInformation["dwFileAttributes"]);
+  if (attributes === undefined) throw refusal("unreadable", "The Win32 trusted-root handle has invalid attributes.");
+
+  return {
+    finalPath: win32FinalPath(api, handle),
+    directory: (attributes & WIN32_FILE_ATTRIBUTE_DIRECTORY) !== 0,
+  };
+}
+
 async function openWindowsDirectory(trustedRoot: string): Promise<SecureOpenedDirectory> {
   const api = await loadWin32Api();
   const handle = asWin32Handle(
@@ -448,30 +486,21 @@ async function openWindowsDirectory(trustedRoot: string): Promise<SecureOpenedDi
       WIN32_FILE_SHARE_READ,
       null,
       WIN32_OPEN_EXISTING,
-      WIN32_FILE_ATTRIBUTE_NORMAL | WIN32_FILE_FLAG_BACKUP_SEMANTICS,
+      win32CreateFileFlags("directory"),
       null
     )
   );
   if (!handle) throw win32Error(api, "unreadable", true);
 
   try {
-    if (asUint32(api.getFileType(handle)) !== WIN32_FILE_TYPE_DISK) {
-      throw refusal("unreadable", "The Win32 trusted-root handle is not a disk directory.");
-    }
-
-    const fileInformation: Record<string, unknown> = {};
-    if (!asBoolean(api.getFileInformationByHandle(handle, fileInformation))) {
-      throw win32Error(api, "unreadable");
-    }
-    const attributes = asUint32(fileInformation["dwFileAttributes"]);
-    if (attributes === undefined) throw refusal("unreadable", "The Win32 trusted-root handle has invalid attributes.");
-    if ((attributes & WIN32_FILE_ATTRIBUTE_DIRECTORY) === 0) {
+    const initial = win32DirectoryProof(api, handle);
+    if (!initial.directory) {
       throw refusal("unreadable", "The Win32 trusted-root handle is not a directory.");
     }
 
     return {
-      finalPath: win32FinalPath(api, handle),
-      directory: true,
+      ...initial,
+      revalidate: async () => win32DirectoryProof(api, handle),
       async close(): Promise<void> {
         closeWin32Handle(api, handle);
       },
@@ -520,9 +549,17 @@ export async function secureOpen(
     if (!openedRoot.directory) {
       throw refusal("unreadable", "The trusted root handle is not a directory.");
     }
-    const canonicalRoot = normalizedFinalPath(openedRoot.finalPath);
+    const initialRoot = normalizedFinalPath(openedRoot.finalPath);
 
     opened = await backend.open(candidate);
+    const revalidatedRoot = await openedRoot.revalidate();
+    if (!revalidatedRoot.directory) {
+      throw refusal("unreadable", "The trusted root handle is no longer a directory.");
+    }
+    const canonicalRoot = normalizedFinalPath(revalidatedRoot.finalPath);
+    if (!equivalentHandlePaths(initialRoot, canonicalRoot)) {
+      throw refusal("unreadable", "The trusted root changed while the candidate was being opened.");
+    }
     const finalPath = normalizedFinalPath(opened.finalPath);
     const relativePath = relativePathInsideCanonical(finalPath, canonicalRoot);
     if (!relativePath) {

@@ -114,7 +114,12 @@ describe("resolveOutboundFile", () => {
 
     const result = await resolveOutboundFile(root, "folder", { maxBytes: 64, policy: "operator" });
 
-    expect(result).toEqual({ ok: false, reason: "not-regular-file" });
+    expect(result).toEqual({
+      ok: false,
+      // CreateFileW no longer requests backup semantics for a candidate, so
+      // Windows refuses directory opens before the handle-level defense runs.
+      reason: process.platform === "win32" ? "unreadable" : "not-regular-file",
+    });
   });
 
   it("refuses zero-byte and oversized files", async () => {

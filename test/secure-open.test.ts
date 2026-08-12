@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SecureOpenError,
   secureOpen,
+  win32CreateFileFlags,
   type SecureOpenBackend,
   type SecureOpenedFile,
 } from "../src/core/secure-open.js";
@@ -30,6 +31,10 @@ function fakeBackend(opened: SecureOpenedFile): SecureOpenBackend {
     openDirectory: vi.fn(async (trustedRoot: string) => ({
       finalPath: trustedRoot,
       directory: true,
+      revalidate: async () => ({
+        finalPath: trustedRoot,
+        directory: true,
+      }),
       close: async () => undefined,
     })),
   };
@@ -54,6 +59,107 @@ describe("secureOpen", () => {
       bytes: Buffer.from("inside bytes"),
       identity: expect.any(String),
     });
+  });
+
+  it("rejects a trusted root whose final path changes after candidate opening before reading", async () => {
+    const root = makeRoot();
+    const replacementRoot = makeRoot();
+    const candidate = write(root, "artifact.txt", "inside");
+    const events: string[] = [];
+    const read = vi.fn(async () => Buffer.from("inside"));
+    const closeCandidate = vi.fn(async () => {
+      events.push("close candidate");
+    });
+    const closeRoot = vi.fn(async () => {
+      events.push("close root");
+    });
+    const revalidate = vi.fn(async () => {
+      events.push("revalidate root");
+      return {
+        finalPath: replacementRoot,
+        directory: true,
+      };
+    });
+    const backend: SecureOpenBackend = {
+      open: vi.fn(async (): Promise<SecureOpenedFile> => {
+        events.push("open candidate");
+        return {
+          finalPath: candidate,
+          regular: true,
+          size: 6,
+          identity: "candidate-handle",
+          modifiedAt: "candidate-time",
+          read,
+          close: closeCandidate,
+        };
+      }),
+      openDirectory: vi.fn(async () => {
+        events.push("open root");
+        return {
+          finalPath: root,
+          directory: true,
+          revalidate,
+          close: closeRoot,
+        };
+      }),
+    };
+
+    await expect(secureOpen(candidate, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
+      reason: "unreadable",
+    } satisfies Partial<SecureOpenError>);
+    expect(read).not.toHaveBeenCalled();
+    expect(revalidate).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["open root", "open candidate", "revalidate root", "close candidate", "close root"]);
+  });
+
+  it("rejects a deleted trusted root after candidate opening before reading", async () => {
+    const root = makeRoot();
+    const candidate = write(root, "artifact.txt", "inside");
+    const events: string[] = [];
+    const read = vi.fn(async () => Buffer.from("inside"));
+    const closeCandidate = vi.fn(async () => {
+      events.push("close candidate");
+    });
+    const closeRoot = vi.fn(async () => {
+      events.push("close root");
+    });
+    const revalidate = vi.fn(async () => {
+      events.push("revalidate root");
+      return {
+        finalPath: `${root} (deleted)`,
+        directory: false,
+      };
+    });
+    const backend: SecureOpenBackend = {
+      open: vi.fn(async (): Promise<SecureOpenedFile> => {
+        events.push("open candidate");
+        return {
+          finalPath: candidate,
+          regular: true,
+          size: 6,
+          identity: "candidate-handle",
+          modifiedAt: "candidate-time",
+          read,
+          close: closeCandidate,
+        };
+      }),
+      openDirectory: vi.fn(async () => {
+        events.push("open root");
+        return {
+          finalPath: root,
+          directory: true,
+          revalidate,
+          close: closeRoot,
+        };
+      }),
+    };
+
+    await expect(secureOpen(candidate, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
+      reason: "unreadable",
+    } satisfies Partial<SecureOpenError>);
+    expect(read).not.toHaveBeenCalled();
+    expect(revalidate).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["open root", "open candidate", "revalidate root", "close candidate", "close root"]);
   });
 
   it("uses the opened root handle final path and refuses a root-side swap before reading", async () => {
@@ -85,6 +191,10 @@ describe("secureOpen", () => {
           // replacement root. A pathname realpath anchor would allow candidate.
           finalPath: replacementRoot,
           directory: true,
+          revalidate: async () => ({
+            finalPath: replacementRoot,
+            directory: true,
+          }),
           close: closeRoot,
         };
       }),
@@ -143,6 +253,12 @@ describe("secureOpen", () => {
     } satisfies Partial<SecureOpenError>);
     expect(read).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps backup semantics exclusive to trusted-directory CreateFileW calls", () => {
+    const backupSemantics = 0x0200_0000;
+    expect(win32CreateFileFlags("candidate") & backupSemantics).toBe(0);
+    expect(win32CreateFileFlags("directory") & backupSemantics).toBe(backupSemantics);
   });
 
   it.runIf(process.platform === "linux")("rejects an actual symlink escape from the Linux handle target", async () => {
