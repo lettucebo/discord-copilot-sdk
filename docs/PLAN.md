@@ -647,6 +647,10 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   生成；重新開檔送出前也比對 path、digest 與 fingerprint。
 - **`.git` lexical/internal gate**：Windows 與 Darwin 都以小寫比對 `.git` segments，故 case-insensitive
   APFS/HFS+ 上的 `.GIT` 等拼法同樣拒絕，且在 pathname 預檢與 handle-derived final path 兩層都套用。
+- **Windows ADS gate**：在開啟 candidate 前，只檢查 Windows root-relative component 是否含 `:`；
+  因此 `C:` drive designator 不會誤判，但 `file.txt:stream` 不能到達 `CreateFileW`。handle-derived
+  root-relative path 則一律在 `.git`、extension 與 display 檢查前拒絕任何 `:`，所以
+  `.git:stream` 與 `artifact.exe:stream` 都不能以 alternate data stream 繞過內部檔案或可執行檔規則。
 - **content digest / endpoint truth**：送出前先固定內容與 digest；成功與否以 Discord 端點回應為準。即使取消發生在送出接近完成時，也只能回報 endpoint 真實結果，不得樂觀宣稱成功。
 - **YOLO fast deny + 卡片撤銷**：`discord_send_file` 在 YOLO 下不是「自動允許」，而是立即拒絕並告知改走 `/file`。切入 YOLO 的同一同步步驟會撤銷已核准檔案、deny 尚待 broker 的 file card，且所有 agent-file currentness 都要求 `!yolo`；所以先前卡片的 Allow click 只能是 inert，不能在 YOLO 後送檔。
 - **allow-once only**：agent 路徑沒有 repo/session 級常駐授權；每次送檔都重新決定。
@@ -659,6 +663,10 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   rollback 會無條件清除仍為 current/active 舊 actor 的**rebind** fence；YOLO 與 abort 仍由
   `/file` lifecycle gate、custom-tool permission/currentness predicate 個別拒絕，不能把暫時狀態
   變成永久停用。
+- **resume terminal transition before lease release**：startup 對 binding refusal、worktree reconstruction
+  failure、thread/binding block 與 definitive session-lost 的 terminal write 都先檢查 `setState()`；
+  寫入失敗即以 fatal reconcile failure 停止 startup，且不釋放 local checkout lease。否則下一個
+  thread 可取得 checkout，而舊的 active durable row 仍會在之後重啟時復原。
 - **`/file` session fence**：命令先捕捉 session identity；resolve 後、傳送期間的
   `Transport.sendFile({canSend})`、及 success reply 前都重查 map identity 與 actor file lifecycle。
   `/end`、rebind 或新 session 取代舊 session 時，transport 走既有 late-cancel/delete 路徑，
@@ -698,6 +706,15 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   `retraction-unconfirmed`、盡力在原 thread 發不 mention 的「附件可能仍可見」警告；actor 與 `/file`
   將它當 failure，不計入成功送檔額度。若 transport 回 `ok` 後 caller 的最後 lifecycle fence 才
   變 stale，也同樣回「可能已在取消前接受」而非聲稱已取消／收回。
+- **lost upload response truthfulness**：`channel.send()` throw 且沒有明確 Discord rejection code
+  時，不能推論附件未被接受、也沒有 message id 可安全 retract；transport 回
+  `upload-outcome-unknown` 並盡力以不 mention 警告說明可能仍公開。actor 與 `/file` 先處理此結果，
+  即使 lifecycle 同時變 stale 也絕不把它改寫成 `cancelled`，且不計入成功送檔額度。已知
+  `50013`、`40005`、`50045` 與明確 blocked upload 則保留其已知未接受的分類。
+- **`/end` local lease ordering**：live map 可以先移除以停止輸入，但 local checkout lease 必須保留
+  到 `SessionStore.remove()` 或 `blocked` terminal retirement 已確認寫入。若 remove/retire 寫入失敗，
+  會保留或重新取得 lease 並回報 durable failure，避免另一個 local session 在尚存 record 的 cleanup
+  window 取得同一 checkout。
 - **schema provenance（v5 stale rebinds）**：帶 `sessions` 的 container 必須有一致的 row schema version；
   v4 container 裡的 v3 row／缺 quota 是 corruption，不是 legacy。v5 的 `staleRebinds` 也必須是
   version-consistent、唯一 immutable identity、`blocked` + `rebind-*` reason 的 terminal rows；不接受
@@ -716,6 +733,10 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 - **bounded late deletion / platform availability**：若取消發生在 Discord 已接受附件後，會有上限地等待
   delete；失敗或 timeout 不會稱為已收回，而以 `retraction-unconfirmed` 與可見警告說明附件可能仍
   公開。警告本身也可能因 thread 已刪除而無法送出，故 caller 的 structured failure 才是權威。
+- **lost response is not proof of non-delivery**：網路中斷或未知 `channel.send()` 例外可能發生在 Discord
+  接受附件後、回應回到 bot 前；此時無 message id 可刪除，只能回
+  `upload-outcome-unknown`。警告發送也可能失敗，所以 structured failure 才是唯一可依賴的 exposure
+  signal。
 - **Windows-only descriptor boundary**：對外 Discord 檔案傳送僅支援 Windows。Windows 依賴 `CreateFileW`
   root handle 排除 delete/rename，因而不能在 proof 與 actor transfer 間替換其 final path。Linux 的
   `/proc/self/fd/<fd>` 與 Darwin 的 `/dev/fd/<fd>` 雖可驗證 retained handle，但 SDK API 只接受 pathname，
@@ -729,13 +750,14 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | `/channel enable` 缺權限診斷包含 `Attach Files` | `test/app-channels.test.ts` |
 | 所有 attachment sends 都 suppress mentions | `test/transport.test.ts` |
 | Windows handle-bound validation path、local/worktree git proof、approval key 僅在 descriptor proof 後導出、root swap 拒絕、actor ownership/close-once；非 Windows 不開 root 卻能建立 session | `test/secure-open.test.ts`、`test/binding.test.ts`、`test/app-channels-race.test.ts`、`test/app-rebind.test.ts`、`test/app-reconcile.test.ts`、`test/session-actor.test.ts` |
-| Windows `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root-relative inline-code card path、同 basename 路徑辨別、U+200B 拒絕、root/content/digest/path 綁定、endpoint truth、late cancellation 不算成功；非 Windows 無 tool 且 `/file` 拒絕 | `test/outbound-file.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
+| Windows `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root-relative inline-code card path、同 basename 路徑辨別、U+200B 拒絕、Windows ADS 預開啟／handle-derived `.git:stream`／executable stream 拒絕、root/content/digest/path 綁定、endpoint truth、late cancellation 不算成功；非 Windows 無 tool 且 `/file` 拒絕 | `test/outbound-file.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
 | 24 MiB 持久化保守預留、舊 record 遷移、session-id + generation CAS、rebind fence/單調 rollback、YOLO/abort rollback 不永久停用 `/file`、restart total、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
 | `/end` 在 commit-failure replacement 初次 teardown 與 fallback 註冊之間勝出；retry 只以 remove CAS 釋放 primary，disconnect／CAS 失敗保留 barrier + tracker | `test/app-rebind.test.ts` |
 | `/file` resolve/send interleaving（end、rebind-style replacement）不可附件或成功回覆 | `test/app-file-command.test.ts`、`test/transport.test.ts` |
 | `/end` 穿插 rebind 的 binding、replacement actor、map-swap 三階段都不能復活 map／record／worktree；commit rollback 的 unconfirmed replacement 會 retain/retry，terminal stale row 寫入失敗時 target reservation 先作 durable barrier，確認 teardown + worktree cleanup 後只以 target identity CAS restore live original 或在 `/end` 勝出時 remove、並同步移除 paired stale rows；CAS／寫入失敗保留 barrier/tracker、封鎖新 rebind，restart 不 resume fallback creating row；`/end` 會擁有兩個 incarnation 並 retry 已追蹤 fallback，沒有 live map 的後續 `/end` 也不得 generic-reap 未對帳 barrier，restore 後的下一次 `/end` 不可留下 primary row | `test/app-rebind.test.ts`、`test/session-store.test.ts`、`test/app-reconcile.test.ts` |
 | faulted/hung SDK disconnect 保留 root lock，確認終止後只 close 一次且 actor 仍拒絕 prompt／送檔 | `test/session-actor.test.ts` |
-| 已送出後 delete reject/timeout 的 `retraction-unconfirmed`、thread warning、transport `ok` 後才 stale 的可見性警告、actor failure 與 `/file` 誠實訊息 | `test/transport.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
+| 已送出後 delete reject/timeout 的 `retraction-unconfirmed`、thread warning、transport `ok` 後才 stale 的可見性警告、accepted upload 後遺失 response 的 `upload-outcome-unknown`／不 mention warning、actor failure 與 `/file` 誠實訊息 | `test/transport.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
+| resume binding/session-lost terminal transition 的 persist failure 必須 fatal，且 local lease 不可提早釋放；`/end` 的 local lease 必須跨 record removal 並在 remove failure 保留 | `test/app-reconcile.test.ts`、`test/app-rebind.test.ts` |
 | v4 container mixed/downgraded row fail-closed；非 Windows 不診斷 Attach Files；YOLO 普通卡與撤銷檔案卡文字一致 | `test/session-store.test.ts`、`test/app-channels.test.ts`、`test/file-delivery-docs.test.ts` |
 | session dispose 後可重新顯示一次 Attach Files 缺權限提示 | `test/transport.test.ts` |
-| README / Discord setup 中英雙檔、PLAN 與 instructions 都如實說明 Windows-only availability | `test/file-delivery-docs.test.ts` |
+| README / Discord setup 中英雙檔、PLAN 與 instructions 都如實說明 Windows-only availability；channel lockdown 的 Attach Files 與 mask 也只列於 Windows | `test/file-delivery-docs.test.ts` |

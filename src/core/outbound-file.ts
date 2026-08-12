@@ -88,6 +88,28 @@ function candidatePath(trustedRoot: TrustedRoot, requestedPath: string): string 
   return path.isAbsolute(requestedPath) ? requestedPath : path.join(trustedRoot.originalPath, requestedPath);
 }
 
+/** Windows lets a colon select an alternate data stream. Inspect only the
+ * root-relative components, never the absolute path, so `C:` remains a drive
+ * designator rather than being mistaken for an artifact stream. */
+function hasWindowsAdsComponent(trustedRoot: TrustedRoot, requestedPath: string): boolean {
+  if (process.platform !== "win32") return false;
+  const root = path.win32.resolve(trustedRoot.originalPath);
+  const candidate = path.win32.isAbsolute(requestedPath)
+    ? path.win32.resolve(requestedPath)
+    : path.win32.resolve(root, requestedPath);
+  const relative = path.win32.relative(root, candidate);
+  if (
+    !relative ||
+    relative === "." ||
+    relative === ".." ||
+    relative.startsWith(`..${path.win32.sep}`) ||
+    path.win32.isAbsolute(relative)
+  ) {
+    return false;
+  }
+  return relative.split(/[\\/]+/).filter(Boolean).some((component) => component.includes(":"));
+}
+
 function extensionAllowed(ext: string, policy: OutboundFilePolicy): boolean {
   return policy === "agent" ? AGENT_ALLOWED_EXTENSIONS.has(ext) : !DISCORD_BLOCKED_EXECUTABLE_EXTENSIONS.has(ext);
 }
@@ -122,6 +144,7 @@ function safeRootRelativePath(relativePath: string): string | undefined {
   if (
     !relativePath ||
     path.isAbsolute(relativePath) ||
+    relativePath.includes(":") ||
     hasBidiOrControls(relativePath) ||
     INVISIBLE_FORMAT_CHARACTER.test(relativePath) ||
     sanitizeForInlineCode(relativePath, FILE_DELIVERY_PATH_MAX) !== relativePath
@@ -143,6 +166,9 @@ export async function resolveOutboundFile(
   options: ResolveOutboundFileOptions
 ): Promise<ResolveOutboundFileResult> {
   const requested = candidatePath(trustedRoot, requestedPath);
+  if (hasWindowsAdsComponent(trustedRoot, requestedPath)) {
+    return { ok: false, reason: "unsafe-filename" };
+  }
   const lexicalRelative = path.relative(path.resolve(trustedRoot.originalPath), path.resolve(requested));
   if (isGitInternalRelative(lexicalRelative) || isGitName(path.basename(requested))) {
     return { ok: false, reason: ".git-internal" };
@@ -158,12 +184,12 @@ export async function resolveOutboundFile(
     return { ok: false, reason: mapSecureOpenRefusal(error) };
   }
 
-  if (isGitInternalRelative(opened.relativePath) || isGitName(path.basename(opened.finalPath))) {
-    return { ok: false, reason: ".git-internal" };
-  }
-
   const relativePath = safeRootRelativePath(opened.relativePath);
   if (!relativePath) return { ok: false, reason: "unsafe-filename" };
+
+  if (isGitInternalRelative(relativePath) || isGitName(path.basename(opened.finalPath))) {
+    return { ok: false, reason: ".git-internal" };
+  }
 
   const displayName = path.basename(opened.finalPath);
   if (

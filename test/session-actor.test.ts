@@ -1605,6 +1605,32 @@ describe("SessionActor permission handling", () => {
       }
     });
 
+    it("reports an unknown upload outcome as possible public delivery without consuming success quota", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-outcome-unknown-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        await approveFilePermission(s, { path: "artifact.txt" }, "lost-upload-response");
+        s.transport.sendFileResult = { ok: false, reason: "upload-outcome-unknown" };
+
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "lost-upload-response")).resolves.toMatchObject({
+          resultType: "failure",
+          error: expect.stringMatching(/may have.*(?:deliver|accept)|may remain/i),
+        });
+
+        s.transport.sendFileResult = { ok: true };
+        for (const toolCallId of ["normal-after-unknown-1", "normal-after-unknown-2", "normal-after-unknown-3"]) {
+          await approveFilePermission(s, { path: "artifact.txt" }, toolCallId);
+          await expect(invokeFileDelivery(s, { path: "artifact.txt" }, toolCallId)).resolves.toMatchObject({
+            resultType: "success",
+          });
+        }
+        expect(s.transport.sentFiles).toHaveLength(4);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it.each([
       ["a newer user turn", async (s: Setup): Promise<void> => s.actor.send("begin a newer turn")],
       ["stop", async (s: Setup): Promise<void> => {

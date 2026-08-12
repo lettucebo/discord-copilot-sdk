@@ -13,7 +13,11 @@ import {
   resolveOutboundFile,
   DISCORD_BLOCKED_EXECUTABLE_EXTENSIONS,
 } from "../src/core/outbound-file.js";
-import { captureTrustedRoot } from "../src/core/secure-open.js";
+import {
+  captureTrustedRoot,
+  type SecureOpenBackend,
+  type SecureOpenedFile,
+} from "../src/core/secure-open.js";
 
 const roots: string[] = [];
 
@@ -58,6 +62,66 @@ async function resolveForTest(
   try {
     return await resolveOutboundFile(trustedRoot, requestedPath, options);
   } finally {
+    await trustedRoot.close();
+  }
+}
+
+function windowsHandleBackend(finalPath: string): {
+  backend: SecureOpenBackend;
+  opened(): number;
+} {
+  let opens = 0;
+  const openedFile = (): SecureOpenedFile => ({
+    finalPath,
+    regular: true,
+    size: 1,
+    linkCount: 1,
+    identity: "windows-stream",
+    modifiedAt: "1",
+    read: async () => Buffer.from("x"),
+    close: async () => undefined,
+  });
+  return {
+    backend: {
+      open: async () => {
+        opens++;
+        return openedFile();
+      },
+      openDirectory: async (trustedRoot) => ({
+        finalPath: trustedRoot,
+        validationPath: trustedRoot,
+        identity: "windows-root",
+        directory: true,
+        revalidate: async () => ({
+          finalPath: trustedRoot,
+          identity: "windows-root",
+          directory: true,
+        }),
+        close: async () => undefined,
+      }),
+    },
+    opened: () => opens,
+  };
+}
+
+async function resolveInWindowsPathMode(
+  requestedPath: string,
+  finalPath: string,
+  policy: "agent" | "operator"
+): Promise<{ result: Awaited<ReturnType<typeof resolveOutboundFile>>; opened: number }> {
+  const rootPath = String.raw`C:\worktree`;
+  const fixture = windowsHandleBackend(finalPath);
+  const trustedRoot = await captureTrustedRoot(rootPath, { backend: fixture.backend, pathMode: "win32" });
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  if (!platform) throw new Error("process.platform descriptor is unavailable");
+  try {
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    return {
+      result: await resolveOutboundFile(trustedRoot, requestedPath, { maxBytes: 64, policy }),
+      opened: fixture.opened(),
+    };
+  } finally {
+    Object.defineProperty(process, "platform", platform);
     await trustedRoot.close();
   }
 }
@@ -161,6 +225,31 @@ describe("resolveOutboundFile", () => {
     const result = await resolveForTest(root, ".git", { maxBytes: 64, policy: "operator" });
 
     expect(result).toEqual({ ok: false, reason: ".git-internal" });
+  });
+
+  it.each(["operator", "agent"] as const)(
+    "rejects a Windows ADS request for %s before opening the artifact handle",
+    async (policy) => {
+      const { result, opened } = await resolveInWindowsPathMode(
+        String.raw`artifacts\report.txt:stream`,
+        String.raw`C:\worktree\artifacts\report.txt:stream`,
+        policy
+      );
+
+      expect(result).toEqual({ ok: false, reason: "unsafe-filename" });
+      expect(opened).toBe(0);
+    }
+  );
+
+  it.each([
+    [String.raw`.git:stream`, String.raw`C:\worktree\.git:stream`],
+    [String.raw`artifact.exe:stream`, String.raw`C:\worktree\artifact.exe:stream`],
+  ])("rejects handle-derived Windows ADS path %s before Git or extension checks", async (_label, finalPath) => {
+    const requestedPath = "safe-name.txt";
+    const { result, opened } = await resolveInWindowsPathMode(requestedPath, finalPath, "operator");
+
+    expect(result).toEqual({ ok: false, reason: "unsafe-filename" });
+    expect(opened).toBe(1);
   });
 
   it("models Darwin as case-insensitive for lexical .git internals", async () => {

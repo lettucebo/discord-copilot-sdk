@@ -496,6 +496,57 @@ describe("/file", () => {
     expect(interaction.edits[0]).not.toContain("已將檔案傳送");
   });
 
+  it("reports an unknown upload outcome truthfully when cancellation races a lost response", async () => {
+    const transport = new FakeTransport();
+    transport.ignoreCurrentness = true;
+    transport.sendFileResult = { ok: false, reason: "upload-outcome-unknown" };
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as CopilotClient,
+      transport,
+      new SessionStore(storeFile),
+      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+    );
+    const workDir = path.join(reposRoot, "repo");
+    const filePath = path.join(workDir, "report.txt");
+    mkdirSync(workDir, { recursive: true });
+    writeFileSync(filePath, "hello");
+    const resolver = actorResolving({
+      ok: true,
+      file: {
+        absPath: filePath,
+        displayName: "report.txt",
+        relativePath: "report.txt",
+        size: 5,
+        fingerprint: "artifact-identity:5:1",
+        digest: "sha256:test",
+        bytes: Buffer.from("hello"),
+      },
+    });
+    sessionsOf(app).set(THREAD, session(workDir, resolver.actor));
+    let releaseSend!: () => void;
+    transport.sendFileGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    const sendStarted = new Promise<void>((resolve) => {
+      transport.sendFileStarted = resolve;
+    });
+    const interaction = slash({ pathValue: "report.txt" });
+
+    const command = invokeInteraction(app, interaction);
+    await sendStarted;
+    sessionsOf(app).delete(THREAD);
+    releaseSend();
+    await command;
+
+    expect(transport.sentFiles).toHaveLength(1);
+    expect(interaction.edits).toHaveLength(1);
+    expect(interaction.edits[0]).toMatch(/可能.*(?:已傳送|接受|可見)/);
+    expect(interaction.edits[0]).not.toContain("檔案傳送已取消");
+    expect(interaction.edits[0]).not.toContain("已將檔案傳送");
+  });
+
   it("reports transport failure honestly", async () => {
     const transport = new FakeTransport();
     transport.sendFileResult = { ok: false, reason: "transient" };

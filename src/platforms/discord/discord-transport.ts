@@ -272,7 +272,11 @@ export class DiscordTransport implements Transport {
       }
       return { ok: true };
     } catch (error: unknown) {
-      return this.classifySendFileError(error);
+      const outcome = this.classifySendFileError(error);
+      if (!outcome.ok && outcome.reason === "upload-outcome-unknown") {
+        await this.postUploadOutcomeUnknownWarning(channel);
+      }
+      return outcome;
     }
   }
 
@@ -419,12 +423,31 @@ export class DiscordTransport implements Transport {
     }
   }
 
+  /** A thrown send has no message id to retract: Discord may have accepted the
+   * attachment before the response was lost, so the caller must see uncertainty,
+   * not a reassuring cancellation. */
+  private async postUploadOutcomeUnknownWarning(channel: MinimalTextChannel): Promise<void> {
+    try {
+      await withTimeout(
+        channel.send({
+          content:
+            "⚠️ Discord 檔案上傳的回應遺失；附件可能已被接受，且仍可能在這個討論串中看見。",
+          ...NO_MENTIONS,
+        }),
+        LATE_ATTACHMENT_DELETE_TIMEOUT_MS
+      );
+    } catch {
+      // The structured outcome remains authoritative when the warning cannot
+      // land, such as after a thread was deleted during /end.
+    }
+  }
+
   private classifySendFileError(error: unknown): SendFileResult {
-    if (!isDiscordLikeError(error)) return { ok: false, reason: "transient" };
+    if (!isDiscordLikeError(error)) return { ok: false, reason: "upload-outcome-unknown" };
     if (error.code === 50013) return { ok: false, reason: "no-attach-permission" };
     if (error.code === 40005 || error.code === 50045) return { ok: false, reason: "too-large" };
     if (isPlatformBlockedUploadError(error)) return { ok: false, reason: "blocked" };
-    return { ok: false, reason: "transient" };
+    return { ok: false, reason: "upload-outcome-unknown" };
   }
 }
 

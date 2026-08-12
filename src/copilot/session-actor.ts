@@ -1132,12 +1132,16 @@ export class SessionActor {
         canSend: () => this.fileDeliveryIsCurrent(approval),
       });
     } catch {
-      if (!this.fileDeliveryIsCurrent(approval)) {
-        return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
-      }
-      return fileDeliveryFailure("Discord file delivery failed before the upload could be confirmed.");
+      return fileDeliveryFailure(
+        "Discord file delivery outcome is unknown; Discord may have accepted the attachment and it may remain visible in the Discord thread."
+      );
     }
     if (!sent.ok) {
+      if (sent.reason === "upload-outcome-unknown") {
+        return fileDeliveryFailure(
+          "Discord file delivery outcome is unknown; Discord may have accepted the attachment and it may remain visible in the Discord thread."
+        );
+      }
       if (sent.reason === "retraction-unconfirmed") {
         return fileDeliveryFailure(
           "Discord accepted the attachment after cancellation, but its retraction could not be confirmed; it may remain visible in the Discord thread."

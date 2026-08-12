@@ -96,6 +96,9 @@ export type SendFileResult =
         | "unavailable"
         | "transient"
         | "cancelled"
+        /** `channel.send()` may have reached Discord before its response was
+         * lost, so neither cancellation nor non-delivery is knowable. */
+        | "upload-outcome-unknown"
         /** Discord accepted a stale attachment, but bounded deletion did not
          * confirm it was retracted, so it may still be publicly visible. */
         | "retraction-unconfirmed";

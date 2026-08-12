@@ -36,6 +36,7 @@ class FakeChannel {
     | null
     | undefined = undefined;
   sendError: unknown;
+  sendErrorAfterAccept: unknown;
   messages = {
     fetch: async (id: string): Promise<FakeMessage> => {
       const m = this.byId.get(id);
@@ -60,6 +61,11 @@ class FakeChannel {
     this.sent.push(m);
     this.byId.set(m.id, m);
     this.afterSend?.(m);
+    if (this.sendErrorAfterAccept !== undefined) {
+      const error = this.sendErrorAfterAccept;
+      this.sendErrorAfterAccept = undefined;
+      throw error;
+    }
     return m;
   }
 }
@@ -441,12 +447,15 @@ describe("DiscordTransport ask_user / plan cards", () => {
     await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({ ok: false, reason: "blocked" });
   });
 
-  it("sendFile converts ordinary channel.send failures into transient without throwing", async () => {
+  it("sendFile reports an unknown upload outcome for ordinary channel.send failures", async () => {
     const ch = new FakeChannel();
     ch.sendError = new Error("socket hang up");
     const t = new DiscordTransport(fakeClient(ch));
 
-    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({ ok: false, reason: "transient" });
+    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({
+      ok: false,
+      reason: "upload-outcome-unknown",
+    });
   });
 
   it("sendFile returns blocked for representative platform-blocked upload errors", async () => {
@@ -457,12 +466,15 @@ describe("DiscordTransport ask_user / plan cards", () => {
     await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({ ok: false, reason: "blocked" });
   });
 
-  it("sendFile returns transient when channel.send fails with an ordinary error", async () => {
+  it("sendFile returns an unknown upload outcome when channel.send loses its response", async () => {
     const ch = new FakeChannel();
     ch.sendError = new Error("socket hang up");
     const t = new DiscordTransport(fakeClient(ch));
 
-    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({ ok: false, reason: "transient" });
+    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({
+      ok: false,
+      reason: "upload-outcome-unknown",
+    });
   });
 });
 
@@ -581,6 +593,25 @@ describe("DiscordTransport sendFile", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("reports an unknown post-accept upload outcome with a no-mention exposure warning", async () => {
+    const ch = new FakeChannel();
+    let current = true;
+    ch.afterSend = (message) => {
+      if (message.id === "m1") current = false;
+    };
+    ch.sendErrorAfterAccept = new Error("socket lost after Discord accepted the attachment");
+    const t = new DiscordTransport(fakeClient(ch));
+
+    await expect(
+      t.sendFile("thread", outboundFile(), undefined, { canSend: () => current })
+    ).resolves.toEqual({ ok: false, reason: "upload-outcome-unknown" });
+
+    expect(ch.sent).toHaveLength(2);
+    expect(ch.sent[0]!.deleted).toBe(false);
+    expect(ch.sent[1]!.content).toMatch(/可能.*(?:已傳送|接受|可見)|may.*(?:deliver|accept|visible)/i);
+    expect(ch.sent[1]!.opts!["allowedMentions"]).toEqual({ parse: [] });
   });
 
   it("fails closed on missing Attach Files permission and posts one deduplicated Chinese notice", async () => {

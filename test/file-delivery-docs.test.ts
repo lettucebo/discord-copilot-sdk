@@ -23,6 +23,10 @@ const ZH_MASKS = [
   "Windows 精簡版：** `309237763072`",
   "非 Windows 精簡版：** `309237730304`",
 ];
+const EN_WINDOWS_LOCKDOWN_MASK = "`395137371200`";
+const EN_NON_WINDOWS_LOCKDOWN_MASK = "`395137338432`";
+const ZH_WINDOWS_LOCKDOWN_MASK = "`395137371200`";
+const ZH_NON_WINDOWS_LOCKDOWN_MASK = "`395137338432`";
 
 describe("file-delivery documentation", () => {
   it("states the Windows-only availability boundary in every required document", () => {
@@ -39,6 +43,25 @@ describe("file-delivery documentation", () => {
     const zh = read("docs", "DISCORD-SETUP.zh-TW.md");
     for (const mask of EN_MASKS) expect(en).toContain(mask);
     for (const mask of ZH_MASKS) expect(zh).toContain(mask);
+  });
+
+  it("keeps Attach Files and its channel-lockdown mask Windows-only in both setup twins", () => {
+    const en = read("docs", "DISCORD-SETUP.md");
+    const zh = read("docs", "DISCORD-SETUP.zh-TW.md");
+    const enLockdown = en.slice(en.indexOf("## 4b."), en.indexOf("## 5."));
+    const zhLockdown = zh.slice(zh.indexOf("## 4b."), zh.indexOf("## 5."));
+
+    expect(enLockdown).toContain("**Windows:**");
+    expect(enLockdown).toContain("**Non-Windows:**");
+    expect(enLockdown).toContain("without `Attach Files`");
+    expect(enLockdown).toContain(EN_WINDOWS_LOCKDOWN_MASK);
+    expect(enLockdown).toContain(EN_NON_WINDOWS_LOCKDOWN_MASK);
+
+    expect(zhLockdown).toContain("**Windows：**");
+    expect(zhLockdown).toContain("**非 Windows：**");
+    expect(zhLockdown).toContain("不含 `Attach Files`");
+    expect(zhLockdown).toContain(ZH_WINDOWS_LOCKDOWN_MASK);
+    expect(zhLockdown).toContain(ZH_NON_WINDOWS_LOCKDOWN_MASK);
   });
 
   it("distinguishes ordinary pending YOLO cards from revoked file-delivery cards in both READMEs", () => {

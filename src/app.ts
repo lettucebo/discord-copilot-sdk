@@ -85,7 +85,7 @@ import {
 } from "./platforms/discord/custom-id.js";
 import { isAuthorized, isOwner, type AuthContext, type AuthPolicy } from "./platforms/discord/auth.js";
 import { ChannelRegistry } from "./core/channel-registry.js";
-import type { Decision, Transport } from "./core/transport.js";
+import type { Decision, SendFileResult, Transport } from "./core/transport.js";
 import { captureTrustedRoot, type SecureOpenBackend, type TrustedRoot } from "./core/secure-open.js";
 import { isFileDeliveryAvailable } from "./core/file-delivery-availability.js";
 
@@ -1678,7 +1678,6 @@ export class DiscordCopilotApp {
     }
     this.sessions.delete(threadId);
     this.approvals.clearSession(threadId);
-    this.releaseLocalLease(threadId);
     this.transport.dispose(threadId);
     if (pendingOld) {
       this.pendingRebindOlds.delete(session);
@@ -1699,6 +1698,7 @@ export class DiscordCopilotApp {
       // now that the command has won, rather than leaving an already-confirmed
       // target actor waiting for some unrelated later lifecycle event.
       await this.retryStaleRebindActorsForThread(threadId);
+      this.releaseRetiredLocalLease(threadId, session.repoPath);
       const fallbackPending = [...this.staleRebindActors.values()].some(
         (entry) => entry.threadId === threadId && entry.fallbackPrimary !== undefined
       );
@@ -1746,10 +1746,13 @@ export class DiscordCopilotApp {
     branch: string | undefined
   ): Promise<{ ok: boolean; tail: string }> {
     let tail = "";
-    // Whatever happens to the worktree and the record, this thread is finished
-    // with the repo: hold on to a local lease here and `/repo dev local` reports
-    // a holder that no longer exists, with no way to clear it but a restart.
-    this.releaseLocalLease(threadId);
+    // A local checkout remains exclusively claimed until the record is
+    // durably removed or terminalized. Releasing first lets another thread
+    // claim it while a failed write leaves this session's active record behind.
+    const retainLocalLease = (): void => {
+      const record = this.store.get(threadId);
+      if (record?.devMode === "local") this.acquireLocalLease(record.repoPath, threadId);
+    };
     // A worktree is exactly "there is a branch and the work dir is not the repo".
     // The owning repo comes from the RECORD, not from a single configured repo:
     // with many repos, `git worktree remove` run in the wrong one simply fails.
@@ -1758,15 +1761,18 @@ export class DiscordCopilotApp {
       tail = this.worktreeOutcomeText(r, workDir, branch);
       if (r !== "removed" && r !== "already-absent") {
         if (!this.retire(threadId)) {
+          retainLocalLease();
           return {
             ok: false,
             tail: `${tail}\n⚠️ 且**無法寫入磁碟**更新記錄，請檢查磁碟／權限後重啟 bot。`,
           };
         }
+        this.releaseLocalLease(threadId);
         return { ok: false, tail: `${tail}\n記錄保留，\`/sessions\` 才看得到還有東西在磁碟上。` };
       }
     }
     if (!this.store.remove(threadId)) {
+      retainLocalLease();
       // Only an `active` record would be resumed next boot; a terminal one is
       // retained untouched, so promising a resume attempt there would be false.
       const willResume = this.store.get(threadId)?.state === "active";
@@ -1777,6 +1783,7 @@ export class DiscordCopilotApp {
           (willResume ? "（否則下次啟動會嘗試復原這個 session）。" : "，記錄仍會留著。"),
       };
     }
+    this.releaseLocalLease(threadId);
     return { ok: true, tail };
   }
 
@@ -3734,10 +3741,10 @@ export class DiscordCopilotApp {
         // command that can reap the record (`/end thread:<id>`) never touched
         // the lease either, so `/repo dev local` would report a phantom holder
         // with a deleted thread, permanently.
-        this.releaseLocalLease(rec.threadId);
         if (!this.store.setState(rec.threadId, "blocked", action.reason)) {
           throw new FatalReconcileError(`reconcile: could not persist blocked state at ${sessionStorePath()}`);
         }
+        this.releaseLocalLease(rec.threadId);
         await this.transport
           .notice(rec.threadId, `⚠️ 無法復原此 session（${action.reason}）。請用 /new 開新的。`)
           .catch(() => {});
@@ -3765,7 +3772,10 @@ export class DiscordCopilotApp {
       } catch (err) {
         // Terminal, not transient: retrying every boot cannot fix a tree we
         // just failed to rebuild.
-        this.store.setState(rec.threadId, "blocked", "worktree-missing");
+        if (!this.store.setState(rec.threadId, "blocked", "worktree-missing")) {
+          throw new FatalReconcileError(`reconcile: could not persist blocked state for ${rec.threadId}`);
+        }
+        this.releaseLocalLease(rec.threadId);
         await this.transport
           .notice(
             rec.threadId,
@@ -3801,7 +3811,9 @@ export class DiscordCopilotApp {
     }
     if (!captured.ok) {
       console.warn(`reconcile: refusing to resume ${rec.threadId} — ${captured.verdict.detail}`);
-      this.store.setState(rec.threadId, "blocked", `binding-${captured.verdict.problem}`);
+      if (!this.store.setState(rec.threadId, "blocked", `binding-${captured.verdict.problem}`)) {
+        throw new FatalReconcileError(`reconcile: could not persist blocked state for ${rec.threadId}`);
+      }
       this.releaseLocalLease(rec.threadId);
       await this.transport
         .notice(
@@ -3841,10 +3853,10 @@ export class DiscordCopilotApp {
         // Definitive: the session id is gone. Mark terminal; a failed persist of
         // that transition is a disk problem we must surface (fail startup).
         // Terminal ⇒ the repo it held in local mode is free again.
-        this.releaseLocalLease(rec.threadId);
         if (!this.store.setState(rec.threadId, "orphaned", "session-lost")) {
           throw new FatalReconcileError(`reconcile: could not persist orphaned state for ${rec.threadId}`);
         }
+        this.releaseLocalLease(rec.threadId);
         await this.transport
           .notice(rec.threadId, "⚠️ 無法復原（session 已遺失）。請用 /new 開新的。")
           .catch(() => {});
@@ -3926,6 +3938,22 @@ export class DiscordCopilotApp {
     for (const [key, holder] of this.localLeases) {
       if (holder === threadId) this.localLeases.delete(key);
     }
+  }
+
+  /** After `/end` joins a pre-swap rebind, keep the old checkout leased only
+   * while its exact durable local binding still exists. A replacement worktree
+   * row needs no local lease; a creating local replacement on the same checkout
+   * does, so it must not be released as collateral. */
+  private releaseRetiredLocalLease(threadId: string, repoPath: string): void {
+    const key = this.leaseKey(repoPath);
+    if (this.localLeases.get(key) !== threadId) return;
+    const record = this.store.get(threadId);
+    const stillClaimsCheckout =
+      record?.devMode === "local" &&
+      record.state !== "blocked" &&
+      record.state !== "orphaned" &&
+      this.leaseKey(record.repoPath) === key;
+    if (!stillClaimsCheckout) this.localLeases.delete(key);
   }
 
   /**
@@ -4323,7 +4351,21 @@ export class DiscordCopilotApp {
       await interaction.editReply({ content: this.fileRefusalMessage(resolved.reason) });
       return;
     }
-    const sent = await this.transport.sendFile(threadId, resolved.file, undefined, { canSend });
+    let sent: SendFileResult;
+    try {
+      sent = await this.transport.sendFile(threadId, resolved.file, undefined, { canSend });
+    } catch {
+      await interaction.editReply({
+        content: "⚠️ Discord 檔案上傳的結果不明；附件可能已被接受，且仍可能在這個討論串中看見。",
+      });
+      return;
+    }
+    if (!sent.ok && sent.reason === "upload-outcome-unknown") {
+      await interaction.editReply({
+        content: "⚠️ Discord 檔案上傳的結果不明；附件可能已被接受，且仍可能在這個討論串中看見。",
+      });
+      return;
+    }
     if (!sent.ok && sent.reason === "retraction-unconfirmed") {
       await interaction.editReply({
         content:

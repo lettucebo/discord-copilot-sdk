@@ -177,11 +177,16 @@ Discord 的權限解析順序是：`@everyone` 伺服器層級 → 身分組伺�
 
 ### 步驟
 
-1. **每個工作頻道** → 編輯頻道 → 權限 → 加入你的 bot 身分組 → 打開下面這些：
-   View Channels · Send Messages · Send Messages in Threads · Create Public Threads ·
-   Create Private Threads · Manage Threads · Embed Links · Attach Files ·
-   Read Message History · Add Reactions · Use External Emoji
-   （這組的整數是 `395137371200`。範圍鎖在工作頻道，所以可以給得寬鬆一點。）
+1. **每個工作頻道** → 編輯頻道 → 權限 → 加入你的 bot 身分組 → 依主機平台打開對應的一組：
+   - **Windows：** View Channels · Send Messages · Send Messages in Threads · Create Public Threads ·
+     Create Private Threads · Manage Threads · Embed Links · Attach Files ·
+     Read Message History · Add Reactions · Use External Emoji
+     Windows 的整數是 `395137371200`。
+   - **非 Windows：** 同一組但不含 `Attach Files`：View Channels · Send Messages ·
+     Send Messages in Threads · Create Public Threads · Create Private Threads · Manage Threads ·
+     Embed Links · Read Message History · Add Reactions · Use External Emoji
+     非 Windows 的整數是 `395137338432`。
+   這個範圍只限工作頻道，所以兩個平台各自的集合都可以比邀請權限稍微寬鬆。
 2. **其他每一個頻道與分類** → 權限 → 加入 bot 身分組 → **拒絕** View Channels。
 3. **最後**：伺服器設定 → 身分組 → 你的 bot 身分組 → **關掉 Administrator**，其餘留空。該頁右上角的 **Clear permissions** 可以一次清空。
 

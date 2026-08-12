@@ -177,11 +177,16 @@ Categories matter too: their permissions cascade to the channels inside them.
 
 ### Steps
 
-1. **Each work channel** → Edit Channel → Permissions → add your bot role → allow:
-   View Channels · Send Messages · Send Messages in Threads · Create Public Threads ·
-   Create Private Threads · Manage Threads · Embed Links · Attach Files ·
-   Read Message History · Add Reactions · Use External Emoji
-   The integer for this set is `395137371200`. Because the scope is limited to work channels, it can be a little wider than the invite set.
+1. **Each work channel** → Edit Channel → Permissions → add your bot role → allow the set for its host:
+   - **Windows:** View Channels · Send Messages · Send Messages in Threads · Create Public Threads ·
+     Create Private Threads · Manage Threads · Embed Links · Attach Files ·
+     Read Message History · Add Reactions · Use External Emoji
+     The Windows integer is `395137371200`.
+   - **Non-Windows:** the same set without `Attach Files`: View Channels · Send Messages ·
+     Send Messages in Threads · Create Public Threads · Create Private Threads · Manage Threads ·
+     Embed Links · Read Message History · Add Reactions · Use External Emoji
+     The non-Windows integer is `395137338432`.
+   Because this scope is limited to work channels, either platform-specific set can be a little wider than its invite set.
 2. **Every other channel and category** → Permissions → add the bot role → **Deny** View Channels.
 3. **Last**: Server Settings → Roles → your bot role → turn **Administrator** off and leave the rest empty. The **Clear permissions** button in the upper-right can clear the page at once.
 

@@ -342,6 +342,61 @@ describe("rebindBlocker — the preconditions that protect work", { timeout: 60_
   });
 });
 
+describe("/end local lease durability", { timeout: 60_000 }, () => {
+  it("keeps the local lease through record removal so a concurrent admission cannot claim the checkout", async () => {
+    const { app, store } = harness({ devMode: "local", repo: repoA });
+    const originalRemove = store.remove.bind(store);
+    const acquire = app as unknown as {
+      acquireLocalLease(repoPath: string, threadId: string): { ok: true } | { ok: false; holder: string };
+    };
+    let admission: { ok: true } | { ok: false; holder: string } | undefined;
+    const removeSpy = vi.spyOn(store, "remove").mockImplementation((threadId) => {
+      admission = acquire.acquireLocalLease(repoA, "competing-thread");
+      return originalRemove(threadId);
+    });
+
+    try {
+      await endThread(app);
+
+      expect(admission).toEqual({ ok: false, holder: "t1" });
+      expect(leases(app).get(leaseKeyOf(repoA))).toBeUndefined();
+      expect(acquire.acquireLocalLease(repoA, "competing-thread")).toEqual({ ok: true });
+    } finally {
+      removeSpy.mockRestore();
+    }
+  });
+
+  it("preserves the local lease and reports a durable removal failure safely", async () => {
+    const { app, store } = harness({ devMode: "local", repo: repoA });
+    const removeSpy = vi.spyOn(store, "remove").mockReturnValue(false);
+    const edits: string[] = [];
+    const interaction = {
+      ...endInteraction(),
+      editReply: async (value: string | { content: string }) => {
+        edits.push(typeof value === "string" ? value : value.content);
+      },
+    } as unknown as ChatInputCommandInteraction;
+    const acquire = app as unknown as {
+      acquireLocalLease(repoPath: string, threadId: string): { ok: true } | { ok: false; holder: string };
+    };
+
+    try {
+      await (
+        app as unknown as {
+          cmdEnd(i: ChatInputCommandInteraction): Promise<void>;
+        }
+      ).cmdEnd(interaction);
+
+      expect(store.get("t1")?.state).toBe("active");
+      expect(leases(app).get(leaseKeyOf(repoA))).toBe("t1");
+      expect(acquire.acquireLocalLease(repoA, "competing-thread")).toEqual({ ok: false, holder: "t1" });
+      expect(edits.join("\n")).toMatch(/無法寫入磁碟/);
+    } finally {
+      removeSpy.mockRestore();
+    }
+  });
+});
+
 describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
   it("moves the lease when going local → local on a DIFFERENT repo", async () => {
     // The first version only released the lease when the TARGET was not local,
@@ -1097,6 +1152,7 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       );
       expect(sessions(app).get("t1")).toBeUndefined();
       expect(store.get("t1")).toBeUndefined();
+      expect(leases(app).get(leaseKeyOf(repoA))).toBeUndefined();
       expect(fs.existsSync(targetWorktree)).toBe(false);
     } finally {
       createSpy.mockRestore();

@@ -179,14 +179,20 @@ function productionStyleApp(
 function sessionsOf(app: DiscordCopilotApp): Map<string, unknown> {
   return (app as unknown as { sessions: Map<string, unknown> }).sessions;
 }
+function localLeasesOf(app: DiscordCopilotApp): Map<string, string> {
+  return (app as unknown as { localLeases: Map<string, string> }).localLeases;
+}
 function reconcile(
   app: DiscordCopilotApp,
-  classify: (threadId: string, expectedParentChannelId: string) => Promise<string>
+  classify: (threadId: string, expectedParentChannelId: string) => Promise<string>,
+  validateBinding: () => Promise<
+    { ok: true } | { ok: false; problem: "repo-not-git"; detail: string }
+  > = async () => ({ ok: true })
 ): Promise<void> {
   return (app as unknown as {
     reconcileOnStartup(d?: {
       classifyThread?: (id: string, expectedParentChannelId: string) => Promise<string>;
-      validateBinding?: () => Promise<{ ok: true }>;
+      validateBinding?: () => Promise<unknown>;
     }): Promise<void>;
   }).reconcileOnStartup({
     classifyThread: classify,
@@ -194,7 +200,7 @@ function reconcile(
     // reconcile STATE MACHINE, not the git-backed ownership proof (which has its
     // own suite in binding.test.ts, against real worktrees). Injecting a
     // pass-through keeps the two concerns from smearing into each other.
-    validateBinding: async () => ({ ok: true }),
+    validateBinding,
   });
 }
 
@@ -377,6 +383,70 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       expect(sessionsOf(app).has("t1")).toBe(false);
       expect(store.get("t1")?.state).toBe("orphaned");
       expect(store.get("t1")?.reason).toBe("session-lost");
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
+  it("fails startup and retains the local lease when a binding block cannot persist", async () => {
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind()); store.commit("t1");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        undefined,
+        { fileDeliveryPlatform: "linux" }
+      );
+      const persist = vi.spyOn(store, "setState").mockReturnValue(false);
+
+      try {
+        await expect(
+          reconcile(
+            app,
+            async () => "valid",
+            async () => ({ ok: false, problem: "repo-not-git", detail: "git proof failed" })
+          )
+        ).rejects.toThrow(/could not persist blocked state/i);
+
+        expect(store.get("t1")?.state).toBe("active");
+        expect([...localLeasesOf(app).values()]).toEqual(["t1"]);
+      } finally {
+        persist.mockRestore();
+      }
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
+  it("fails startup and retains the local lease when a definitive lost-session transition cannot persist", async () => {
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind()); store.commit("t1");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot({ resumeError: "session not found" }),
+        new FakeTransport(),
+        store,
+        undefined,
+        { fileDeliveryPlatform: "linux" }
+      );
+      const persist = vi.spyOn(store, "setState").mockReturnValue(false);
+
+      try {
+        await expect(reconcile(app, async () => "valid")).rejects.toThrow(/could not persist orphaned state/i);
+
+        expect(store.get("t1")?.state).toBe("active");
+        expect([...localLeasesOf(app).values()]).toEqual(["t1"]);
+      } finally {
+        persist.mockRestore();
+      }
     } finally {
       rmSync(f, { force: true });
     }
