@@ -46,10 +46,11 @@ afterEach(() => {
 describe("resolveOutboundFile", () => {
   it("returns a normal agent artifact with bytes and sanitized display name", async () => {
     const root = makeRoot();
-    const abs = write(root, "artifacts\\report.txt", "hello report");
+    const requestedPath = path.join("artifacts", "report.txt");
+    const abs = write(root, requestedPath, "hello report");
     const trustedRoot = await captureTrustedRoot(root);
 
-    const result = await resolveOutboundFile(trustedRoot, "artifacts\\report.txt", {
+    const result = await resolveOutboundFile(trustedRoot, requestedPath, {
       maxBytes: 1024,
       policy: "agent",
     });
@@ -69,7 +70,7 @@ describe("resolveOutboundFile", () => {
 
   it("accepts an absolute path that stays inside the worktree", async () => {
     const root = makeRoot();
-    const abs = write(root, "logs\\session.log", "ok");
+    const abs = write(root, path.join("logs", "session.log"), "ok");
 
     const result = await resolveForTest(root, abs, { maxBytes: 64, policy: "agent" });
 
@@ -101,7 +102,7 @@ describe("resolveOutboundFile", () => {
       return;
     }
 
-    const result = await resolveForTest(root, "escape\\loot.txt", {
+    const result = await resolveForTest(root, path.join("escape", "loot.txt"), {
       maxBytes: 64,
       policy: "agent",
     });

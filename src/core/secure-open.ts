@@ -619,13 +619,56 @@ function posixRawCall(value: unknown): RawPosixCall {
   return value as unknown as RawPosixCall;
 }
 
+export type LinuxLibcLoad<T> = (soname: string) => T;
+
+/**
+ * glibc exposes libc.so.6 on every supported architecture. musl uses an
+ * architecture-specific SONAME, so ambiguous Node architectures are omitted
+ * rather than guessing a compatible libc. libc.so is only a final fallback
+ * after an exact musl SONAME is known for the current architecture.
+ */
+const MUSL_LIBC_SONAME_BY_NODE_ARCH: Readonly<Record<string, string>> = {
+  arm64: "libc.musl-aarch64.so.1",
+  ia32: "libc.musl-i386.so.1",
+  riscv64: "libc.musl-riscv64.so.1",
+  s390x: "libc.musl-s390x.so.1",
+  x64: "libc.musl-x86_64.so.1",
+};
+
+/** Ordered Linux libc loader candidates for a known Node CPU architecture. */
+export function linuxLibcCandidates(architecture: string = process.arch): readonly string[] {
+  const muslSoname = MUSL_LIBC_SONAME_BY_NODE_ARCH[architecture];
+  return muslSoname ? ["libc.so.6", muslSoname, "libc.so"] : ["libc.so.6"];
+}
+
+/**
+ * Loads only a glibc SONAME or the musl SONAME explicitly matched to this CPU.
+ * Koffi errors are intentionally not exposed: failure to load every candidate
+ * must leave the secure-open boundary closed.
+ */
+export function loadLinuxLibc<T>(load: LinuxLibcLoad<T>, architecture: string = process.arch): T {
+  const candidates = linuxLibcCandidates(architecture);
+  for (const candidate of candidates) {
+    try {
+      return load(candidate);
+    } catch {
+      // Try the next compatible libc SONAME.
+    }
+  }
+
+  throw refusal(
+    "unreadable",
+    `Unable to load a compatible Linux libc for ${architecture}; tried ${candidates.join(", ")}.`
+  );
+}
+
 let linuxApiPromise: Promise<PosixNativeApi> | undefined;
 
 async function loadLinuxApi(): Promise<PosixNativeApi> {
   if (!linuxApiPromise) {
     linuxApiPromise = (async () => {
       const koffi = (await import("koffi")).default;
-      const libc = koffi.load("libc.so.6");
+      const libc = loadLinuxLibc((candidate) => koffi.load(candidate));
       const openat = posixRawCall(libc.func("openat", "int", ["int", "str", "int"]));
       const errno = posixRawCall(koffi.errno);
       return {

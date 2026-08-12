@@ -7,6 +7,8 @@ import {
   createDarwinBackend,
   createLinuxBackend,
   LINUX_POSIX_OPEN_FLAGS,
+  linuxLibcCandidates,
+  loadLinuxLibc,
   SecureOpenError,
   secureOpen,
   win32CreateFileFlags,
@@ -448,6 +450,42 @@ describe("secureOpen", () => {
     const backupSemantics = 0x0200_0000;
     expect(win32CreateFileFlags("candidate") & backupSemantics).toBe(0);
     expect(win32CreateFileFlags("directory") & backupSemantics).toBe(backupSemantics);
+  });
+
+  it("falls back from glibc to the architecture-matched musl libc", () => {
+    const muslLibc = { source: "musl" };
+    const load = vi.fn((soname: string) => {
+      if (soname === "libc.musl-x86_64.so.1") return muslLibc;
+      throw new Error(`missing ${soname}`);
+    });
+
+    expect(loadLinuxLibc(load, "x64")).toBe(muslLibc);
+    expect(load).toHaveBeenNthCalledWith(1, "libc.so.6");
+    expect(load).toHaveBeenNthCalledWith(2, "libc.musl-x86_64.so.1");
+    expect(linuxLibcCandidates("arm64")).toEqual([
+      "libc.so.6",
+      "libc.musl-aarch64.so.1",
+      "libc.so",
+    ]);
+  });
+
+  it("fails closed after every architecture-matched Linux libc candidate fails", () => {
+    const load = vi.fn((_soname: string) => {
+      throw new Error("not found");
+    });
+    let failure: unknown;
+
+    try {
+      loadLinuxLibc(load, "arm64");
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      name: "SecureOpenError",
+      reason: "unreadable",
+    } satisfies Partial<SecureOpenError>);
+    expect(load.mock.calls.map(([soname]) => soname)).toEqual(linuxLibcCandidates("arm64"));
   });
 
   it("opens a POSIX candidate component-by-component from the trusted root fd after pathname ABA replacement", async () => {
