@@ -14,6 +14,7 @@ import { SessionStore } from "../src/core/session-store.js";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { removeWorktreeIfClean, worktreeBranch, worktreePath } from "../src/core/worktree.js";
 import { worktreeRoot } from "../src/core/paths.js";
+import type { SecureOpenBackend } from "../src/core/secure-open.js";
 
 const OWNER = "10000";
 const GUILD = "20000";
@@ -24,6 +25,7 @@ const FIXTURES = join(process.cwd(), ".test-fixtures-app-channels-race");
 const RACE_THREAD_ID = `channel-race-reserve-fence-${process.pid}`;
 const UNRELATED_RACE_THREAD_ID = `channel-race-unrelated-mutation-${process.pid}`;
 const QUOTA_THREAD_ID = `channel-race-file-quota-${process.pid}`;
+const APPROVAL_KEY_THREAD_ID = `channel-race-approval-key-${process.pid}`;
 const run = promisify(execFile);
 
 let cleanupRepo: string | undefined;
@@ -404,6 +406,80 @@ describe("/new channel-registry epoch fence", { timeout: 60_000 }, () => {
       expect(store.get(QUOTA_THREAD_ID)?.fileDeliveryBytes).toBe(1);
     } finally {
       createSpy.mockRestore();
+      await cleanupKnownWorktree();
+    }
+  });
+
+  it("derives a new session approval key from the successfully validated descriptor path", async () => {
+    const reposRoot = join(FIXTURES, "repos");
+    const repoPath = await makeRepo();
+    const registry = new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels.json"));
+    expect(registry.enable(SECONDARY, OWNER)).toBe(true);
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      fakeCopilot(),
+      new FakeTransport(),
+      new SessionStore(join(FIXTURES, "sessions.json")),
+      registry
+    );
+    const branch = worktreeBranch(APPROVAL_KEY_THREAD_ID);
+    const expectedWorktree = worktreePath(worktreeRoot(), repoPath, APPROVAL_KEY_THREAD_ID);
+    cleanupRepo = repoPath;
+    cleanupWorktree = expectedWorktree;
+    cleanupBranch = branch;
+    const pathMode = process.platform === "win32" ? "win32" : "posix";
+    const validationPath = process.platform === "win32" ? String.raw`C:\descriptor\new` : "/proc/self/fd/new";
+    const rootClose = vi.fn(async () => undefined);
+    const backend: SecureOpenBackend = {
+      open: vi.fn(async () => {
+        throw new Error("this regression only captures a root");
+      }),
+      openDirectory: vi.fn(async () => ({
+        finalPath: expectedWorktree,
+        validationPath,
+        identity: "new-validated-root",
+        directory: true,
+        revalidate: async () => ({
+          finalPath: expectedWorktree,
+          identity: "new-validated-root",
+          directory: true,
+        }),
+        close: rootClose,
+      })),
+    };
+    (
+      app as unknown as {
+        actorCreateDependencies?: {
+          secureOpen?: { backend?: SecureOpenBackend; pathMode?: "win32" | "posix" };
+        };
+      }
+    ).actorCreateDependencies = { secureOpen: { backend, pathMode } };
+    const bindingCheck = vi.fn(async (binding: Binding) => {
+      expect(binding.workDir).toBe(validationPath);
+      return { ok: true } as const;
+    });
+    patchBindingCheck(app, bindingCheck);
+    const approvalKeySpy = vi
+      .spyOn(app as unknown as { approvalKeyFor(path: string): Promise<string> }, "approvalKeyFor")
+      .mockResolvedValue(repoPath);
+
+    try {
+      patchChannelFetch(app, async () => ({
+        type: ChannelType.GuildText,
+        threads: { create: async () => ({ id: APPROVAL_KEY_THREAD_ID, delete: async () => {} }) },
+      }));
+      await cmdNew(app, asInteraction(slash()));
+
+      expect(bindingCheck).toHaveBeenCalledOnce();
+      expect(approvalKeySpy).toHaveBeenCalledExactlyOnceWith(validationPath);
+    } finally {
+      approvalKeySpy.mockRestore();
+      const actor = (
+        app as unknown as { sessions: Map<string, { actor: { disconnect(): Promise<void> } }> }
+      ).sessions.get(APPROVAL_KEY_THREAD_ID)?.actor;
+      await actor?.disconnect().catch(() => {});
+      expect(rootClose).toHaveBeenCalledTimes(1);
       await cleanupKnownWorktree();
     }
   });

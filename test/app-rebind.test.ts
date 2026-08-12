@@ -542,6 +542,10 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     );
     (app as unknown as { bindingCheck: unknown }).bindingCheck = bindingCheck;
     const createSpy = vi.spyOn(SessionActor, "create");
+    const approvalKeySpy = vi.spyOn(
+      app as unknown as { approvalKeyFor(path: string): Promise<string> },
+      "approvalKeyFor"
+    );
     try {
       const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
 
@@ -553,10 +557,60 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       expect(validationPath).not.toBe(restoredWorktreePath);
       expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
       expect(createSpy).not.toHaveBeenCalled();
+      expect(approvalKeySpy).not.toHaveBeenCalled();
       expect(rootClose).toHaveBeenCalledTimes(1);
       expect(transport.notices).toEqual([]);
     } finally {
       createSpy.mockRestore();
+      approvalKeySpy.mockRestore();
+    }
+  });
+
+  it("derives a rebind approval key from the successfully validated descriptor path", async () => {
+    const { app } = harness();
+    const pathMode = process.platform === "win32" ? "win32" : "posix";
+    const validationPath = process.platform === "win32" ? String.raw`C:\descriptor\98` : "/proc/self/fd/98";
+    const rootClose = vi.fn(async () => undefined);
+    const backend: SecureOpenBackend = {
+      open: vi.fn(async () => {
+        throw new Error("this regression only captures a root");
+      }),
+      openDirectory: vi.fn(async () => ({
+        finalPath: repoB,
+        validationPath,
+        identity: "validated-target-root",
+        directory: true,
+        revalidate: async () => ({
+          finalPath: repoB,
+          identity: "validated-target-root",
+          directory: true,
+        }),
+        close: rootClose,
+      })),
+    };
+    (
+      app as unknown as {
+        actorCreateDependencies?: {
+          secureOpen?: { backend?: SecureOpenBackend; pathMode?: "win32" | "posix" };
+        };
+      }
+    ).actorCreateDependencies = { secureOpen: { backend, pathMode } };
+    const bindingCheck = vi.fn(async (binding: { workDir: string }) => {
+      expect(binding.workDir).toBe(validationPath);
+      return { ok: true } as const;
+    });
+    (app as unknown as { bindingCheck: unknown }).bindingCheck = bindingCheck;
+    const approvalKeySpy = vi
+      .spyOn(app as unknown as { approvalKeyFor(path: string): Promise<string> }, "approvalKeyFor")
+      .mockResolvedValue(repoB);
+
+    try {
+      await expect(applyRebind(app, { repoPath: repoB, devMode: "local" })).resolves.toMatch(/已改綁/);
+      expect(bindingCheck).toHaveBeenCalledOnce();
+      expect(approvalKeySpy).toHaveBeenCalledExactlyOnceWith(validationPath);
+    } finally {
+      approvalKeySpy.mockRestore();
+      await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
     }
   });
 

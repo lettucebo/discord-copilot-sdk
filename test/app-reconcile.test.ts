@@ -3,6 +3,7 @@ import { DiscordCopilotApp } from "../src/app.js";
 import { SessionActor, type SessionActorOpts } from "../src/copilot/session-actor.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
+import type { SecureOpenBackend } from "../src/core/secure-open.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { tmpdir } from "node:os";
@@ -230,6 +231,63 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
         ok: false,
         reason: "unreadable",
       });
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
+  it("derives a resumed session approval key from the successfully validated descriptor path", async () => {
+    const f = tmpFile();
+    const pathMode = process.platform === "win32" ? "win32" : "posix";
+    const validationPath = process.platform === "win32" ? String.raw`C:\descriptor\resume` : "/proc/self/fd/resume";
+    const rootClose = vi.fn(async () => undefined);
+    const backend: SecureOpenBackend = {
+      open: vi.fn(async () => {
+        throw new Error("this regression only captures a root");
+      }),
+      openDirectory: vi.fn(async () => ({
+        finalPath: REPO,
+        validationPath,
+        identity: "resume-validated-root",
+        directory: true,
+        revalidate: async () => ({
+          finalPath: REPO,
+          identity: "resume-validated-root",
+          directory: true,
+        }),
+        close: rootClose,
+      })),
+    };
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind());
+      store.commit("t1");
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const internals = app as unknown as {
+        actorCreateDependencies?: {
+          secureOpen?: { backend?: SecureOpenBackend; pathMode?: "win32" | "posix" };
+        };
+        bindingCheck: (binding: { workDir: string }) => Promise<{ ok: true }>;
+        approvalKeyFor(path: string): Promise<string>;
+        resumeRecord(record: unknown): Promise<void>;
+      };
+      internals.actorCreateDependencies = { secureOpen: { backend, pathMode } };
+      internals.bindingCheck = vi.fn(async (binding) => {
+        expect(binding.workDir).toBe(validationPath);
+        return { ok: true } as const;
+      });
+      const approvalKeySpy = vi.spyOn(internals, "approvalKeyFor").mockResolvedValue(REPO);
+
+      try {
+        await internals.resumeRecord(store.get("t1"));
+        expect(internals.bindingCheck).toHaveBeenCalledOnce();
+        expect(approvalKeySpy).toHaveBeenCalledExactlyOnceWith(validationPath);
+      } finally {
+        approvalKeySpy.mockRestore();
+        const actor = (sessionsOf(app).get("t1") as { actor?: { disconnect(): Promise<void> } } | undefined)?.actor;
+        await actor?.disconnect().catch(() => {});
+      }
+      expect(rootClose).toHaveBeenCalledTimes(1);
     } finally {
       rmSync(f, { force: true });
     }

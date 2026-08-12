@@ -430,7 +430,8 @@ describe("SessionActor config hardening", () => {
     expect(tool.name).toBe(FILE_DELIVERY_TOOL);
     expect(tool.defer).toBe("never");
     expect("skipPermission" in tool).toBe(false);
-    expect(tool.description).toMatch(/generated file.*current workdir/i);
+    expect(tool.description).toMatch(/file from the current session workdir/i);
+    expect(tool.description).not.toMatch(/generated/i);
     expect(tool.description).toMatch(/explicit operator approval/i);
     expect(tool.description).toMatch(/unavailable in YOLO mode/i);
     expect(tool.parameters).toEqual({
@@ -766,6 +767,79 @@ describe("SessionActor trusted roots", () => {
     expect(retained.close).toHaveBeenCalledTimes(1);
   });
 
+  for (const mode of ["create", "resume"] as const) {
+    for (const [window, changedOnRevalidation] of [
+      ["before skill discovery", 1],
+      ["immediately before the SDK RPC", 2],
+      ["immediately after the SDK RPC", 3],
+    ] as const) {
+      it(`fails closed when a retained root changes ${window} during ${mode}`, async () => {
+        const stableProof = {
+          finalPath: defaultWorkingDirectory,
+          validationPath: defaultWorkingDirectory,
+          identity: "captured-root",
+          directory: true,
+        };
+        const replacementProof = {
+          finalPath: `${defaultWorkingDirectory}-replacement`,
+          identity: "replacement-root",
+          directory: true,
+        };
+        let revalidations = 0;
+        const rootClose = vi.fn(async () => undefined);
+        const openDirectory = vi.fn(async () => ({
+          ...stableProof,
+          revalidate: async () => {
+            revalidations++;
+            return revalidations === changedOnRevalidation ? replacementProof : stableProof;
+          },
+          close: rootClose,
+        }));
+        const backend: SecureOpenBackend = {
+          open: async () => {
+            throw new Error("actor initialization must not open an outbound file");
+          },
+          openDirectory,
+        };
+        const session = new FakeSession();
+        const createSession = vi.fn(async () => session);
+        const resumeSession = vi.fn(async () => session);
+        const deleteSession = vi.fn(async () => undefined);
+        const client = { createSession, resumeSession, deleteSession } as unknown as CopilotClient;
+
+        await expect(
+          SessionActor.createForTest(
+            client,
+            {
+              sessionKey: "root-handoff",
+              workingDirectory: defaultWorkingDirectory,
+              skillsHomeDirectory: join(tmpdir(), `discord-copilot-sdk-no-skills-${Math.random()}`),
+              broker: new PendingInteractionBroker(),
+              transport: new FakeTransport(),
+              policy: new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`)),
+              initialFileDeliveryBytes: 0,
+              fileDeliverySessionId: `root-handoff-${mode}-${changedOnRevalidation}`,
+              reserveFileDeliveryBytes: () => true,
+              ...(mode === "resume" ? { resumeSessionId: "persisted-root-handoff" } : {}),
+            },
+            { secureOpen: { backend } }
+          )
+        ).rejects.toThrow(/trusted-root|root/i);
+
+        const sessionWasCreated = changedOnRevalidation === 3;
+        expect(createSession).toHaveBeenCalledTimes(mode === "create" && sessionWasCreated ? 1 : 0);
+        expect(resumeSession).toHaveBeenCalledTimes(mode === "resume" && sessionWasCreated ? 1 : 0);
+        expect(session.disconnected).toBe(sessionWasCreated ? 1 : 0);
+        expect(deleteSession).toHaveBeenCalledTimes(mode === "create" && sessionWasCreated ? 1 : 0);
+        expect(session.sent).toEqual([]);
+        expect(session.handlers).toHaveLength(0);
+        expect(revalidations).toBe(changedOnRevalidation);
+        expect(openDirectory).toHaveBeenCalledExactlyOnceWith(defaultWorkingDirectory);
+        expect(rootClose).toHaveBeenCalledTimes(1);
+      });
+    }
+  }
+
   it("uses the retained root capability when a later pathname reopen would resolve a replacement", async () => {
     const root = defaultWorkingDirectory;
     const candidate = join(root, "artifact.txt");
@@ -866,11 +940,41 @@ describe("SessionActor permission handling", () => {
         expect(view.canOfferSession).toBe(false);
         expect(view.scopeCommands).toEqual([]);
         expect(view.summary).toContain("report.txt");
+        expect(view.summary).toContain("Path: report.txt");
         expect(view.summary).toContain("6 bytes");
         expect(view.summary).toContain("finished 'report' for review");
+        expect(view.summary).not.toMatch(/generated/i);
         expect(view.summary).toMatch(/anyone who can view this thread or its parent channel can download/i);
         s.transport.deliverDecision(view.nonce, "once", "u1");
         await expect(approval).resolves.toEqual({ kind: "approve-once" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("discloses distinct safe root-relative paths for same-basename artifacts", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-card-paths-"));
+      try {
+        const draftPath = join("drafts", "report.txt");
+        const finalPath = join("final", "report.txt");
+        mkdirSync(join(root, "drafts"), { recursive: true });
+        mkdirSync(join(root, "final"), { recursive: true });
+        writeArtifact(root, draftPath, "draft");
+        writeArtifact(root, finalPath, "final");
+        const s = await setup({ workingDirectory: root });
+
+        const first = requestFilePermission(s, { path: draftPath }, "draft-report");
+        const draftCard = await latestFilePermission(s, 0);
+        expect(draftCard.summary).toContain(`Path: ${draftPath}`);
+        s.transport.deliverDecision(draftCard.nonce, "deny", "u1");
+        await expect(first).resolves.toEqual({ kind: "reject" });
+
+        const second = requestFilePermission(s, { path: finalPath }, "final-report");
+        const finalCard = await latestFilePermission(s, 1);
+        expect(finalCard.summary).toContain(`Path: ${finalPath}`);
+        expect(finalCard.summary).not.toBe(draftCard.summary);
+        s.transport.deliverDecision(finalCard.nonce, "deny", "u1");
+        await expect(second).resolves.toEqual({ kind: "reject" });
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

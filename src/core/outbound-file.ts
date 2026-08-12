@@ -8,6 +8,10 @@ export type OutboundFilePolicy = "agent" | "operator";
 export interface OutboundFile {
   absPath: string;
   displayName: string;
+  /** Canonical root-relative location when content passed secure-open. Optional
+   * so transport fixtures and adapters that never validate content remain
+   * source-compatible. */
+  relativePath?: string;
   size: number;
   fingerprint: string;
   /** Present on files produced by resolveOutboundFile; optional so transport
@@ -29,6 +33,7 @@ export type OutboundRefusal =
 
 export interface ValidatedOutboundFile extends OutboundFile {
   digest: string;
+  relativePath: string;
 }
 
 export type ResolveOutboundFileResult = { ok: true; file: ValidatedOutboundFile } | { ok: false; reason: OutboundRefusal };
@@ -58,14 +63,21 @@ const AGENT_ALLOWED_EXTENSIONS = new Set([
 
 export const DISCORD_BLOCKED_EXECUTABLE_EXTENSIONS = new Set([".exe", ".bat", ".cmd", ".scr", ".msi", ".com"]);
 export const MAX_DISCORD_UPLOAD_BYTES = 8 * 1024 * 1024;
+const FILE_DELIVERY_PATH_MAX = 512;
 
 function isGitInternalRelative(rel: string): boolean {
   const segs = rel.split(/[\\/]+/).filter(Boolean);
-  return segs.some((seg) => (process.platform === "win32" ? seg.toLowerCase() : seg) === ".git");
+  return segs.some((seg) => (gitNamesAreCaseInsensitive() ? seg.toLowerCase() : seg) === ".git");
 }
 
 function isGitName(name: string): boolean {
-  return (process.platform === "win32" ? name.toLowerCase() : name) === ".git";
+  return (gitNamesAreCaseInsensitive() ? name.toLowerCase() : name) === ".git";
+}
+
+function gitNamesAreCaseInsensitive(): boolean {
+  // APFS/HFS+ commonly compares names case-insensitively. Treat Darwin
+  // conservatively so a `.GIT` spelling cannot reveal git internals there.
+  return process.platform === "win32" || process.platform === "darwin";
 }
 
 function candidatePath(trustedRoot: TrustedRoot, requestedPath: string): string {
@@ -102,6 +114,18 @@ function mapSecureOpenRefusal(error: unknown): OutboundRefusal {
   }
 }
 
+function safeRootRelativePath(relativePath: string): string | undefined {
+  if (
+    !relativePath ||
+    path.isAbsolute(relativePath) ||
+    hasBidiOrControls(relativePath) ||
+    sanitizeForInlineCode(relativePath, FILE_DELIVERY_PATH_MAX) !== relativePath
+  ) {
+    return undefined;
+  }
+  return relativePath;
+}
+
 /**
  * Resolve an artifact only through the actor's retained capture-time root
  * capability. The secure-open boundary revalidates that same live directory
@@ -133,6 +157,9 @@ export async function resolveOutboundFile(
     return { ok: false, reason: ".git-internal" };
   }
 
+  const relativePath = safeRootRelativePath(opened.relativePath);
+  if (!relativePath) return { ok: false, reason: "unsafe-filename" };
+
   const displayName = path.basename(opened.finalPath);
   if (hasBidiOrControls(displayName) || sanitizeForInlineCode(displayName) !== displayName) {
     return { ok: false, reason: "unsafe-filename" };
@@ -148,6 +175,7 @@ export async function resolveOutboundFile(
     file: {
       absPath: opened.finalPath,
       displayName,
+      relativePath,
       size: opened.size,
       fingerprint: `${opened.identity}:${opened.size}:${opened.modifiedAt}`,
       digest: `sha256:${createHash("sha256").update(opened.bytes).digest("hex")}`,

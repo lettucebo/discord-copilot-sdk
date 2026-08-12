@@ -629,9 +629,20 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   canonicalise 後改用 mutable final path。Linux 為持有 fd 期間的 `/proc/self/fd/<fd>`，Darwin
   為 `/dev/fd/<fd>`；Windows 的 directory handle 只分享 read、拒絕 delete/rename，所以其
   handle-derived final path 在 handle 存活時仍綁定同一 root。若 git 不能操作該 validation path
-  即拒絕，絕不回退到原 workdir。proof 完成後同一 capability 轉交 actor，actor 不得按 mutable
-  pathname 重捕；驗證或初始化失敗各自恰好 close 一次，因此 root swap／junction 不能在 proof 與
-  actor 之間把 repo 外目錄變成 trusted root。
+  即拒絕，絕不回退到原 workdir。approval key 也只能在 proof 成功後以該 validation path 的
+  `--git-common-dir` 導出，不能先用可替換的 repo pathname 選擇既有授權。proof 完成後同一
+  capability 轉交 actor，actor 不得按 mutable pathname 重捕；且在解析 skills/config 前、
+  create/resume RPC 前、及 RPC 回傳後都會用**原 handle**重驗 final path + identity。最後一道
+  fence 失敗會 best-effort disconnect/delete 新建 runtime，actor 不會可用或接收 prompt，並由既有
+  init cleanup 恰好 close root 一次；因此 POSIX rename/replacement 也不能在 proof 與 actor
+  之間把 replacement cwd 交給 SDK。
+- **可審核的檔案身份**：`secureOpen` 給出的 canonical root-relative path 會一路保留到
+  `OutboundFile` 與 agent file approval；卡片同時列出完整 `Path`、檔名、大小及 comment。
+  path 含 bidi/control、換行/tab/backtick、會被轉義或截斷的字元、或超過完整顯示上限時直接拒絕，
+  不以省略號隱藏尾端。custom tool 只聲稱從 current session workdir 傳檔，不宣稱檔案由 agent
+  生成；重新開檔送出前也比對 path、digest 與 fingerprint。
+- **`.git` lexical/internal gate**：Windows 與 Darwin 都以小寫比對 `.git` segments，故 case-insensitive
+  APFS/HFS+ 上的 `.GIT` 等拼法同樣拒絕，且在 pathname 預檢與 handle-derived final path 兩層都套用。
 - **content digest / endpoint truth**：送出前先固定內容與 digest；成功與否以 Discord 端點回應為準。即使取消發生在送出接近完成時，也只能回報 endpoint 真實結果，不得樂觀宣稱成功。
 - **YOLO fast deny + 卡片撤銷**：`discord_send_file` 在 YOLO 下不是「自動允許」，而是立即拒絕並告知改走 `/file`。切入 YOLO 的同一同步步驟會撤銷已核准檔案、deny 尚待 broker 的 file card，且所有 agent-file currentness 都要求 `!yolo`；所以先前卡片的 Allow click 只能是 inert，不能在 YOLO 後送檔。
 - **allow-once only**：agent 路徑沒有 repo/session 級常駐授權；每次送檔都重新決定。
@@ -670,8 +681,8 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | --- | --- |
 | `/channel enable` 缺權限診斷包含 `Attach Files` | `test/app-channels.test.ts` |
 | 所有 attachment sends 都 suppress mentions | `test/transport.test.ts` |
-| handle-bound validation path（Linux/Darwin fd path、Windows locked final path）、local/worktree git proof、root swap 拒絕、actor ownership/close-once | `test/secure-open.test.ts`、`test/binding.test.ts`、`test/app-rebind.test.ts`、`test/session-actor.test.ts` |
-| `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root/content/digest 綁定、endpoint truth、late cancellation 不算成功 | `test/session-actor.test.ts`、`test/app-file-command.test.ts` |
+| handle-bound validation path（Linux/Darwin fd path、Windows locked final path）、local/worktree git proof、approval key 僅在 descriptor proof 後導出、root swap 拒絕、actor ownership/close-once | `test/secure-open.test.ts`、`test/binding.test.ts`、`test/app-channels-race.test.ts`、`test/app-rebind.test.ts`、`test/app-reconcile.test.ts`、`test/session-actor.test.ts` |
+| `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root-relative card path、Darwin `.GIT` 拒絕、root/content/digest/path 綁定、endpoint truth、late cancellation 不算成功 | `test/outbound-file.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
 | 24 MiB 持久化保守預留、舊 record 遷移、session-id + generation CAS、rebind fence/單調 rollback、YOLO/abort rollback 不永久停用 `/file`、restart total、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
 | `/file` resolve/send interleaving（end、rebind-style replacement）不可附件或成功回覆 | `test/app-file-command.test.ts`、`test/transport.test.ts` |
 | session dispose 後可重新顯示一次 Attach Files 缺權限提示 | `test/transport.test.ts` |

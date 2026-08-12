@@ -49,6 +49,7 @@ import { pickTitleModel, buildTitlePrompt, cleanModelTitle } from "./core/title.
 import {
   isGitRepo,
   repoRoot,
+  repoRootStrict,
   addWorktree,
   inspectWorktree,
   removeWorktreeIfClean,
@@ -458,6 +459,10 @@ export class DiscordCopilotApp {
   /** Only createForTest sets this. Production must capture a native trusted
    * root, while app state-machine fixtures receive an opaque fail-closed root. */
   private actorCreateDependencies?: SessionActorCreateDependencies;
+  /** Test-only substitute for the Git common-dir proof. State-machine fixtures
+   * intentionally use nonexistent roots, so production's strict lookup cannot
+   * run there; every production path leaves this unset. */
+  private approvalKeyForTest?: (validationPath: string) => Promise<string>;
   /** Threads with a clone/init in flight. A clone can take minutes, during which
    *  a second one in the same thread would race for the same destination. */
   private readonly provisioning = new Set<string>();
@@ -555,14 +560,14 @@ export class DiscordCopilotApp {
    * captured directory before actor creation. Only createForTest populates the
    * injected backend.
    *
-   * On a failed verdict this method closes the capability itself. On success it
-   * transfers ownership to the caller, which must either hand it to
-   * SessionActor.create() or close it on its own failure path.
+   * On a failed verdict or approval-key proof this method closes the capability
+   * itself. On success it transfers ownership to the caller, which must either
+   * hand it to SessionActor.create() or close it on its own failure path.
    */
   private async captureValidatedRoot(
     binding: Binding
   ): Promise<
-    | { ok: true; trustedRoot: TrustedRoot; binding: Binding }
+    | { ok: true; trustedRoot: TrustedRoot; binding: Binding; approvalKey: string }
     | { ok: false; verdict: Exclude<BindingVerdict, { ok: true }> }
   > {
     const trustedRoot = await captureTrustedRoot(binding.workDir, this.actorCreateDependencies?.secureOpen);
@@ -581,9 +586,19 @@ export class DiscordCopilotApp {
       await trustedRoot.close().catch(() => {});
       return { ok: false, verdict };
     }
+    let approvalKey: string;
+    try {
+      // The approval key is a security-relevant repository identity, not a
+      // display label. Derive it only after binding succeeds, from the same
+      // retained descriptor path Git just proved owns this worktree.
+      approvalKey = await this.approvalKeyFor(trustedRoot.validationPath);
+    } catch (error) {
+      await trustedRoot.close().catch(() => {});
+      throw error;
+    }
     // Persist and hand the SDK the handle's final display path. The descriptor
     // capability itself remains the file-security boundary after this proof.
-    return { ok: true, trustedRoot, binding: { ...binding, workDir: trustedRoot.finalPath } };
+    return { ok: true, trustedRoot, binding: { ...binding, workDir: trustedRoot.finalPath }, approvalKey };
   }
 
   /**
@@ -633,6 +648,7 @@ export class DiscordCopilotApp {
     const app = new DiscordCopilotApp(config, copilot, noopLock, transport, store, channels);
     app.reposRoot = reposRoot;
     app.actorCreateDependencies = createForTestActorDependencies();
+    app.approvalKeyForTest = async (validationPath) => validationPath;
     return app;
   }
 
@@ -719,10 +735,18 @@ export class DiscordCopilotApp {
    * Follows the REPOSITORY, not the per-session checkout: with worktrees every
    * session has a different `workDir`, so keying on that would silently
    * re-prompt for a command the operator already trusted in this repository.
-   * Lenient on purpose — a wrong key only costs an extra prompt, and this is not
-   * the security boundary (`validateBinding` is).
+   * This is intentionally strict: sharing an approval across the wrong repo is
+   * a security boundary failure, not merely an extra prompt. Callers may invoke
+   * it only after validateBinding has proved this descriptor-backed path.
    */
-  private async approvalKeyFor(repoPath: string): Promise<string> {
+  private async approvalKeyFor(validationPath: string): Promise<string> {
+    if (this.approvalKeyForTest) return this.approvalKeyForTest(validationPath);
+    return repoRootStrict(validationPath);
+  }
+
+  /** Display-only fallback for `/approvals`; actor approval keys are always
+   * derived through approvalKeyFor() after descriptor-backed binding. */
+  private async displayApprovalKeyFor(repoPath: string): Promise<string> {
     return (await isGitRepo(repoPath)) ? repoRoot(repoPath) : repoPath;
   }
 
@@ -1320,14 +1344,6 @@ export class DiscordCopilotApp {
         await interaction.editReply(msg);
       };
 
-      let approvalKey: string;
-      try {
-        approvalKey = await this.approvalKeyFor(repoPath);
-      } catch (err) {
-        await abort(`⚠️ 無法建立 repo 核准範圍（${err instanceof Error ? err.message : String(err)}）。未建立 session。`);
-        return;
-      }
-
       // Capture first, then prove the handle-bound validation path. Validating
       // the mutable generated pathname and capturing it later leaves a swap
       // window that can make an external directory the actor's trusted root.
@@ -1353,6 +1369,7 @@ export class DiscordCopilotApp {
       }
       const trustedRoot = captured.trustedRoot;
       const workDir = captured.binding.workDir;
+      const approvalKey = captured.approvalKey;
 
       // LAST authorization check before anything durable exists. The window from
       // the first check to here spans a thread creation, a `git worktree add`
@@ -2404,15 +2421,6 @@ export class DiscordCopilotApp {
       }
     };
 
-    let approvalKey: string;
-    try {
-      approvalKey = await this.approvalKeyFor(target.repoPath);
-    } catch (err) {
-      restoreOldFileDelivery();
-      await undoWorktree();
-      return `⚠️ 無法建立 repo 核准範圍（${err instanceof Error ? err.message : String(err)}）。未改綁。`;
-    }
-
     let captured;
     try {
       captured = await this.captureValidatedRoot({
@@ -2433,6 +2441,7 @@ export class DiscordCopilotApp {
     }
     const trustedRoot = captured.trustedRoot;
     const workDir = captured.binding.workDir;
+    const approvalKey = captured.approvalKey;
 
     // Take the lease BEFORE the new session exists, so a concurrent
     // `/repo dev local` in another thread cannot slip in between check and create.
@@ -3044,20 +3053,6 @@ export class DiscordCopilotApp {
         return;
       }
     }
-    let approvalKey: string;
-    try {
-      approvalKey = await this.approvalKeyFor(rec.repoPath);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`reconcile: transient approval-key failure for ${rec.threadId}: ${msg}`);
-      await this.transport
-        .notice(
-          rec.threadId,
-          `⚠️ 暫時無法復原此對話（${msg}）。session 記錄已保留——重新啟動 bot 可再嘗試復原；或用 /new 重新開始。`
-        )
-        .catch(() => {});
-      return;
-    }
     // Capture before git sees the path. The persisted JSON pathname is mutable;
     // Git proves only the retained handle's validation path, while the same
     // capability and its final display path transfer to the resumed actor.
@@ -3094,6 +3089,7 @@ export class DiscordCopilotApp {
     }
     const trustedRoot = captured.trustedRoot;
     const workDir = captured.binding.workDir;
+    const approvalKey = captured.approvalKey;
     const broker = new PendingInteractionBroker();
     let actor: SessionActor;
     try {
@@ -3470,7 +3466,7 @@ export class DiscordCopilotApp {
     const sessionRules = [...new Set(scope.flatMap((k) => this.approvals.sessionApprovals(k)))];
     // Show the CURRENT thread's repo rules when there is one, else everything.
     const here = this.sessions.get(interaction.channelId);
-    const hereKey = here ? await this.approvalKeyFor(here.repoPath) : undefined;
+    const hereKey = here ? await this.displayApprovalKeyFor(here.repoPath) : undefined;
     const repoRules = hereKey
       ? this.approvals.repoApprovals(hereKey)
       : [...new Set(this.approvals.repoKeys().flatMap((k) => this.approvals.repoApprovals(k)))];

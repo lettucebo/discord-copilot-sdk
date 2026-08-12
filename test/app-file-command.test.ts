@@ -320,6 +320,7 @@ describe("/file", () => {
       file: {
         absPath: filePath,
         displayName: "report.txt",
+        relativePath: "report.txt",
         size: 5,
         fingerprint: "artifact-identity:5:1",
         digest: "sha256:test",
@@ -384,6 +385,7 @@ describe("/file", () => {
       file: {
         absPath: filePath,
         displayName: "report.txt",
+        relativePath: "report.txt",
         size: 5,
         fingerprint: "artifact-identity:5:1",
         digest: "sha256:test",
@@ -415,6 +417,7 @@ describe("/file", () => {
       file: {
         absPath: filePath,
         displayName: "report.txt",
+        relativePath: path.join("artifacts", "report.txt"),
         size: 5,
         fingerprint: "artifact-identity:5:1",
         digest: "sha256:test",
@@ -461,6 +464,7 @@ describe("/file", () => {
       file: {
         absPath: filePath,
         displayName: "report.txt",
+        relativePath: "report.txt",
         size: 5,
         fingerprint: "artifact-identity:5:1",
         digest: "sha256:test",
@@ -497,6 +501,7 @@ describe("/file", () => {
       file: {
         absPath: filePath,
         displayName: "report.txt",
+        relativePath: "report.txt",
         size: 5,
         fingerprint: "artifact-identity:5:1",
         digest: "sha256:test",

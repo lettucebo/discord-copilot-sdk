@@ -90,6 +90,7 @@ describe("resolveOutboundFile", () => {
       file: {
         absPath: abs,
         displayName: "report.txt",
+        relativePath: requestedPath,
         size: 12,
         fingerprint: expect.any(String),
         digest: "sha256:6dce0a4409fabc637beaa80f9a1d36e0528575f6201c4834d02f6ec7e421fd66",
@@ -160,6 +161,44 @@ describe("resolveOutboundFile", () => {
     const result = await resolveForTest(root, ".git", { maxBytes: 64, policy: "operator" });
 
     expect(result).toEqual({ ok: false, reason: ".git-internal" });
+  });
+
+  it("models Darwin as case-insensitive for lexical .git internals", async () => {
+    const root = makeRoot();
+    write(root, path.join(".GIT", "config"), "git config");
+    const trustedRoot = await captureTrustedRoot(root);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    if (!platform) throw new Error("process.platform descriptor is unavailable");
+
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+      await expect(
+        resolveOutboundFile(trustedRoot, path.join(".GIT", "config"), { maxBytes: 64, policy: "operator" })
+      ).resolves.toEqual({ ok: false, reason: ".git-internal" });
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+      await trustedRoot.close();
+    }
+  });
+
+  it("retains an exact safe root-relative path and rejects an unsafe path segment", async () => {
+    const root = makeRoot();
+    const firstPath = path.join("drafts", "report.txt");
+    const secondPath = path.join("final", "report.txt");
+    write(root, firstPath, "draft");
+    write(root, secondPath, "final");
+    write(root, path.join(`spoof\u202Edir`, "report.txt"), "unsafe");
+
+    const first = await resolveForTest(root, firstPath, { maxBytes: 64, policy: "agent" });
+    const second = await resolveForTest(root, secondPath, { maxBytes: 64, policy: "agent" });
+    const unsafe = await resolveForTest(root, path.join(`spoof\u202Edir`, "report.txt"), {
+      maxBytes: 64,
+      policy: "agent",
+    });
+
+    expect(first).toMatchObject({ ok: true, file: { displayName: "report.txt", relativePath: firstPath } });
+    expect(second).toMatchObject({ ok: true, file: { displayName: "report.txt", relativePath: secondPath } });
+    expect(unsafe).toEqual({ ok: false, reason: "unsafe-filename" });
   });
 
   it("refuses directories", async () => {

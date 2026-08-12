@@ -13,7 +13,12 @@ import {
   type OutboundFilePolicy,
   type ResolveOutboundFileResult,
 } from "../core/outbound-file.js";
-import { captureTrustedRoot, type SecureOpenDependencies, type TrustedRoot } from "../core/secure-open.js";
+import {
+  assertTrustedRootCurrent as assertCurrentTrustedRoot,
+  captureTrustedRoot,
+  type SecureOpenDependencies,
+  type TrustedRoot,
+} from "../core/secure-open.js";
 
 const PERMISSION_TIMEOUT_MS = 5 * 60_000;
 const TURN_WATCHDOG_MS = 15 * 60_000;
@@ -70,6 +75,7 @@ interface ApprovedFileDelivery {
   fingerprint: string;
   digest: string;
   displayName: string;
+  relativePath: string;
   size: number;
   comment?: string;
   turnEpoch: number;
@@ -126,9 +132,10 @@ function fileDeliveryFailure(text: string): ToolResultObject {
   return { resultType: "failure", textResultForLlm: text, error: text };
 }
 
-function fileDeliverySummary(displayName: string, size: number, comment?: string): string {
+function fileDeliverySummary(relativePath: string, displayName: string, size: number, comment?: string): string {
   return [
-    "Send this generated file to the owning Discord thread.",
+    "Send a file from the current session workdir to the owning Discord thread.",
+    `Path: ${relativePath}`,
     `File: ${displayName}`,
     `Size: ${size} bytes`,
     ...(comment ? [`Comment: ${comment}`] : []),
@@ -376,7 +383,38 @@ export class SessionActor {
     await trustedRoot.close();
   }
 
+  private async assertCurrentRootForSdk(): Promise<void> {
+    await assertCurrentTrustedRoot(this.opts.trustedRoot);
+  }
+
+  /** A successful RPC may have spawned a process against a swapped pathname.
+   * Disconnect it before initialization propagates the failed root fence; the
+   * outer create cleanup remains the single owner of the retained root close. */
+  private async assertCurrentRootAfterSdkSession(client: CopilotClient): Promise<void> {
+    try {
+      await this.assertCurrentRootForSdk();
+    } catch (error) {
+      await Promise.resolve()
+        .then(() => this.session.disconnect())
+        .catch(() => {});
+      // A resume reconnects a durable conversation, so it must only disconnect.
+      // A newly-created session has no safe owner after this fence failed; delete
+      // it best effort after disconnect so it cannot linger as an orphan.
+      const sessionId = this.opts.resumeSessionId ? undefined : this.opts.createSessionId ?? this.session.sessionId;
+      if (typeof sessionId === "string" && sessionId.length > 0) {
+        const clientWithDelete = client as unknown as { deleteSession?: (id: string) => Promise<unknown> };
+        await Promise.resolve()
+          .then(() => clientWithDelete.deleteSession?.(sessionId))
+          .catch(() => {});
+      }
+      throw error;
+    }
+  }
+
   private async init(client: CopilotClient): Promise<void> {
+    // Skills are resolved by pathname, so prove the retained root immediately
+    // before any SDK-facing working-directory work begins.
+    await this.assertCurrentRootForSdk();
     const includeRepoSkills = this.opts.enableRepoSkills ?? true;
     const includeUserSkills = this.opts.enableUserSkills ?? true;
     const repoSkillDirectories = resolveSkillDirectories({
@@ -431,7 +469,7 @@ export class SessionActor {
       tools: [
         defineTool<FileDeliveryArgs>(FILE_DELIVERY_TOOL, {
           description:
-            "Sends only a generated file in the current workdir to the owning Discord thread. " +
+            "Sends a file from the current session workdir to the owning Discord thread. " +
             "Requires explicit operator approval and is unavailable in YOLO mode.",
           parameters: FILE_DELIVERY_PARAMETERS,
           defer: "never",
@@ -478,11 +516,13 @@ export class SessionActor {
       // value before a session's first /model change. The real user-selected
       // values are read back from the runtime below.
       const { model: _m, contextTier: _c, ...resumeConfig } = config;
+      await this.assertCurrentRootForSdk();
       this.session = await c.resumeSession(this.opts.resumeSessionId, {
         ...resumeConfig,
         continuePendingWork: false,
         suppressResumeEvent: true,
       });
+      await this.assertCurrentRootAfterSdkSession(client);
       // Keep the constructor's defaults only as a last resort: if the runtime
       // can't tell us, showing the configured default is better than showing
       // nothing (and `reconfigure` needs SOME model to merge onto).
@@ -491,7 +531,9 @@ export class SessionActor {
       // Reserve-before-create uses a caller-assigned id so a crash between the
       // durable reserve and this create leaves an identifiable id on disk.
       if (this.opts.createSessionId) config["sessionId"] = this.opts.createSessionId;
+      await this.assertCurrentRootForSdk();
       this.session = await c.createSession(config);
+      await this.assertCurrentRootAfterSdkSession(client);
     }
     this.unsubscribeDecision = this.opts.transport.onDecision((nonce, decision) =>
       this.onDecision(nonce, decision)
@@ -802,12 +844,13 @@ export class SessionActor {
     }
     if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) return undefined;
 
-    const { fingerprint, digest, displayName, size } = resolved.file;
+    const { fingerprint, digest, displayName, relativePath, size } = resolved.file;
     return {
       requestedPath,
       fingerprint,
       digest,
       displayName,
+      relativePath,
       size,
       ...(comment ? { comment } : {}),
       turnEpoch,
@@ -865,7 +908,7 @@ export class SessionActor {
         nonce,
         sessionKey: this.opts.sessionKey,
         kind: "custom-tool",
-        summary: fileDeliverySummary(approval.displayName, approval.size, approval.comment),
+        summary: fileDeliverySummary(approval.relativePath, approval.displayName, approval.size, approval.comment),
         supported: true,
         canOfferSession: false,
         scopeCommands: [],
@@ -980,6 +1023,7 @@ export class SessionActor {
       file.fingerprint !== approval.fingerprint ||
       file.digest !== approval.digest ||
       file.displayName !== approval.displayName ||
+      file.relativePath !== approval.relativePath ||
       file.size !== approval.size
     ) {
       return fileDeliveryFailure("The approved file changed after approval and was not delivered.");

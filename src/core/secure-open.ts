@@ -333,6 +333,22 @@ function acquireTrustedRootUse(trustedRoot: TrustedRoot): {
   };
 }
 
+/**
+ * Prove that a retained root capability still names the captured directory.
+ * This deliberately asks only the already-open handle for its current proof;
+ * reopening finalPath would reintroduce the pathname replacement race.
+ */
+export async function assertTrustedRootCurrent(trustedRoot: TrustedRoot): Promise<void> {
+  const lease = acquireTrustedRootUse(trustedRoot);
+  try {
+    assertCapturedRoot(await lease.state.openedRoot.revalidate(), lease.state, lease.state.pathMode);
+  } catch (error) {
+    throw classifyOpenError(error);
+  } finally {
+    lease.release();
+  }
+}
+
 function assertCapturedRoot(
   proof: SecureDirectoryProof,
   trustedRoot: { finalPath: string; identity: string },
