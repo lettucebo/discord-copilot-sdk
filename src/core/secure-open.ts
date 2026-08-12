@@ -49,8 +49,16 @@ export interface SecureOpenedFile {
   close(): Promise<void>;
 }
 
+/** Metadata sourced from one still-open trusted-root directory handle. */
+export interface SecureOpenedDirectory {
+  finalPath: string;
+  directory: boolean;
+  close(): Promise<void>;
+}
+
 export interface SecureOpenBackend {
   open(candidate: string): Promise<SecureOpenedFile>;
+  openDirectory(trustedRoot: string): Promise<SecureOpenedDirectory>;
 }
 
 /** Test-only dependency injection for the OS-handle boundary. */
@@ -139,14 +147,19 @@ function validSize(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
+async function linuxFinalPath(fd: number): Promise<string> {
+  const finalPath = await fs.readlink(`/proc/self/fd/${fd}`);
+  if (finalPath.endsWith(" (deleted)")) {
+    throw refusal("unreadable", "The opened handle was deleted before its containment could be proved.");
+  }
+  return finalPath;
+}
+
 const linuxBackend: SecureOpenBackend = {
   async open(candidate: string): Promise<SecureOpenedFile> {
     const handle = await fs.open(candidate, "r");
     try {
-      const finalPath = await fs.readlink(`/proc/self/fd/${handle.fd}`);
-      if (finalPath.endsWith(" (deleted)")) {
-        throw refusal("unreadable", "The opened file was deleted before its containment could be proved.");
-      }
+      const finalPath = await linuxFinalPath(handle.fd);
       const stat = await handle.stat();
       return {
         finalPath,
@@ -155,6 +168,21 @@ const linuxBackend: SecureOpenBackend = {
         identity: `${stat.dev}:${stat.ino}`,
         modifiedAt: String(stat.mtimeMs),
         read: () => handle.readFile(),
+        close: () => handle.close(),
+      };
+    } catch (error) {
+      await handle.close();
+      throw error;
+    }
+  },
+  async openDirectory(trustedRoot: string): Promise<SecureOpenedDirectory> {
+    const handle = await fs.open(trustedRoot, "r");
+    try {
+      const finalPath = await linuxFinalPath(handle.fd);
+      const stat = await handle.stat();
+      return {
+        finalPath,
+        directory: stat.isDirectory(),
         close: () => handle.close(),
       };
     } catch (error) {
@@ -384,18 +412,21 @@ async function openWindows(candidate: string): Promise<SecureOpenedFile> {
       modifiedAt,
       async read(): Promise<Buffer> {
         const bytes = Buffer.allocUnsafe(size);
-        for (let offset = 0; offset < size; ) {
+        let offset = 0;
+        while (offset < size) {
           const length = Math.min(size - offset, WIN32_MAX_READ_CHUNK);
           const readOut: unknown[] = [0];
           if (!asBoolean(api.readFile(handle, bytes.subarray(offset, offset + length), length, readOut, null))) {
             throw win32Error(api, "unreadable");
           }
           const read = asUint32(readOut[0]);
-          if (read === undefined || read !== length) {
+          if (read === undefined || read > length) {
             throw refusal("unreadable", "The Win32 handle changed while it was being read.");
           }
+          if (read === 0) break;
           offset += read;
         }
+        if (offset !== size) throw refusal("unreadable", "The Win32 handle ended before its statted byte count.");
         return bytes;
       },
       async close(): Promise<void> {
@@ -408,13 +439,62 @@ async function openWindows(candidate: string): Promise<SecureOpenedFile> {
   }
 }
 
-const windowsBackend: SecureOpenBackend = { open: openWindows };
+async function openWindowsDirectory(trustedRoot: string): Promise<SecureOpenedDirectory> {
+  const api = await loadWin32Api();
+  const handle = asWin32Handle(
+    api.createFileW(
+      trustedRoot,
+      WIN32_GENERIC_READ,
+      WIN32_FILE_SHARE_READ,
+      null,
+      WIN32_OPEN_EXISTING,
+      WIN32_FILE_ATTRIBUTE_NORMAL | WIN32_FILE_FLAG_BACKUP_SEMANTICS,
+      null
+    )
+  );
+  if (!handle) throw win32Error(api, "unreadable", true);
+
+  try {
+    if (asUint32(api.getFileType(handle)) !== WIN32_FILE_TYPE_DISK) {
+      throw refusal("unreadable", "The Win32 trusted-root handle is not a disk directory.");
+    }
+
+    const fileInformation: Record<string, unknown> = {};
+    if (!asBoolean(api.getFileInformationByHandle(handle, fileInformation))) {
+      throw win32Error(api, "unreadable");
+    }
+    const attributes = asUint32(fileInformation["dwFileAttributes"]);
+    if (attributes === undefined) throw refusal("unreadable", "The Win32 trusted-root handle has invalid attributes.");
+    if ((attributes & WIN32_FILE_ATTRIBUTE_DIRECTORY) === 0) {
+      throw refusal("unreadable", "The Win32 trusted-root handle is not a directory.");
+    }
+
+    return {
+      finalPath: win32FinalPath(api, handle),
+      directory: true,
+      async close(): Promise<void> {
+        closeWin32Handle(api, handle);
+      },
+    };
+  } catch (error) {
+    closeWin32Handle(api, handle);
+    throw error;
+  }
+}
+
+const windowsBackend: SecureOpenBackend = {
+  open: openWindows,
+  openDirectory: openWindowsDirectory,
+};
 
 function defaultBackend(): SecureOpenBackend {
   if (process.platform === "linux") return linuxBackend;
   if (process.platform === "win32") return windowsBackend;
   return {
     async open(): Promise<SecureOpenedFile> {
+      throw refusal("unsupported-platform", `No handle-bound secure open backend exists for ${process.platform}.`);
+    },
+    async openDirectory(): Promise<SecureOpenedDirectory> {
       throw refusal("unsupported-platform", `No handle-bound secure open backend exists for ${process.platform}.`);
     },
   };
@@ -432,16 +512,17 @@ export async function secureOpen(
 ): Promise<SecureOpenResult> {
   if (!validSize(options.maxBytes)) throw refusal("unreadable", "The file size limit is invalid.");
 
-  let canonicalRoot: string;
-  try {
-    canonicalRoot = await fs.realpath(trustedRoot);
-  } catch {
-    throw refusal("unreadable", "The trusted root cannot be canonicalized.");
-  }
-
+  const backend = dependencies.backend ?? defaultBackend();
+  let openedRoot: SecureOpenedDirectory | undefined;
   let opened: SecureOpenedFile | undefined;
   try {
-    opened = await (dependencies.backend ?? defaultBackend()).open(candidate);
+    openedRoot = await backend.openDirectory(trustedRoot);
+    if (!openedRoot.directory) {
+      throw refusal("unreadable", "The trusted root handle is not a directory.");
+    }
+    const canonicalRoot = normalizedFinalPath(openedRoot.finalPath);
+
+    opened = await backend.open(candidate);
     const finalPath = normalizedFinalPath(opened.finalPath);
     const relativePath = relativePathInsideCanonical(finalPath, canonicalRoot);
     if (!relativePath) {
@@ -468,6 +549,10 @@ export async function secureOpen(
   } catch (error) {
     throw classifyOpenError(error);
   } finally {
-    if (opened) await opened.close();
+    try {
+      if (opened) await opened.close();
+    } finally {
+      if (openedRoot) await openedRoot.close();
+    }
   }
 }

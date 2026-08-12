@@ -25,7 +25,14 @@ function write(root: string, rel: string, content: Buffer | string): string {
 }
 
 function fakeBackend(opened: SecureOpenedFile): SecureOpenBackend {
-  return { open: vi.fn(async () => opened) };
+  return {
+    open: vi.fn(async () => opened),
+    openDirectory: vi.fn(async (trustedRoot: string) => ({
+      finalPath: trustedRoot,
+      directory: true,
+      close: async () => undefined,
+    })),
+  };
 }
 
 afterEach(() => {
@@ -47,6 +54,49 @@ describe("secureOpen", () => {
       bytes: Buffer.from("inside bytes"),
       identity: expect.any(String),
     });
+  });
+
+  it("uses the opened root handle final path and refuses a root-side swap before reading", async () => {
+    const root = makeRoot();
+    const candidate = write(root, "artifact.txt", "inside");
+    const replacementRoot = makeRoot();
+    const events: string[] = [];
+    const read = vi.fn(async () => Buffer.from("inside"));
+    const closeCandidate = vi.fn(async () => undefined);
+    const closeRoot = vi.fn(async () => undefined);
+    const backend = {
+      open: vi.fn(async (): Promise<SecureOpenedFile> => {
+        events.push("candidate");
+        return {
+          finalPath: candidate,
+          regular: true,
+          size: 6,
+          identity: "candidate-handle",
+          modifiedAt: "candidate-time",
+          read,
+          close: closeCandidate,
+        };
+      }),
+      openDirectory: vi.fn(async (requestedRoot: string) => {
+        events.push("root");
+        expect(requestedRoot).toBe(root);
+        return {
+          // The pathname still points at `root`, but its opened handle proves a
+          // replacement root. A pathname realpath anchor would allow candidate.
+          finalPath: replacementRoot,
+          directory: true,
+          close: closeRoot,
+        };
+      }),
+    };
+
+    await expect(secureOpen(candidate, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
+      reason: "outside-root",
+    } satisfies Partial<SecureOpenError>);
+    expect(events).toEqual(["root", "candidate"]);
+    expect(read).not.toHaveBeenCalled();
+    expect(closeCandidate).toHaveBeenCalledTimes(1);
+    expect(closeRoot).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a three-phase swap from the opened handle path before reading external bytes", async () => {
