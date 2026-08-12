@@ -379,7 +379,16 @@ function isDiscordLikeError(error: unknown): error is DiscordLikeError {
 
 function isPlatformBlockedUploadError(error: DiscordLikeError): boolean {
   const msg = typeof error.message === "string" ? error.message.toLowerCase() : "";
-  return msg.includes("blocked") && msg.includes("upload");
+  const hasUploadContext =
+    msg.includes("upload") ||
+    msg.includes("send this file") ||
+    (msg.includes("send") && msg.includes("file"));
+  const hasRestrictionSignal =
+    msg.includes("blocked") ||
+    msg.includes("flagged") ||
+    msg.includes("restriction") ||
+    msg.includes("restricted");
+  return hasUploadContext && hasRestrictionSignal;
 }
 
 /** Split buttons into Discord action rows (max 5 per row, max 5 rows). */
