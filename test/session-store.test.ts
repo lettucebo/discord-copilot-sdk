@@ -269,6 +269,53 @@ describe("SessionStore — durable file delivery quota", () => {
     expect(store.get("t1")?.fileDeliveryBytes).toBe(42);
   });
 
+  it("fails closed if a persisted v4 row later loses its reserved byte total", () => {
+    const f = tmpFile();
+    writeFileSync(
+      f,
+      JSON.stringify({
+        schemaVersion: 3,
+        generationHighWater: 1,
+        sessions: [
+          {
+            schemaVersion: 3,
+            threadId: "legacy",
+            sessionId: "s-legacy",
+            generation: 1,
+            repoPath: "C:\\repo",
+            guildId: "g1",
+            parentChannelId: "p1",
+            workDir: "C:\\repo",
+            devMode: "local",
+            state: "active",
+            updatedAt: 1,
+          },
+        ],
+      }),
+      "utf8"
+    );
+
+    const migrated = new SessionStore(f);
+    expect(migrated.isCorrupt()).toBe(false);
+    expect(migrated.get("legacy")?.fileDeliveryBytes).toBe(0);
+    expect(migrated.reserveFileDeliveryBytes("legacy", 0, 42)).toBe(true);
+
+    const persisted = JSON.parse(readFileSync(f, "utf8")) as {
+      schemaVersion: number;
+      sessions: Array<Record<string, unknown>>;
+    };
+    expect(persisted.schemaVersion).toBe(4);
+    expect(persisted.sessions[0]?.schemaVersion).toBe(4);
+    expect(persisted.sessions[0]?.fileDeliveryBytes).toBe(42);
+
+    delete persisted.sessions[0]!.fileDeliveryBytes;
+    writeFileSync(f, JSON.stringify(persisted), "utf8");
+
+    const restarted = new SessionStore(f);
+    expect(restarted.isCorrupt()).toBe(true);
+    expect(restarted.all()).toEqual([]);
+  });
+
   it("keeps the prior byte total in memory when its durable reservation fails", () => {
     const dir = mkdtempSync(join(tmpdir(), "dcs-store-quota-ro-"));
     const f = join(dir, "s.json");

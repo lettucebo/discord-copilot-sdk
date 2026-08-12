@@ -190,7 +190,7 @@ export class SessionStore {
    *  later step fails, restoring the still-live previous session). */
   restore(rec: SessionRecord): boolean {
     return this.mutate((m, hw) => {
-      m.set(rec.threadId, { ...rec, updatedAt: Date.now() });
+      m.set(rec.threadId, { ...this.toRecord(rec), state: rec.state, ...(rec.reason ? { reason: rec.reason } : {}) });
       return Math.max(hw, rec.generation);
     });
   }
@@ -256,13 +256,22 @@ export class SessionStore {
     const candidate: StoreFile = {
       schemaVersion: SCHEMA_VERSION,
       generationHighWater: nextHw,
-      sessions: [...next.values()],
+      sessions: [...next.values()].map((record) => this.canonicalizeRecord(record)),
     };
     if (!this.write(candidate)) return false;
     this.sessions = next;
     this.highWater = nextHw;
     this.corrupt = false;
     return true;
+  }
+
+  private canonicalizeRecord(record: SessionRecord): SessionRecord {
+    return {
+      ...this.toRecord(record),
+      state: record.state,
+      ...(record.reason ? { reason: record.reason } : {}),
+      updatedAt: record.updatedAt,
+    };
   }
 
   /** Atomically write the file. Returns false (and logs) on any I/O error —
@@ -437,7 +446,7 @@ function asRecord(v: unknown): SessionRecord | undefined {
   if (fileDeliveryBytes === undefined) return undefined;
 
   return {
-    schemaVersion,
+    schemaVersion: SCHEMA_VERSION,
     threadId,
     sessionId,
     generation,
