@@ -10,6 +10,7 @@ import { PendingInteractionBroker } from "../src/core/broker.js";
 import { addWorktree } from "../src/core/worktree.js";
 import { canonicalPathOr } from "../src/core/repo.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
+import { ApprovalPolicy } from "../src/core/approval-policy.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import { SessionActor, type SessionActorOpts } from "../src/copilot/session-actor.js";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
@@ -126,6 +127,21 @@ function fakeCopilot(opts: { createFails?: boolean } = {}): CopilotClient {
     },
     async stop() {},
   } as unknown as CopilotClient;
+}
+
+async function createActiveActor(workDir: string, transport: Transport): Promise<SessionActor> {
+  return SessionActor.createForTest(fakeCopilot(), {
+    sessionKey: "t1",
+    workingDirectory: workDir,
+    skillsHomeDirectory: path.join(tmp, "no-user-skills"),
+    broker: new PendingInteractionBroker(),
+    transport,
+    policy: new ApprovalPolicy(path.join(tmp, `approvals-${Math.random()}.json`)),
+    auditLog: { append: () => true },
+    initialFileDeliveryBytes: 0,
+    fileDeliverySessionId: "s1",
+    reserveFileDeliveryBytes: () => true,
+  });
 }
 
 interface Harness {
@@ -382,6 +398,61 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     expect(new SessionStore(storeFile).get("t1")?.fileDeliveryBytes).toBe(17);
   });
 
+  it("clears a failed rebind fence under YOLO so explicit /file stays available", async () => {
+    const { app, transport } = harness({ createFails: true });
+    const liveActor = await createActiveActor(repoA, transport);
+    sessions(app).get("t1")!.actor = liveActor;
+    liveActor.setYolo(true);
+
+    try {
+      const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+
+      expect(out).toMatch(/原本的對話仍在/);
+      expect(sessions(app).get("t1")?.actor).toBe(liveActor);
+      expect(liveActor.canDeliverFiles()).toBe(true);
+    } finally {
+      await liveActor.disconnect().catch(() => {});
+    }
+  });
+
+  it("clears a failed rebind fence during abort, but waits for the next turn to allow /file", async () => {
+    const { app, transport } = harness({ createFails: true });
+    const liveActor = await createActiveActor(repoA, transport);
+    sessions(app).get("t1")!.actor = liveActor;
+    await liveActor.stop();
+
+    try {
+      const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+
+      expect(out).toMatch(/原本的對話仍在/);
+      expect(liveActor.canDeliverFiles()).toBe(false);
+      await liveActor.send("the normal lifecycle resumes");
+      expect(liveActor.canDeliverFiles()).toBe(true);
+    } finally {
+      await liveActor.disconnect().catch(() => {});
+    }
+  });
+
+  it("keeps the old actor file-fenced after a successful rebind", async () => {
+    const { app, transport } = harness();
+    const liveActor = await createActiveActor(repoA, transport);
+    sessions(app).get("t1")!.actor = liveActor;
+
+    try {
+      const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+
+      expect(out).toMatch(/已改綁/);
+      expect(sessions(app).get("t1")?.actor).not.toBe(liveActor);
+      expect(liveActor.canDeliverFiles()).toBe(false);
+    } finally {
+      const replacement = sessions(app).get("t1")?.actor;
+      if (replacement && replacement !== liveActor) {
+        await replacement.disconnect().catch(() => {});
+      }
+      await liveActor.disconnect().catch(() => {});
+    }
+  });
+
   it("keeps old file delivery fenced when failed rollback preserves a newer reservation", async () => {
     const { app, actor, store } = harness({ createFails: true });
     expect(store.reserveFileDeliveryBytes("t1", "s1", 1, 0, 17)).toBe(true);
@@ -428,20 +499,25 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     expect(actor.disconnectCalls).toBe(0);
   });
 
-  it("validates the captured root final path before creating a rebound actor", async () => {
+  it("hands the handle-bound validation path to git and rejects a root-swap model before actor creation", async () => {
     const { app, actor, transport } = harness();
-    const externalRoot = path.join(tmp, "external-root");
+    const restoredWorktreePath = "/repo/restored-worktree";
+    const validationPath = "/proc/self/fd/97";
     const rootClose = vi.fn(async () => undefined);
     const backend: SecureOpenBackend = {
       open: vi.fn(async () => {
         throw new Error("this regression only captures a root");
       }),
       openDirectory: vi.fn(async () => ({
-        finalPath: externalRoot,
+        // The attacker restores this mutable pathname to the expected target
+        // before git runs. The descriptor path still names the external root
+        // that was captured before the swap.
+        finalPath: restoredWorktreePath,
+        validationPath,
         identity: "outside-repo-root",
         directory: true,
         revalidate: async () => ({
-          finalPath: externalRoot,
+          finalPath: restoredWorktreePath,
           identity: "outside-repo-root",
           directory: true,
         }),
@@ -450,22 +526,31 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     };
     (
       app as unknown as {
-        actorCreateDependencies?: { secureOpen?: { backend?: SecureOpenBackend } };
+        actorCreateDependencies?: {
+          secureOpen?: { backend?: SecureOpenBackend; pathMode?: "win32" | "posix" };
+        };
       }
-    ).actorCreateDependencies = { secureOpen: { backend } };
-    (app as unknown as { bindingCheck: unknown }).bindingCheck = async (binding: { workDir: string }) =>
-      binding.workDir === externalRoot
+    ).actorCreateDependencies = { secureOpen: { backend, pathMode: "posix" } };
+    const bindingCheck = vi.fn(async (binding: { workDir: string }) =>
+      binding.workDir === validationPath
         ? {
             ok: false,
             problem: "worktree-owner-mismatch",
-            detail: "captured root belongs outside the claimed repo",
+            detail: "the retained root belongs outside the claimed repo",
           }
-        : { ok: true };
+        : { ok: true }
+    );
+    (app as unknown as { bindingCheck: unknown }).bindingCheck = bindingCheck;
     const createSpy = vi.spyOn(SessionActor, "create");
     try {
       const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
 
       expect(out).toMatch(/無法通過驗證/);
+      expect(bindingCheck).toHaveBeenCalledWith(
+        expect.objectContaining({ workDir: validationPath }),
+        expect.anything()
+      );
+      expect(validationPath).not.toBe(restoredWorktreePath);
       expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
       expect(createSpy).not.toHaveBeenCalled();
       expect(rootClose).toHaveBeenCalledTimes(1);

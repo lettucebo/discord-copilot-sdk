@@ -624,10 +624,14 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 ### 18.3 安全與競態防護
 
 - **capture-before-binding root capability**：`/new`、rebind、startup resume 都先以 workdir
-  捕捉不透明 directory handle，再只用該 handle 回報的 final path 交給 git ownership proof；
-  同一 capability 轉交 actor 擁有，actor 不得按 mutable pathname 重捕。驗證或初始化失敗各自
-  恰好 close 一次，因此 root swap／junction 不能在 proof 與 actor 之間把 repo 外目錄變成
-  trusted root。
+  捕捉不透明 directory handle；git ownership proof（local 的 `--show-toplevel` 與 worktree 的
+  `--git-common-dir`）只接收該 capability 的原始 handle-bound validation path，不能把它
+  canonicalise 後改用 mutable final path。Linux 為持有 fd 期間的 `/proc/self/fd/<fd>`，Darwin
+  為 `/dev/fd/<fd>`；Windows 的 directory handle 只分享 read、拒絕 delete/rename，所以其
+  handle-derived final path 在 handle 存活時仍綁定同一 root。若 git 不能操作該 validation path
+  即拒絕，絕不回退到原 workdir。proof 完成後同一 capability 轉交 actor，actor 不得按 mutable
+  pathname 重捕；驗證或初始化失敗各自恰好 close 一次，因此 root swap／junction 不能在 proof 與
+  actor 之間把 repo 外目錄變成 trusted root。
 - **content digest / endpoint truth**：送出前先固定內容與 digest；成功與否以 Discord 端點回應為準。即使取消發生在送出接近完成時，也只能回報 endpoint 真實結果，不得樂觀宣稱成功。
 - **YOLO fast deny + 卡片撤銷**：`discord_send_file` 在 YOLO 下不是「自動允許」，而是立即拒絕並告知改走 `/file`。切入 YOLO 的同一同步步驟會撤銷已核准檔案、deny 尚待 broker 的 file card，且所有 agent-file currentness 都要求 `!yolo`；所以先前卡片的 Allow click 只能是 inert，不能在 YOLO 後送檔。
 - **allow-once only**：agent 路徑沒有 repo/session 級常駐授權；每次送檔都重新決定。
@@ -636,7 +640,10 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   compare-and-reserve 寫入下一個總量，CAS 同時比對 thread、session id、generation 與舊總量；
   rebind 一開始同步 suspend 舊 actor 的 file path，rollback 只可替換預期的新 incarnation，
   並以較大總量單調恢復。若新 incarnation 已預留 bytes，舊 actor 保持 file-fenced 而可繼續非檔案回合。
-  寫入失敗即不送檔。因此重啟、resume 與 rebind 都不能重開配額。
+  寫入失敗即不送檔。因此重啟、resume 與 rebind 都不能重開配額。反之，未建立新 incarnation 的
+  rollback 會無條件清除仍為 current/active 舊 actor 的**rebind** fence；YOLO 與 abort 仍由
+  `/file` lifecycle gate、custom-tool permission/currentness predicate 個別拒絕，不能把暫時狀態
+  變成永久停用。
 - **`/file` session fence**：命令先捕捉 session identity；resolve 後、傳送期間的
   `Transport.sendFile({canSend})`、及 success reply 前都重查 map identity 與 actor file lifecycle。
   `/end`、rebind 或新 session 取代舊 session 時，transport 走既有 late-cancel/delete 路徑，
@@ -652,6 +659,10 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   使同一 thread 反覆重開配額。代價是未成功的送檔也可能耗盡該 thread 的剩餘額度。
 - **thread visibility / CDN expiry**：檔案一旦成功送出，誰看得到由 Discord thread 權限決定；附件 CDN 存續時間與快取失效屬平台行為，本程式只能如實揭露，不能保證立即失效。
 - **best-effort late deletion / platform availability**：若後續清理由 Discord API 或平台狀態限制而失敗，只能 best effort 嘗試並誠實回報；不能把未刪除說成已收回。
+- **descriptor validation portability**：Linux 的 `/proc/self/fd/<fd>` 與 Darwin 的 `/dev/fd/<fd>`
+  只在 retained root handle 存活時有意義；前者以真實 git regression 驗證，後者若主機的 git
+  無法操作該 fd path 即 fail closed。Windows 依賴 `CreateFileW` root handle 排除 delete/rename，
+  因此不能在 proof 與 actor transfer 間替換其 final path。
 
 ### 18.5 §9 測試對照補記
 
@@ -659,8 +670,8 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | --- | --- |
 | `/channel enable` 缺權限診斷包含 `Attach Files` | `test/app-channels.test.ts` |
 | 所有 attachment sends 都 suppress mentions | `test/transport.test.ts` |
-| capture final-path root proof、root swap 拒絕、actor ownership/close-once | `test/secure-open.test.ts`、`test/app-rebind.test.ts`、`test/session-actor.test.ts` |
+| handle-bound validation path（Linux/Darwin fd path、Windows locked final path）、local/worktree git proof、root swap 拒絕、actor ownership/close-once | `test/secure-open.test.ts`、`test/binding.test.ts`、`test/app-rebind.test.ts`、`test/session-actor.test.ts` |
 | `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root/content/digest 綁定、endpoint truth、late cancellation 不算成功 | `test/session-actor.test.ts`、`test/app-file-command.test.ts` |
-| 24 MiB 持久化保守預留、舊 record 遷移、session-id + generation CAS、rebind fence/單調 rollback、restart total、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
+| 24 MiB 持久化保守預留、舊 record 遷移、session-id + generation CAS、rebind fence/單調 rollback、YOLO/abort rollback 不永久停用 `/file`、restart total、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
 | `/file` resolve/send interleaving（end、rebind-style replacement）不可附件或成功回覆 | `test/app-file-command.test.ts`、`test/transport.test.ts` |
 | session dispose 後可重新顯示一次 Attach Files 缺權限提示 | `test/transport.test.ts` |

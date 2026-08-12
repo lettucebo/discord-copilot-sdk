@@ -242,6 +242,7 @@ function retainedRootDependencies(root: string): {
   const close = vi.fn(async () => undefined);
   const proof = {
     finalPath: root,
+    validationPath: root,
     identity: "retained-root:1",
     directory: true,
   };
@@ -705,6 +706,7 @@ describe("SessionActor trusted roots", () => {
     );
     const proof = {
       finalPath: defaultWorkingDirectory,
+      validationPath: defaultWorkingDirectory,
       identity: "retained-root:1",
       directory: true,
     };
@@ -788,6 +790,7 @@ describe("SessionActor trusted roots", () => {
       .fn()
       .mockResolvedValueOnce({
         ...proof,
+        validationPath: root,
         openCandidate,
         revalidate: async () => proof,
         close: rootClose,
@@ -2082,6 +2085,63 @@ describe("SessionActor permission handling", () => {
     const result = await perm(s)({ kind: "shell", fullCommandText: "ls" });
     expect(result).toEqual({ kind: "user-not-available" });
     expect(s.broker.size).toBe(0);
+  });
+});
+
+describe("SessionActor failed-rebind file fences", () => {
+  it("clears only the rebind fence under YOLO while stale agent approvals remain denied", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-rebind-yolo-"));
+    try {
+      writeArtifact(root, "artifact.txt", "artifact");
+      const s = await setup({ workingDirectory: root });
+      await expect(approveFilePermission(s, { path: "artifact.txt" }, "before-rebind")).resolves.toEqual({
+        kind: "approve-once",
+      });
+
+      const fence = s.actor.suspendFileDelivery();
+      s.actor.setYolo(true);
+
+      expect(s.actor.resumeFileDeliveryIfCurrent(fence)).toBe(true);
+      expect(s.actor.canDeliverFiles()).toBe(true);
+      await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "before-rebind")).resolves.toMatchObject({
+        resultType: "failure",
+      });
+      await expect(requestFilePermission(s, { path: "artifact.txt" }, "after-rebind")).resolves.toEqual({
+        kind: "user-not-available",
+      });
+      expect(s.transport.sentFiles).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("clears only the rebind fence during abort until the next turn clears the abort latch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-rebind-abort-"));
+    try {
+      writeArtifact(root, "artifact.txt", "artifact");
+      const s = await setup({ workingDirectory: root });
+      await expect(approveFilePermission(s, { path: "artifact.txt" }, "before-abort")).resolves.toEqual({
+        kind: "approve-once",
+      });
+
+      const fence = s.actor.suspendFileDelivery();
+      await expect(s.actor.stop()).resolves.toBe(true);
+
+      expect(s.actor.resumeFileDeliveryIfCurrent(fence)).toBe(true);
+      expect(s.actor.canDeliverFiles()).toBe(false);
+      await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "before-abort")).resolves.toMatchObject({
+        resultType: "failure",
+      });
+
+      await s.actor.send("the normal lifecycle resumes");
+      expect(s.actor.canDeliverFiles()).toBe(true);
+      await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "before-abort")).resolves.toMatchObject({
+        resultType: "failure",
+      });
+      expect(s.transport.sentFiles).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

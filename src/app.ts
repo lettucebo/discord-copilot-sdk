@@ -400,6 +400,9 @@ function createForTestActorDependencies(): SessionActorCreateDependencies {
       });
       return {
         ...proof,
+        // Synthetic test roots have no OS descriptor; this test-only backend
+        // models a stable handle path without weakening the production backend.
+        validationPath: finalPath,
         revalidate: async () => proof,
         close: async () => {},
       };
@@ -546,10 +549,11 @@ export class DiscordCopilotApp {
   }
 
   /**
-   * Capture the root BEFORE any git proof observes it. The handle-derived final
-   * path is the only pathname binding validation is allowed to ask git about;
-   * otherwise an attacker can swap the lexical workDir between validation and
-   * actor creation. Only createForTest populates the injected backend.
+   * Capture the root BEFORE any git proof observes it. Git receives the
+   * capability's handle-bound validation path, not its mutable final pathname;
+   * otherwise an attacker can swap a root around the proof and restore the
+   * captured directory before actor creation. Only createForTest populates the
+   * injected backend.
    *
    * On a failed verdict this method closes the capability itself. On success it
    * transfers ownership to the caller, which must either hand it to
@@ -562,10 +566,10 @@ export class DiscordCopilotApp {
     | { ok: false; verdict: Exclude<BindingVerdict, { ok: true }> }
   > {
     const trustedRoot = await captureTrustedRoot(binding.workDir, this.actorCreateDependencies?.secureOpen);
-    const capturedBinding: Binding = { ...binding, workDir: trustedRoot.finalPath };
+    const validationBinding: Binding = { ...binding, workDir: trustedRoot.validationPath };
     let verdict: BindingVerdict;
     try {
-      verdict = await this.bindingCheck(capturedBinding, {
+      verdict = await this.bindingCheck(validationBinding, {
         reposRoot: this.reposRoot,
         worktreeRoot: worktreeRoot(),
       });
@@ -577,7 +581,9 @@ export class DiscordCopilotApp {
       await trustedRoot.close().catch(() => {});
       return { ok: false, verdict };
     }
-    return { ok: true, trustedRoot, binding: capturedBinding };
+    // Persist and hand the SDK the handle's final display path. The descriptor
+    // capability itself remains the file-security boundary after this proof.
+    return { ok: true, trustedRoot, binding: { ...binding, workDir: trustedRoot.finalPath } };
   }
 
   /**
@@ -1322,9 +1328,9 @@ export class DiscordCopilotApp {
         return;
       }
 
-      // Capture first, then prove the HANDLE-DERIVED final path. Validating the
-      // mutable generated pathname and capturing it later leaves a swap window
-      // that can make an external directory the actor's trusted root.
+      // Capture first, then prove the handle-bound validation path. Validating
+      // the mutable generated pathname and capturing it later leaves a swap
+      // window that can make an external directory the actor's trusted root.
       let captured;
       try {
         captured = await this.captureValidatedRoot({
@@ -3053,8 +3059,8 @@ export class DiscordCopilotApp {
       return;
     }
     // Capture before git sees the path. The persisted JSON pathname is mutable;
-    // only the final path reported by the retained handle may be proven as this
-    // record's worktree and passed to the resumed actor.
+    // Git proves only the retained handle's validation path, while the same
+    // capability and its final display path transfer to the resumed actor.
     let captured;
     try {
       captured = await this.captureValidatedRoot({

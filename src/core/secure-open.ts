@@ -66,6 +66,10 @@ export interface SecureDirectoryProof {
 
 /** A trusted root that can be proven again without reopening its pathname. */
 export interface SecureOpenedDirectory extends SecureDirectoryProof {
+  /** A path Git may use while this handle is retained. POSIX implementations
+   * expose the live descriptor; Windows exposes its delete/rename-locked final
+   * handle path. Callers must never replace this with `finalPath`. */
+  readonly validationPath: string;
   /** Present only on POSIX roots; it is the descriptor used for openat traversal. */
   readonly fd?: number;
   /** POSIX candidates must be opened below this proof, never by their pathname. */
@@ -89,6 +93,7 @@ export interface SecureOpenDependencies {
 interface TrustedRootState {
   readonly originalPath: string;
   readonly finalPath: string;
+  readonly validationPath: string;
   readonly identity: string;
   readonly openedRoot: SecureOpenedDirectory;
   readonly backend: SecureOpenBackend;
@@ -125,10 +130,15 @@ class TrustedRootCapability {
   }
 
   /** Immutable final path reported by the still-open directory handle at
-   * capture time. Consumers may prove ownership with this value, but cannot
-   * construct or retarget the capability from it. */
+   * capture time. It is for display/actor startup; ownership proof must use
+   * validationPath, and neither path can construct or retarget this capability. */
   get finalPath(): string {
     return trustedRootState(this).finalPath;
+  }
+
+  /** Handle-bound path for the one Git ownership proof made before transfer. */
+  get validationPath(): string {
+    return trustedRootState(this).validationPath;
   }
 
   /** True from the instant teardown begins, including while active reads drain. */
@@ -667,6 +677,7 @@ function createPosixBackend(
   api: PosixNativeApi,
   flags: PosixOpenFlags,
   defaultFinalPath: (fd: number) => Promise<string>,
+  validationPathForFd: (fd: number) => string,
   dependencies: PosixBackendDependencies = {}
 ): SecureOpenBackend {
   const operations = defaultPosixOperations(defaultFinalPath, flags, dependencies);
@@ -695,6 +706,7 @@ function createPosixBackend(
         }
         return {
           ...initial,
+          validationPath: normalizedFinalPath(validationPathForFd(rootFd), "posix"),
           fd: rootFd,
           revalidate: () => posixDirectoryProof(handle as PosixDirectoryHandle, operations),
           openCandidate: (candidate, maxBytes) =>
@@ -794,7 +806,13 @@ export function createLinuxBackend(
   api: PosixNativeApi,
   dependencies: PosixBackendDependencies = {}
 ): SecureOpenBackend {
-  return createPosixBackend(api, LINUX_POSIX_OPEN_FLAGS, linuxFinalPath, dependencies);
+  return createPosixBackend(
+    api,
+    LINUX_POSIX_OPEN_FLAGS,
+    linuxFinalPath,
+    (fd) => `/proc/self/fd/${fd}`,
+    dependencies
+  );
 }
 
 const linuxBackend: SecureOpenBackend = {
@@ -854,7 +872,13 @@ export function createDarwinBackend(
   api: DarwinFcntl,
   dependencies: PosixBackendDependencies = {}
 ): SecureOpenBackend {
-  return createPosixBackend(api, DARWIN_POSIX_OPEN_FLAGS, async (fd) => darwinFinalPath(api, fd), dependencies);
+  return createPosixBackend(
+    api,
+    DARWIN_POSIX_OPEN_FLAGS,
+    async (fd) => darwinFinalPath(api, fd),
+    (fd) => `/dev/fd/${fd}`,
+    dependencies
+  );
 }
 
 const darwinBackend: SecureOpenBackend = {
@@ -1167,6 +1191,9 @@ async function openWindowsDirectory(trustedRoot: string): Promise<SecureOpenedDi
 
     return {
       ...initial,
+      // The root handle is opened with FILE_SHARE_READ only, excluding delete
+      // and rename; its handle-derived final path stays bound to this root until close.
+      validationPath: initial.finalPath,
       revalidate: async () => win32DirectoryProof(api, handle),
       async close(): Promise<void> {
         closeWin32Handle(api, handle);
@@ -1216,6 +1243,7 @@ export async function captureTrustedRoot(
     return new TrustedRootCapability(trustedRootConstructionToken, {
       originalPath,
       finalPath: proof.finalPath,
+      validationPath: normalizedFinalPath(openedRoot.validationPath, pathMode),
       identity: proof.identity,
       openedRoot,
       backend,

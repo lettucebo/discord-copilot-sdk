@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import { validateBinding, isDevMode, type Binding, type BindingDeps } from "../src/core/binding.js";
+import { captureTrustedRoot } from "../src/core/secure-open.js";
 import { repoRootStrict, addWorktree } from "../src/core/worktree.js";
 
 const run = promisify(execFile);
@@ -64,6 +65,16 @@ describe("validateBinding (proves ownership, never assumes it)", { timeout: 60_0
     expect(await validateBinding(binding({}), deps())).toEqual({ ok: true });
   });
 
+  it("asks git to prove the supplied local workdir instead of reopening repoPath", async () => {
+    const validationPath = `${repoA}${path.sep}.`;
+    const topLevelOf = vi.fn(async () => repoA);
+
+    await expect(validateBinding(binding({ workDir: validationPath }), { ...deps(), topLevelOf })).resolves.toEqual({
+      ok: true,
+    });
+    expect(topLevelOf).toHaveBeenCalledExactlyOnceWith(validationPath);
+  });
+
   it("refuses a repo outside REPOS_ROOT", async () => {
     const outside = gitRepo(tmp, "outside");
     await initRepo(outside);
@@ -99,6 +110,50 @@ describe("validateBinding (proves ownership, never assumes it)", { timeout: 60_0
     );
     expect(v).toEqual({ ok: true });
   });
+
+  it("asks git to prove the supplied worktree path instead of reopening its canonical spelling", async () => {
+    const validationPath = `${path.join(worktreeRoot, "descriptor-root")}${path.sep}.`;
+    const ownerOf = vi.fn(async () => repoA);
+
+    await expect(
+      validateBinding(
+        {
+          repoPath: repoA,
+          workDir: validationPath,
+          devMode: "worktree",
+          branch: "copilot/t-descriptor-root",
+        },
+        { ...deps(), ownerOf }
+      )
+    ).resolves.toEqual({ ok: true });
+    expect(ownerOf).toHaveBeenCalledExactlyOnceWith(validationPath);
+  });
+
+  it.skipIf(process.platform !== "linux")(
+    "asks real git to prove a retained descriptor-backed worktree",
+    async () => {
+      const dir = path.join(worktreeRoot, "hash-a", "descriptor-root");
+      await addWorktree(repoA, dir, "copilot/t-descriptor-root");
+      const trustedRoot = await captureTrustedRoot(dir);
+      try {
+        const validationPath = trustedRoot.validationPath;
+        expect(validationPath).toMatch(/^\/proc\/self\/fd\/\d+$/);
+        await expect(
+          validateBinding(
+            {
+              repoPath: repoA,
+              workDir: validationPath,
+              devMode: "worktree",
+              branch: "copilot/t-descriptor-root",
+            },
+            deps()
+          )
+        ).resolves.toEqual({ ok: true });
+      } finally {
+        await trustedRoot.close();
+      }
+    }
+  );
 
   it("REFUSES repo A's worktree presented as repo B's — the flat-layout bug", async () => {
     // This is the exact failure a path-prefix check waves through: the worktree

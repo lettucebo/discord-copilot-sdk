@@ -764,16 +764,11 @@ export class SessionActor {
   }
 
   /** Re-enable file delivery after a failed rebind only for the fence that
-   * suspended it. Callers additionally verify this actor is still mapped to the
-   * thread; an advanced durable quota intentionally leaves the fence closed. */
+   * suspended it. YOLO and abort remain independent guards in the custom-tool
+   * predicates and canDeliverFiles(); keeping this rebind fence under either
+   * state would permanently disable an explicit /file after normal recovery. */
   resumeFileDeliveryIfCurrent(fence: number): boolean {
-    if (
-      fence !== this.fileDeliveryFence ||
-      !this.fileDeliverySuspended ||
-      this.lifecycle !== "active" ||
-      this.aborting ||
-      this.yolo
-    ) {
+    if (fence !== this.fileDeliveryFence || !this.fileDeliverySuspended || this.lifecycle !== "active") {
       return false;
     }
     this.fileDeliverySuspended = false;

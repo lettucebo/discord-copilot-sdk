@@ -111,7 +111,9 @@ export async function validateBinding(b: Binding, deps: BindingDeps): Promise<Bi
     // key this session's approvals to that other repo. Only git can settle it.
     let top: string;
     try {
-      top = await topLevel(repo);
+      // The app supplies its retained-root validation path here. Reopening
+      // `repo` would let a pathname swap prove a different local checkout.
+      top = await topLevel(b.workDir);
     } catch (err) {
       return {
         ok: false,
@@ -151,7 +153,9 @@ export async function validateBinding(b: Binding, deps: BindingDeps): Promise<Bi
   }
   let actual: string;
   try {
-    actual = await owner(work);
+    // `work` is only for structural containment. Git must receive the original
+    // descriptor-backed validation path, not its canonicalized mutable spelling.
+    actual = await owner(b.workDir);
   } catch (err) {
     return {
       ok: false,

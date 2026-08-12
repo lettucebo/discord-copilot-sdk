@@ -37,6 +37,7 @@ function fakeBackend(opened: SecureOpenedFile): SecureOpenBackend {
     open: vi.fn(async () => opened),
     openDirectory: vi.fn(async (trustedRoot: string) => ({
       finalPath: trustedRoot,
+      validationPath: trustedRoot,
       identity: `root:${trustedRoot}`,
       directory: true,
       revalidate: async () => ({
@@ -127,6 +128,7 @@ describe("secureOpen", () => {
       .fn()
       .mockResolvedValueOnce({
         finalPath: originalRoot,
+        validationPath: originalRoot,
         identity: "7:101",
         directory: true,
         openCandidate: candidateOpen,
@@ -180,6 +182,7 @@ describe("secureOpen", () => {
       }),
       openDirectory: vi.fn(async () => ({
         finalPath: handleFinalPath,
+        validationPath: handleFinalPath,
         identity: "root:captured",
         directory: true,
         revalidate: async () => ({
@@ -194,6 +197,55 @@ describe("secureOpen", () => {
     const root = await captureTrustedRoot(lexicalRoot, posixHandlePathDependencies(backend));
 
     expect((root as unknown as { finalPath?: string }).finalPath).toBe(handleFinalPath);
+    await root.close();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("exposes a Linux descriptor-backed validation path for the retained root", async () => {
+    const rootPath = "/repo/worktrees/session";
+    const close = vi.fn(async () => undefined);
+    const backend = createLinuxBackend(
+      {
+        openat: () => {
+          throw new Error("this test only captures a root");
+        },
+      },
+      {
+        openDirectory: async () => ({ fd: 41, close }),
+        finalPath: async () => rootPath,
+        fstat: async () => posixStat({ directory: true, ino: 41, nlink: 2 }),
+      }
+    );
+
+    const root = await captureTrustedRoot(rootPath, posixHandlePathDependencies(backend));
+
+    expect(root.validationPath).toBe("/proc/self/fd/41");
+    expect(root.validationPath).not.toBe(root.finalPath);
+    await root.close();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("exposes a Darwin descriptor-backed validation path for the retained root", async () => {
+    const rootPath = "/repo/worktrees/session";
+    const close = vi.fn(async () => undefined);
+    const backend = createDarwinBackend(
+      {
+        fcntl: () => 0,
+        openat: () => {
+          throw new Error("this test only captures a root");
+        },
+      },
+      {
+        openDirectory: async () => ({ fd: 42, close }),
+        finalPath: async () => rootPath,
+        fstat: async () => posixStat({ directory: true, ino: 42, nlink: 2 }),
+      }
+    );
+
+    const root = await captureTrustedRoot(rootPath, posixHandlePathDependencies(backend));
+
+    expect(root.validationPath).toBe("/dev/fd/42");
+    expect(root.validationPath).not.toBe(root.finalPath);
     await root.close();
     expect(close).toHaveBeenCalledTimes(1);
   });
@@ -224,6 +276,7 @@ describe("secureOpen", () => {
       }),
       openDirectory: vi.fn(async () => ({
         ...proof,
+        validationPath: root,
         openCandidate,
         revalidate: async () => proof,
         close: rootClose,
@@ -280,6 +333,7 @@ describe("secureOpen", () => {
         events.push("revalidate root");
         return {
           finalPath: root,
+          validationPath: root,
           identity: "root-handle",
           directory: true,
         };
@@ -310,6 +364,7 @@ describe("secureOpen", () => {
         events.push("open root");
         return {
           finalPath: root,
+          validationPath: root,
           identity: "root-handle",
           directory: true,
           revalidate,
@@ -350,6 +405,7 @@ describe("secureOpen", () => {
         events.push("revalidate root");
         return {
           finalPath: root,
+          validationPath: root,
           identity: "root-handle",
           directory: true,
         };
@@ -380,6 +436,7 @@ describe("secureOpen", () => {
         events.push("open root");
         return {
           finalPath: root,
+          validationPath: root,
           identity: "root-handle",
           directory: true,
           revalidate,
@@ -432,6 +489,7 @@ describe("secureOpen", () => {
           // The pathname still points at `root`, but its opened handle proves a
           // replacement root. A pathname realpath anchor would allow candidate.
           finalPath: replacementRoot,
+          validationPath: replacementRoot,
           identity: "replacement-root",
           directory: true,
           revalidate: async () => ({
@@ -497,6 +555,7 @@ describe("secureOpen", () => {
       })),
       openDirectory: vi.fn(async () => ({
         finalPath: root,
+        validationPath: root,
         identity: "root-handle",
         directory: true,
         revalidate: vi
