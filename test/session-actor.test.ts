@@ -261,10 +261,10 @@ function retainedRootDependencies(root: string): {
 
 function createActor(
   client: CopilotClient,
-  opts: Parameters<typeof SessionActor.create>[1],
+  opts: Parameters<typeof SessionActor.createForTest>[1],
   dependencies?: SessionActorCreateDependencies
 ): Promise<SessionActor> {
-  return SessionActor.create(client, opts, dependencies).then((actor) => {
+  return SessionActor.createForTest(client, opts, dependencies).then((actor) => {
     liveActors.add(actor);
     return actor;
   });
@@ -283,7 +283,12 @@ async function setup(
   const box: { resumeArgs?: { id: string; cfg: Record<string, unknown> } } = {};
   let persistedFileDeliveryBytes =
     typeof extra["initialFileDeliveryBytes"] === "number" ? extra["initialFileDeliveryBytes"] : 0;
-  const reserveFileDeliveryBytes = (nextTotal: number, expectedCurrent = persistedFileDeliveryBytes): boolean => {
+  const reserveFileDeliveryBytes = (
+    _sessionId: string,
+    _generation: number,
+    nextTotal: number,
+    expectedCurrent = persistedFileDeliveryBytes
+  ): boolean => {
     if (expectedCurrent !== persistedFileDeliveryBytes || nextTotal <= expectedCurrent) return false;
     persistedFileDeliveryBytes = nextTotal;
     return true;
@@ -311,6 +316,7 @@ async function setup(
       policy,
       auditLog,
       initialFileDeliveryBytes: persistedFileDeliveryBytes,
+      fileDeliverySessionId: "fake-session-id",
       reserveFileDeliveryBytes,
       ...extra,
     },
@@ -631,7 +637,7 @@ describe("SessionActor trusted roots", () => {
     } as unknown as CopilotClient;
 
     await expect(
-      SessionActor.create(client, {
+      SessionActor.createForTest(client, {
         sessionKey: "t",
         workingDirectory: join(tmpdir(), `dcs-missing-root-${Math.random()}`, "work"),
         skillsHomeDirectory: join(tmpdir(), `dcs-no-skills-${Math.random()}`),
@@ -639,6 +645,7 @@ describe("SessionActor trusted roots", () => {
         transport: new FakeTransport(),
         policy: new ApprovalPolicy(join(tmpdir(), `dcs-test-approvals-${Math.random()}.json`)),
         initialFileDeliveryBytes: 0,
+        fileDeliverySessionId: "root-capture-test",
         reserveFileDeliveryBytes: () => true,
       })
     ).rejects.toThrow();
@@ -745,6 +752,7 @@ describe("SessionActor trusted roots", () => {
           transport: new FakeTransport(),
           policy: new ApprovalPolicy(join(tmpdir(), `dcs-test-approvals-${Math.random()}.json`)),
           initialFileDeliveryBytes: 0,
+          fileDeliverySessionId: "create-failure-test",
           reserveFileDeliveryBytes: () => true,
         },
         retained.dependencies
@@ -1473,7 +1481,7 @@ describe("SessionActor permission handling", () => {
         writeArtifact(root, "artifact.txt", "artifact");
         const operations: string[] = [];
         let s!: Setup;
-        const reserveFileDeliveryBytes = vi.fn((nextTotal: number) => {
+        const reserveFileDeliveryBytes = vi.fn((_sessionId: string, _generation: number, nextTotal: number) => {
           expect(s.transport.sentFiles).toHaveLength(0);
           operations.push(`reserve:${nextTotal}`);
           return true;
@@ -1490,7 +1498,7 @@ describe("SessionActor permission handling", () => {
           invokeFileDelivery(s, { path: "artifact.txt" }, "reserve-before-send")
         ).resolves.toMatchObject({ resultType: "success" });
 
-        expect(reserveFileDeliveryBytes).toHaveBeenCalledExactlyOnceWith(18, 10);
+        expect(reserveFileDeliveryBytes).toHaveBeenCalledExactlyOnceWith("fake-session-id", 1, 18, 10);
         expect(operations).toEqual(["reserve:18", "send"]);
         expect(s.transport.sentFiles).toHaveLength(1);
       } finally {
@@ -1514,7 +1522,7 @@ describe("SessionActor permission handling", () => {
           resultType: "failure",
         });
 
-        expect(reserveFileDeliveryBytes).toHaveBeenCalledExactlyOnceWith(12, 4);
+        expect(reserveFileDeliveryBytes).toHaveBeenCalledExactlyOnceWith("fake-session-id", 1, 12, 4);
         expect(s.transport.sentFiles).toHaveLength(0);
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -1550,9 +1558,9 @@ describe("SessionActor permission handling", () => {
           resultType: "success",
         });
 
-        expect(reserveFileDeliveryBytes).toHaveBeenNthCalledWith(1, 13, 5);
-        expect(reserveFileDeliveryBytes).toHaveBeenNthCalledWith(2, 21, 13);
-        expect(reserveFileDeliveryBytes).toHaveBeenNthCalledWith(3, 29, 21);
+        expect(reserveFileDeliveryBytes).toHaveBeenNthCalledWith(1, "fake-session-id", 1, 13, 5);
+        expect(reserveFileDeliveryBytes).toHaveBeenNthCalledWith(2, "fake-session-id", 1, 21, 13);
+        expect(reserveFileDeliveryBytes).toHaveBeenNthCalledWith(3, "fake-session-id", 1, 29, 21);
         expect(s.transport.sentFiles).toHaveLength(3);
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -1590,6 +1598,29 @@ describe("SessionActor permission handling", () => {
         const card = await latestFilePermission(s, before);
         s.transport.deliverDecision(card.nonce, "once", "u1");
         await expect(normal).resolves.toEqual({ kind: "approve-once" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("revokes a pending file card when deferred YOLO enable takes effect", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-yolo-pending-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        const before = s.transport.permissions.length;
+        const pending = requestFilePermission(s, { path: "artifact.txt" }, "yolo-pending-file");
+        const card = await latestFilePermission(s, before);
+
+        expect(s.actor.enableYoloIfCurrent(s.actor.yoloEpochValue())).toBe(true);
+        s.transport.deliverDecision(card.nonce, "once", "u1");
+
+        await expect(pending).resolves.toEqual({ kind: "user-not-available" });
+        await expect(
+          invokeFileDelivery(s, { path: "artifact.txt" }, "yolo-pending-file")
+        ).resolves.toMatchObject({ resultType: "failure" });
+        expect(s.broker.size).toBe(0);
+        expect(s.transport.sentFiles).toHaveLength(0);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -2482,6 +2513,7 @@ describe("SessionActor resume/create-id seam (P2)", () => {
       transport: new FakeTransport(),
       policy: new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`)),
       initialFileDeliveryBytes: 0,
+      fileDeliverySessionId: "sess-123",
       reserveFileDeliveryBytes: () => true,
       resumeSessionId: "sess-123",
       model: "gpt-5.4", // the startup default — must NOT win

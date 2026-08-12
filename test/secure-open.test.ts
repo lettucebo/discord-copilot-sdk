@@ -170,6 +170,34 @@ describe("secureOpen", () => {
     expect(rootClose).toHaveBeenCalledTimes(1);
   });
 
+  it("exposes the captured handle final path without making the capability constructible", async () => {
+    const lexicalRoot = "/work/session";
+    const handleFinalPath = "/repo/worktrees/session";
+    const close = vi.fn(async () => undefined);
+    const backend: SecureOpenBackend = {
+      open: vi.fn(async () => {
+        throw new Error("this test only captures a root");
+      }),
+      openDirectory: vi.fn(async () => ({
+        finalPath: handleFinalPath,
+        identity: "root:captured",
+        directory: true,
+        revalidate: async () => ({
+          finalPath: handleFinalPath,
+          identity: "root:captured",
+          directory: true,
+        }),
+        close,
+      })),
+    };
+
+    const root = await captureTrustedRoot(lexicalRoot, posixHandlePathDependencies(backend));
+
+    expect((root as unknown as { finalPath?: string }).finalPath).toBe(handleFinalPath);
+    await root.close();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps the captured root handle open across multiple resolutions then fences use after close", async () => {
     const root = "/trusted-worktree";
     const candidate = `${root}/artifact.txt`;

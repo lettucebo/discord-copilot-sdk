@@ -261,12 +261,45 @@ describe("SessionStore — durable file delivery quota", () => {
     const f = tmpFile();
     const store = new SessionStore(f);
     expect(store.reserve(bind("t1"))).toBe(true);
-    expect(store.reserveFileDeliveryBytes("t1", 0, 42)).toBe(true);
+    expect(store.reserveFileDeliveryBytes("t1", "sess-t1", 1, 0, 42)).toBe(true);
     expect(store.get("t1")?.fileDeliveryBytes).toBe(42);
     expect(new SessionStore(f).get("t1")?.fileDeliveryBytes).toBe(42);
-    expect(store.reserveFileDeliveryBytes("t1", 0, 50)).toBe(false);
-    expect(store.reserveFileDeliveryBytes("t1", 42, 41)).toBe(false);
+    expect(store.reserveFileDeliveryBytes("t1", "sess-t1", 1, 0, 50)).toBe(false);
+    expect(store.reserveFileDeliveryBytes("t1", "sess-t1", 1, 42, 41)).toBe(false);
     expect(store.get("t1")?.fileDeliveryBytes).toBe(42);
+  });
+
+  it("refuses a stale restore rather than lowering a newer incarnation's reserved quota", () => {
+    const f = tmpFile();
+    const store = new SessionStore(f);
+    expect(store.reserve(bind("t1", { sessionId: "old", generation: 1, fileDeliveryBytes: 17 }))).toBe(true);
+    const prior = store.get("t1")!;
+    expect(store.reserve(bind("t1", { sessionId: "new", generation: 2, fileDeliveryBytes: 17 }))).toBe(true);
+    expect(store.reserveFileDeliveryBytes("t1", "new", 2, 17, 25)).toBe(true);
+
+    expect(store.restore(prior)).toBe(false);
+    expect(new SessionStore(f).get("t1")).toMatchObject({
+      sessionId: "new",
+      generation: 2,
+      fileDeliveryBytes: 25,
+    });
+  });
+
+  it("keeps an advanced replacement reservation across conditional rollback and restart", () => {
+    const f = tmpFile();
+    const store = new SessionStore(f);
+    expect(store.reserve(bind("t1", { sessionId: "old", generation: 1, fileDeliveryBytes: 17 }))).toBe(true);
+    const prior = store.get("t1")!;
+    expect(store.reserve(bind("t1", { sessionId: "replacement", generation: 2, fileDeliveryBytes: 17 }))).toBe(true);
+    expect(store.reserveFileDeliveryBytes("t1", "replacement", 2, 17, 25)).toBe(true);
+
+    expect(store.restoreIfCurrent(prior, "replacement", 2)).toEqual({ ok: true, quotaAdvanced: true });
+    expect(store.get("t1")).toMatchObject({
+      sessionId: "old",
+      generation: 1,
+      fileDeliveryBytes: 25,
+    });
+    expect(new SessionStore(f).get("t1")?.fileDeliveryBytes).toBe(25);
   });
 
   it("fails closed if a persisted v4 row later loses its reserved byte total", () => {
@@ -298,7 +331,7 @@ describe("SessionStore — durable file delivery quota", () => {
     const migrated = new SessionStore(f);
     expect(migrated.isCorrupt()).toBe(false);
     expect(migrated.get("legacy")?.fileDeliveryBytes).toBe(0);
-    expect(migrated.reserveFileDeliveryBytes("legacy", 0, 42)).toBe(true);
+    expect(migrated.reserveFileDeliveryBytes("legacy", "s-legacy", 1, 0, 42)).toBe(true);
 
     const persisted = JSON.parse(readFileSync(f, "utf8")) as {
       schemaVersion: number;
@@ -321,11 +354,11 @@ describe("SessionStore — durable file delivery quota", () => {
     const f = join(dir, "s.json");
     const store = new SessionStore(f);
     expect(store.reserve(bind("t1"))).toBe(true);
-    expect(store.reserveFileDeliveryBytes("t1", 0, 10)).toBe(true);
+    expect(store.reserveFileDeliveryBytes("t1", "sess-t1", 1, 0, 10)).toBe(true);
     rmSync(f, { force: true });
     mkdirSync(f);
     try {
-      expect(store.reserveFileDeliveryBytes("t1", 10, 20)).toBe(false);
+      expect(store.reserveFileDeliveryBytes("t1", "sess-t1", 1, 10, 20)).toBe(false);
       expect(store.get("t1")?.fileDeliveryBytes).toBe(10);
     } finally {
       rmSync(dir, { recursive: true, force: true });

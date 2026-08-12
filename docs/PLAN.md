@@ -623,14 +623,24 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 
 ### 18.3 安全與競態防護
 
-- **root handle capability**：每個檔案送出都綁定到 session 當下的 workdir root；不接受 root 外、跨 repo、或利用相對路徑跳脫的檔案。
+- **capture-before-binding root capability**：`/new`、rebind、startup resume 都先以 workdir
+  捕捉不透明 directory handle，再只用該 handle 回報的 final path 交給 git ownership proof；
+  同一 capability 轉交 actor 擁有，actor 不得按 mutable pathname 重捕。驗證或初始化失敗各自
+  恰好 close 一次，因此 root swap／junction 不能在 proof 與 actor 之間把 repo 外目錄變成
+  trusted root。
 - **content digest / endpoint truth**：送出前先固定內容與 digest；成功與否以 Discord 端點回應為準。即使取消發生在送出接近完成時，也只能回報 endpoint 真實結果，不得樂觀宣稱成功。
-- **YOLO fast deny**：`discord_send_file` 在 YOLO 下不是「自動允許」，而是立即拒絕並告知改走 `/file`。這是刻意把 outbound file capability 排除在 YOLO 的風險接受之外。
+- **YOLO fast deny + 卡片撤銷**：`discord_send_file` 在 YOLO 下不是「自動允許」，而是立即拒絕並告知改走 `/file`。切入 YOLO 的同一同步步驟會撤銷已核准檔案、deny 尚待 broker 的 file card，且所有 agent-file currentness 都要求 `!yolo`；所以先前卡片的 Allow click 只能是 inert，不能在 YOLO 後送檔。
 - **allow-once only**：agent 路徑沒有 repo/session 級常駐授權；每次送檔都重新決定。
 - **持久化的保守預留配額**：agent `discord_send_file` 的 24 MiB 總量屬於邏輯 Discord thread 的
   `SessionStore` record；舊 record 遷移為 0。實際呼叫 Discord 前，actor 必須以 persist-first
-  compare-and-reserve 寫入下一個總量，且 stale actor 無法覆寫較新的總量；寫入失敗即不送檔。
-  因此重啟、resume 與 rebind 都不能重開配額。
+  compare-and-reserve 寫入下一個總量，CAS 同時比對 thread、session id、generation 與舊總量；
+  rebind 一開始同步 suspend 舊 actor 的 file path，rollback 只可替換預期的新 incarnation，
+  並以較大總量單調恢復。若新 incarnation 已預留 bytes，舊 actor 保持 file-fenced 而可繼續非檔案回合。
+  寫入失敗即不送檔。因此重啟、resume 與 rebind 都不能重開配額。
+- **`/file` session fence**：命令先捕捉 session identity；resolve 後、傳送期間的
+  `Transport.sendFile({canSend})`、及 success reply 前都重查 map identity 與 actor file lifecycle。
+  `/end`、rebind 或新 session 取代舊 session 時，transport 走既有 late-cancel/delete 路徑，
+  不可留下 attachment success claim。
 - **mentions suppression**：所有 attachment sends 都必須保留 `allowedMentions:{parse:[]}`，避免 agent 藉檔案說明或 UI 路徑 ping 人。
 
 ### 18.4 平台事實與殘留風險
@@ -649,6 +659,8 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | --- | --- |
 | `/channel enable` 缺權限診斷包含 `Attach Files` | `test/app-channels.test.ts` |
 | 所有 attachment sends 都 suppress mentions | `test/transport.test.ts` |
-| `discord_send_file` Allow once / Deny、YOLO fast deny、root/content/digest 綁定、endpoint truth、late cancellation 不算成功 | `test/session-actor.test.ts`、`test/app-file-command.test.ts` |
-| 24 MiB 持久化保守預留、舊 record 遷移、CAS stale-actor fence、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
+| capture final-path root proof、root swap 拒絕、actor ownership/close-once | `test/secure-open.test.ts`、`test/app-rebind.test.ts`、`test/session-actor.test.ts` |
+| `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root/content/digest 綁定、endpoint truth、late cancellation 不算成功 | `test/session-actor.test.ts`、`test/app-file-command.test.ts` |
+| 24 MiB 持久化保守預留、舊 record 遷移、session-id + generation CAS、rebind fence/單調 rollback、restart total、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
+| `/file` resolve/send interleaving（end、rebind-style replacement）不可附件或成功回覆 | `test/app-file-command.test.ts`、`test/transport.test.ts` |
 | session dispose 後可重新顯示一次 Attach Files 缺權限提示 | `test/transport.test.ts` |

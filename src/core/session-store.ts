@@ -57,6 +57,15 @@ export interface SessionBinding {
   branch?: string;
 }
 
+/** Result of replacing a freshly reserved rebind row with its prior record. */
+export interface ConditionalRestoreResult {
+  ok: boolean;
+  /** A replacement actor reserved bytes before rollback. The prior identity was
+   * restored, but its file delivery must stay suspended because its local total
+   * is now stale. */
+  quotaAdvanced: boolean;
+}
+
 interface StoreFile {
   schemaVersion: number;
   generationHighWater: number;
@@ -140,9 +149,20 @@ export class SessionStore {
   /** Atomically compare-and-reserve the next total for agent file delivery.
    *  This is persist-first: false means the in-memory total was NOT changed,
    *  so callers must fail closed before any attachment leaves the process. The
-   *  expected total fences a stale actor left briefly alive during rebind. */
-  reserveFileDeliveryBytes(threadId: string, expectedTotal: number, nextTotal: number): boolean {
+   *  record identity AND expected total fence an old actor after rebind: a
+   *  thread id alone names a mutable slot, not the actor that owns it. */
+  reserveFileDeliveryBytes(
+    threadId: string,
+    expectedSessionId: string,
+    expectedGeneration: number,
+    expectedTotal: number,
+    nextTotal: number
+  ): boolean {
     if (
+      typeof expectedSessionId !== "string" ||
+      expectedSessionId.length === 0 ||
+      !Number.isSafeInteger(expectedGeneration) ||
+      expectedGeneration < 1 ||
       !isFileDeliveryBytes(expectedTotal) ||
       !isFileDeliveryBytes(nextTotal) ||
       nextTotal <= expectedTotal
@@ -150,7 +170,14 @@ export class SessionStore {
       return false;
     }
     const current = this.sessions.get(threadId);
-    if (!current || current.fileDeliveryBytes !== expectedTotal) return false;
+    if (
+      !current ||
+      current.sessionId !== expectedSessionId ||
+      current.generation !== expectedGeneration ||
+      current.fileDeliveryBytes !== expectedTotal
+    ) {
+      return false;
+    }
     return this.mutate((m, hw) => {
       const record = m.get(threadId)!;
       m.set(threadId, { ...record, fileDeliveryBytes: nextTotal, updatedAt: Date.now() });
@@ -177,6 +204,23 @@ export class SessionStore {
     });
   }
 
+  /** Tombstone a record only if the same immutable incarnation still owns the
+   * thread slot. A failed rebind must never erase a later replacement. */
+  removeIfCurrent(threadId: string, expectedSessionId: string, expectedGeneration: number): boolean {
+    const current = this.sessions.get(threadId);
+    if (
+      !current ||
+      current.sessionId !== expectedSessionId ||
+      current.generation !== expectedGeneration
+    ) {
+      return false;
+    }
+    return this.mutate((m, hw) => {
+      m.delete(threadId);
+      return hw;
+    });
+  }
+
   /** Forget every session. The file is KEPT (holding only the generation
    *  high-water mark) so generations still never repeat — see `mutate`. */
   clear(): boolean {
@@ -186,13 +230,56 @@ export class SessionStore {
     });
   }
 
-  /** Write a prior record back verbatim (used to roll back a reserve when a
-   *  later step fails, restoring the still-live previous session). */
+  /** Write a record back only when its incarnation still owns the slot. A
+   *  generic restore is used by recovery tooling; it must not let an old record
+   *  replace a newer session or lower a newer reservation. */
   restore(rec: SessionRecord): boolean {
+    const current = this.sessions.get(rec.threadId);
+    if (
+      current &&
+      (current.sessionId !== rec.sessionId || current.generation !== rec.generation)
+    ) {
+      return false;
+    }
+    const fileDeliveryBytes = Math.max(current?.fileDeliveryBytes ?? 0, rec.fileDeliveryBytes);
     return this.mutate((m, hw) => {
-      m.set(rec.threadId, { ...this.toRecord(rec), state: rec.state, ...(rec.reason ? { reason: rec.reason } : {}) });
+      m.set(rec.threadId, {
+        ...this.toRecord({ ...rec, fileDeliveryBytes }),
+        state: rec.state,
+        ...(rec.reason ? { reason: rec.reason } : {}),
+      });
       return Math.max(hw, rec.generation);
     });
+  }
+
+  /** Replace exactly the record installed by this rebind attempt with the
+   * previous record. If that replacement accumulated a reservation, preserve
+   * its larger total and report that the restored old actor cannot safely resume
+   * file delivery. */
+  restoreIfCurrent(
+    rec: SessionRecord,
+    expectedSessionId: string,
+    expectedGeneration: number
+  ): ConditionalRestoreResult {
+    const current = this.sessions.get(rec.threadId);
+    if (
+      !current ||
+      current.sessionId !== expectedSessionId ||
+      current.generation !== expectedGeneration
+    ) {
+      return { ok: false, quotaAdvanced: false };
+    }
+    const fileDeliveryBytes = Math.max(rec.fileDeliveryBytes, current.fileDeliveryBytes);
+    const quotaAdvanced = fileDeliveryBytes !== rec.fileDeliveryBytes;
+    const ok = this.mutate((m, hw) => {
+      m.set(rec.threadId, {
+        ...this.toRecord({ ...rec, fileDeliveryBytes }),
+        state: rec.state,
+        ...(rec.reason ? { reason: rec.reason } : {}),
+      });
+      return Math.max(hw, rec.generation);
+    });
+    return { ok, quotaAdvanced };
   }
 
   private toRecord(b: SessionBinding): SessionRecord {

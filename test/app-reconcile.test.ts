@@ -279,9 +279,9 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     const f = tmpFile();
     const seen: SessionActorOpts[] = [];
     const originalCreate = SessionActor.create;
-    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation((client, options, dependencies) => {
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation((client, options) => {
       seen.push(options);
-      return originalCreate(client, options, dependencies);
+      return originalCreate(client, options);
     });
     try {
       const store = new SessionStore(f);
@@ -293,7 +293,14 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
 
       expect(seen).toHaveLength(1);
       expect(seen[0]!.initialFileDeliveryBytes).toBe(17);
-      expect(seen[0]!.reserveFileDeliveryBytes(18, 17)).toBe(true);
+      expect(
+        seen[0]!.reserveFileDeliveryBytes(
+          seen[0]!.fileDeliverySessionId,
+          seen[0]!.generation ?? 1,
+          18,
+          17
+        )
+      ).toBe(true);
       expect(store.get("t1")?.fileDeliveryBytes).toBe(18);
     } finally {
       createSpy.mockRestore();

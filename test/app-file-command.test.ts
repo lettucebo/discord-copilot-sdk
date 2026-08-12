@@ -27,6 +27,8 @@ const THREAD = "t1";
 class FakeTransport implements Transport {
   sentFiles: Array<{ key: string; file: OutboundFile; note?: string; options?: SendFileOptions }> = [];
   sendFileResult: SendFileResult = { ok: true };
+  sendFileGate?: Promise<void>;
+  sendFileStarted?: () => void;
   async render(): Promise<void> {}
   async sendFile(
     sessionKey: string,
@@ -34,6 +36,9 @@ class FakeTransport implements Transport {
     note?: string,
     options?: SendFileOptions
   ): Promise<SendFileResult> {
+    this.sendFileStarted?.();
+    if (this.sendFileGate) await this.sendFileGate;
+    if (options?.canSend && !options.canSend()) return { ok: false, reason: "cancelled" };
     this.sentFiles.push({
       key: sessionKey,
       file,
@@ -173,17 +178,17 @@ function invokeInteraction(app: DiscordCopilotApp, interaction: FakeSlash): Prom
 type FileResolverActor = Pick<SessionActor, "resolveFileForDelivery">;
 
 function actorResolving(result: ResolveOutboundFileResult): {
-  actor: FileResolverActor;
+  actor: FileResolverActor & { canDeliverFiles(): boolean };
   resolveFileForDelivery: ReturnType<typeof vi.fn>;
 } {
   const resolveFileForDelivery = vi.fn(async (_path: string, _policy: OutboundFilePolicy) => result);
   return {
-    actor: { resolveFileForDelivery },
+    actor: { resolveFileForDelivery, canDeliverFiles: () => true },
     resolveFileForDelivery,
   };
 }
 
-function session(workDir: string, actor: FileResolverActor): Session {
+function session(workDir: string, actor: FileResolverActor & { canDeliverFiles(): boolean }): Session {
   return {
     actor: actor as SessionActor,
     broker: new PendingInteractionBroker(),
@@ -338,6 +343,102 @@ describe("/file", () => {
       },
     });
     expect(MAX_DISCORD_UPLOAD_BYTES).toBe(8 * 1024 * 1024);
+  });
+
+  it("does not send or claim success when the session is replaced while resolving", async () => {
+    const transport = new FakeTransport();
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as CopilotClient,
+      transport,
+      new SessionStore(storeFile),
+      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+    );
+    const workDir = path.join(reposRoot, "repo");
+    const filePath = path.join(workDir, "report.txt");
+    mkdirSync(workDir, { recursive: true });
+    writeFileSync(filePath, "hello");
+    let releaseResolution!: (result: ResolveOutboundFileResult) => void;
+    const resolutionStarted = new Promise<void>((resolve) => {
+      const resolver = {
+        resolveFileForDelivery: vi.fn(
+          () =>
+            new Promise<ResolveOutboundFileResult>((resolveResult) => {
+              releaseResolution = resolveResult;
+              resolve();
+            })
+        ),
+        canDeliverFiles: () => true,
+      };
+      sessionsOf(app).set(THREAD, session(workDir, resolver));
+    });
+    const interaction = slash({ pathValue: "report.txt" });
+
+    const command = invokeInteraction(app, interaction);
+    await resolutionStarted;
+    const replacement = actorResolving({ ok: false, reason: "unreadable" });
+    sessionsOf(app).set(THREAD, session(workDir, replacement.actor));
+    releaseResolution({
+      ok: true,
+      file: {
+        absPath: filePath,
+        displayName: "report.txt",
+        size: 5,
+        fingerprint: "artifact-identity:5:1",
+        digest: "sha256:test",
+        bytes: Buffer.from("hello"),
+      },
+    });
+    await command;
+
+    expect(transport.sentFiles).toHaveLength(0);
+    expect(interaction.edits).toEqual(["檔案傳送已取消。"]);
+  });
+
+  it("passes a currentness gate to cancel a send when the session ends in flight", async () => {
+    const transport = new FakeTransport();
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as CopilotClient,
+      transport,
+      new SessionStore(storeFile),
+      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+    );
+    const workDir = path.join(reposRoot, "repo");
+    const filePath = path.join(workDir, "report.txt");
+    mkdirSync(workDir, { recursive: true });
+    writeFileSync(filePath, "hello");
+    const resolver = actorResolving({
+      ok: true,
+      file: {
+        absPath: filePath,
+        displayName: "report.txt",
+        size: 5,
+        fingerprint: "artifact-identity:5:1",
+        digest: "sha256:test",
+        bytes: Buffer.from("hello"),
+      },
+    });
+    sessionsOf(app).set(THREAD, session(workDir, resolver.actor));
+    let releaseSend!: () => void;
+    transport.sendFileGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    const sendStarted = new Promise<void>((resolve) => {
+      transport.sendFileStarted = resolve;
+    });
+    const interaction = slash({ pathValue: "report.txt" });
+
+    const command = invokeInteraction(app, interaction);
+    await sendStarted;
+    sessionsOf(app).delete(THREAD);
+    releaseSend();
+    await command;
+
+    expect(transport.sentFiles).toHaveLength(0);
+    expect(interaction.edits).toEqual(["檔案傳送已取消。"]);
   });
 
   it("reports transport failure honestly", async () => {

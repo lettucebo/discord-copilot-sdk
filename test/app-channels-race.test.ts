@@ -377,9 +377,9 @@ describe("/new channel-registry epoch fence", { timeout: 60_000 }, () => {
     const fakeThread = { id: QUOTA_THREAD_ID, delete: async (): Promise<void> => {} };
     const seen: SessionActorOpts[] = [];
     const originalCreate = SessionActor.create;
-    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation((client, options, dependencies) => {
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation((client, options) => {
       seen.push(options);
-      return originalCreate(client, options, dependencies);
+      return originalCreate(client, options);
     });
     try {
       patchChannelFetch(app, async () => ({
@@ -393,7 +393,14 @@ describe("/new channel-registry epoch fence", { timeout: 60_000 }, () => {
       expect(store.get(QUOTA_THREAD_ID)?.fileDeliveryBytes).toBe(0);
       expect(seen).toHaveLength(1);
       expect(seen[0]!.initialFileDeliveryBytes).toBe(0);
-      expect(seen[0]!.reserveFileDeliveryBytes(1, 0)).toBe(true);
+      expect(
+        seen[0]!.reserveFileDeliveryBytes(
+          seen[0]!.fileDeliverySessionId,
+          seen[0]!.generation ?? 1,
+          1,
+          0
+        )
+      ).toBe(true);
       expect(store.get(QUOTA_THREAD_ID)?.fileDeliveryBytes).toBe(1);
     } finally {
       createSpy.mockRestore();

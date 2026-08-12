@@ -26,7 +26,13 @@ import type { InstanceLock } from "./core/single-instance.js";
 import { sessionStorePath, worktreeRoot, channelRegistryPath } from "./core/paths.js";
 import { clearStartupReady } from "./core/startup-ready.js";
 import { resolveReposRoot, resolveRepoWithinRoot, listRepos, isStrictlyInside, pathRelation, canonicalPathOr } from "./core/repo.js";
-import { validateBinding, describeBindingProblem, type DevMode } from "./core/binding.js";
+import {
+  validateBinding,
+  describeBindingProblem,
+  type Binding,
+  type BindingVerdict,
+  type DevMode,
+} from "./core/binding.js";
 import { RepoProvisioner, sweepStaleStaging } from "./core/repo-provision.js";
 import { gitDiffSummary } from "./core/git.js";
 import { downloadBounded } from "./core/download.js";
@@ -79,7 +85,7 @@ import {
 import { isAuthorized, isOwner, type AuthContext, type AuthPolicy } from "./platforms/discord/auth.js";
 import { ChannelRegistry } from "./core/channel-registry.js";
 import type { Decision, Transport } from "./core/transport.js";
-import type { SecureOpenBackend } from "./core/secure-open.js";
+import { captureTrustedRoot, type SecureOpenBackend, type TrustedRoot } from "./core/secure-open.js";
 
 /** One live Discord thread ↔ Copilot session. Exported so tests can build a
  *  TYPED fixture — an untyped `as Record<string, unknown>` fixture is how a
@@ -521,13 +527,57 @@ export class DiscordCopilotApp {
    *  can send attachments against an in-memory-only quota. */
   private fileDeliveryQuotaOptions(
     threadId: string,
-    initialFileDeliveryBytes: number
-  ): Pick<SessionActorOpts, "initialFileDeliveryBytes" | "reserveFileDeliveryBytes"> {
+    initialFileDeliveryBytes: number,
+    sessionId: string,
+    generation: number
+  ): Pick<SessionActorOpts, "initialFileDeliveryBytes" | "fileDeliverySessionId" | "reserveFileDeliveryBytes"> {
     return {
       initialFileDeliveryBytes,
-      reserveFileDeliveryBytes: (nextTotal, expectedCurrent) =>
-        this.store.reserveFileDeliveryBytes(threadId, expectedCurrent, nextTotal),
+      fileDeliverySessionId: sessionId,
+      reserveFileDeliveryBytes: (boundSessionId, boundGeneration, nextTotal, expectedCurrent) =>
+        this.store.reserveFileDeliveryBytes(
+          threadId,
+          boundSessionId,
+          boundGeneration,
+          expectedCurrent,
+          nextTotal
+        ),
     };
+  }
+
+  /**
+   * Capture the root BEFORE any git proof observes it. The handle-derived final
+   * path is the only pathname binding validation is allowed to ask git about;
+   * otherwise an attacker can swap the lexical workDir between validation and
+   * actor creation. Only createForTest populates the injected backend.
+   *
+   * On a failed verdict this method closes the capability itself. On success it
+   * transfers ownership to the caller, which must either hand it to
+   * SessionActor.create() or close it on its own failure path.
+   */
+  private async captureValidatedRoot(
+    binding: Binding
+  ): Promise<
+    | { ok: true; trustedRoot: TrustedRoot; binding: Binding }
+    | { ok: false; verdict: Exclude<BindingVerdict, { ok: true }> }
+  > {
+    const trustedRoot = await captureTrustedRoot(binding.workDir, this.actorCreateDependencies?.secureOpen);
+    const capturedBinding: Binding = { ...binding, workDir: trustedRoot.finalPath };
+    let verdict: BindingVerdict;
+    try {
+      verdict = await this.bindingCheck(capturedBinding, {
+        reposRoot: this.reposRoot,
+        worktreeRoot: worktreeRoot(),
+      });
+    } catch (error) {
+      await trustedRoot.close().catch(() => {});
+      throw error;
+    }
+    if (!verdict.ok) {
+      await trustedRoot.close().catch(() => {});
+      return { ok: false, verdict };
+    }
+    return { ok: true, trustedRoot, binding: capturedBinding };
   }
 
   /**
@@ -1236,11 +1286,11 @@ export class DiscordCopilotApp {
       // operator's own checkout.
       const devMode: DevMode = "worktree";
       const branch = worktreeBranch(thread.id);
-      const workDir = worktreePath(worktreeRoot(), repoPath, thread.id);
+      const requestedWorkDir = worktreePath(worktreeRoot(), repoPath, thread.id);
       let worktreeCreated = false;
       await pruneWorktrees(repoPath);
       try {
-        await addWorktree(repoPath, workDir, branch);
+        await addWorktree(repoPath, requestedWorkDir, branch);
         worktreeCreated = true;
       } catch (err) {
         await dropThread();
@@ -1256,7 +1306,7 @@ export class DiscordCopilotApp {
       // created is clean by construction, so nothing can be lost.
       const dropWorktree = async (): Promise<void> => {
         if (!worktreeCreated) return;
-        await removeWorktreeIfClean(repoPath, workDir, branch).catch(() => "failed" as const);
+        await removeWorktreeIfClean(repoPath, requestedWorkDir, branch).catch(() => "failed" as const);
       };
       const abort = async (msg: string): Promise<void> => {
         await dropWorktree();
@@ -1264,21 +1314,39 @@ export class DiscordCopilotApp {
         await interaction.editReply(msg);
       };
 
-      // Prove the binding before an agent is pointed at it — the same gate the
-      // resume and rebind paths use. `addWorktree` already refuses to adopt a
-      // directory belonging to another repo, but asking git directly is what
-      // makes "this worktree belongs to this repo" a fact rather than an
-      // inference from how we happened to build the path.
-      const newVerdict = await this.bindingCheck(
-        { repoPath, workDir, devMode, branch },
-        { reposRoot: this.reposRoot, worktreeRoot: worktreeRoot() }
-      );
-      if (!newVerdict.ok) {
+      let approvalKey: string;
+      try {
+        approvalKey = await this.approvalKeyFor(repoPath);
+      } catch (err) {
+        await abort(`⚠️ 無法建立 repo 核准範圍（${err instanceof Error ? err.message : String(err)}）。未建立 session。`);
+        return;
+      }
+
+      // Capture first, then prove the HANDLE-DERIVED final path. Validating the
+      // mutable generated pathname and capturing it later leaves a swap window
+      // that can make an external directory the actor's trusted root.
+      let captured;
+      try {
+        captured = await this.captureValidatedRoot({
+          repoPath,
+          workDir: requestedWorkDir,
+          devMode,
+          branch,
+        });
+      } catch (err) {
         await abort(
-          `⚠️ 無法確認工作目錄歸屬（${describeBindingProblem(newVerdict.problem)}：${newVerdict.detail}）。未建立 session。`
+          `⚠️ 無法安全開啟工作目錄（${err instanceof Error ? err.message : String(err)}）。未建立 session。`
         );
         return;
       }
+      if (!captured.ok) {
+        await abort(
+          `⚠️ 無法確認工作目錄歸屬（${describeBindingProblem(captured.verdict.problem)}：${captured.verdict.detail}）。未建立 session。`
+        );
+        return;
+      }
+      const trustedRoot = captured.trustedRoot;
+      const workDir = captured.binding.workDir;
 
       // LAST authorization check before anything durable exists. The window from
       // the first check to here spans a thread creation, a `git worktree add`
@@ -1286,6 +1354,7 @@ export class DiscordCopilotApp {
       // this session until the record below exists. Checking here is what makes
       // "a disabled channel never gains a session" true rather than likely.
       if (!stillEnabled()) {
+        await trustedRoot.close().catch(() => {});
         await abort(`⚠️ <#${parentChannelId}> 在這期間被停用了，已回復（討論串與 worktree 都已移除）。`);
         return;
       }
@@ -1303,6 +1372,7 @@ export class DiscordCopilotApp {
         branch,
       });
       if (!reserved) {
+        await trustedRoot.close().catch(() => {});
         await abort("⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未建立新的 session。請檢查磁碟／權限後重試。");
         return;
       }
@@ -1312,8 +1382,9 @@ export class DiscordCopilotApp {
       try {
         actor = await SessionActor.create(this.copilot, {
           sessionKey: thread.id,
+          trustedRoot,
           workingDirectory: workDir,
-          approvalKey: await this.approvalKeyFor(repoPath),
+          approvalKey,
           model: this.config.DEFAULT_MODEL,
           contextTier: this.config.DEFAULT_CONTEXT_TIER,
           broker,
@@ -1321,9 +1392,9 @@ export class DiscordCopilotApp {
           policy: this.approvals,
           generation,
           createSessionId: sessionId,
-          ...this.fileDeliveryQuotaOptions(thread.id, fileDeliveryBytes),
+          ...this.fileDeliveryQuotaOptions(thread.id, fileDeliveryBytes, sessionId, generation),
           ...this.skillSourceOptions(),
-        }, this.actorCreateDependencies);
+        });
       } catch (err) {
         // Create failed. The RPC may or may not have created the assigned id, so
         // best-effort DELETE it to remove any dormant runtime session (it has no
@@ -2288,12 +2359,24 @@ export class DiscordCopilotApp {
   ): Promise<string> {
     const session = this.sessions.get(threadId);
     if (!session) return "⚠️ 這個討論串已經沒有進行中的 session，未改綁。";
+    // Fence old attachments synchronously, before rebindBlocker or any git/SDK
+    // await. A stale actor must not reserve or send against the replacement
+    // record while this transaction is in flight.
+    const fileDeliveryFence = session.actor.suspendFileDelivery();
+    const restoreOldFileDelivery = (): void => {
+      if (this.sessions.get(threadId) === session) {
+        session.actor.resumeFileDeliveryIfCurrent(fileDeliveryFence);
+      }
+    };
     const stale = await this.rebindBlocker(threadId, session, target);
-    if (stale) return `${stale}\n（在你確認的這段時間內狀態改變了，因此未改綁。）`;
+    if (stale) {
+      restoreOldFileDelivery();
+      return `${stale}\n（在你確認的這段時間內狀態改變了，因此未改綁。）`;
+    }
 
     const old = { ...session };
     const branch = target.devMode === "worktree" ? worktreeBranch(threadId) : undefined;
-    const workDir =
+    const requestedWorkDir =
       target.devMode === "worktree"
         ? worktreePath(worktreeRoot(), target.repoPath, threadId)
         : target.repoPath;
@@ -2302,26 +2385,48 @@ export class DiscordCopilotApp {
     if (target.devMode === "worktree" && branch) {
       try {
         await pruneWorktrees(target.repoPath);
-        await addWorktree(target.repoPath, workDir, branch);
+        await addWorktree(target.repoPath, requestedWorkDir, branch);
         createdWorktree = true;
       } catch (err) {
+        restoreOldFileDelivery();
         return `⚠️ 無法建立目標 worktree（${err instanceof Error ? err.message : String(err)}）。未改綁，原本的設定不變。`;
       }
     }
     const undoWorktree = async (): Promise<void> => {
       if (createdWorktree) {
-        await removeWorktreeIfClean(target.repoPath, workDir, branch).catch(() => "failed" as const);
+        await removeWorktreeIfClean(target.repoPath, requestedWorkDir, branch).catch(() => "failed" as const);
       }
     };
 
-    const verdict = await this.bindingCheck(
-      { repoPath: target.repoPath, workDir, devMode: target.devMode, branch },
-      { reposRoot: this.reposRoot, worktreeRoot: worktreeRoot() }
-    );
-    if (!verdict.ok) {
+    let approvalKey: string;
+    try {
+      approvalKey = await this.approvalKeyFor(target.repoPath);
+    } catch (err) {
+      restoreOldFileDelivery();
       await undoWorktree();
-      return `⚠️ 目標綁定無法通過驗證（${describeBindingProblem(verdict.problem)}：${verdict.detail}）。未改綁。`;
+      return `⚠️ 無法建立 repo 核准範圍（${err instanceof Error ? err.message : String(err)}）。未改綁。`;
     }
+
+    let captured;
+    try {
+      captured = await this.captureValidatedRoot({
+        repoPath: target.repoPath,
+        workDir: requestedWorkDir,
+        devMode: target.devMode,
+        branch,
+      });
+    } catch (err) {
+      restoreOldFileDelivery();
+      await undoWorktree();
+      return `⚠️ 無法安全開啟目標工作目錄（${err instanceof Error ? err.message : String(err)}）。未改綁。`;
+    }
+    if (!captured.ok) {
+      restoreOldFileDelivery();
+      await undoWorktree();
+      return `⚠️ 目標綁定無法通過驗證（${describeBindingProblem(captured.verdict.problem)}：${captured.verdict.detail}）。未改綁。`;
+    }
+    const trustedRoot = captured.trustedRoot;
+    const workDir = captured.binding.workDir;
 
     // Take the lease BEFORE the new session exists, so a concurrent
     // `/repo dev local` in another thread cannot slip in between check and create.
@@ -2332,6 +2437,8 @@ export class DiscordCopilotApp {
       this.releaseLocalLease(threadId);
       const lease = this.acquireLocalLease(target.repoPath, threadId);
       if (!lease.ok) {
+        await trustedRoot.close().catch(() => {});
+        restoreOldFileDelivery();
         this.restoreLeaseFor(threadId, old);
         await undoWorktree();
         return `🔒 \`${path.basename(target.repoPath)}\` 剛剛被 <#${lease.holder}> 取走 local 佔用，未改綁。`;
@@ -2362,6 +2469,8 @@ export class DiscordCopilotApp {
       branch,
     });
     if (!reserved) {
+      await trustedRoot.close().catch(() => {});
+      restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
       await undoWorktree();
       return "⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未改綁。請檢查磁碟／權限後重試。";
@@ -2372,8 +2481,9 @@ export class DiscordCopilotApp {
     try {
       actor = await SessionActor.create(this.copilot, {
         sessionKey: threadId,
+        trustedRoot,
         workingDirectory: workDir,
-        approvalKey: await this.approvalKeyFor(target.repoPath),
+        approvalKey,
         model: this.config.DEFAULT_MODEL,
         contextTier: this.config.DEFAULT_CONTEXT_TIER,
         broker,
@@ -2381,24 +2491,41 @@ export class DiscordCopilotApp {
         policy: this.approvals,
         generation,
         createSessionId: sessionId,
-        ...this.fileDeliveryQuotaOptions(threadId, fileDeliveryBytes),
+        ...this.fileDeliveryQuotaOptions(threadId, fileDeliveryBytes, sessionId, generation),
         ...this.skillSourceOptions(),
-      }, this.actorCreateDependencies);
+      });
     } catch (err) {
       // The OLD session is still live and registered — nothing has been swapped
-      // yet — so restoring its record puts everything back exactly as it was.
-      if (previous) this.store.restore(previous);
-      else this.store.remove(threadId);
+      // yet — restore only the row this attempt reserved. Preserving a larger
+      // total keeps a late replacement reservation monotonic, at the cost of
+      // leaving old file delivery fenced when its in-memory total is stale.
+      const rollback = previous
+        ? this.store.restoreIfCurrent(previous, sessionId, generation)
+        : { ok: this.store.removeIfCurrent(threadId, sessionId, generation), quotaAdvanced: false };
+      if (rollback.ok && !rollback.quotaAdvanced) restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
       await undoWorktree();
-      return `⚠️ 建立新的 Copilot session 失敗（${err instanceof Error ? err.message : String(err)}）。未改綁，原本的對話仍在。`;
+      return (
+        `⚠️ 建立新的 Copilot session 失敗（${err instanceof Error ? err.message : String(err)}）。未改綁，原本的對話仍在。` +
+        (rollback.ok && !rollback.quotaAdvanced
+          ? ""
+          : "\n⚠️ 為避免覆寫較新的檔案配額，原 session 的檔案傳送保持停用。")
+      );
     }
     if (!this.store.commit(threadId)) {
       await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS).catch(() => {});
-      if (previous) this.store.restore(previous);
+      const rollback = previous
+        ? this.store.restoreIfCurrent(previous, sessionId, generation)
+        : { ok: this.store.removeIfCurrent(threadId, sessionId, generation), quotaAdvanced: false };
+      if (rollback.ok && !rollback.quotaAdvanced) restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
       await undoWorktree();
-      return "⚠️ 無法持久化 session 狀態（commit 失敗），未改綁。請檢查磁碟／權限後重試。";
+      return (
+        "⚠️ 無法持久化 session 狀態（commit 失敗），未改綁。請檢查磁碟／權限後重試。" +
+        (rollback.ok && !rollback.quotaAdvanced
+          ? ""
+          : "\n⚠️ 為避免覆寫較新的檔案配額，原 session 的檔案傳送保持停用。")
+      );
     }
 
     // Swap. From here the new session owns the thread.
@@ -2911,23 +3038,56 @@ export class DiscordCopilotApp {
         return;
       }
     }
-    // Prove the binding BEFORE handing the directory to an agent. The record is
-    // plain JSON in the user's home, and a worktree that belongs to a different
-    // repo than the record claims is indistinguishable from a valid one by shape
-    // alone — only git can answer, and it must.
-    const verdict = await this.bindingCheck(
-      { repoPath: rec.repoPath, workDir: rec.workDir, devMode: rec.devMode, branch: rec.branch },
-      { reposRoot: this.reposRoot, worktreeRoot: worktreeRoot() }
-    );
-    if (!verdict.ok) {
-      console.warn(`reconcile: refusing to resume ${rec.threadId} — ${verdict.detail}`);
-      this.store.setState(rec.threadId, "blocked", `binding-${verdict.problem}`);
-      this.releaseLocalLease(rec.threadId);
+    let approvalKey: string;
+    try {
+      approvalKey = await this.approvalKeyFor(rec.repoPath);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`reconcile: transient approval-key failure for ${rec.threadId}: ${msg}`);
       await this.transport
-        .notice(rec.threadId, `⚠️ 無法復原：${describeBindingProblem(verdict.problem)}。請用 /new 開新的。`)
+        .notice(
+          rec.threadId,
+          `⚠️ 暫時無法復原此對話（${msg}）。session 記錄已保留——重新啟動 bot 可再嘗試復原；或用 /new 重新開始。`
+        )
         .catch(() => {});
       return;
     }
+    // Capture before git sees the path. The persisted JSON pathname is mutable;
+    // only the final path reported by the retained handle may be proven as this
+    // record's worktree and passed to the resumed actor.
+    let captured;
+    try {
+      captured = await this.captureValidatedRoot({
+        repoPath: rec.repoPath,
+        workDir: rec.workDir,
+        devMode: rec.devMode,
+        branch: rec.branch,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`reconcile: transient trusted-root capture failure for ${rec.threadId}: ${msg}`);
+      await this.transport
+        .notice(
+          rec.threadId,
+          `⚠️ 暫時無法復原此對話（${msg}）。session 記錄已保留——重新啟動 bot 可再嘗試復原；或用 /new 重新開始。`
+        )
+        .catch(() => {});
+      return;
+    }
+    if (!captured.ok) {
+      console.warn(`reconcile: refusing to resume ${rec.threadId} — ${captured.verdict.detail}`);
+      this.store.setState(rec.threadId, "blocked", `binding-${captured.verdict.problem}`);
+      this.releaseLocalLease(rec.threadId);
+      await this.transport
+        .notice(
+          rec.threadId,
+          `⚠️ 無法復原：${describeBindingProblem(captured.verdict.problem)}。請用 /new 開新的。`
+        )
+        .catch(() => {});
+      return;
+    }
+    const trustedRoot = captured.trustedRoot;
+    const workDir = captured.binding.workDir;
     const broker = new PendingInteractionBroker();
     let actor: SessionActor;
     try {
@@ -2936,8 +3096,9 @@ export class DiscordCopilotApp {
         // Back into the SAME directory this session was created in — resuming a
         // worktree session into another tree would run one thread's conversation
         // against another thread's files.
-        workingDirectory: rec.workDir,
-        approvalKey: await this.approvalKeyFor(rec.repoPath),
+        trustedRoot,
+        workingDirectory: workDir,
+        approvalKey,
         model: this.config.DEFAULT_MODEL,
         contextTier: this.config.DEFAULT_CONTEXT_TIER,
         broker,
@@ -2945,9 +3106,9 @@ export class DiscordCopilotApp {
         policy: this.approvals,
         generation: rec.generation,
         resumeSessionId: rec.sessionId,
-        ...this.fileDeliveryQuotaOptions(rec.threadId, rec.fileDeliveryBytes),
+        ...this.fileDeliveryQuotaOptions(rec.threadId, rec.fileDeliveryBytes, rec.sessionId, rec.generation),
         ...this.skillSourceOptions(),
-      }, this.actorCreateDependencies);
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (classifyResumeError(msg) === "session-lost") {
@@ -2984,7 +3145,7 @@ export class DiscordCopilotApp {
       titled: true,
       titleEpoch: 0,
       queue: [],
-      workDir: rec.workDir,
+      workDir,
       repoPath: rec.repoPath,
       devMode: rec.devMode,
       branch: rec.branch,
@@ -3396,24 +3557,39 @@ export class DiscordCopilotApp {
       return;
     }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const session = this.sessions.get(interaction.channelId);
+    const threadId = interaction.channelId;
+    const session = this.sessions.get(threadId);
     if (!session) {
       await interaction.editReply({ content: "這個討論串沒有進行中的 session，無法傳送檔案。" });
       return;
     }
+    const canSend = (): boolean =>
+      this.sessions.get(threadId) === session && session.actor.canDeliverFiles();
     const requestedPath = interaction.options.getString("path", true);
     let resolved: Awaited<ReturnType<SessionActor["resolveFileForDelivery"]>>;
     try {
       resolved = await session.actor.resolveFileForDelivery(requestedPath, "operator");
     } catch {
+      if (!canSend()) {
+        await interaction.editReply({ content: "檔案傳送已取消。" });
+        return;
+      }
       await interaction.editReply({ content: this.fileRefusalMessage("unreadable") });
+      return;
+    }
+    if (!canSend()) {
+      await interaction.editReply({ content: "檔案傳送已取消。" });
       return;
     }
     if (!resolved.ok) {
       await interaction.editReply({ content: this.fileRefusalMessage(resolved.reason) });
       return;
     }
-    const sent = await this.transport.sendFile(interaction.channelId, resolved.file);
+    const sent = await this.transport.sendFile(threadId, resolved.file, undefined, { canSend });
+    if (!canSend()) {
+      await interaction.editReply({ content: "檔案傳送已取消。" });
+      return;
+    }
     if (!sent.ok) {
       await interaction.editReply({
         content: sent.reason === "cancelled" ? "檔案傳送已取消。" : "檔案已解析，但傳送到 Discord 失敗。",

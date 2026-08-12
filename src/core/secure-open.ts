@@ -124,6 +124,13 @@ class TrustedRootCapability {
     return trustedRootState(this).originalPath;
   }
 
+  /** Immutable final path reported by the still-open directory handle at
+   * capture time. Consumers may prove ownership with this value, but cannot
+   * construct or retarget the capability from it. */
+  get finalPath(): string {
+    return trustedRootState(this).finalPath;
+  }
+
   /** True from the instant teardown begins, including while active reads drain. */
   get closed(): boolean {
     return trustedRootState(this).closing;

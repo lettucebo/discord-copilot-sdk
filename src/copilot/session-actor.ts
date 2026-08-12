@@ -138,6 +138,10 @@ function fileDeliverySummary(displayName: string, size: number, comment?: string
 
 export interface SessionActorOpts {
   sessionKey: string;
+  /** A live root capability captured and binding-validated by the app. Ownership
+   * transfers to this actor, which closes it exactly once on init failure or
+   * teardown; production must never recapture `workingDirectory` by pathname. */
+  trustedRoot: TrustedRoot;
   workingDirectory: string;
   /** Identity that "always allow for this repo" rules are stored under. With
    *  per-session worktrees the working directory differs for every session, so
@@ -153,10 +157,17 @@ export interface SessionActorOpts {
   /** Bytes already durably reserved by this logical Discord thread before this
    *  actor was created or resumed. */
   initialFileDeliveryBytes: number;
-  /** Atomically persist a next reservation for this logical thread only when
-   *  its durable total still equals `expectedCurrent`. A false result must
+  /** Immutable durable incarnation for this actor's file quota callback. */
+  fileDeliverySessionId: string;
+  /** Atomically persist a next reservation only when this actor's durable
+   *  session id, generation, and current total still match. A false result must
    *  prevent the attachment send. */
-  reserveFileDeliveryBytes(nextTotal: number, expectedCurrent: number): boolean;
+  reserveFileDeliveryBytes(
+    sessionId: string,
+    generation: number,
+    nextTotal: number,
+    expectedCurrent: number
+  ): boolean;
   /** Durable record of auto-approved actions. A write failure fails YOLO closed. */
   auditLog?: AuditSink;
   /** Session incarnation (P1: always 1; P2 resume will vary this). */
@@ -181,6 +192,10 @@ export interface SessionActorOpts {
 export interface SessionActorCreateDependencies {
   secureOpen?: SecureOpenDependencies;
 }
+
+/** Test-only creation input. Production callers must supply a root capability
+ * captured before binding validation to `create()`. */
+export type SessionActorCreateForTestOpts = Omit<SessionActorOpts, "trustedRoot">;
 
 /** A raw-bytes attachment for send() — Discord images become blobs (P5). */
 export interface BlobAttachment {
@@ -247,6 +262,10 @@ export class SessionActor {
   /** A file can be delivered only by the exact custom-tool invocation whose
    * permission card validated its immutable metadata and content digest. */
   private readonly approvedFileDeliveries = new Map<string, ApprovedFileDelivery>();
+  /** The one broker request that currently owns the file-delivery card. Keeping
+   * its nonce lets a lifecycle fence deny it immediately instead of leaving a
+   * stale Allow button live until the five-minute timeout. */
+  private pendingFilePermissionNonce?: string;
   /** Bounds pre-card reads and prevents multiple pending cards from retaining
    * up to 8 MiB each. A lifecycle boundary drops this owner immediately; an
    * old callback can only release its own token, never a later request's gate. */
@@ -260,6 +279,11 @@ export class SessionActor {
   /** Serializes sends so a concurrent pair cannot reserve from the same stale
    *  total and each believe it fits the durable quota. */
   private fileDeliveryChain: Promise<void> = Promise.resolve();
+  /** A rebind fences the old actor synchronously before it awaits any target
+   * work. The token prevents an unrelated later fence from being cleared by an
+   * old rollback path. */
+  private fileDeliveryFence = 0;
+  private fileDeliverySuspended = false;
   /** True while a /stop abort is in flight — new permissions fail closed. */
   private aborting = false;
   /** YOLO mode: auto-approve EVERY SDK permission request for this session.
@@ -300,10 +324,8 @@ export class SessionActor {
   /** Per-nonce exit-plan metadata (actions for index→action mapping). */
   private readonly pendingPlan = new Map<string, { actions: string[] }>();
 
-  private constructor(
-    private readonly opts: SessionActorOpts,
-    private readonly dependencies: SessionActorCreateDependencies
-  ) {
+  private constructor(private readonly opts: SessionActorOpts) {
+    this.trustedRoot = opts.trustedRoot;
     this.generation = opts.generation ?? 1;
     this.currentModel = opts.model;
     this.currentContext = opts.contextTier;
@@ -311,22 +333,23 @@ export class SessionActor {
     if (!isFileDeliveryByteTotal(opts.initialFileDeliveryBytes)) {
       throw new Error("initial file delivery byte total is invalid");
     }
+    if (typeof opts.fileDeliverySessionId !== "string" || opts.fileDeliverySessionId.length === 0) {
+      throw new Error("file delivery session identity is invalid");
+    }
     this.fileDeliveryBytes = opts.initialFileDeliveryBytes;
   }
 
-  static async create(
-    client: CopilotClient,
-    opts: SessionActorOpts,
-    dependencies: SessionActorCreateDependencies = {}
-  ): Promise<SessionActor> {
-    const actor = new SessionActor(opts, dependencies);
+  /** Create from the exact root already captured and validated by the app. */
+  static async create(client: CopilotClient, opts: SessionActorOpts): Promise<SessionActor> {
+    let actor: SessionActor | undefined;
     try {
-      await actor.initTrustedRoot();
+      actor = new SessionActor(opts);
       await actor.init(client);
       return actor;
     } catch (error) {
       try {
-        await actor.closeTrustedRoot();
+        if (actor) await actor.closeTrustedRoot();
+        else await opts.trustedRoot.close();
       } catch {
         // The actor is never returned after initialization fails; the original
         // SDK error remains the actionable failure and close was attempted once.
@@ -335,8 +358,15 @@ export class SessionActor {
     }
   }
 
-  private async initTrustedRoot(): Promise<void> {
-    this.trustedRoot = await captureTrustedRoot(this.opts.workingDirectory, this.dependencies.secureOpen);
+  /** Test-only constructor path. It is intentionally the only place that can
+   * create a fake root backend; production must use `create()` above. */
+  static async createForTest(
+    client: CopilotClient,
+    opts: SessionActorCreateForTestOpts,
+    dependencies: SessionActorCreateDependencies = {}
+  ): Promise<SessionActor> {
+    const trustedRoot = await captureTrustedRoot(opts.workingDirectory, dependencies.secureOpen);
+    return this.create(client, { ...opts, trustedRoot });
   }
 
   private async closeTrustedRoot(): Promise<void> {
@@ -675,6 +705,11 @@ export class SessionActor {
     this.fileApprovalEpoch++;
     this.approvedFileDeliveries.clear();
     this.fileDeliveryPermissionOwner = undefined;
+    const pendingNonce = this.pendingFilePermissionNonce;
+    this.pendingFilePermissionNonce = undefined;
+    if (pendingNonce) {
+      this.opts.broker.settle(pendingNonce, DENY_UNAVAILABLE, this.generation);
+    }
   }
 
   private acquireFileDeliveryPermissionGate(): symbol | undefined {
@@ -695,6 +730,8 @@ export class SessionActor {
       this.fileDeliveryPermissionOwner === owner &&
       this.lifecycle === "active" &&
       !this.aborting &&
+      !this.yolo &&
+      !this.fileDeliverySuspended &&
       turnEpoch === this.fileApprovalEpoch
     );
   }
@@ -703,8 +740,44 @@ export class SessionActor {
     return (
       this.lifecycle === "active" &&
       !this.aborting &&
+      !this.yolo &&
+      !this.fileDeliverySuspended &&
       approval.turnEpoch === this.fileApprovalEpoch
     );
+  }
+
+  /** Whether this actor can still deliver an operator-requested `/file`.
+   * YOLO deliberately does not block that explicit user action, but teardown
+   * and a rebind fence do. */
+  canDeliverFiles(): boolean {
+    return this.lifecycle === "active" && !this.aborting && !this.fileDeliverySuspended;
+  }
+
+  /** Fence every old file card, approval and send before rebind begins any
+   * asynchronous work. The returned token may only be cleared by the matching
+   * rollback while this actor remains the current session. */
+  suspendFileDelivery(): number {
+    this.fileDeliveryFence++;
+    this.fileDeliverySuspended = true;
+    this.clearFileDeliveryApprovals();
+    return this.fileDeliveryFence;
+  }
+
+  /** Re-enable file delivery after a failed rebind only for the fence that
+   * suspended it. Callers additionally verify this actor is still mapped to the
+   * thread; an advanced durable quota intentionally leaves the fence closed. */
+  resumeFileDeliveryIfCurrent(fence: number): boolean {
+    if (
+      fence !== this.fileDeliveryFence ||
+      !this.fileDeliverySuspended ||
+      this.lifecycle !== "active" ||
+      this.aborting ||
+      this.yolo
+    ) {
+      return false;
+    }
+    this.fileDeliverySuspended = false;
+    return true;
   }
 
   /** Read the artifact once, then return only scalar state that is safe to keep
@@ -840,6 +913,7 @@ export class SessionActor {
         onDefault: () => DENY_UNAVAILABLE,
       });
       this.pendingPerms.set(nonce, { executable: "", canOfferSession: false });
+      this.pendingFilePermissionNonce = nonce;
       try {
         void this.presentFileDeliveryPermissionCard(nonce, approval, owner, turnEpoch).catch(() => {
           this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
@@ -853,6 +927,9 @@ export class SessionActor {
         return decision;
       } finally {
         this.pendingPerms.delete(nonce);
+        if (this.pendingFilePermissionNonce === nonce) {
+          this.pendingFilePermissionNonce = undefined;
+        }
       }
     } finally {
       this.releaseFileDeliveryPermissionGate(owner);
@@ -929,7 +1006,13 @@ export class SessionActor {
     }
     let reserved = false;
     try {
-      reserved = this.opts.reserveFileDeliveryBytes(nextFileDeliveryBytes, expectedFileDeliveryBytes) === true;
+      reserved =
+        this.opts.reserveFileDeliveryBytes(
+          this.opts.fileDeliverySessionId,
+          this.generation,
+          nextFileDeliveryBytes,
+          expectedFileDeliveryBytes
+        ) === true;
     } catch {
       reserved = false;
     }
@@ -1466,6 +1549,12 @@ export class SessionActor {
    *  epoch, which invalidates any deferred enable still awaiting its ack. */
   setYolo(on: boolean): void {
     this.yoloEpoch++;
+    if (on && !this.yolo) {
+      // A card issued while YOLO was off must not become an exfiltration path
+      // after the mode flips. Deny the broker request synchronously; late card
+      // clicks are then inert and the handler has no approval to consume.
+      this.clearFileDeliveryApprovals();
+    }
     this.yolo = on;
   }
 
@@ -1483,6 +1572,11 @@ export class SessionActor {
    *  `epoch`. Returns whether it was applied (false ⇒ superseded, stays as-is). */
   enableYoloIfCurrent(epoch: number): boolean {
     if (epoch !== this.yoloEpoch) return false;
+    if (!this.yolo) {
+      // See setYolo(true): deferred acknowledgement must enforce the same
+      // invalidation at the exact moment YOLO actually takes effect.
+      this.clearFileDeliveryApprovals();
+    }
     this.yolo = true;
     return true;
   }

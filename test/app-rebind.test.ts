@@ -14,6 +14,7 @@ import type { CopilotClient } from "@github/copilot-sdk";
 import { SessionActor, type SessionActorOpts } from "../src/copilot/session-actor.js";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import type { DevMode } from "../src/core/binding.js";
+import type { SecureOpenBackend } from "../src/core/secure-open.js";
 
 const run = promisify(execFile);
 
@@ -34,6 +35,10 @@ const run = promisify(execFile);
 class FakeActor {
   disconnectCalls = 0;
   disconnectFails = false;
+  suspendFileDeliveryCalls = 0;
+  resumeFileDeliveryCalls: number[] = [];
+  onSuspendFileDelivery?: () => void;
+  oldQuotaReserve?: boolean;
   isFaulted(): boolean {
     return false;
   }
@@ -45,6 +50,15 @@ class FakeActor {
     if (this.disconnectFails) throw new Error("runtime did not answer");
   }
   async stop(): Promise<boolean> {
+    return true;
+  }
+  suspendFileDelivery(): number {
+    this.suspendFileDeliveryCalls++;
+    this.onSuspendFileDelivery?.();
+    return this.suspendFileDeliveryCalls;
+  }
+  resumeFileDeliveryIfCurrent(fence: number): boolean {
+    this.resumeFileDeliveryCalls.push(fence);
     return true;
   }
 }
@@ -351,6 +365,56 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     expect(leases(app).get(leaseKeyOf(repoB))).toBeUndefined();
   });
 
+  it("suspends old file delivery before rebinding and restores it only after a failed rollback", async () => {
+    const { app, actor, store } = harness({ createFails: true });
+    expect(store.reserveFileDeliveryBytes("t1", "s1", 1, 0, 17)).toBe(true);
+
+    const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+
+    expect(out).toMatch(/原本的對話仍在/);
+    expect(actor.suspendFileDeliveryCalls).toBe(1);
+    expect(actor.resumeFileDeliveryCalls).toEqual([1]);
+    expect(store.get("t1")).toMatchObject({
+      sessionId: "s1",
+      generation: 1,
+      fileDeliveryBytes: 17,
+    });
+    expect(new SessionStore(storeFile).get("t1")?.fileDeliveryBytes).toBe(17);
+  });
+
+  it("keeps old file delivery fenced when failed rollback preserves a newer reservation", async () => {
+    const { app, actor, store } = harness({ createFails: true });
+    expect(store.reserveFileDeliveryBytes("t1", "s1", 1, 0, 17)).toBe(true);
+    const originalCreate = SessionActor.create;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation((client, options) => {
+      expect(
+        store.reserveFileDeliveryBytes(
+          "t1",
+          options.fileDeliverySessionId,
+          options.generation ?? 1,
+          17,
+          25
+        )
+      ).toBe(true);
+      return originalCreate(client, options);
+    });
+    try {
+      const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+
+      expect(out).toMatch(/檔案傳送保持停用/);
+      expect(actor.suspendFileDeliveryCalls).toBe(1);
+      expect(actor.resumeFileDeliveryCalls).toEqual([]);
+      expect(store.get("t1")).toMatchObject({
+        sessionId: "s1",
+        generation: 1,
+        fileDeliveryBytes: 25,
+      });
+      expect(new SessionStore(storeFile).get("t1")?.fileDeliveryBytes).toBe(25);
+    } finally {
+      createSpy.mockRestore();
+    }
+  });
+
   it("refuses when the binding cannot be proved, and touches nothing", async () => {
     const { app, store, actor } = harness();
     (app as unknown as { bindingCheck: unknown }).bindingCheck = async () => ({
@@ -364,6 +428,53 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     expect(actor.disconnectCalls).toBe(0);
   });
 
+  it("validates the captured root final path before creating a rebound actor", async () => {
+    const { app, actor, transport } = harness();
+    const externalRoot = path.join(tmp, "external-root");
+    const rootClose = vi.fn(async () => undefined);
+    const backend: SecureOpenBackend = {
+      open: vi.fn(async () => {
+        throw new Error("this regression only captures a root");
+      }),
+      openDirectory: vi.fn(async () => ({
+        finalPath: externalRoot,
+        identity: "outside-repo-root",
+        directory: true,
+        revalidate: async () => ({
+          finalPath: externalRoot,
+          identity: "outside-repo-root",
+          directory: true,
+        }),
+        close: rootClose,
+      })),
+    };
+    (
+      app as unknown as {
+        actorCreateDependencies?: { secureOpen?: { backend?: SecureOpenBackend } };
+      }
+    ).actorCreateDependencies = { secureOpen: { backend } };
+    (app as unknown as { bindingCheck: unknown }).bindingCheck = async (binding: { workDir: string }) =>
+      binding.workDir === externalRoot
+        ? {
+            ok: false,
+            problem: "worktree-owner-mismatch",
+            detail: "captured root belongs outside the claimed repo",
+          }
+        : { ok: true };
+    const createSpy = vi.spyOn(SessionActor, "create");
+    try {
+      const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+
+      expect(out).toMatch(/無法通過驗證/);
+      expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(rootClose).toHaveBeenCalledTimes(1);
+      expect(transport.notices).toEqual([]);
+    } finally {
+      createSpy.mockRestore();
+    }
+  });
+
   it("says the conversation is gone, and starts the new session with no history", async () => {
     const { app } = harness();
     const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
@@ -374,12 +485,12 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
 
   it("preserves and wires the durable file quota when rebinding the thread", async () => {
     const { app, store } = harness();
-    expect(store.reserveFileDeliveryBytes("t1", 0, 17)).toBe(true);
+    expect(store.reserveFileDeliveryBytes("t1", "s1", 1, 0, 17)).toBe(true);
     const seen: SessionActorOpts[] = [];
     const originalCreate = SessionActor.create;
-    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation((client, options, dependencies) => {
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation((client, options) => {
       seen.push(options);
-      return originalCreate(client, options, dependencies);
+      return originalCreate(client, options);
     });
     try {
       const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
@@ -387,8 +498,38 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       expect(out).toMatch(/已改綁/);
       expect(seen).toHaveLength(1);
       expect(seen[0]!.initialFileDeliveryBytes).toBe(17);
-      expect(seen[0]!.reserveFileDeliveryBytes(18, 17)).toBe(true);
+      expect(
+        seen[0]!.reserveFileDeliveryBytes(
+          seen[0]!.fileDeliverySessionId,
+          seen[0]!.generation ?? 1,
+          18,
+          17
+        )
+      ).toBe(true);
       expect(store.get("t1")?.fileDeliveryBytes).toBe(18);
+    } finally {
+      createSpy.mockRestore();
+    }
+  });
+
+  it("rejects an old actor quota reservation after the rebind record replaces its identity", async () => {
+    const { app, store, actor } = harness();
+    expect(store.reserveFileDeliveryBytes("t1", "s1", 1, 0, 17)).toBe(true);
+    const originalCreate = SessionActor.create;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation((client, options) => {
+      // This runs after applyRebind has durably installed its replacement row,
+      // exactly where an old actor's delayed reservation used to overwrite it.
+      actor.oldQuotaReserve = store.reserveFileDeliveryBytes("t1", "s1", 1, 17, 18);
+      return originalCreate(client, options);
+    });
+    try {
+      const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+
+      expect(out).toMatch(/已改綁/);
+      expect(actor.suspendFileDeliveryCalls).toBe(1);
+      expect(actor.oldQuotaReserve).toBe(false);
+      expect(store.get("t1")?.fileDeliveryBytes).toBe(17);
+      expect(new SessionStore(storeFile).get("t1")?.fileDeliveryBytes).toBe(17);
     } finally {
       createSpy.mockRestore();
     }
