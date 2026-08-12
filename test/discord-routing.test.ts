@@ -211,8 +211,8 @@ describe("applyYoloToggle (ack-before-allow for blanket approval)", () => {
 });
 
 describe("yoloOnWarning", () => {
-  it("states that YOLO auto-approves other permissions but fast-denies discord_send_file", () => {
-    const warning = yoloOnWarning(false);
+  it("states Windows YOLO auto-approves other permissions but fast-denies discord_send_file", () => {
+    const warning = yoloOnWarning(false, true);
     expect(warning).toMatch(/other permission requests are auto-approved/i);
     expect(warning).toMatch(/discord_send_file/i);
     expect(warning).toMatch(/fast-denied/i);
@@ -221,8 +221,8 @@ describe("yoloOnWarning", () => {
     expect(warning).not.toMatch(/including file writes and other kinds that are normally refused/i);
   });
 
-  it("preserves the repository-skill warning while staying truthful about file delivery", () => {
-    const warning = yoloOnWarning(true);
+  it("preserves the repository-skill warning while staying truthful about Windows file delivery", () => {
+    const warning = yoloOnWarning(true, true);
     expect(warning).toMatch(/repository skills/i);
     expect(warning).toMatch(/YOLO/i);
     expect(warning).toMatch(/Discord approval gate/i);
@@ -230,8 +230,16 @@ describe("yoloOnWarning", () => {
     expect(warning).toMatch(/\/file path:</i);
   });
 
+  it("states non-Windows outbound delivery is unavailable instead of claiming file fallback", () => {
+    const warning = yoloOnWarning(false, false);
+    expect(warning).toMatch(/outbound Discord file delivery is unavailable on this platform/i);
+    expect(warning).not.toMatch(/discord_send_file/i);
+    expect(warning).not.toMatch(/fast-denied/i);
+    expect(warning).not.toMatch(/\/file path:</i);
+  });
+
   it("does not claim repository skills when none were loaded", () => {
-    expect(yoloOnWarning(false)).not.toMatch(/repository skills/i);
+    expect(yoloOnWarning(false, true)).not.toMatch(/repository skills/i);
   });
 });
 

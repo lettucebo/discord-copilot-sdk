@@ -82,7 +82,18 @@ Removing the install link does **not** affect a bot already in your server: slas
 
 ## 4. Invite the bot
 
-Replace `YOUR_APP_ID` below with the **Application ID** from the **General Information** tab:
+Replace `YOUR_APP_ID` below with the **Application ID** from the **General Information** tab.
+
+Choose the invite mask that matches the host platform:
+
+- **Windows normal:** `326417632256`
+- **Non-Windows normal:** `326417599488`
+- **Windows lean:** `309237763072`
+- **Non-Windows lean:** `309237730304`
+
+Windows needs `Attach Files` because outbound Discord file delivery is available there. Non-Windows can omit `Attach Files` because outbound delivery is unavailable on that platform.
+
+### Windows normal invite
 
 ```text
 https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20applications.commands&permissions=326417632256
@@ -109,7 +120,20 @@ Open it in a browser → pick your server → **Authorize**.
 
 **Already invited the bot?** If you used an older install link, the bot role does **not** gain `Attach Files` until you re-authorize the application (or grant the channel permission manually). Existing threads keep working for text, but `/file` and approved file sends will fail until that permission is added.
 
-**Want to grant less**: drop `Manage Threads` and use `permissions=309237763072`. Everything still works; the **only** difference is that a failed `/new` leaves an empty thread for you to delete.
+### Non-Windows normal invite
+
+```text
+https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20applications.commands&permissions=326417599488
+```
+
+This is the same normal invite set without `Attach Files`, because non-Windows cannot deliver outbound Discord files.
+
+**Want to grant less**:
+
+- **Windows lean:** drop `Manage Threads` and use `permissions=309237763072`.
+- **Non-Windows lean:** drop `Manage Threads` from the non-Windows set and use `permissions=309237730304`.
+
+Everything still works; the **only** behavior difference versus the corresponding normal mask is that a failed `/new` leaves an empty thread for you to delete.
 
 > Renaming threads (auto-title and `/rename`) does **not** need `Manage Threads` — Discord lets a thread's creator rename it, and the bot is the creator.
 

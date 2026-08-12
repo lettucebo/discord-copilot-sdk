@@ -367,11 +367,17 @@ export async function applyYoloToggle(
 /** Full acknowledgement text shown before enabling YOLO. Repository skill
  * descriptions are controlled-repo text in the model context; spell out that
  * YOLO removes the human approval boundary that normally constrains this risk. */
-export function yoloOnWarning(repoSkillsLoaded: boolean): string {
+function yoloFileDeliveryMessage(fileDeliveryAvailable: boolean): string {
+  return fileDeliveryAvailable
+    ? "• `discord_send_file` is fast-denied in YOLO; to deliver a file, use `/file path:<file>`.\n"
+    : "• Outbound Discord file delivery is unavailable on this platform.\n";
+}
+
+export function yoloOnWarning(repoSkillsLoaded: boolean, fileDeliveryAvailable: boolean): string {
   return (
     "⚠️ **YOLO ON for this thread** — other permission requests are auto-approved with **no prompt**. " +
     "Tools run as your OS user with no sandbox.\n" +
-    "• `discord_send_file` is fast-denied in YOLO; to deliver a file, use `/file path:<file>`.\n" +
+    yoloFileDeliveryMessage(fileDeliveryAvailable) +
     "• This is **not** persisted: a restart or session recovery resets it to OFF.\n" +
     (repoSkillsLoaded
       ? "• ⚠️ This session loaded repository skills. Their text can steer the agent, and YOLO removes the Discord approval gate that normally constrains that risk.\n"
@@ -3451,7 +3457,8 @@ export class DiscordCopilotApp {
       return;
     }
     const on = interaction.options.getString("mode", true) === "on";
-    const warning = yoloOnWarning(session.actor.hasRepoSkills());
+    const fileDeliveryAvailable = this.fileDeliveryAvailable();
+    const warning = yoloOnWarning(session.actor.hasRepoSkills(), fileDeliveryAvailable);
     await applyYoloToggle(
       on,
       () =>
@@ -3469,7 +3476,12 @@ export class DiscordCopilotApp {
       // `/yolo off` may have superseded it).
       if (enabled) {
         await this.transport
-          .notice(interaction.channelId, "⚡ **YOLO mode ON** — other permissions are now auto-approved for this session; `discord_send_file` is fast-denied, so use `/file path:<file>` to deliver files.")
+          .notice(
+            interaction.channelId,
+            fileDeliveryAvailable
+              ? "⚡ **YOLO mode ON** — other permissions are now auto-approved for this session; `discord_send_file` is fast-denied, so use `/file path:<file>` to deliver files."
+              : "⚡ **YOLO mode ON** — other permissions are now auto-approved for this session; outbound Discord file delivery is unavailable on this platform."
+          )
           .catch(() => {});
       }
     });

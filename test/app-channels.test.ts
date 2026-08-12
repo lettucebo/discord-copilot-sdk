@@ -467,4 +467,80 @@ describe("/channel", () => {
     ]);
   });
 
+  it("on non-Windows, /yolo mode:on warns and notices that outbound file delivery is unavailable", async () => {
+    const notices: Array<{ key: string; text: string }> = [];
+    class NoticeTransport extends FakeTransport {
+      override async notice(key: string, text: string): Promise<void> {
+        notices.push({ key, text });
+      }
+    }
+
+    const reposRoot = join(FIXTURES, "repos-nonwin");
+    mkdirSync(reposRoot, { recursive: true });
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as unknown as CopilotClient,
+      new NoticeTransport(),
+      new SessionStore(join(FIXTURES, "sessions-yolo-nonwin.json")),
+      new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels-yolo-nonwin.json")),
+      { fileDeliveryPlatform: "linux" }
+    );
+
+    const state = { on: false, epoch: 0 };
+    const actor = {
+      hasRepoSkills: () => false,
+      yoloEpochValue: () => state.epoch,
+      setYolo: (on: boolean) => {
+        state.epoch++;
+        state.on = on;
+      },
+      enableYoloIfCurrent: async (epoch: number) => {
+        await Promise.resolve();
+        if (epoch !== state.epoch) return false;
+        state.on = true;
+        return true;
+      },
+    } as unknown as Pick<Session["actor"], "hasRepoSkills" | "yoloEpochValue" | "setYolo" | "enableYoloIfCurrent">;
+
+    sessionsOf(app).set("thread-yolo-nonwin", {
+      actor: actor as Session["actor"],
+      broker: new PendingInteractionBroker(),
+      running: false,
+      titled: true,
+      titleEpoch: 0,
+      queue: [],
+      workDir: join(FIXTURES, "repo-nonwin"),
+      repoPath: join(FIXTURES, "repo-nonwin"),
+      devMode: "local",
+      parentChannelId: SEED,
+      hasRunTurn: false,
+    });
+
+    const interaction = slash({
+      channelId: "thread-yolo-nonwin",
+      threadParentId: SEED,
+      strings: { mode: "on" },
+    });
+
+    await cmdYolo(app, asInteraction(interaction));
+
+    expect(interaction.replies).toEqual([
+      expect.objectContaining({
+        content: expect.stringMatching(/outbound Discord file delivery is unavailable on this platform/i),
+        flags: MessageFlags.Ephemeral,
+      }),
+    ]);
+    expect(interaction.replies[0]).toEqual(
+      expect.not.objectContaining({ content: expect.stringMatching(/discord_send_file|\/file path:</i) })
+    );
+    expect(state.on).toBe(true);
+    expect(notices).toEqual([
+      {
+        key: "thread-yolo-nonwin",
+        text: "⚡ **YOLO mode ON** — other permissions are now auto-approved for this session; outbound Discord file delivery is unavailable on this platform.",
+      },
+    ]);
+  });
+
 });

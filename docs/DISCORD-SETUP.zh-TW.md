@@ -82,7 +82,18 @@ Discord 不允許「私有 App」帶著公開安裝連結，所以**順序是反
 
 ## 4. 邀請 Bot 進伺服器
 
-把下面網址中的 `YOUR_APP_ID` 換成 **General Information** 分頁的 **Application ID**：
+把下面網址中的 `YOUR_APP_ID` 換成 **General Information** 分頁的 **Application ID**。
+
+依照主機平台選對邀請權限整數：
+
+- **Windows 一般版：** `326417632256`
+- **非 Windows 一般版：** `326417599488`
+- **Windows 精簡版：** `309237763072`
+- **非 Windows 精簡版：** `309237730304`
+
+Windows 需要 `Attach Files`，因為只有 Windows 支援對外 Discord 檔案傳送。非 Windows 可以省略 `Attach Files`，因為該平台根本沒有對外送檔能力。
+
+### Windows 一般版邀請網址
 
 ```text
 https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20applications.commands&permissions=326417632256
@@ -109,7 +120,20 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20appli
 
 **已經邀請過 bot？** 如果你之前用的是舊的安裝連結，bot 身分組**不會**自動多出 `Attach Files`；你需要重新授權這個 application，或手動在工作頻道補上該權限。舊的 thread 文字功能仍可用，但 `/file` 與核准後的送檔在補權限前都會失敗。
 
-**想給更少權限**：拿掉 `Manage Threads`，改用 `permissions=309237763072`。所有功能照常，**唯一差別**是 `/new` 中途失敗時會留下一個空討論串要你自己刪。
+### 非 Windows 一般版邀請網址
+
+```text
+https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20applications.commands&permissions=326417599488
+```
+
+這和一般版權限相同，只是拿掉 `Attach Files`，因為非 Windows 根本不能對外傳 Discord 檔案。
+
+**想給更少權限**：
+
+- **Windows 精簡版：** 拿掉 `Manage Threads`，改用 `permissions=309237763072`。
+- **非 Windows 精簡版：** 從非 Windows 權限集合拿掉 `Manage Threads`，改用 `permissions=309237730304`。
+
+除了對應平台的 `/new` 中途失敗時會留下一個空討論串要你自己刪之外，其餘功能照常。
 
 > 改討論串名稱（自動命名與 `/rename`）**不需要** `Manage Threads` —— Discord 允許討論串的建立者改自己的討論串名稱，而討論串正是這個 bot 建的。
 

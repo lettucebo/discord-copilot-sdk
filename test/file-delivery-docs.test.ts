@@ -7,6 +7,18 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (...parts: string[]): string => readFileSync(join(root, ...parts), "utf8");
 const EN_AVAILABILITY = "Outbound Discord file delivery is available only on Windows.";
 const ZH_AVAILABILITY = "對外 Discord 檔案傳送僅支援 Windows。";
+const EN_MASKS = [
+  "**Windows normal:** `326417632256`",
+  "**Non-Windows normal:** `326417599488`",
+  "**Windows lean:** `309237763072`",
+  "**Non-Windows lean:** `309237730304`",
+];
+const ZH_MASKS = [
+  "Windows 一般版：** `326417632256`",
+  "非 Windows 一般版：** `326417599488`",
+  "Windows 精簡版：** `309237763072`",
+  "非 Windows 精簡版：** `309237730304`",
+];
 
 describe("file-delivery documentation", () => {
   it("states the Windows-only availability boundary in every required document", () => {
@@ -16,5 +28,12 @@ describe("file-delivery documentation", () => {
     expect(read("docs", "DISCORD-SETUP.zh-TW.md")).toContain(ZH_AVAILABILITY);
     expect(read("docs", "PLAN.md")).toContain(ZH_AVAILABILITY);
     expect(read(".github", "copilot-instructions.md")).toContain(EN_AVAILABILITY);
+  });
+
+  it("lists platform-specific invite masks in both Discord setup twins", () => {
+    const en = read("docs", "DISCORD-SETUP.md");
+    const zh = read("docs", "DISCORD-SETUP.zh-TW.md");
+    for (const mask of EN_MASKS) expect(en).toContain(mask);
+    for (const mask of ZH_MASKS) expect(zh).toContain(mask);
   });
 });
