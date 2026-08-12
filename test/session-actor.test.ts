@@ -6,6 +6,7 @@ import type { AuditEntry, AuditSink } from "../src/core/audit-log.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Decision, PermissionView, PlanView, Transport, UserInputView } from "../src/core/transport.js";
 import type { RenderState } from "../src/core/turn-render.js";
+import type { OutboundFile } from "../src/core/outbound-file.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -77,6 +78,12 @@ class FakeTransport implements Transport {
   plan?: (nonce: string, action: number | "reject", userId: string) => void;
   async render(_k: string, s: RenderState): Promise<void> {
     this.renders.push(s);
+  }
+  async sendFile(
+    _k: string,
+    _file: OutboundFile
+  ): Promise<{ ok: true } | { ok: false; reason: "no-attach-permission" | "too-large" | "blocked" | "unavailable" | "transient" }> {
+    return { ok: false, reason: "unavailable" };
   }
   async flush(): Promise<void> {}
   resetTurn(): void {}

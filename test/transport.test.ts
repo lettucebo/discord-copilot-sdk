@@ -2,8 +2,9 @@ import { describe, it, expect, vi } from "vitest";
 import { DiscordTransport, sanitizeForCodeBlock } from "../src/platforms/discord/discord-transport.js";
 import { hasBidiOrControls } from "../src/core/text-safety.js";
 import { decodePermissionId, decodeChoiceId, decodePlanId } from "../src/platforms/discord/custom-id.js";
-import type { Client } from "discord.js";
+import { AttachmentBuilder, PermissionFlagsBits, type Client } from "discord.js";
 import type { TimelineItem } from "../src/core/turn-render.js";
+import type { OutboundFile } from "../src/core/outbound-file.js";
 
 class FakeMessage {
   content?: string;
@@ -23,6 +24,11 @@ class FakeChannel {
   sent: FakeMessage[] = [];
   private seq = 0;
   private byId = new Map<string, FakeMessage>();
+  permissionsForResult:
+    | { has(flag: bigint): boolean }
+    | null
+    | undefined = undefined;
+  sendError: unknown;
   messages = {
     fetch: async (id: string): Promise<FakeMessage> => {
       const m = this.byId.get(id);
@@ -33,7 +39,12 @@ class FakeChannel {
   isTextBased(): boolean {
     return true;
   }
+  permissionsFor(): { has(flag: bigint): boolean } | null | undefined {
+    if (this.permissionsForResult === undefined) return undefined;
+    return this.permissionsForResult;
+  }
   async send(o: Record<string, unknown>): Promise<FakeMessage> {
+    if (this.sendError !== undefined) throw this.sendError;
     const m = new FakeMessage(`m${++this.seq}`);
     m.content = o["content"] as string;
     m.opts = o;
@@ -56,6 +67,14 @@ function buttonIds(msg: FakeMessage): string[] {
 
 const st = (assistantText: string) => ({ assistantText, tools: [] });
 const timeline = (items: TimelineItem[]) => ({ assistantText: "", tools: [], items });
+const outboundFile = (over: Partial<OutboundFile> = {}): OutboundFile => ({
+  absPath: "C:\\repo\\report.txt",
+  displayName: "report.txt",
+  size: 3,
+  fingerprint: "f",
+  bytes: Buffer.from("abc"),
+  ...over,
+});
 
 describe("sanitizeForCodeBlock", () => {
   it("makes triple-backtick breakout impossible while keeping visible chars", () => {
@@ -399,5 +418,62 @@ describe("DiscordTransport ask_user / plan cards", () => {
       .join("");
     expect(textPosted).toContain("S".repeat(5000)); // ENTIRE summary present across chunks
     expect(ch.sent.some((m) => m.opts && (m.opts as Record<string, unknown>)["embeds"])).toBe(true); // card posted
+  });
+});
+
+describe("DiscordTransport sendFile", () => {
+  it("sends an attachment to the owning thread with no mentions and optional note", async () => {
+    const ch = new FakeChannel();
+    ch.permissionsForResult = { has: (flag) => flag === PermissionFlagsBits.AttachFiles };
+    const t = new DiscordTransport(fakeClient(ch));
+
+    const result = await t.sendFile("thread", outboundFile(), "已傳送 @everyone");
+
+    expect(result).toEqual({ ok: true });
+    expect(ch.sent).toHaveLength(1);
+    expect(ch.sent[0]!.content).toBe("已傳送 @everyone");
+    expect(ch.sent[0]!.opts!["allowedMentions"]).toEqual({ parse: [] });
+    const files = ch.sent[0]!.opts!["files"] as AttachmentBuilder[];
+    expect(files).toHaveLength(1);
+    expect(files[0]).toBeInstanceOf(AttachmentBuilder);
+  });
+
+  it("returns unavailable when the thread cannot be fetched", async () => {
+    const t = new DiscordTransport({ channels: { fetch: async () => null } } as unknown as Client);
+
+    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({ ok: false, reason: "unavailable" });
+  });
+
+  it("fails closed on missing Attach Files permission and posts one deduplicated Chinese notice", async () => {
+    const ch = new FakeChannel();
+    ch.permissionsForResult = { has: () => false };
+    const t = new DiscordTransport(fakeClient(ch));
+
+    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({
+      ok: false,
+      reason: "no-attach-permission",
+    });
+    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({
+      ok: false,
+      reason: "no-attach-permission",
+    });
+
+    expect(ch.sent).toHaveLength(1);
+    expect(ch.sent[0]!.content).toContain("Attach Files");
+    expect(ch.sent[0]!.content).toContain("326417632256");
+    expect(ch.sent[0]!.opts!["allowedMentions"]).toEqual({ parse: [] });
+  });
+
+  it.each([
+    [50013, "no-attach-permission"],
+    [40005, "too-large"],
+    [50045, "too-large"],
+  ] as const)("maps Discord API code %s to %s", async (code, reason) => {
+    const ch = new FakeChannel();
+    ch.permissionsForResult = undefined;
+    ch.sendError = { code, message: `discord ${code}` };
+    const t = new DiscordTransport(fakeClient(ch));
+
+    await expect(t.sendFile("thread", outboundFile())).resolves.toEqual({ ok: false, reason });
   });
 });

@@ -1,4 +1,5 @@
 import type { RenderState } from "./turn-render.js";
+import type { OutboundFile } from "./outbound-file.js";
 
 /** A user's response to a permission prompt. `once`/`session`/`always` are
  *  escalating approval scopes; `deny` refuses. For shell these map to the SDK's
@@ -32,6 +33,8 @@ export interface PermissionView {
 export interface Transport {
   /** Render/refresh a session's assistant output + tool statuses. */
   render(sessionKey: string, state: RenderState): Promise<void>;
+  /** Send a validated outbound file to the session's owning surface. */
+  sendFile(sessionKey: string, file: OutboundFile, note?: string): Promise<SendFileResult>;
   /** Present a permission prompt; the transport later delivers the decision via
    *  the handler registered with `onDecision`. */
   showPermission(view: PermissionView): Promise<void>;
@@ -70,6 +73,10 @@ export interface Transport {
   /** Release all per-session render state/timers (on session teardown). */
   dispose(sessionKey: string): void;
 }
+
+export type SendFileResult =
+  | { ok: true }
+  | { ok: false; reason: "no-attach-permission" | "too-large" | "blocked" | "unavailable" | "transient" };
 
 /** ask_user prompt: a question with optional multiple-choice buttons; freeform
  *  answers arrive as a normal thread message when `allowFreeform`. */

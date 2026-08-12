@@ -9,12 +9,16 @@ import { SessionStore, type SessionBinding } from "../src/core/session-store.js"
 import { addWorktree } from "../src/core/worktree.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { Transport } from "../src/core/transport.js";
+import type { OutboundFile } from "../src/core/outbound-file.js";
 
 const exec = promisify(execFile);
 const git = (cwd: string, ...args: string[]): Promise<{ stdout: string }> => exec("git", args, { cwd });
 
 class NullTransport implements Transport {
   async render(): Promise<void> {}
+  async sendFile(): Promise<{ ok: true } | { ok: false; reason: "no-attach-permission" | "too-large" | "blocked" | "unavailable" | "transient" }> {
+    return { ok: false, reason: "unavailable" };
+  }
   async showPermission(): Promise<void> {}
   async showUserInput(): Promise<void> {}
   async showPlan(): Promise<void> {}

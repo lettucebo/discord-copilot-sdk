@@ -1,18 +1,28 @@
 import {
   type Client,
+  AttachmentBuilder,
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  PermissionFlagsBits,
 } from "discord.js";
 import { chunkText } from "../../core/chunk.js";
 import type { RenderState } from "../../core/turn-render.js";
 import { formatTimelineItems } from "../../core/format-timeline.js";
 import { chunkTimeline } from "../../core/timeline-chunk.js";
-import type { Decision, PermissionView, PlanView, Transport, UserInputView } from "../../core/transport.js";
+import type {
+  Decision,
+  PermissionView,
+  PlanView,
+  SendFileResult,
+  Transport,
+  UserInputView,
+} from "../../core/transport.js";
 import { encodePermissionId, encodeChoiceId, encodePlanId } from "./custom-id.js";
 import { renderChunks } from "./render-chunks.js";
 import { sanitizeForCodeBlock } from "../../core/text-safety.js";
+import type { OutboundFile } from "../../core/outbound-file.js";
 
 export { sanitizeForCodeBlock };
 
@@ -40,12 +50,19 @@ interface MinimalTextChannel {
   isTextBased(): boolean;
   send(opts: unknown): Promise<MinimalMessage>;
   messages: { fetch(id: string): Promise<MinimalMessage> };
+  permissionsFor?(member: unknown): { has(flag: bigint): boolean } | null;
+}
+
+interface DiscordLikeError {
+  code?: number;
+  message?: string;
 }
 
 /** Transport that posts to Discord threads. Renders are debounced (~1s) and
  *  serialized per session; the final state is always flushed. */
 export class DiscordTransport implements Transport {
   private readonly sessions = new Map<string, SessionRender>();
+  private readonly attachNoticeSessions = new Set<string>();
   /** One handler per live SessionActor; a decision is broadcast to all and only
    *  the broker owning the nonce settles (others no-op). */
   private readonly decisionHandlers = new Set<
@@ -213,6 +230,29 @@ export class DiscordTransport implements Transport {
     await channel.send({ embeds: [embed], components: [row], ...NO_MENTIONS });
   }
 
+  async sendFile(sessionKey: string, file: OutboundFile, note?: string): Promise<SendFileResult> {
+    const channel = await this.fetchThread(sessionKey);
+    if (!channel) return { ok: false, reason: "unavailable" };
+
+    const permission = this.getAttachPermission(channel);
+    if (permission === false) {
+      await this.postMissingAttachNoticeOnce(sessionKey, channel);
+      return { ok: false, reason: "no-attach-permission" };
+    }
+
+    try {
+      const content = typeof note === "string" ? note.slice(0, 1900) : undefined;
+      await channel.send({
+        ...(content ? { content } : {}),
+        files: [new AttachmentBuilder(file.bytes, { name: file.displayName })],
+        ...NO_MENTIONS,
+      });
+      return { ok: true };
+    } catch (error: unknown) {
+      return this.classifySendFileError(error);
+    }
+  }
+
   async notice(sessionKey: string, text: string): Promise<void> {
     const channel = await this.fetchThread(sessionKey);
     if (channel) await channel.send({ content: text.slice(0, 1900), ...NO_MENTIONS });
@@ -300,6 +340,46 @@ export class DiscordTransport implements Transport {
       return undefined;
     }
   }
+
+  private getAttachPermission(channel: MinimalTextChannel): boolean | "unknown" {
+    if (typeof channel.permissionsFor !== "function") return "unknown";
+    const member = this.client.user ?? this.client;
+    const permissions = channel.permissionsFor(member);
+    if (permissions === undefined) return "unknown";
+    if (permissions === null) return false;
+    return permissions.has(PermissionFlagsBits.AttachFiles);
+  }
+
+  private async postMissingAttachNoticeOnce(sessionKey: string, channel: MinimalTextChannel): Promise<void> {
+    if (this.attachNoticeSessions.has(sessionKey)) return;
+    this.attachNoticeSessions.add(sessionKey);
+    try {
+      await channel.send({
+        content:
+          "目前這個執行個體缺少 Discord「Attach Files」權限，無法傳送檔案。請用正確的邀請整數 326417632256 重新邀請機器人，並確認目標討論串/頻道允許 Attach Files。",
+        ...NO_MENTIONS,
+      });
+    } catch {
+      // Best effort only: the classified result still tells the caller upload is blocked by permissions.
+    }
+  }
+
+  private classifySendFileError(error: unknown): SendFileResult {
+    if (!isDiscordLikeError(error)) return { ok: false, reason: "transient" };
+    if (error.code === 50013) return { ok: false, reason: "no-attach-permission" };
+    if (error.code === 40005 || error.code === 50045) return { ok: false, reason: "too-large" };
+    if (isPlatformBlockedUploadError(error)) return { ok: false, reason: "blocked" };
+    return { ok: false, reason: "transient" };
+  }
+}
+
+function isDiscordLikeError(error: unknown): error is DiscordLikeError {
+  return typeof error === "object" && error !== null;
+}
+
+function isPlatformBlockedUploadError(error: DiscordLikeError): boolean {
+  const msg = typeof error.message === "string" ? error.message.toLowerCase() : "";
+  return msg.includes("blocked") && msg.includes("upload");
 }
 
 /** Split buttons into Discord action rows (max 5 per row, max 5 rows). */

@@ -11,6 +11,7 @@ import type { Binding, BindingDeps, BindingVerdict } from "../src/core/binding.j
 import { ChannelRegistry } from "../src/core/channel-registry.js";
 import { SessionStore } from "../src/core/session-store.js";
 import type { Transport } from "../src/core/transport.js";
+import type { OutboundFile } from "../src/core/outbound-file.js";
 import { removeWorktreeIfClean, worktreeBranch, worktreePath } from "../src/core/worktree.js";
 import { worktreeRoot } from "../src/core/paths.js";
 
@@ -30,6 +31,9 @@ let cleanupBranch: string | undefined;
 
 class FakeTransport implements Transport {
   async render(): Promise<void> {}
+  async sendFile(): Promise<{ ok: true } | { ok: false; reason: "no-attach-permission" | "too-large" | "blocked" | "unavailable" | "transient" }> {
+    return { ok: false, reason: "unavailable" };
+  }
   async showPermission(): Promise<void> {}
   async showUserInput(): Promise<void> {}
   async showPlan(): Promise<void> {}
