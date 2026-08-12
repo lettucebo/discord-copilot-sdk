@@ -126,6 +126,7 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 | 未知權限變體 fail-closed | `session-actor.test.ts`（`auto-denies a non-shell permission (fail closed)`）|
 | resume 對帳四種情形 | `reconcile.test.ts`（14）+ `app-reconcile.test.ts`（9）|
 | **message 404 新 anchor** | `render-chunks.ts` + `render-chunks.test.ts`（`RE-ANCHORS ...`、survivor-safety；補貼於尾端，見下方殘留）|
+| **rebind 舊 incarnation teardown / `/end` 交錯** | `app-rebind.test.ts`（post-swap 舊 actor retain/retry、`/end` 同時擁有 replacement + 舊 worktree、unconfirmed durable pointer、pre-swap rollback end race）+ `session-store.test.ts`（v5 stale-rebind terminal record restart persistence）|
 | 最小 CI（Win/Ubuntu、Node 20.19+22.12）| `.github/workflows/ci.yml` |
 
 **設計決策（與 §9 措辭的差異，刻意記錄）：**
@@ -669,6 +670,15 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   instance 重驗，故 `/end` 永遠優先且不會被晚到的 rebind 重新建立。即使 commit 失敗而非 `/end`
   造成的 rollback，也不能丟棄尚未確認 teardown 的 replacement：保留它與 root，確認後才清 target
   worktree，同時可安全還原舊 record。
+- **rebind 舊 incarnation 的雙重所有權帳本**：在可變的主 thread record 被 replacement 覆寫前，先將舊
+  immutable `(threadId, sessionId, generation)` binding 寫入 v5 `staleRebinds`，以既有 `blocked`
+  terminal state 記錄 `rebind-cleanup-pending`／`rebind-teardown-unconfirmed`。map swap 後，該 actor、
+  captured binding、worktree/branch、owner thread 與 cleanup plan 一起留在 `staleRebindActors`；它的
+  trusted root 只有在 disconnect **確認**後才可釋放。`/end`、正常 rebind 收尾與 shutdown join 同一個
+  bounded disconnect promise：`/end` 即使已清 replacement，也會處理舊 incarnation；確認後只在 rebind
+  preflight 曾證明可清、且 `removeWorktreeIfClean` 再次證明安全時移除 worktree。若仍未確認，terminal
+  pointer 留在 store，restart 的 `/sessions`／startup leftovers 報告與後續 `/end` 都能看見它；不會把
+  possibly-live root/worktree 變成無記錄物件。
 - **faulted actor 的 Windows root lock**：fault path 的 bounded disconnect 只限制等待時間，不能在
   SDK 尚未確認終止時關閉 retained root。actor 維持 faulted（不能 prompt／送檔），root 作為
   rename/delete fence 留在原處；同一個或稍後 retry 的 disconnect 一旦真的 resolve，才 close 一次
@@ -678,9 +688,11 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   `retraction-unconfirmed`、盡力在原 thread 發不 mention 的「附件可能仍可見」警告；actor 與 `/file`
   將它當 failure，不計入成功送檔額度。若 transport 回 `ok` 後 caller 的最後 lifecycle fence 才
   變 stale，也同樣回「可能已在取消前接受」而非聲稱已取消／收回。
-- **quota schema provenance**：帶 `sessions` 的 container 必須有一致的 row schema version；v4
-  container 裡的 v3 row／缺 quota 是 corruption，不是 legacy。只有明確 v1 bare record 或版本一致的
-  舊 container 才能遷移，避免手動 downgrade 或 torn write 把 quota 重設為 0。
+- **schema provenance（v5 stale rebinds）**：帶 `sessions` 的 container 必須有一致的 row schema version；
+  v4 container 裡的 v3 row／缺 quota 是 corruption，不是 legacy。v5 的 `staleRebinds` 也必須是
+  version-consistent、唯一 immutable identity、`blocked` + `rebind-*` reason 的 terminal rows；不接受
+  active stale row（否則 restart 可為同一 Discord thread resume 第二個 actor）。只有明確 v1 bare record
+  或版本一致的舊 container 才能遷移，避免手動 downgrade 或 torn write 把 quota 重設為 0。
 - **mentions suppression**：所有 attachment sends 都必須保留 `allowedMentions:{parse:[]}`，避免 agent 藉檔案說明或 UI 路徑 ping 人。
 
 ### 18.4 平台事實與殘留風險
@@ -710,7 +722,7 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | Windows `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root-relative inline-code card path、同 basename 路徑辨別、U+200B 拒絕、root/content/digest/path 綁定、endpoint truth、late cancellation 不算成功；非 Windows 無 tool 且 `/file` 拒絕 | `test/outbound-file.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
 | 24 MiB 持久化保守預留、舊 record 遷移、session-id + generation CAS、rebind fence/單調 rollback、YOLO/abort rollback 不永久停用 `/file`、restart total、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
 | `/file` resolve/send interleaving（end、rebind-style replacement）不可附件或成功回覆 | `test/app-file-command.test.ts`、`test/transport.test.ts` |
-| `/end` 穿插 rebind 的 binding、replacement actor、map-swap 三階段都不能復活 map／record／worktree；commit rollback 的 unconfirmed replacement 會 retain/retry | `test/app-rebind.test.ts` |
+| `/end` 穿插 rebind 的 binding、replacement actor、map-swap 三階段都不能復活 map／record／worktree；commit rollback 的 unconfirmed replacement 會 retain/retry；post-swap old actor／root/worktree 有 durable stale pointer、`/end` 會擁有兩個 incarnation、pre-swap rollback end race 不遺失 old pointer | `test/app-rebind.test.ts`、`test/session-store.test.ts` |
 | faulted/hung SDK disconnect 保留 root lock，確認終止後只 close 一次且 actor 仍拒絕 prompt／送檔 | `test/session-actor.test.ts` |
 | 已送出後 delete reject/timeout 的 `retraction-unconfirmed`、thread warning、transport `ok` 後才 stale 的可見性警告、actor failure 與 `/file` 誠實訊息 | `test/transport.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
 | v4 container mixed/downgraded row fail-closed；非 Windows 不診斷 Attach Files；YOLO 普通卡與撤銷檔案卡文字一致 | `test/session-store.test.ts`、`test/app-channels.test.ts`、`test/file-delivery-docs.test.ts` |

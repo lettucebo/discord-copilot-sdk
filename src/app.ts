@@ -135,6 +135,23 @@ export interface Session {
   hasRunTurn: boolean;
 }
 
+/** One old SDK incarnation detached by a rebind. The actor remains strongly
+ * referenced until its disconnect resolves, because its retained trusted root
+ * is the Windows rename/delete fence for the worktree it was using. */
+interface StaleRebindActor {
+  actor: SessionActor;
+  /** Discord thread whose lifecycle owns this detached incarnation. */
+  threadId: string;
+  /** Immutable durable identity and the exact old binding/worktree to clean. */
+  binding: SessionRecord;
+  /** Runs only after a confirmed disconnect; it rechecks worktree safety before
+   * deleting anything, then removes the paired terminal store record. */
+  cleanupPlan: () => Promise<{ ok: boolean; tail: string }>;
+  /** Concurrent `/end`, normal rebind completion and shutdown must join ONE
+   * teardown attempt rather than issue duplicate SDK disconnects. */
+  disconnecting?: Promise<{ confirmed: boolean; tail: string }>;
+}
+
 /** The subset of an SDK session the throwaway titler uses. */
 interface TitlerSession {
   sessionId?: string;
@@ -481,12 +498,18 @@ export class DiscordCopilotApp {
    *  would each create a session and each `sessions.set`, leaving the loser's
    *  SDK session live but referenced by nothing. */
   private readonly rebinding = new Set<string>();
-  /** Replacement actors detached before a rebind can install them — either
-   * because `/end` won ownership or persistence failed. They stay strongly
-   * referenced until a confirmed disconnect releases their retained root, so
-   * an unconfirmed runtime cannot become an untracked worktree writer merely
-   * because its map entry was never installed. */
-  private readonly staleRebindActors = new Map<SessionActor, () => Promise<void>>();
+  /** Detached rebind incarnations, whether the detached actor was the old
+   * session after a swap or a replacement that lost the race before install.
+   * Each entry has a paired durable `blocked` stale-rebind record. Keeping this
+   * map strongly owns its actor/root until disconnect is confirmed; otherwise
+   * a GC-released root could let a possibly-live runtime write a renamed or
+   * deleted worktree. */
+  private readonly staleRebindActors = new Map<SessionActor, StaleRebindActor>();
+  /** An old incarnation is made durable before rebind overwrites its main
+   * thread record. `/end` can arrive while target creation is still suspended;
+   * this lets that winner terminalize the OLD binding instead of leaving the
+   * target reservation as the only on-disk pointer. */
+  private readonly pendingRebindOlds = new WeakMap<Session, StaleRebindActor>();
   /** The pending rebind confirmation per thread, so a second `/repo set` can
    *  supersede the first instead of leaving two live cards that can both be
    *  confirmed. */
@@ -1593,6 +1616,11 @@ export class DiscordCopilotApp {
     // suspended in git or SDK work while this actor remains in the map; without
     // this fence it could later reserve and install a replacement after `/end`.
     this.endedSessions.add(session);
+    // Once rebind has reserved its durable old-incarnation companion, `/end`
+    // must finish that companion rather than treating the mutable main record
+    // (which may already be the target reservation) as if it described this
+    // old actor.
+    const pendingOld = this.pendingRebindOlds.get(session);
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     session.currentAbort?.abort();
     session.queue = [];
@@ -1603,6 +1631,11 @@ export class DiscordCopilotApp {
       closed = false; // runtime may still be live — keep the record, say so
     }
     if (!closed) {
+      if (pendingOld) this.retainStaleRebindActor(pendingOld);
+      // A replacement can have been swapped in before this `/end`; it does not
+      // excuse the old incarnation from cleanup merely because ending the
+      // replacement timed out too.
+      await this.retryStaleRebindActorsForThread(threadId);
       await interaction.editReply(
         "⚠️ 無法確認 runtime 已關閉，這個 session 保留為屏障（不會再接受訊息）。請重啟 bot。"
       );
@@ -1612,10 +1645,29 @@ export class DiscordCopilotApp {
     this.approvals.clearSession(threadId);
     this.releaseLocalLease(threadId);
     this.transport.dispose(threadId);
+    if (pendingOld) {
+      this.pendingRebindOlds.delete(session);
+      // The rebind's target reservation/worktree belongs to its own rollback
+      // path. Touching `reclaim(threadId, old...)` here would delete or retire
+      // that target row by thread id and lose the exact old pointer we just
+      // proved stopped. The companion cleanup owns only the old incarnation.
+      const outcome = await pendingOld.cleanupPlan();
+      await interaction.editReply(
+        `${outcome.ok ? "✅" : "⚠️"} 這個 session 已結束。${outcome.tail}`
+      );
+      return;
+    }
+    // A post-swap `/end` owns BOTH the current replacement and every detached
+    // old actor for this thread. Joining their teardown before removing the
+    // replacement row keeps an unconfirmed old actor's terminal pointer
+    // durable, while a confirmed one can release its clean worktree now.
+    await this.retryStaleRebindActorsForThread(threadId);
     const outcome = await this.reclaim(threadId, session.repoPath, session.workDir, session.branch);
     const left = this.sessions.size;
+    const stale = this.store.staleRebindsForThread(threadId).length;
     await interaction.editReply(
-      `${outcome.ok ? "✅" : "⚠️"} 這個 session 已結束。${left ? `其他 ${left} 個 session 仍在執行。` : "目前沒有其他 session。"}${outcome.tail}`
+      `${outcome.ok ? "✅" : "⚠️"} 這個 session 已結束。${left ? `其他 ${left} 個 session 仍在執行。` : "目前沒有其他 session。"}${outcome.tail}` +
+        (stale ? "\n⚠️ 舊 incarnation 尚未確認停止；其 worktree 記錄已保留，可稍後用 `/end` 重試。" : "")
     );
   }
 
@@ -1675,6 +1727,51 @@ export class DiscordCopilotApp {
     return { ok: true, tail };
   }
 
+  /** Reclaim the durable companion of a detached rebind incarnation. It shares
+   * `reclaim()`'s proof-before-delete rule, but never touches the main
+   * thread→replacement record: the two can coexist after a map swap. */
+  private async reclaimStaleRebind(
+    binding: SessionRecord,
+    preflightClean: boolean
+  ): Promise<{ ok: boolean; tail: string }> {
+    let tail = "";
+    if (binding.branch && binding.workDir !== binding.repoPath) {
+      // Rebind already refused a dirty/detached/unknown old tree. Keep the
+      // captured preflight as an additional transaction fence, then ask git
+      // again immediately before delete because a runtime may have written
+      // between the two checks.
+      if (!preflightClean) {
+        const kept = this.store.retainStaleRebind(binding, "rebind-worktree-kept");
+        return {
+          ok: false,
+          tail:
+            "\n🌿 舊的 worktree **保留**：改綁前未能證明它可安全移除。" +
+            (kept ? "" : "\n⚠️ 且無法寫入磁碟保留清理記錄。"),
+        };
+      }
+      const outcome = await removeWorktreeIfClean(binding.repoPath, binding.workDir, binding.branch).catch(
+        () => "failed" as const
+      );
+      tail = this.worktreeOutcomeText(outcome, binding.workDir, binding.branch);
+      if (outcome !== "removed" && outcome !== "already-absent") {
+        const kept = this.store.retainStaleRebind(binding, "rebind-worktree-kept");
+        return {
+          ok: false,
+          tail:
+            `${tail}\n記錄保留，\`/sessions\` 才看得到還有東西在磁碟上。` +
+            (kept ? "" : "\n⚠️ 且無法寫入磁碟更新記錄，請檢查磁碟／權限。"),
+        };
+      }
+    }
+    if (!this.store.removeStaleRebind(binding.threadId, binding.sessionId, binding.generation)) {
+      return {
+        ok: false,
+        tail: `${tail}\n⚠️ 但無法寫入磁碟移除舊 incarnation 記錄，請檢查磁碟／權限後重試。`,
+      };
+    }
+    return { ok: true, tail };
+  }
+
   /**
    * Retire a record whose worktree we refused to remove: terminal, so the next
    * boot does not try to resume a session we already stopped, but still listed
@@ -1721,6 +1818,37 @@ export class DiscordCopilotApp {
     threadId: string
   ): Promise<void> {
     const rec = this.store.get(threadId);
+    const stale = this.store.staleRebindsForThread(threadId);
+    if (!rec && stale.length) {
+      // If this process still owns the old actor, an explicit `/end` is a
+      // retry, not permission to delete a worktree underneath an unconfirmed
+      // runtime. A later restart has no retained actor/root, so the terminal
+      // row is deliberately visible to an operator for the existing
+      // proof-before-delete reclaim path.
+      await this.retryStaleRebindActorsForThread(threadId);
+      const stillLive = [...this.staleRebindActors.values()].some((entry) => entry.threadId === threadId);
+      if (stillLive) {
+        await interaction.reply({
+          content: "⚠️ 舊 runtime 仍未確認停止；其 worktree 記錄已保留，請稍後重試或重啟 bot。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const remaining = this.store.staleRebindsForThread(threadId);
+      if (!remaining.length) {
+        await interaction.reply({ content: "✅ 舊 incarnation 已確認清理。", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const outcomes: Array<{ ok: boolean; tail: string }> = [];
+      for (const binding of remaining) outcomes.push(await this.reclaimStaleRebind(binding, true));
+      await interaction.editReply(
+        outcomes.every((outcome) => outcome.ok)
+          ? `✅ 已清除這個討論串的 ${outcomes.length} 個舊 incarnation 記錄。${outcomes.map((o) => o.tail).join("")}`
+          : `⚠️ 有舊 incarnation 記錄保留。${outcomes.map((o) => o.tail).join("")}`
+      );
+      return;
+    }
     if (!rec) {
       await interaction.reply({ content: "這個討論串沒有進行中的 session。", flags: MessageFlags.Ephemeral });
       return;
@@ -1793,6 +1921,16 @@ export class DiscordCopilotApp {
       if (d === "reapable") reapable.push(`${line} · id \`${r.threadId}\``);
       else pending.push(line);
     }
+    // A rebind can retain an OLD terminal binding while the same thread has a
+    // live replacement. It cannot live in the main store map (that map is
+    // keyed by mutable thread id), so show this durable companion explicitly
+    // rather than misreporting its worktree as an untracked stray after restart.
+    const staleRebinds = this.store.staleRebinds();
+    const staleRows = staleRebinds.map(
+      (r) =>
+        `• <#${r.threadId}> — 舊 incarnation \`${r.sessionId}\` · ${r.reason ?? "rebind-cleanup-pending"}` +
+        `${r.branch ? ` · \`${r.branch}\`` : ""} · \`${r.workDir}\``
+    );
     const leases = [...this.localLeases.entries()].map(
       ([repo, tid]) => `\`${path.basename(repo)}\` → <#${tid}>`
     );
@@ -1806,7 +1944,10 @@ export class DiscordCopilotApp {
       (reapable.length
         ? `\n\n可清除的殘留記錄（在該討論串用 \`/end\`；討論串已刪除時用 \`/end thread:<id>\`）：\n${reapable.join("\n")}`
         : "") +
-      (pending.length ? `\n\n暫時無法復原、**重啟後會再試**的記錄（不會被清除）：\n${pending.join("\n")}` : "");
+      (pending.length ? `\n\n暫時無法復原、**重啟後會再試**的記錄（不會被清除）：\n${pending.join("\n")}` : "") +
+      (staleRows.length
+        ? `\n\n改綁後保留的舊 incarnation（runtime 未確認停止或 worktree 尚待確認）：\n${staleRows.join("\n")}`
+        : "");
     await interaction.reply({
       content: (body + tail).slice(0, 1900),
       flags: MessageFlags.Ephemeral,
@@ -2422,29 +2563,90 @@ export class DiscordCopilotApp {
     }
   }
 
-  /** Keep an unconfirmed replacement reachable until it can prove its runtime
-   * is gone. Its cleanup is deliberately separate from record rollback: an
-   * `/end` winner must never restore the old record, while a failed commit can
-   * safely restore it without dropping the new actor's root fence. */
-  private retainStaleRebindActor(actor: SessionActor, cleanup: () => Promise<void>): void {
-    this.staleRebindActors.set(actor, cleanup);
-    void this.retryStaleRebindActor(actor);
+  /** Build the one ownership object shared by normal rebind completion, `/end`
+   * and shutdown. The durable record is made before the main record is
+   * overwritten; this in-memory entry keeps the actor's trusted root fenced
+   * until the same cleanup plan sees a confirmed disconnect. */
+  private staleRebindActor(
+    actor: SessionActor,
+    binding: SessionRecord,
+    preflightClean: boolean
+  ): StaleRebindActor {
+    const immutableBinding = { ...binding };
+    return {
+      actor,
+      threadId: immutableBinding.threadId,
+      binding: immutableBinding,
+      cleanupPlan: () => this.reclaimStaleRebind(immutableBinding, preflightClean),
+    };
   }
 
-  /** Retry a stale replacement's disconnect; after confirmation it is safe to
-   * release its root and remove the clean target worktree. A failed retry keeps
-   * the actor in the map as the deliberate Windows root-lock fence. */
-  private async retryStaleRebindActor(actor: SessionActor): Promise<void> {
-    const cleanup = this.staleRebindActors.get(actor);
-    if (!cleanup) return;
-    try {
-      await actor.disconnect();
-    } catch {
-      return;
+  /** Persist and strongly retain an actor that has already failed a disconnect
+   * attempt. The durable row uses existing `blocked` semantics, so reconcile
+   * cannot accidentally resume this old conversation. */
+  private retainStaleRebindActor(entry: StaleRebindActor, reason = "rebind-teardown-unconfirmed"): void {
+    if (!this.store.retainStaleRebind(entry.binding, reason)) {
+      // The pre-swap intent was persisted before this method is reachable for
+      // an old actor. Keep the root in memory even if a reason refresh loses a
+      // transient disk race; silently releasing it would be worse.
+      console.warn(`rebind: could not persist stale actor ${entry.binding.sessionId} (${reason})`);
     }
-    if (this.staleRebindActors.get(actor) !== cleanup) return;
-    await cleanup().catch(() => {});
-    if (this.staleRebindActors.get(actor) === cleanup) this.staleRebindActors.delete(actor);
+    this.staleRebindActors.set(entry.actor, entry);
+    this.scheduleStaleRebindRetry(entry);
+  }
+
+  private scheduleStaleRebindRetry(entry: StaleRebindActor): void {
+    queueMicrotask(() => {
+      if (this.staleRebindActors.get(entry.actor) === entry) {
+        void this.retryStaleRebindActor(entry.actor);
+      }
+    });
+  }
+
+  /** Retry one actor. A concurrent normal rebind completion or `/end` joins the
+   * same `disconnecting` promise below, so retry never creates competing SDK
+   * teardowns for one root. */
+  private async retryStaleRebindActor(actor: SessionActor): Promise<void> {
+    const entry = this.staleRebindActors.get(actor);
+    if (!entry) return;
+    await this.disconnectStaleRebindActor(entry);
+  }
+
+  /** Explicit cleanup (and shutdown) is per owning Discord thread, not merely
+   * per current map entry: after a map swap there can be both a replacement and
+   * its old incarnation. */
+  private async retryStaleRebindActorsForThread(threadId: string): Promise<void> {
+    const entries = [...this.staleRebindActors.values()].filter((entry) => entry.threadId === threadId);
+    for (const entry of entries) await this.retryStaleRebindActor(entry.actor);
+  }
+
+  /** Make exactly one bounded disconnect attempt for a stale incarnation. On
+   * success its cleanup plan rechecks the worktree before deletion; on failure
+   * the `blocked` durable row and strong actor/root reference both remain. */
+  private async disconnectStaleRebindActor(
+    entry: StaleRebindActor
+  ): Promise<{ confirmed: boolean; tail: string }> {
+    if (entry.disconnecting) return entry.disconnecting;
+    const attempt = (async (): Promise<{ confirmed: boolean; tail: string }> => {
+      try {
+        await withTimeout(entry.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
+      } catch {
+        if (!this.store.retainStaleRebind(entry.binding, "rebind-teardown-unconfirmed")) {
+          console.warn(`rebind: could not mark stale actor ${entry.binding.sessionId} unconfirmed`);
+        }
+        this.staleRebindActors.set(entry.actor, entry);
+        return { confirmed: false, tail: "\n⚠️ 無法確認舊的 runtime 已關閉，建議稍後重啟 bot。" };
+      }
+      const cleanup = await entry.cleanupPlan();
+      if (this.staleRebindActors.get(entry.actor) === entry) this.staleRebindActors.delete(entry.actor);
+      return { confirmed: true, tail: cleanup.tail };
+    })();
+    entry.disconnecting = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (entry.disconnecting === attempt) entry.disconnecting = undefined;
+    }
   }
 
   private async applyRebindInner(
@@ -2484,6 +2686,8 @@ export class DiscordCopilotApp {
     let trustedRoot: TrustedRoot | undefined;
     let reservedIdentity: { sessionId: string; generation: number } | undefined;
     let replacementActor: SessionActor | undefined;
+    let replacementBinding: SessionRecord | undefined;
+    let oldStale: StaleRebindActor | undefined;
     let targetLeaseHeld = false;
     if (target.devMode === "worktree" && branch) {
       try {
@@ -2524,7 +2728,16 @@ export class DiscordCopilotApp {
           replacementClosed = false;
           // Retain the actor and root fence until a retry can CONFIRM teardown;
           // do not let a timed-out `/end` turn it into an invisible writer.
-          this.retainStaleRebindActor(replacementActor, undoWorktree);
+          if (replacementBinding) {
+            this.retainStaleRebindActor(
+              this.staleRebindActor(replacementActor, replacementBinding, true)
+            );
+          } else {
+            // This should be unreachable: a replacement actor is created only
+            // after reserve has produced its immutable binding. Do not close a
+            // root we cannot durably describe.
+            console.warn("rebind: replacement actor lost its durable binding before teardown");
+          }
         }
       } else {
         await trustedRoot?.close().catch(() => {});
@@ -2590,10 +2803,34 @@ export class DiscordCopilotApp {
     const sessionId = randomUUID();
     const generation = this.store.nextGeneration();
     const previous = this.store.get(threadId);
+    if (!previous) {
+      // A live actor without its persist-first record is already an unsafe
+      // state. Do not overwrite the only possible durable pointer with a
+      // replacement whose rollback could not describe the old root.
+      await trustedRoot?.close().catch(() => {});
+      trustedRoot = undefined;
+      restoreOldFileDelivery();
+      this.restoreLeaseFor(threadId, old);
+      await undoWorktree();
+      return "⚠️ 找不到目前 session 的耐久記錄，為避免遺失舊 runtime／worktree 擁有權，未改綁。";
+    }
     // A rebind replaces the SDK conversation but not the Discord thread that
     // owns this outbound capability, so retain its conservative quota.
-    const fileDeliveryBytes = previous?.fileDeliveryBytes ?? 0;
+    const fileDeliveryBytes = previous.fileDeliveryBytes;
     if (!ownsOldSession()) return abandonEndedRebind();
+    // Persist the old incarnation BEFORE `reserve()` replaces the mutable
+    // thread slot. If `/end` wins during target create, this is the durable
+    // pointer it terminalizes; it is never a resumable second session.
+    oldStale = this.staleRebindActor(old.actor, previous, true);
+    if (!this.store.retainStaleRebind(previous, "rebind-cleanup-pending")) {
+      await trustedRoot?.close().catch(() => {});
+      trustedRoot = undefined;
+      restoreOldFileDelivery();
+      this.restoreLeaseFor(threadId, old);
+      await undoWorktree();
+      return "⚠️ 無法持久化舊 session 的改綁清理記錄，未改綁。請檢查磁碟／權限後重試。";
+    }
+    this.pendingRebindOlds.set(session, oldStale);
     const reserved = this.store.reserve({
       threadId,
       sessionId,
@@ -2615,12 +2852,15 @@ export class DiscordCopilotApp {
       await trustedRoot?.close().catch(() => {});
       trustedRoot = undefined;
       if (!ownsOldSession()) return abandonEndedRebind();
+      this.pendingRebindOlds.delete(session);
+      this.store.removeStaleRebind(previous.threadId, previous.sessionId, previous.generation);
       restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
       await undoWorktree();
       return "⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未改綁。請檢查磁碟／權限後重試。";
     }
     reservedIdentity = { sessionId, generation };
+    replacementBinding = this.store.get(threadId);
 
     const broker = new PendingInteractionBroker();
     let actor: SessionActor;
@@ -2651,9 +2891,11 @@ export class DiscordCopilotApp {
       // yet — restore only the row this attempt reserved. Preserving a larger
       // total keeps a late replacement reservation monotonic, at the cost of
       // leaving old file delivery fenced when its in-memory total is stale.
-      const rollback = previous
-        ? this.store.restoreIfCurrent(previous, sessionId, generation)
-        : { ok: this.store.removeIfCurrent(threadId, sessionId, generation), quotaAdvanced: false };
+      const rollback = this.store.restoreIfCurrent(previous, sessionId, generation);
+      if (rollback.ok) {
+        this.pendingRebindOlds.delete(session);
+        this.store.removeStaleRebind(previous.threadId, previous.sessionId, previous.generation);
+      }
       if (rollback.ok && !rollback.quotaAdvanced) restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
       await undoWorktree();
@@ -2675,12 +2917,18 @@ export class DiscordCopilotApp {
         // until a confirmed retry releases its root, and only then remove its
         // target worktree. Otherwise a live SDK process could become invisible
         // while its working directory is deleted underneath it.
-        this.retainStaleRebindActor(actor, undoWorktree);
+        if (replacementBinding) {
+          this.retainStaleRebindActor(this.staleRebindActor(actor, replacementBinding, true));
+        } else {
+          console.warn("rebind: commit-failed replacement lost its durable binding before teardown");
+        }
       }
       if (!ownsOldSession()) return abandonEndedRebind();
-      const rollback = previous
-        ? this.store.restoreIfCurrent(previous, sessionId, generation)
-        : { ok: this.store.removeIfCurrent(threadId, sessionId, generation), quotaAdvanced: false };
+      const rollback = this.store.restoreIfCurrent(previous, sessionId, generation);
+      if (rollback.ok) {
+        this.pendingRebindOlds.delete(session);
+        this.store.removeStaleRebind(previous.threadId, previous.sessionId, previous.generation);
+      }
       if (rollback.ok && !rollback.quotaAdvanced) restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
       if (replacementClosed) await undoWorktree();
@@ -2722,34 +2970,33 @@ export class DiscordCopilotApp {
     const ownsReplacement = (): boolean =>
       this.sessions.get(threadId) === replacement && !this.endedSessions.has(replacement);
 
-    let tail = "";
-    let oldClosed = true;
-    try {
-      await withTimeout(old.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
-    } catch {
-      // Cannot confirm the old runtime is gone. Say so rather than pretend: it
-      // owns no thread any more, but it may still be alive in the runtime.
-      oldClosed = false;
-      tail += "\n⚠️ 無法確認舊的 runtime 已關閉，建議稍後重啟 bot。";
+    // The old actor is no longer in `sessions`, so ownership transfers to the
+    // stale tracker BEFORE its first disconnect await. `/end` can now join this
+    // exact operation rather than delete the replacement and leave the old
+    // root/worktree unowned.
+    const detachedOld = oldStale;
+    if (!detachedOld) {
+      // This can only happen after a broken in-memory mutation; fail closed by
+      // leaving the replacement active rather than pretending its predecessor
+      // was retired.
+      return "⚠️ 舊 session 的改綁清理擁有權遺失，為安全起見未完成改綁。請重啟 bot。";
     }
+    this.pendingRebindOlds.delete(session);
+    this.staleRebindActors.set(detachedOld.actor, detachedOld);
+    const oldTeardown = await this.disconnectStaleRebindActor(detachedOld);
+    if (!oldTeardown.confirmed) this.scheduleStaleRebindRetry(detachedOld);
+    // Cleanup happened (or its durable unconfirmed record was installed)
+    // BEFORE this fence. Thus a winning `/end` cannot skip old cleanup merely
+    // because it removed the replacement from the map while we were awaiting.
     if (!ownsReplacement()) return endedRebind;
-    // Only now is the old worktree genuinely unreferenced — and only if the
-    // runtime that was working in it is provably gone. Removing a tree an
-    // unconfirmed agent may still be writing to is the one ordering that can
-    // destroy work, so an unconfirmed teardown KEEPS it and says where it is.
-    if (old.devMode === "worktree" && old.branch && old.workDir !== old.repoPath) {
-      if (!oldClosed) {
-        tail += `\n🌿 舊的 worktree **保留**：\`${old.workDir}\`（分支 \`${old.branch}\`）—— 無法確認舊 runtime 已停止，不在此時移除。`;
-      } else {
-        if (!ownsReplacement()) return endedRebind;
-        const r = await removeWorktreeIfClean(old.repoPath, old.workDir, old.branch).catch(
-          () => "failed" as const
-        );
-        if (!ownsReplacement()) return endedRebind;
-        if (r !== "removed" && r !== "already-absent") {
-          tail += `\n${this.worktreeOutcomeText(r, old.workDir, old.branch)}`;
-        }
-      }
+    let tail = oldTeardown.tail;
+    if (
+      !oldTeardown.confirmed &&
+      old.devMode === "worktree" &&
+      old.branch &&
+      old.workDir !== old.repoPath
+    ) {
+      tail += `\n🌿 舊的 worktree **保留**：\`${old.workDir}\`（分支 \`${old.branch}\`）—— 無法確認舊 runtime 已停止，不在此時移除。`;
     }
     return (
       `✅ 已改綁到 \`${path.basename(target.repoPath)}\` · \`${target.devMode}\`` +
@@ -2991,6 +3238,9 @@ export class DiscordCopilotApp {
       "thread-inaccessible",
       "thread-archived",
       "worktree-kept",
+      "rebind-cleanup-pending",
+      "rebind-teardown-unconfirmed",
+      "rebind-worktree-kept",
       // `bindingOk` rejects a disabled/changed parent BEFORE it attempts to
       // fetch the thread. If the thread is ALSO gone, its direct `notice()` is
       // silently undeliverable; route this config mismatch to the parent/seed
@@ -2998,6 +3248,7 @@ export class DiscordCopilotApp {
       "config-mismatch",
     ]);
     const records = this.store.all();
+    const staleRebinds = this.store.staleRebinds();
     const byParent = new Map<string, string[]>();
     for (const r of records) {
       if (
@@ -3013,6 +3264,17 @@ export class DiscordCopilotApp {
       );
       byParent.set(r.parentChannelId, lines);
     }
+    for (const r of staleRebinds) {
+      // A live replacement can report this through `/sessions`; a terminal old
+      // binding with no live thread cannot, so route it through the existing
+      // parent/seed fallback rather than silently leaving its worktree on disk.
+      if (this.sessions.has(r.threadId) || !r.reason || !unreachable.has(r.reason)) continue;
+      const lines = byParent.get(r.parentChannelId) ?? [];
+      lines.push(
+        `• \`${r.threadId}\`（舊 incarnation：${r.reason}）${r.branch ? ` · 分支 \`${r.branch}\`` : ""} — \`${r.workDir}\``
+      );
+      byParent.set(r.parentChannelId, lines);
+    }
     // The other direction: /new creates the worktree BEFORE it persists the
     // record, so a crash in between leaves a checkout that no record mentions —
     // invisible to /sessions and to /end alike. Same for a store file replaced
@@ -3023,7 +3285,7 @@ export class DiscordCopilotApp {
     // created since multi-repo, and the flat `<root>/<threadId>` that older
     // records still legitimately point at (they are never migrated, because
     // moving a checkout is exactly the operation that loses uncommitted work).
-    const known = new Set(records.map((r) => this.leaseKey(r.workDir)));
+    const known = new Set([...records, ...staleRebinds].map((r) => this.leaseKey(r.workDir)));
     const stray = this.strayWorktreeDirs(known).map(
       (d) => `• \`${d}\`（沒有對應的 session 記錄）`
     );

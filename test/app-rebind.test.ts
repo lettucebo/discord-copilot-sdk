@@ -221,6 +221,20 @@ const sessions = (app: DiscordCopilotApp): Map<string, Session> =>
   (app as unknown as { sessions: Map<string, Session> }).sessions;
 const leases = (app: DiscordCopilotApp): Map<string, string> =>
   (app as unknown as { localLeases: Map<string, string> }).localLeases;
+const staleRebindActors = (app: DiscordCopilotApp): Map<SessionActor, unknown> =>
+  (app as unknown as { staleRebindActors: Map<SessionActor, unknown> }).staleRebindActors;
+const staleRebinds = (store: SessionStore): ReturnType<SessionStore["all"]> =>
+  (
+    store as unknown as {
+      staleRebinds(): ReturnType<SessionStore["all"]>;
+    }
+  ).staleRebinds();
+const retryStaleRebinds = (app: DiscordCopilotApp): Promise<void> =>
+  (
+    app as unknown as {
+      retryStaleRebindActorsForThread(threadId: string): Promise<void>;
+    }
+  ).retryStaleRebindActorsForThread("t1");
 /** Mirrors `DiscordCopilotApp.leaseKey`: the SAME canonicaliser, case-folded on
  *  Windows ONLY. Using `path.resolve().toLowerCase()` here made the assertions
  *  pass locally and fail on CI twice — once for the case rule on Linux, once
@@ -766,6 +780,54 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     }
   });
 
+  it("persists and retries a post-swap old actor before releasing its root and worktree", async () => {
+    const wtRoot = `${path.join(os.homedir(), ".discord-copilot-sdk")}-worktrees`;
+    const oldWt = path.join(wtRoot, `rebind-stale-${Date.now()}`, "t1");
+    const branch = "copilot/t-t1";
+    let cleanupApp: DiscordCopilotApp | undefined;
+    await addWorktree(repoA, oldWt, branch);
+    try {
+      const { app, store, actor } = harness({ devMode: "worktree" });
+      cleanupApp = app;
+      const oldRecord = store.get("t1")!;
+      expect(store.restore({ ...oldRecord, workDir: oldWt, branch, devMode: "worktree" })).toBe(true);
+      const s = sessions(app).get("t1")!;
+      s.workDir = oldWt;
+      s.branch = branch;
+      actor.disconnectFails = true;
+
+      await expect(applyRebind(app, { repoPath: repoB, devMode: "local" })).resolves.toMatch(
+        /無法確認舊的 runtime/
+      );
+
+      expect(staleRebindActors(app).has(actor as unknown as SessionActor)).toBe(true);
+      expect(staleRebinds(store)).toEqual([
+        expect.objectContaining({
+          threadId: "t1",
+          sessionId: "s1",
+          generation: 1,
+          workDir: oldWt,
+          branch,
+          state: "blocked",
+          reason: "rebind-teardown-unconfirmed",
+        }),
+      ]);
+      expect(staleRebinds(new SessionStore(storeFile))).toEqual([
+        expect.objectContaining({ sessionId: "s1", workDir: oldWt, reason: "rebind-teardown-unconfirmed" }),
+      ]);
+
+      actor.disconnectFails = false;
+      await retryStaleRebinds(app);
+
+      expect(staleRebindActors(app).has(actor as unknown as SessionActor)).toBe(false);
+      expect(staleRebinds(store)).toEqual([]);
+      expect(fs.existsSync(oldWt)).toBe(false);
+    } finally {
+      if (cleanupApp) await sessions(cleanupApp).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(oldWt), { recursive: true, force: true });
+    }
+  });
+
   it("/end wins while target binding is still pending and removes the unowned worktree", async () => {
     const { app, store, actor } = harness();
     const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
@@ -882,6 +944,184 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     } finally {
       releaseOldDisconnect?.();
       await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
+  it("/end after a map swap owns both the replacement and preflight-clean old worktrees", async () => {
+    const wtRoot = `${path.join(os.homedir(), ".discord-copilot-sdk")}-worktrees`;
+    const oldWt = path.join(wtRoot, `rebind-end-both-${Date.now()}`, "t1");
+    const branch = "copilot/t-t1";
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    await addWorktree(repoA, oldWt, branch);
+    let releaseOldDisconnect!: () => void;
+    const oldDisconnectGate = new Promise<void>((resolve) => {
+      releaseOldDisconnect = resolve;
+    });
+    let oldDisconnectStarted!: () => void;
+    const oldDisconnectStartedPromise = new Promise<void>((resolve) => {
+      oldDisconnectStarted = resolve;
+    });
+    let releaseReplacementDisconnect!: () => void;
+    const replacementDisconnectGate = new Promise<void>((resolve) => {
+      releaseReplacementDisconnect = resolve;
+    });
+    let replacementDisconnectStarted!: () => void;
+    const replacementDisconnectStartedPromise = new Promise<void>((resolve) => {
+      replacementDisconnectStarted = resolve;
+    });
+    let cleanupApp: DiscordCopilotApp | undefined;
+
+    try {
+      const { app, store, actor } = harness({ devMode: "worktree" });
+      cleanupApp = app;
+      const oldRecord = store.get("t1")!;
+      expect(store.restore({ ...oldRecord, workDir: oldWt, branch, devMode: "worktree" })).toBe(true);
+      const old = sessions(app).get("t1")!;
+      old.workDir = oldWt;
+      old.branch = branch;
+      actor.disconnectGate = oldDisconnectGate;
+      actor.onDisconnect = oldDisconnectStarted;
+
+      const rebinding = applyRebind(app, { repoPath: repoB, devMode: "worktree" });
+      await oldDisconnectStartedPromise;
+      const replacement = sessions(app).get("t1")!.actor;
+      const originalDisconnect = replacement.disconnect.bind(replacement);
+      const replacementDisconnect = vi.spyOn(replacement, "disconnect").mockImplementation(async () => {
+        replacementDisconnectStarted();
+        await replacementDisconnectGate;
+        return originalDisconnect();
+      });
+
+      const ending = endThread(app);
+      await replacementDisconnectStartedPromise;
+      releaseOldDisconnect();
+      releaseReplacementDisconnect();
+      await ending;
+      await expect(rebinding).resolves.toMatch(/已結束/);
+
+      expect(sessions(app).get("t1")).toBeUndefined();
+      expect(store.get("t1")).toBeUndefined();
+      expect(staleRebinds(store)).toEqual([]);
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+      expect(fs.existsSync(oldWt)).toBe(false);
+      replacementDisconnect.mockRestore();
+    } finally {
+      releaseOldDisconnect?.();
+      releaseReplacementDisconnect?.();
+      if (cleanupApp) await sessions(cleanupApp).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(oldWt), { recursive: true, force: true });
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
+  it("/end retains an unconfirmed old incarnation durably and cleans it on a later explicit retry", async () => {
+    const wtRoot = `${path.join(os.homedir(), ".discord-copilot-sdk")}-worktrees`;
+    const oldWt = path.join(wtRoot, `rebind-end-stale-${Date.now()}`, "t1");
+    const branch = "copilot/t-t1";
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    let cleanupApp: DiscordCopilotApp | undefined;
+    await addWorktree(repoA, oldWt, branch);
+    try {
+      const { app, store, actor } = harness({ devMode: "worktree" });
+      cleanupApp = app;
+      const oldRecord = store.get("t1")!;
+      expect(store.restore({ ...oldRecord, workDir: oldWt, branch, devMode: "worktree" })).toBe(true);
+      const old = sessions(app).get("t1")!;
+      old.workDir = oldWt;
+      old.branch = branch;
+      actor.disconnectFails = true;
+
+      await expect(applyRebind(app, { repoPath: repoB, devMode: "worktree" })).resolves.toMatch(
+        /無法確認舊的 runtime/
+      );
+      await endThread(app);
+
+      expect(store.get("t1")).toBeUndefined();
+      expect(staleRebinds(new SessionStore(storeFile))).toEqual([
+        expect.objectContaining({
+          threadId: "t1",
+          sessionId: "s1",
+          generation: 1,
+          workDir: oldWt,
+          branch,
+          state: "blocked",
+          reason: "rebind-teardown-unconfirmed",
+        }),
+      ]);
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+      expect(fs.existsSync(oldWt)).toBe(true);
+
+      actor.disconnectFails = false;
+      await endThread(app);
+
+      expect(staleRebinds(store)).toEqual([]);
+      expect(fs.existsSync(oldWt)).toBe(false);
+    } finally {
+      if (cleanupApp) await sessions(cleanupApp).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(oldWt), { recursive: true, force: true });
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a terminal old pointer when /end races a failed pre-swap rebind rollback", async () => {
+    const wtRoot = `${path.join(os.homedir(), ".discord-copilot-sdk")}-worktrees`;
+    const oldWt = path.join(wtRoot, `rebind-rollback-end-${Date.now()}`, "t1");
+    const branch = "copilot/t-t1";
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    await addWorktree(repoA, oldWt, branch);
+    const originalCreate = SessionActor.create;
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    let replacementCreated!: () => void;
+    const replacementCreatedPromise = new Promise<void>((resolve) => {
+      replacementCreated = resolve;
+    });
+    let cleanupApp: DiscordCopilotApp | undefined;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation(async (client, options) => {
+      const replacement = await originalCreate(client, options);
+      replacementCreated();
+      await createGate;
+      return replacement;
+    });
+
+    try {
+      const { app, store, actor } = harness({ devMode: "worktree" });
+      cleanupApp = app;
+      const oldRecord = store.get("t1")!;
+      expect(store.restore({ ...oldRecord, workDir: oldWt, branch, devMode: "worktree" })).toBe(true);
+      const old = sessions(app).get("t1")!;
+      old.workDir = oldWt;
+      old.branch = branch;
+      actor.disconnectFails = true;
+
+      const rebinding = applyRebind(app, { repoPath: repoB, devMode: "worktree" });
+      await replacementCreatedPromise;
+      await endThread(app);
+      releaseCreate();
+      await expect(rebinding).resolves.toMatch(/已結束/);
+
+      expect(store.get("t1")).toBeUndefined();
+      expect(staleRebinds(new SessionStore(storeFile))).toEqual([
+        expect.objectContaining({
+          threadId: "t1",
+          sessionId: "s1",
+          generation: 1,
+          workDir: oldWt,
+          branch,
+          state: "blocked",
+          reason: "rebind-teardown-unconfirmed",
+        }),
+      ]);
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+      expect(fs.existsSync(oldWt)).toBe(true);
+    } finally {
+      createSpy.mockRestore();
+      releaseCreate?.();
+      if (cleanupApp) await sessions(cleanupApp).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(oldWt), { recursive: true, force: true });
       fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
     }
   });

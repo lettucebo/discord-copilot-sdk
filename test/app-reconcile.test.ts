@@ -803,6 +803,40 @@ describe("startup announcement for records whose thread is gone", () => {
     }
   });
 
+  it("announces a terminal stale rebind pointer instead of reporting its worktree as unowned", async () => {
+    const f = tmpFile();
+    const wt = join(`${stateDir()}-worktrees`, "stale-old");
+    try {
+      const store = new SessionStore(f);
+      store.reserve(
+        bind({
+          threadId: "stale",
+          sessionId: "old-session",
+          generation: 1,
+          workDir: wt,
+          branch: "copilot/t-stale",
+        })
+      );
+      store.commit("stale");
+      const old = store.get("stale")!;
+      expect(store.retainStaleRebind(old, "rebind-teardown-unconfirmed")).toBe(true);
+      expect(store.remove("stale")).toBe(true);
+
+      const transport = new KeyedTransport();
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
+      await reconcile(app, async () => "valid");
+
+      const parent = transport.sent.filter((m) => m.key === "c1");
+      expect(parent).toHaveLength(1);
+      expect(parent[0]!.text).toContain("stale");
+      expect(parent[0]!.text).toContain("舊 incarnation");
+      expect(parent[0]!.text).toContain(wt);
+      expect(parent[0]!.text).not.toContain("沒有對應的 session 記錄");
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
   it("stays silent when nothing is unreachable", async () => {
     const f = tmpFile();
     try {

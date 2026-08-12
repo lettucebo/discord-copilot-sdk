@@ -74,6 +74,61 @@ describe("SessionStore — basics", () => {
       branch: "copilot/t1",
     });
   });
+
+  it("persists a terminal stale rebind binding separately from its replacement", () => {
+    const f = tmpFile();
+    const store = new SessionStore(f);
+    expect(
+      store.reserve(
+        bind("t1", {
+          sessionId: "old-session",
+          generation: 1,
+          workDir: "C:\\wt\\old",
+          devMode: "worktree",
+          branch: "copilot/t-t1",
+        })
+      )
+    ).toBe(true);
+    expect(store.commit("t1")).toBe(true);
+    const old = store.get("t1")!;
+    expect(
+      (
+        store as unknown as {
+          retainStaleRebind(record: typeof old, reason: string): boolean;
+        }
+      ).retainStaleRebind(old, "rebind-teardown-unconfirmed")
+    ).toBe(true);
+
+    expect(
+      store.reserve(
+        bind("t1", {
+          sessionId: "replacement-session",
+          generation: 2,
+          workDir: "C:\\wt\\replacement",
+          devMode: "worktree",
+          branch: "copilot/t-t1",
+        })
+      )
+    ).toBe(true);
+    expect(store.commit("t1")).toBe(true);
+
+    const reloaded = new SessionStore(f) as unknown as {
+      get(threadId: string): ReturnType<SessionStore["get"]>;
+      staleRebinds(): Array<ReturnType<SessionStore["get"]> extends infer R ? Exclude<R, undefined> : never>;
+    };
+    expect(reloaded.get("t1")).toMatchObject({ sessionId: "replacement-session", generation: 2, state: "active" });
+    expect(reloaded.staleRebinds()).toEqual([
+      expect.objectContaining({
+        threadId: "t1",
+        sessionId: "old-session",
+        generation: 1,
+        workDir: "C:\\wt\\old",
+        branch: "copilot/t-t1",
+        state: "blocked",
+        reason: "rebind-teardown-unconfirmed",
+      }),
+    ]);
+  });
 });
 
 describe("SessionStore — many concurrent sessions", () => {
@@ -180,7 +235,7 @@ describe("SessionStore — v1 migration", () => {
     const s = new SessionStore(f);
     s.reserve(bind("new-thread", { generation: s.nextGeneration() }));
     const onDisk = JSON.parse(readFileSync(f, "utf8")) as { schemaVersion: number; sessions: unknown[] };
-    expect(onDisk.schemaVersion).toBe(4);
+    expect(onDisk.schemaVersion).toBe(5);
     expect(onDisk.sessions).toHaveLength(2);
     expect(new SessionStore(f).get("old-thread")?.sessionId).toBe("old-sess");
   });
@@ -337,8 +392,8 @@ describe("SessionStore — durable file delivery quota", () => {
       schemaVersion: number;
       sessions: Array<Record<string, unknown>>;
     };
-    expect(persisted.schemaVersion).toBe(4);
-    expect(persisted.sessions[0]?.schemaVersion).toBe(4);
+    expect(persisted.schemaVersion).toBe(5);
+    expect(persisted.sessions[0]?.schemaVersion).toBe(5);
     expect(persisted.sessions[0]?.fileDeliveryBytes).toBe(42);
 
     delete persisted.sessions[0]!.fileDeliveryBytes;
@@ -357,7 +412,7 @@ describe("SessionStore — durable file delivery quota", () => {
       schemaVersion: number;
       sessions: Array<Record<string, unknown>>;
     };
-    expect(persisted.schemaVersion).toBe(4);
+    expect(persisted.schemaVersion).toBe(5);
     persisted.sessions[0]!.schemaVersion = 3;
     delete persisted.sessions[0]!.fileDeliveryBytes;
     writeFileSync(f, JSON.stringify(persisted), "utf8");

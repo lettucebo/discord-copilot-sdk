@@ -9,8 +9,10 @@ export type SessionState = "creating" | "active" | "orphaned" | "blocked";
 /** v1 stored ONE bare record at the top level. v2 stores many, plus a
  *  generation high-water mark. v3 adds `devMode`, because it can no longer be
  *  inferred (see `asRecord`). v4 adds the conservatively reserved file-delivery
- *  byte total. Older files are migrated on read. */
-const SCHEMA_VERSION = 4;
+ * byte total. v5 adds terminal stale-rebind records, so an old incarnation can
+ * remain durably visible while its replacement owns the logical thread. Older
+ * files are migrated on read. */
+const SCHEMA_VERSION = 5;
 
 export interface SessionRecord {
   schemaVersion: number;
@@ -70,6 +72,11 @@ interface StoreFile {
   schemaVersion: number;
   generationHighWater: number;
   sessions: SessionRecord[];
+  /** Old rebind incarnations are terminal (`blocked`) records keyed by their
+   * immutable session identity. They deliberately do not share the main
+   * thread-id map: a live replacement and an unconfirmed old actor can coexist
+   * for one Discord thread. */
+  staleRebinds: SessionRecord[];
 }
 
 /**
@@ -95,6 +102,7 @@ interface StoreFile {
  */
 export class SessionStore {
   private sessions = new Map<string, SessionRecord>();
+  private staleRebindRecords = new Map<string, SessionRecord>();
   private highWater = 0;
   private corrupt = false;
 
@@ -107,10 +115,61 @@ export class SessionStore {
     return [...this.sessions.values()].map((r) => ({ ...r }));
   }
 
+  /** Terminal old incarnations retained while rebind teardown was unconfirmed.
+   * They are intentionally separate from `all()`: reconcile must never resume
+   * them, while `/sessions` and explicit cleanup can still make their worktree
+   * visible and reclaimable. */
+  staleRebinds(): SessionRecord[] {
+    return [...this.staleRebindRecords.values()].map((r) => ({ ...r }));
+  }
+
+  staleRebindsForThread(threadId: string): SessionRecord[] {
+    return this.staleRebinds().filter((r) => r.threadId === threadId);
+  }
+
   /** One record by thread id, or undefined. */
   get(threadId: string): SessionRecord | undefined {
     const r = this.sessions.get(threadId);
     return r ? { ...r } : undefined;
+  }
+
+  /** Persist a blocked old incarnation independently of the current thread
+   * record. `threadId` alone is mutable during rebind, so the tuple including
+   * session id and generation is the ownership fence. */
+  retainStaleRebind(record: SessionRecord, reason: string): boolean {
+    if (
+      !record.threadId ||
+      !record.sessionId ||
+      !Number.isSafeInteger(record.generation) ||
+      record.generation < 1 ||
+      !isFileDeliveryBytes(record.fileDeliveryBytes) ||
+      !reason.startsWith("rebind-")
+    ) {
+      return false;
+    }
+    const key = staleRebindKey(record.threadId, record.sessionId, record.generation);
+    return this.mutate((_, highWater, stale) => {
+      const prior = stale.get(key);
+      const fileDeliveryBytes = Math.max(prior?.fileDeliveryBytes ?? 0, record.fileDeliveryBytes);
+      stale.set(key, {
+        ...this.toRecord({ ...record, fileDeliveryBytes }),
+        state: "blocked",
+        reason,
+        updatedAt: Date.now(),
+      });
+      return Math.max(highWater, record.generation);
+    });
+  }
+
+  /** Forget a terminal stale incarnation only after its actor has confirmed
+   * teardown and its cleanup plan has safely dealt with the recorded worktree. */
+  removeStaleRebind(threadId: string, sessionId: string, generation: number): boolean {
+    const key = staleRebindKey(threadId, sessionId, generation);
+    if (!this.staleRebindRecords.has(key)) return true;
+    return this.mutate((_, highWater, stale) => {
+      stale.delete(key);
+      return highWater;
+    });
   }
 
   /** True when the on-disk file existed but could not be parsed/validated.
@@ -221,8 +280,10 @@ export class SessionStore {
     });
   }
 
-  /** Forget every session. The file is KEPT (holding only the generation
-   *  high-water mark) so generations still never repeat — see `mutate`. */
+  /** Forget every primary thread record. Terminal stale-rebind records remain:
+   * a generic reset must not erase the only durable pointer to an unconfirmed
+   * actor/worktree. The file is KEPT (holding at least the generation
+   * high-water mark) so generations still never repeat — see `mutate`. */
   clear(): boolean {
     return this.mutate((m, hw) => {
       m.clear();
@@ -321,6 +382,9 @@ export class SessionStore {
         return;
       }
       for (const r of records.sessions) this.sessions.set(r.threadId, r);
+      for (const r of records.staleRebinds) {
+        this.staleRebindRecords.set(staleRebindKey(r.threadId, r.sessionId, r.generation), r);
+      }
       this.highWater = records.highWater;
     } catch {
       this.corrupt = true;
@@ -337,16 +401,21 @@ export class SessionStore {
    * reused after the last session ends — which is exactly what generations
    * exist to prevent.
    */
-  private mutate(f: (m: Map<string, SessionRecord>, highWater: number) => number): boolean {
+  private mutate(
+    f: (m: Map<string, SessionRecord>, highWater: number, stale: Map<string, SessionRecord>) => number
+  ): boolean {
     const next = new Map(this.sessions);
-    const nextHw = f(next, this.highWater);
+    const nextStale = new Map(this.staleRebindRecords);
+    const nextHw = f(next, this.highWater, nextStale);
     const candidate: StoreFile = {
       schemaVersion: SCHEMA_VERSION,
       generationHighWater: nextHw,
       sessions: [...next.values()].map((record) => this.canonicalizeRecord(record)),
+      staleRebinds: [...nextStale.values()].map((record) => this.canonicalizeRecord(record)),
     };
     if (!this.write(candidate)) return false;
     this.sessions = next;
+    this.staleRebindRecords = nextStale;
     this.highWater = nextHw;
     this.corrupt = false;
     return true;
@@ -424,7 +493,7 @@ function isFileDeliveryBytes(value: unknown): value is number {
 }
 
 /** Parse a versioned multi-session file or a bare v1 record, or undefined if neither. */
-function readRecords(v: unknown): { sessions: SessionRecord[]; highWater: number } | undefined {
+function readRecords(v: unknown): { sessions: SessionRecord[]; staleRebinds: SessionRecord[]; highWater: number } | undefined {
   if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
   const o = v as Record<string, unknown>;
   if (Object.hasOwn(o, "sessions")) {
@@ -442,15 +511,34 @@ function readRecords(v: unknown): { sessions: SessionRecord[]; highWater: number
       if (!r) return undefined; // one bad row invalidates the file — fail closed
       out.push(r);
     }
+    const rawStale = o["staleRebinds"];
+    if (containerVersion >= 5 && !Array.isArray(rawStale)) return undefined;
+    const staleItems: unknown[] = containerVersion >= 5 ? (rawStale as unknown[]) : [];
+    const staleRebinds: SessionRecord[] = [];
+    const staleKeys = new Set<string>();
+    for (const item of staleItems) {
+      const r = asRecord(item, containerVersion);
+      // A stale rebind must stay terminal. Accepting an active row here would
+      // make reconcile resume a second actor for one Discord thread.
+      if (!r || r.state !== "blocked" || !r.reason?.startsWith("rebind-")) return undefined;
+      const key = staleRebindKey(r.threadId, r.sessionId, r.generation);
+      if (staleKeys.has(key)) return undefined;
+      staleKeys.add(key);
+      staleRebinds.push(r);
+    }
     const hw = typeof o["generationHighWater"] === "number" ? o["generationHighWater"] : 0;
-    return { sessions: out, highWater: Math.max(hw, ...out.map((r) => r.generation), 0) };
+    return {
+      sessions: out,
+      staleRebinds,
+      highWater: Math.max(hw, ...out.map((r) => r.generation), ...staleRebinds.map((r) => r.generation), 0),
+    };
   }
   // Only an actual v1 bare record is legacy. A later-version object without
   // the multi-session container is corrupt, not an invitation to infer fields.
   if (readSchemaVersion(o["schemaVersion"]) !== 1) return undefined;
   const single = asRecord(o, 1);
   if (!single) return undefined;
-  return { sessions: [single], highWater: single.generation };
+  return { sessions: [single], staleRebinds: [], highWater: single.generation };
 }
 
 function readSchemaVersion(value: unknown): number | undefined {
@@ -538,7 +626,7 @@ function asRecord(v: unknown, containerVersion: number): SessionRecord | undefin
   // a thread's attachment budget after a hand edit or torn upgrade.
   const fileDeliveryBytes =
     rawFileDeliveryBytes === undefined
-      ? containerVersion < SCHEMA_VERSION
+      ? containerVersion < 4
         ? 0
         : undefined
       : isFileDeliveryBytes(rawFileDeliveryBytes)
@@ -562,4 +650,8 @@ function asRecord(v: unknown, containerVersion: number): SessionRecord | undefin
     ...(reason ? { reason } : {}),
     updatedAt,
   };
+}
+
+function staleRebindKey(threadId: string, sessionId: string, generation: number): string {
+  return JSON.stringify([threadId, sessionId, generation]);
 }
