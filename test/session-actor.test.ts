@@ -748,35 +748,34 @@ describe("SessionActor permission handling", () => {
 
     it("releases the gate when stop overtakes a stalled pre-card resolver", async () => {
       const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-stop-stalled-resolver-"));
-      const target = join(root, "artifact.txt");
-      let releaseLstat: (() => void) | undefined;
+      let releaseRealpath: (() => void) | undefined;
       let first: Promise<unknown> | undefined;
-      let lstatSpy: ReturnType<typeof vi.spyOn> | undefined;
+      let realpathSpy: ReturnType<typeof vi.spyOn> | undefined;
       try {
         writeArtifact(root, "artifact.txt", "artifact");
         const s = await setup({ workingDirectory: root });
-        const originalLstat = fs.lstat;
-        let markLstatStarted!: () => void;
-        const lstatStarted = new Promise<void>((resolve) => {
-          markLstatStarted = resolve;
+        const originalRealpath = fs.realpath;
+        let markRealpathStarted!: () => void;
+        const realpathStarted = new Promise<void>((resolve) => {
+          markRealpathStarted = resolve;
         });
-        const stalledLstat = new Promise<void>((resolve) => {
-          releaseLstat = resolve;
+        const stalledRealpath = new Promise<void>((resolve) => {
+          releaseRealpath = resolve;
         });
-        lstatSpy = vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
-          if (String(args[0]) !== target) return originalLstat(...args);
-          markLstatStarted();
-          await stalledLstat;
-          return originalLstat(...args);
+        realpathSpy = vi.spyOn(fs, "realpath").mockImplementation(async (...args) => {
+          if (String(args[0]) !== root) return originalRealpath(...args);
+          markRealpathStarted();
+          await stalledRealpath;
+          return originalRealpath(...args);
         });
 
         first = requestFilePermission(s, { path: "artifact.txt" }, "stop-stalled-resolver");
-        await lstatStarted;
+        await realpathStarted;
         await expect(s.actor.stop()).resolves.toBe(true);
 
         // The stale resolver remains hung, but its old owner must not block a
         // fresh turn or produce a card once it is finally released.
-        lstatSpy.mockRestore();
+        realpathSpy.mockRestore();
         await s.actor.send("begin a fresh turn");
         const before = s.transport.permissions.length;
         const later = requestFilePermission(s, { path: "artifact.txt" }, "after-stop-resolver");
@@ -784,8 +783,8 @@ describe("SessionActor permission handling", () => {
         s.transport.deliverDecision(view.nonce, "once", "u1");
         await expect(later).resolves.toEqual({ kind: "approve-once" });
 
-        if (!releaseLstat) throw new Error("stalled resolver was never reached");
-        releaseLstat();
+        if (!releaseRealpath) throw new Error("stalled resolver was never reached");
+        releaseRealpath();
         await expect(first).resolves.toEqual({ kind: "user-not-available" });
         expect(s.transport.permissions).toHaveLength(before + 1);
         await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "stop-stalled-resolver")).resolves.toMatchObject({
@@ -793,8 +792,8 @@ describe("SessionActor permission handling", () => {
         });
         expect(s.transport.sentFiles).toHaveLength(0);
       } finally {
-        releaseLstat?.();
-        lstatSpy?.mockRestore();
+        releaseRealpath?.();
+        realpathSpy?.mockRestore();
         await Promise.allSettled([first].filter((request): request is Promise<unknown> => request !== undefined));
         rmSync(root, { recursive: true, force: true });
       }
@@ -963,7 +962,7 @@ describe("SessionActor permission handling", () => {
     it("fails closed before another 8 MiB file is resolved and releases the gate after settlement", async () => {
       const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-concurrent-"));
       const s = await setup({ workingDirectory: root });
-      const openSpy = vi.spyOn(fs, "open");
+      const realpathSpy = vi.spyOn(fs, "realpath");
       let first: Promise<unknown> | undefined;
       let second: Promise<unknown> | undefined;
       try {
@@ -982,7 +981,7 @@ describe("SessionActor permission handling", () => {
         ]);
         expect(secondResult).toEqual({ kind: "user-not-available" });
         expect(s.transport.permissions).toHaveLength(before + 1);
-        expect(openSpy).toHaveBeenCalledTimes(1);
+        expect(realpathSpy).toHaveBeenCalledTimes(1);
 
         s.transport.deliverDecision(firstCard.nonce, "deny", "u1");
         await expect(first).resolves.toEqual({ kind: "reject" });
@@ -990,13 +989,13 @@ describe("SessionActor permission handling", () => {
         const laterBefore = s.transport.permissions.length;
         const later = requestFilePermission(s, { path: "second.zip" }, "later-large-file");
         const laterCard = await latestFilePermission(s, laterBefore);
-        expect(openSpy).toHaveBeenCalledTimes(2);
+        expect(realpathSpy).toHaveBeenCalledTimes(2);
         s.transport.deliverDecision(laterCard.nonce, "once", "u1");
         await expect(later).resolves.toEqual({ kind: "approve-once" });
       } finally {
         await s.actor.stop();
         await Promise.allSettled([first, second].filter((request): request is Promise<unknown> => request !== undefined));
-        openSpy.mockRestore();
+        realpathSpy.mockRestore();
         rmSync(root, { recursive: true, force: true });
       }
     });
