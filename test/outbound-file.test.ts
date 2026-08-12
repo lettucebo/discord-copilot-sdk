@@ -209,6 +209,43 @@ describe("resolveOutboundFile", () => {
     }
   });
 
+  it("maps handle read permission failures to unreadable", async () => {
+    const root = makeRoot();
+    write(root, "denied.txt", "secret");
+    const denied = Object.assign(new Error("permission denied"), { code: "EACCES" as const });
+
+    const readFile = vi.fn(async () => {
+      throw denied;
+    });
+
+    const close = vi.fn(async () => undefined);
+    const stat = vi.fn(async () => ({
+      isFile: () => true,
+      size: 6,
+      dev: 1,
+      ino: 2,
+      mtimeMs: 3,
+    }));
+
+    const openSpy = vi.spyOn(fsPromises, "open").mockResolvedValue({
+      stat,
+      readFile,
+      close,
+    } as unknown as Awaited<ReturnType<typeof fsPromises.open>>);
+
+    try {
+      const result = await resolveOutboundFile(root, "denied.txt", { maxBytes: 64, policy: "agent" });
+
+      expect(result).toEqual({ ok: false, reason: "unreadable" });
+      expect(openSpy).toHaveBeenCalledTimes(1);
+      expect(stat).toHaveBeenCalledTimes(1);
+      expect(readFile).toHaveBeenCalledTimes(1);
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
   it("refuses missing paths", async () => {
     const root = makeRoot();
     const missing = await resolveOutboundFile(root, "ghost.txt", { maxBytes: 64, policy: "agent" });
