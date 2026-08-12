@@ -94,11 +94,13 @@ Open it in a browser → pick your server → **Authorize**.
 
 `permissions=326417632256` is exactly the set below. The integer was verified against the Discord API: it round-trips to precisely these permissions, no more.
 
+> **Platform availability:** Outbound Discord file delivery is available only on Windows. Linux, macOS, and other hosts run sessions normally but deliberately expose neither `/file` delivery nor `discord_send_file`, so **Attach Files** is not needed for this bot there.
+
 | Permission | Why |
 | --- | --- |
 | View Channel | See the work channel. |
 | Send Messages | Conventionally granted; this bot's own messages go **only into threads**. Parent-channel replies are ephemeral interaction responses. If you want to trim further, this is the first one to try removing. |
-| Attach Files | Required for deliberate `/file` uploads and agent-proposed `discord_send_file` approvals; without it, file delivery fails even when the thread itself works. |
+| Attach Files | On Windows, required for deliberate `/file` uploads and agent-proposed `discord_send_file` approvals; without it, file delivery fails even when the thread itself works. |
 | Embed Links | Approval cards are embeds. |
 | Read Message History | Edit its own earlier messages while streaming. |
 | Create Public Threads | `/new` opens a thread. |

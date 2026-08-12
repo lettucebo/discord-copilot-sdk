@@ -87,6 +87,7 @@ import { isAuthorized, isOwner, type AuthContext, type AuthPolicy } from "./plat
 import { ChannelRegistry } from "./core/channel-registry.js";
 import type { Decision, Transport } from "./core/transport.js";
 import { captureTrustedRoot, type SecureOpenBackend, type TrustedRoot } from "./core/secure-open.js";
+import { isFileDeliveryAvailable } from "./core/file-delivery-availability.js";
 
 /** One live Discord thread ↔ Copilot session. Exported so tests can build a
  *  TYPED fixture — an untyped `as Record<string, unknown>` fixture is how a
@@ -384,7 +385,7 @@ export function yoloOnWarning(repoSkillsLoaded: boolean): string {
  * need an opaque root capability to reach SDK wiring, but must never gain file
  * resolution: a candidate open is always rejected and no OS handle is held.
  */
-function createForTestActorDependencies(): SessionActorCreateDependencies {
+function createForTestActorDependencies(fileDeliveryPlatform: NodeJS.Platform): SessionActorCreateDependencies {
   const backend: SecureOpenBackend = {
     async open(): Promise<never> {
       throw new Error("createForTest roots must not open file candidates.");
@@ -409,7 +410,7 @@ function createForTestActorDependencies(): SessionActorCreateDependencies {
       };
     },
   };
-  return { secureOpen: { backend } };
+  return { secureOpen: { backend }, fileDeliveryPlatform };
 }
 
 /**
@@ -476,6 +477,13 @@ export class DiscordCopilotApp {
   private readonly rebindCards = new Map<string, string>();
   /** See `provisioner()` — one instance, because its lease is instance state. */
   private repoProvisioner?: RepoProvisioner;
+
+  /** Production availability is intentionally derived from the host platform.
+   * Tests inject a platform through the actor dependency seam so Windows-only
+   * descriptor behavior remains testable on every CI host. */
+  private fileDeliveryAvailable(): boolean {
+    return isFileDeliveryAvailable(this.actorCreateDependencies?.fileDeliveryPlatform ?? process.platform);
+  }
 
   private constructor(
     private readonly config: Config,
@@ -554,24 +562,31 @@ export class DiscordCopilotApp {
   }
 
   /**
-   * Capture the root BEFORE any git proof observes it. Git receives the
-   * capability's handle-bound validation path, not its mutable final pathname;
-   * otherwise an attacker can swap a root around the proof and restore the
-   * captured directory before actor creation. Only createForTest populates the
-   * injected backend.
+   * On Windows capture the root BEFORE any git proof observes it. Git receives
+   * the capability's handle-bound validation path, not its mutable final
+   * pathname; otherwise an attacker can swap a root around the proof and
+   * restore the captured directory before actor creation. On POSIX there is no
+   * safe descriptor-to-SDK-cwd handoff, so file delivery is unavailable and no
+   * root capability is opened; normal session binding still uses the pathname.
    *
-   * On a failed verdict or approval-key proof this method closes the capability
-   * itself. On success it transfers ownership to the caller, which must either
-   * hand it to SessionActor.create() or close it on its own failure path.
+   * On a failed verdict or approval-key proof this method closes any captured
+   * capability itself. On success a Windows capability transfers ownership to
+   * the caller, which must either hand it to SessionActor.create() or close it
+   * on its own failure path.
    */
   private async captureValidatedRoot(
     binding: Binding
   ): Promise<
-    | { ok: true; trustedRoot: TrustedRoot; binding: Binding; approvalKey: string }
+    | { ok: true; trustedRoot?: TrustedRoot; binding: Binding; approvalKey: string }
     | { ok: false; verdict: Exclude<BindingVerdict, { ok: true }> }
   > {
-    const trustedRoot = await captureTrustedRoot(binding.workDir, this.actorCreateDependencies?.secureOpen);
-    const validationBinding: Binding = { ...binding, workDir: trustedRoot.validationPath };
+    const trustedRoot = this.fileDeliveryAvailable()
+      ? await captureTrustedRoot(binding.workDir, this.actorCreateDependencies?.secureOpen)
+      : undefined;
+    const validationBinding: Binding = {
+      ...binding,
+      workDir: trustedRoot?.validationPath ?? binding.workDir,
+    };
     let verdict: BindingVerdict;
     try {
       verdict = await this.bindingCheck(validationBinding, {
@@ -579,11 +594,11 @@ export class DiscordCopilotApp {
         worktreeRoot: worktreeRoot(),
       });
     } catch (error) {
-      await trustedRoot.close().catch(() => {});
+      await trustedRoot?.close().catch(() => {});
       throw error;
     }
     if (!verdict.ok) {
-      await trustedRoot.close().catch(() => {});
+      await trustedRoot?.close().catch(() => {});
       return { ok: false, verdict };
     }
     let approvalKey: string;
@@ -591,14 +606,19 @@ export class DiscordCopilotApp {
       // The approval key is a security-relevant repository identity, not a
       // display label. Derive it only after binding succeeds, from the same
       // retained descriptor path Git just proved owns this worktree.
-      approvalKey = await this.approvalKeyFor(trustedRoot.validationPath);
+      approvalKey = await this.approvalKeyFor(validationBinding.workDir);
     } catch (error) {
-      await trustedRoot.close().catch(() => {});
+      await trustedRoot?.close().catch(() => {});
       throw error;
     }
-    // Persist and hand the SDK the handle's final display path. The descriptor
-    // capability itself remains the file-security boundary after this proof.
-    return { ok: true, trustedRoot, binding: { ...binding, workDir: trustedRoot.finalPath }, approvalKey };
+    // Persist and hand the SDK the handle's final display path on Windows. The
+    // descriptor capability remains the file-security boundary after this proof.
+    return {
+      ok: true,
+      ...(trustedRoot ? { trustedRoot } : {}),
+      binding: { ...binding, workDir: trustedRoot?.finalPath ?? binding.workDir },
+      approvalKey,
+    };
   }
 
   /**
@@ -642,12 +662,13 @@ export class DiscordCopilotApp {
     copilot: CopilotClient,
     transport: Transport,
     store?: SessionStore,
-    channels?: ChannelRegistry
+    channels?: ChannelRegistry,
+    options: { fileDeliveryPlatform?: NodeJS.Platform } = {}
   ): DiscordCopilotApp {
     const noopLock: InstanceLock = { path: "(test)", release: async () => {} };
     const app = new DiscordCopilotApp(config, copilot, noopLock, transport, store, channels);
     app.reposRoot = reposRoot;
-    app.actorCreateDependencies = createForTestActorDependencies();
+    app.actorCreateDependencies = createForTestActorDependencies(options.fileDeliveryPlatform ?? "win32");
     app.approvalKeyForTest = async (validationPath) => validationPath;
     return app;
   }
@@ -1344,9 +1365,9 @@ export class DiscordCopilotApp {
         await interaction.editReply(msg);
       };
 
-      // Capture first, then prove the handle-bound validation path. Validating
-      // the mutable generated pathname and capturing it later leaves a swap
-      // window that can make an external directory the actor's trusted root.
+      // On Windows capture first, then prove the handle-bound validation path.
+      // POSIX starts a normal session without a root capability because the SDK
+      // only accepts a mutable cwd pathname; it therefore exposes no file tool.
       let captured;
       try {
         captured = await this.captureValidatedRoot({
@@ -1377,7 +1398,7 @@ export class DiscordCopilotApp {
       // this session until the record below exists. Checking here is what makes
       // "a disabled channel never gains a session" true rather than likely.
       if (!stillEnabled()) {
-        await trustedRoot.close().catch(() => {});
+        await trustedRoot?.close().catch(() => {});
         await abort(`⚠️ <#${parentChannelId}> 在這期間被停用了，已回復（討論串與 worktree 都已移除）。`);
         return;
       }
@@ -1395,7 +1416,7 @@ export class DiscordCopilotApp {
         branch,
       });
       if (!reserved) {
-        await trustedRoot.close().catch(() => {});
+        await trustedRoot?.close().catch(() => {});
         await abort("⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未建立新的 session。請檢查磁碟／權限後重試。");
         return;
       }
@@ -1405,7 +1426,7 @@ export class DiscordCopilotApp {
       try {
         actor = await SessionActor.create(this.copilot, {
           sessionKey: thread.id,
-          trustedRoot,
+          ...(trustedRoot ? { trustedRoot } : {}),
           workingDirectory: workDir,
           approvalKey,
           model: this.config.DEFAULT_MODEL,
@@ -2452,7 +2473,7 @@ export class DiscordCopilotApp {
       this.releaseLocalLease(threadId);
       const lease = this.acquireLocalLease(target.repoPath, threadId);
       if (!lease.ok) {
-        await trustedRoot.close().catch(() => {});
+        await trustedRoot?.close().catch(() => {});
         restoreOldFileDelivery();
         this.restoreLeaseFor(threadId, old);
         await undoWorktree();
@@ -2484,7 +2505,7 @@ export class DiscordCopilotApp {
       branch,
     });
     if (!reserved) {
-      await trustedRoot.close().catch(() => {});
+      await trustedRoot?.close().catch(() => {});
       restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
       await undoWorktree();
@@ -2496,7 +2517,7 @@ export class DiscordCopilotApp {
     try {
       actor = await SessionActor.create(this.copilot, {
         sessionKey: threadId,
-        trustedRoot,
+        ...(trustedRoot ? { trustedRoot } : {}),
         workingDirectory: workDir,
         approvalKey,
         model: this.config.DEFAULT_MODEL,
@@ -3053,9 +3074,10 @@ export class DiscordCopilotApp {
         return;
       }
     }
-    // Capture before git sees the path. The persisted JSON pathname is mutable;
-    // Git proves only the retained handle's validation path, while the same
+    // Windows captures before git sees the path. The persisted JSON pathname is
+    // mutable; Git proves the retained handle's validation path, while the same
     // capability and its final display path transfer to the resumed actor.
+    // POSIX resumes normally without file-delivery machinery.
     let captured;
     try {
       captured = await this.captureValidatedRoot({
@@ -3098,7 +3120,7 @@ export class DiscordCopilotApp {
         // Back into the SAME directory this session was created in — resuming a
         // worktree session into another tree would run one thread's conversation
         // against another thread's files.
-        trustedRoot,
+        ...(trustedRoot ? { trustedRoot } : {}),
         workingDirectory: workDir,
         approvalKey,
         model: this.config.DEFAULT_MODEL,
@@ -3531,6 +3553,8 @@ export class DiscordCopilotApp {
 
   private fileRefusalMessage(reason: OutboundRefusal): string {
     switch (reason) {
+      case "unavailable":
+        return "檔案傳送在此平台無法使用（僅支援 Windows）。";
       case "outside-workdir":
         return "無法傳送這個檔案：路徑不在這個 session 的工作目錄內。";
       case "not-found":
@@ -3563,6 +3587,10 @@ export class DiscordCopilotApp {
     const session = this.sessions.get(threadId);
     if (!session) {
       await interaction.editReply({ content: "這個討論串沒有進行中的 session，無法傳送檔案。" });
+      return;
+    }
+    if (!this.fileDeliveryAvailable()) {
+      await interaction.editReply({ content: this.fileRefusalMessage("unavailable") });
       return;
     }
     const canSend = (): boolean =>

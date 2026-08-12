@@ -194,6 +194,8 @@ four IDs — is in [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md).
 
 Use `/file path:<path>` when you deliberately want to upload a validated file from the session's workdir to the owning Discord thread. Agents can also propose `discord_send_file({path,comment?})`, but it always requires its own Allow once / Deny card, is limited to workdir files, and shares the same 8 MiB Discord upload cap. The bot needs Discord's **Attach Files** permission for both paths, all file sends suppress mentions, and YOLO fast-denies agent file-send requests with a notice to use `/file` instead.
 
+> **Platform availability:** Outbound Discord file delivery is available only on Windows. On Linux, macOS, and other platforms, sessions and every non-file bot feature continue normally, but `/file` safely reports unavailable and `discord_send_file` is not exposed. This is deliberate: the SDK accepts only a pathname `workingDirectory`, not a retained descriptor, so POSIX cannot safely prevent a swap-and-restore during create or resume.
+
 From an existing clone:
 
 ```bash

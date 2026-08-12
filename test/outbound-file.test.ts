@@ -185,9 +185,11 @@ describe("resolveOutboundFile", () => {
     const root = makeRoot();
     const firstPath = path.join("drafts", "report.txt");
     const secondPath = path.join("final", "report.txt");
+    const zeroWidthPath = path.join(`review\u200Bcopy`, "report.txt");
     write(root, firstPath, "draft");
     write(root, secondPath, "final");
     write(root, path.join(`spoof\u202Edir`, "report.txt"), "unsafe");
+    write(root, zeroWidthPath, "invisible");
 
     const first = await resolveForTest(root, firstPath, { maxBytes: 64, policy: "agent" });
     const second = await resolveForTest(root, secondPath, { maxBytes: 64, policy: "agent" });
@@ -195,10 +197,12 @@ describe("resolveOutboundFile", () => {
       maxBytes: 64,
       policy: "agent",
     });
+    const zeroWidth = await resolveForTest(root, zeroWidthPath, { maxBytes: 64, policy: "agent" });
 
     expect(first).toMatchObject({ ok: true, file: { displayName: "report.txt", relativePath: firstPath } });
     expect(second).toMatchObject({ ok: true, file: { displayName: "report.txt", relativePath: secondPath } });
     expect(unsafe).toEqual({ ok: false, reason: "unsafe-filename" });
+    expect(zeroWidth).toEqual({ ok: false, reason: "unsafe-filename" });
   });
 
   it("refuses directories", async () => {

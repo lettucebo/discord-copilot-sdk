@@ -2,6 +2,7 @@ import { defineTool, type CopilotClient, type CopilotSession, type ToolInvocatio
 import { PendingInteractionBroker } from "../core/broker.js";
 import { TurnRenderer } from "../core/turn-render.js";
 import type { Decision, SendFileResult, Transport } from "../core/transport.js";
+import { isFileDeliveryAvailable } from "../core/file-delivery-availability.js";
 import { normalizeSdkEvent } from "./normalize.js";
 import { sanitizeForCodeBlock, sanitizeForInlineCode, hasBidiOrControls } from "../core/text-safety.js";
 import { ApprovalPolicy, commandExecutable } from "../core/approval-policy.js";
@@ -28,6 +29,10 @@ const FAULT_GRACE_MS = 15_000;
 /** Cap on how long the fault-path disconnect may take before we give up on it
  *  (so a hung disconnect RPC can't make a turn hang forever). */
 const FAULT_DISCONNECT_MS = 5_000;
+/** Bound cleanup after a failed post-RPC root fence. The runtime session may
+ * already have inherited a swapped pathname, but a hung cleanup must not retain
+ * the Windows root handle or block actor initialization forever. */
+const POST_RPC_CLEANUP_TIMEOUT_MS = FAULT_DISCONNECT_MS;
 /** Max SANITIZED (display) length of a permission summary we will show. The
  *  card lives in a Discord embed description (≤4096). Beyond this we auto-deny
  *  rather than show a partial/undisplayable command. */
@@ -43,6 +48,7 @@ const FILE_DELIVERY_TOOL = "discord_send_file";
 const FILE_DELIVERY_TURN_LIMIT = 3;
 const FILE_DELIVERY_SESSION_BYTE_LIMIT = 24 * 1024 * 1024;
 const FILE_DELIVERY_COMMENT_MAX = 1900;
+const FILE_DELIVERY_DISPLAY_PATH_MAX = 512;
 
 /** Safe-default permission result (deny). Used for timeout/abort and for
  *  permission kinds discord-copilot-sdk has no UI for (fail-closed). */
@@ -135,8 +141,8 @@ function fileDeliveryFailure(text: string): ToolResultObject {
 function fileDeliverySummary(relativePath: string, displayName: string, size: number, comment?: string): string {
   return [
     "Send a file from the current session workdir to the owning Discord thread.",
-    `Path: ${relativePath}`,
-    `File: ${displayName}`,
+    `Path: \`${sanitizeForInlineCode(relativePath, FILE_DELIVERY_DISPLAY_PATH_MAX)}\``,
+    `File: \`${sanitizeForInlineCode(displayName, FILE_DELIVERY_DISPLAY_PATH_MAX)}\``,
     `Size: ${size} bytes`,
     ...(comment ? [`Comment: ${comment}`] : []),
     "Warning: anyone who can view this thread or its parent channel can download this file.",
@@ -147,8 +153,8 @@ export interface SessionActorOpts {
   sessionKey: string;
   /** A live root capability captured and binding-validated by the app. Ownership
    * transfers to this actor, which closes it exactly once on init failure or
-   * teardown; production must never recapture `workingDirectory` by pathname. */
-  trustedRoot: TrustedRoot;
+   * teardown; it is absent when file delivery is unavailable on this platform. */
+  trustedRoot?: TrustedRoot;
   workingDirectory: string;
   /** Identity that "always allow for this repo" rules are stored under. With
    *  per-session worktrees the working directory differs for every session, so
@@ -192,17 +198,42 @@ export interface SessionActorOpts {
   /** Test seam for the logged-in user's home directory. Never sourced from .env:
    *  making this user-controlled would let it point back at the controlled repo. */
   skillsHomeDirectory?: string;
+  /** @internal Test-only override for the bounded post-RPC cleanup path. */
+  postRpcCleanupTimeoutMs?: number;
 }
 
 /** @internal Test-only seams for the OS-handle security boundary. Production
  * callers use the platform backend captured by secure-open itself. */
 export interface SessionActorCreateDependencies {
   secureOpen?: SecureOpenDependencies;
+  /** Test-only platform seam. Production availability is derived from
+   * `process.platform`; test construction defaults to win32 so descriptor
+   * coverage remains deterministic on every CI host. */
+  fileDeliveryPlatform?: NodeJS.Platform;
+  /** Test-only timeout override for post-RPC cleanup. */
+  postRpcCleanupTimeoutMs?: number;
 }
 
 /** Test-only creation input. Production callers must supply a root capability
  * captured before binding validation to `create()`. */
 export type SessionActorCreateForTestOpts = Omit<SessionActorOpts, "trustedRoot">;
+
+function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("operation timed out")), timeoutMs);
+    (timer as { unref?: () => void }).unref?.();
+    operation.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
 
 /** A raw-bytes attachment for send() — Discord images become blobs (P5). */
 export interface BlobAttachment {
@@ -236,6 +267,7 @@ export class SessionActor {
   private turnActive = false;
   private readonly auditLog: AuditSink;
   private readonly generation: number;
+  private readonly postRpcCleanupTimeoutMs: number;
   /** True when this actor loaded at least one skill from its controlled repo.
    *  YOLO needs this signal to warn when it removes the approval gate that
    *  normally constrains model steering from those skill descriptions. */
@@ -337,6 +369,10 @@ export class SessionActor {
     this.currentModel = opts.model;
     this.currentContext = opts.contextTier;
     this.auditLog = opts.auditLog ?? new AuditLog();
+    this.postRpcCleanupTimeoutMs = opts.postRpcCleanupTimeoutMs ?? POST_RPC_CLEANUP_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.postRpcCleanupTimeoutMs) || this.postRpcCleanupTimeoutMs <= 0) {
+      throw new Error("post-RPC cleanup timeout is invalid");
+    }
     if (!isFileDeliveryByteTotal(opts.initialFileDeliveryBytes)) {
       throw new Error("initial file delivery byte total is invalid");
     }
@@ -356,7 +392,7 @@ export class SessionActor {
     } catch (error) {
       try {
         if (actor) await actor.closeTrustedRoot();
-        else await opts.trustedRoot.close();
+        else await opts.trustedRoot?.close();
       } catch {
         // The actor is never returned after initialization fails; the original
         // SDK error remains the actionable failure and close was attempted once.
@@ -372,8 +408,17 @@ export class SessionActor {
     opts: SessionActorCreateForTestOpts,
     dependencies: SessionActorCreateDependencies = {}
   ): Promise<SessionActor> {
-    const trustedRoot = await captureTrustedRoot(opts.workingDirectory, dependencies.secureOpen);
-    return this.create(client, { ...opts, trustedRoot });
+    const fileDeliveryAvailable = isFileDeliveryAvailable(dependencies.fileDeliveryPlatform ?? "win32");
+    const trustedRoot = fileDeliveryAvailable
+      ? await captureTrustedRoot(opts.workingDirectory, dependencies.secureOpen)
+      : undefined;
+    return this.create(client, {
+      ...opts,
+      ...(trustedRoot ? { trustedRoot } : {}),
+      ...(dependencies.postRpcCleanupTimeoutMs === undefined
+        ? {}
+        : { postRpcCleanupTimeoutMs: dependencies.postRpcCleanupTimeoutMs }),
+    });
   }
 
   private async closeTrustedRoot(): Promise<void> {
@@ -384,7 +429,8 @@ export class SessionActor {
   }
 
   private async assertCurrentRootForSdk(): Promise<void> {
-    await assertCurrentTrustedRoot(this.opts.trustedRoot);
+    const trustedRoot = this.trustedRoot;
+    if (trustedRoot) await assertCurrentTrustedRoot(trustedRoot);
   }
 
   /** A successful RPC may have spawned a process against a swapped pathname.
@@ -394,18 +440,22 @@ export class SessionActor {
     try {
       await this.assertCurrentRootForSdk();
     } catch (error) {
-      await Promise.resolve()
-        .then(() => this.session.disconnect())
-        .catch(() => {});
+      await withTimeout(
+        Promise.resolve().then(() => this.session.disconnect()),
+        this.postRpcCleanupTimeoutMs
+      ).catch(() => {});
       // A resume reconnects a durable conversation, so it must only disconnect.
       // A newly-created session has no safe owner after this fence failed; delete
-      // it best effort after disconnect so it cannot linger as an orphan.
+      // it best effort after the bounded disconnect so it cannot linger as an
+      // orphan. The calls are separately bounded: a stuck disconnect must not
+      // prevent the delete attempt or the outer root close.
       const sessionId = this.opts.resumeSessionId ? undefined : this.opts.createSessionId ?? this.session.sessionId;
       if (typeof sessionId === "string" && sessionId.length > 0) {
         const clientWithDelete = client as unknown as { deleteSession?: (id: string) => Promise<unknown> };
-        await Promise.resolve()
-          .then(() => clientWithDelete.deleteSession?.(sessionId))
-          .catch(() => {});
+        await withTimeout(
+          Promise.resolve().then(() => clientWithDelete.deleteSession?.(sessionId)),
+          this.postRpcCleanupTimeoutMs
+        ).catch(() => {});
       }
       throw error;
     }
@@ -466,16 +516,18 @@ export class SessionActor {
       // instructions — the same trust-boundary hole enableFileHooks:false closes
       // for permission hooks.
       skipCustomInstructions: true,
-      tools: [
-        defineTool<FileDeliveryArgs>(FILE_DELIVERY_TOOL, {
-          description:
-            "Sends a file from the current session workdir to the owning Discord thread. " +
-            "Requires explicit operator approval and is unavailable in YOLO mode.",
-          parameters: FILE_DELIVERY_PARAMETERS,
-          defer: "never",
-          handler: (args, invocation) => this.handleFileDelivery(args, invocation),
-        }),
-      ],
+      tools: this.trustedRoot
+        ? [
+            defineTool<FileDeliveryArgs>(FILE_DELIVERY_TOOL, {
+              description:
+                "Sends a file from the current session workdir to the owning Discord thread. " +
+                "Requires explicit operator approval and is unavailable in YOLO mode.",
+              parameters: FILE_DELIVERY_PARAMETERS,
+              defer: "never",
+              handler: (args, invocation) => this.handleFileDelivery(args, invocation),
+            }),
+          ]
+        : [],
       onPermissionRequest: (req: unknown) => this.handlePermission(req),
       // Interactive UIs (P3): ask_user → choice buttons + freeform; exit-plan →
       // action buttons + reject. Elicitation stays fail-closed (cancel) with a
@@ -678,9 +730,10 @@ export class SessionActor {
     policy: OutboundFilePolicy
   ): Promise<ResolveOutboundFileResult> {
     const trustedRoot = this.trustedRoot;
-    if (this.lifecycle !== "active" || !trustedRoot) {
+    if (this.lifecycle !== "active") {
       return { ok: false, reason: "unreadable" };
     }
+    if (!trustedRoot) return { ok: false, reason: "unavailable" };
     return resolveOutboundFile(trustedRoot, requestedPath, {
       policy,
       maxBytes: MAX_DISCORD_UPLOAD_BYTES,
@@ -770,6 +823,7 @@ export class SessionActor {
   private fileDeliveryPermissionIsCurrent(owner: symbol, turnEpoch: number): boolean {
     return (
       this.fileDeliveryPermissionOwner === owner &&
+      this.trustedRoot !== undefined &&
       this.lifecycle === "active" &&
       !this.aborting &&
       !this.yolo &&
@@ -781,6 +835,7 @@ export class SessionActor {
   private fileDeliveryIsCurrent(approval: ApprovedFileDelivery): boolean {
     return (
       this.lifecycle === "active" &&
+      this.trustedRoot !== undefined &&
       !this.aborting &&
       !this.yolo &&
       !this.fileDeliverySuspended &&
@@ -792,7 +847,7 @@ export class SessionActor {
    * YOLO deliberately does not block that explicit user action, but teardown
    * and a rebind fence do. */
   canDeliverFiles(): boolean {
-    return this.lifecycle === "active" && !this.aborting && !this.fileDeliverySuspended;
+    return this.trustedRoot !== undefined && this.lifecycle === "active" && !this.aborting && !this.fileDeliverySuspended;
   }
 
   /** Fence every old file card, approval and send before rebind begins any

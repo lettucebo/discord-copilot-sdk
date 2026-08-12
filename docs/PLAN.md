@@ -608,38 +608,41 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 
 ### 18.1 採納方案
 
-採用**雙路徑、同一安全邊界**：
+採用**Windows-only 的雙路徑、同一安全邊界**：
 
-1. 使用者明示的 `/file path:<path>`：只允許 session workdir 內、經 canonical path 驗證的檔案，直接送回擁有該 session 的 Discord thread。
-2. agent tool `discord_send_file({path,comment?})`：由 host 註冊、repo extension allow-list 控制、每次都要獨立 Allow once / Deny 卡，不提供 session-scope 擴權。
+1. Windows 上，使用者明示的 `/file path:<path>`：只允許 session workdir 內、經 canonical path 驗證的檔案，直接送回擁有該 session 的 Discord thread。
+2. Windows 上，agent tool `discord_send_file({path,comment?})`：由 host 註冊、repo extension allow-list 控制、每次都要獨立 Allow once / Deny 卡，不提供 session-scope 擴權。
+3. Linux、Darwin 與其他非 Windows 平台：session 的建立、resume 與所有非送檔功能照常；但不捕捉 trusted root、不暴露 `discord_send_file`，且 `/file` 明確 fail-closed 回覆平台不可用。
 
-我建議這個方案，因為它把「人主動送檔」與「agent 建議送檔」分開：前者保留明確操作捷徑，後者保留審批與可追溯性；兩者共用 workdir/root 綁定、內容驗證與 Discord 送檔事實回報，風險面最小，也最符合既有 fail-closed/一次一授權模型。
+我建議這個方案，因為 SDK 只接受 mutable pathname `workingDirectory`，而非可交給 child/runtime 的 retained fd。Windows root handle 可拒絕 delete/rename，令 pathname 在 create/resume handoff 期間維持綁定；POSIX 則可在 RPC 期間 swap-and-restore，令 RPC 拿到 replacement cwd 而前後檢查都看到原 root。保留 POSIX 送檔會假稱安全，故只保留正常 session，移除這條 outbound capability。
 
 ### 18.2 否決方案與取捨
 
 1. **自動送檔、沒有卡片**：優點是 friction 最低；缺點是 agent 只要拿到檔案路徑就能直接把內容送出 Discord，等同新增一條無人工確認的外流通道。與現有 approval model 衝突，故否決。
 2. **把 `discord_send_file` 納入 YOLO 自動核准**：優點是行為一致；缺點是 YOLO 本來就已移除最後一道 Discord permission gate，而送檔是額外 outbound exfiltration path，風險明顯更高。故刻意 fast-deny 並提示改用 `/file`。
 3. **使用未記錄/未文件化的雲端上傳或暫存轉交**：理論上可繞過部分本機限制，但缺點是平台行為、權限、保留期限與審計語義都不穩定，且會引入第三條未揭露的資料流。因缺乏可驗證契約，故否決。
+4. **POSIX retained-fd + SDK 前後 root fence**：優點是 Linux/Darwin 仍可提供送檔；缺點是 SDK API 不接受 fd、也沒有安全的 fd inheritance/cwd handoff。攻擊者可在 create/resume RPC 期間 swap working-directory pathname，並在前後 fence 前 restore，令 SDK 使用 replacement cwd 而兩次檢查皆通過。此基本限制不可由本程式修補，故否決 POSIX 送檔。
 
 ### 18.3 安全與競態防護
 
-- **capture-before-binding root capability**：`/new`、rebind、startup resume 都先以 workdir
+- **Windows capture-before-binding root capability**：僅 Windows 的 `/new`、rebind、startup resume 都先以 workdir
   捕捉不透明 directory handle；git ownership proof（local 的 `--show-toplevel` 與 worktree 的
   `--git-common-dir`）只接收該 capability 的原始 handle-bound validation path，不能把它
-  canonicalise 後改用 mutable final path。Linux 為持有 fd 期間的 `/proc/self/fd/<fd>`，Darwin
-  為 `/dev/fd/<fd>`；Windows 的 directory handle 只分享 read、拒絕 delete/rename，所以其
+  canonicalise 後改用 mutable final path。Windows 的 directory handle 只分享 read、拒絕 delete/rename，所以其
   handle-derived final path 在 handle 存活時仍綁定同一 root。若 git 不能操作該 validation path
   即拒絕，絕不回退到原 workdir。approval key 也只能在 proof 成功後以該 validation path 的
   `--git-common-dir` 導出，不能先用可替換的 repo pathname 選擇既有授權。proof 完成後同一
   capability 轉交 actor，actor 不得按 mutable pathname 重捕；且在解析 skills/config 前、
   create/resume RPC 前、及 RPC 回傳後都會用**原 handle**重驗 final path + identity。最後一道
-  fence 失敗會 best-effort disconnect/delete 新建 runtime，actor 不會可用或接收 prompt，並由既有
-  init cleanup 恰好 close root 一次；因此 POSIX rename/replacement 也不能在 proof 與 actor
-  之間把 replacement cwd 交給 SDK。
+  fence 失敗會以 bounded best-effort disconnect/delete 新建 runtime，actor 不會可用或接收 prompt，
+  並由既有 init cleanup 恰好 close root 一次。非 Windows 不啟動這套 root machinery：仍以 pathname
+  執行一般 git binding/session workflow，但沒有送檔 capability，因此不能把 replacement cwd 變成
+  Discord outbound file。
 - **可審核的檔案身份**：`secureOpen` 給出的 canonical root-relative path 會一路保留到
   `OutboundFile` 與 agent file approval；卡片同時列出完整 `Path`、檔名、大小及 comment。
-  path 含 bidi/control、換行/tab/backtick、會被轉義或截斷的字元、或超過完整顯示上限時直接拒絕，
-  不以省略號隱藏尾端。custom tool 只聲稱從 current session workdir 傳檔，不宣稱檔案由 agent
+  path 含 bidi/control、不可見 Unicode format 字元（含 U+200B）、換行/tab/backtick、會被轉義或截斷的字元、
+  或超過完整顯示上限時直接拒絕，不以省略號隱藏尾端；完整 root-relative path 以安全 inline code
+  delimiter 顯示，所以同 basename 的不同檔案不會混淆。custom tool 只聲稱從 current session workdir 傳檔，不宣稱檔案由 agent
   生成；重新開檔送出前也比對 path、digest 與 fingerprint。
 - **`.git` lexical/internal gate**：Windows 與 Darwin 都以小寫比對 `.git` segments，故 case-insensitive
   APFS/HFS+ 上的 `.GIT` 等拼法同樣拒絕，且在 pathname 預檢與 handle-derived final path 兩層都套用。
@@ -670,10 +673,11 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   使同一 thread 反覆重開配額。代價是未成功的送檔也可能耗盡該 thread 的剩餘額度。
 - **thread visibility / CDN expiry**：檔案一旦成功送出，誰看得到由 Discord thread 權限決定；附件 CDN 存續時間與快取失效屬平台行為，本程式只能如實揭露，不能保證立即失效。
 - **best-effort late deletion / platform availability**：若後續清理由 Discord API 或平台狀態限制而失敗，只能 best effort 嘗試並誠實回報；不能把未刪除說成已收回。
-- **descriptor validation portability**：Linux 的 `/proc/self/fd/<fd>` 與 Darwin 的 `/dev/fd/<fd>`
-  只在 retained root handle 存活時有意義；前者以真實 git regression 驗證，後者若主機的 git
-  無法操作該 fd path 即 fail closed。Windows 依賴 `CreateFileW` root handle 排除 delete/rename，
-  因此不能在 proof 與 actor transfer 間替換其 final path。
+- **Windows-only descriptor boundary**：對外 Discord 檔案傳送僅支援 Windows。Windows 依賴 `CreateFileW`
+  root handle 排除 delete/rename，因而不能在 proof 與 actor transfer 間替換其 final path。Linux 的
+  `/proc/self/fd/<fd>` 與 Darwin 的 `/dev/fd/<fd>` 雖可驗證 retained handle，但 SDK API 只接受 pathname，
+  沒有可保證的 fd inheritance/cwd handoff；因此非 Windows 不捕捉 root、不註冊 custom tool，`/file`
+  只回覆不可用，正常 session 仍可 create/resume。
 
 ### 18.5 §9 測試對照補記
 
@@ -681,8 +685,9 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | --- | --- |
 | `/channel enable` 缺權限診斷包含 `Attach Files` | `test/app-channels.test.ts` |
 | 所有 attachment sends 都 suppress mentions | `test/transport.test.ts` |
-| handle-bound validation path（Linux/Darwin fd path、Windows locked final path）、local/worktree git proof、approval key 僅在 descriptor proof 後導出、root swap 拒絕、actor ownership/close-once | `test/secure-open.test.ts`、`test/binding.test.ts`、`test/app-channels-race.test.ts`、`test/app-rebind.test.ts`、`test/app-reconcile.test.ts`、`test/session-actor.test.ts` |
-| `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root-relative card path、Darwin `.GIT` 拒絕、root/content/digest/path 綁定、endpoint truth、late cancellation 不算成功 | `test/outbound-file.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
+| Windows handle-bound validation path、local/worktree git proof、approval key 僅在 descriptor proof 後導出、root swap 拒絕、actor ownership/close-once；非 Windows 不開 root 卻能建立 session | `test/secure-open.test.ts`、`test/binding.test.ts`、`test/app-channels-race.test.ts`、`test/app-rebind.test.ts`、`test/app-reconcile.test.ts`、`test/session-actor.test.ts` |
+| Windows `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root-relative inline-code card path、同 basename 路徑辨別、U+200B 拒絕、root/content/digest/path 綁定、endpoint truth、late cancellation 不算成功；非 Windows 無 tool 且 `/file` 拒絕 | `test/outbound-file.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
 | 24 MiB 持久化保守預留、舊 record 遷移、session-id + generation CAS、rebind fence/單調 rollback、YOLO/abort rollback 不永久停用 `/file`、restart total、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
 | `/file` resolve/send interleaving（end、rebind-style replacement）不可附件或成功回覆 | `test/app-file-command.test.ts`、`test/transport.test.ts` |
 | session dispose 後可重新顯示一次 Attach Files 缺權限提示 | `test/transport.test.ts` |
+| README / Discord setup 中英雙檔、PLAN 與 instructions 都如實說明 Windows-only availability | `test/file-delivery-docs.test.ts` |

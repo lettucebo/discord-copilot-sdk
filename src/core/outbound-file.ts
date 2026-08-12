@@ -21,6 +21,7 @@ export interface OutboundFile {
 }
 
 export type OutboundRefusal =
+  | "unavailable"
   | "not-found"
   | "unreadable"
   | "outside-workdir"
@@ -64,6 +65,9 @@ const AGENT_ALLOWED_EXTENSIONS = new Set([
 export const DISCORD_BLOCKED_EXECUTABLE_EXTENSIONS = new Set([".exe", ".bat", ".cmd", ".scr", ".msi", ".com"]);
 export const MAX_DISCORD_UPLOAD_BYTES = 8 * 1024 * 1024;
 const FILE_DELIVERY_PATH_MAX = 512;
+/** Format controls such as U+200B have no visible representation in a Discord
+ * approval card, so a path containing one must never be approved or rendered. */
+const INVISIBLE_FORMAT_CHARACTER = /\p{Cf}/u;
 
 function isGitInternalRelative(rel: string): boolean {
   const segs = rel.split(/[\\/]+/).filter(Boolean);
@@ -119,6 +123,7 @@ function safeRootRelativePath(relativePath: string): string | undefined {
     !relativePath ||
     path.isAbsolute(relativePath) ||
     hasBidiOrControls(relativePath) ||
+    INVISIBLE_FORMAT_CHARACTER.test(relativePath) ||
     sanitizeForInlineCode(relativePath, FILE_DELIVERY_PATH_MAX) !== relativePath
   ) {
     return undefined;
@@ -161,7 +166,11 @@ export async function resolveOutboundFile(
   if (!relativePath) return { ok: false, reason: "unsafe-filename" };
 
   const displayName = path.basename(opened.finalPath);
-  if (hasBidiOrControls(displayName) || sanitizeForInlineCode(displayName) !== displayName) {
+  if (
+    hasBidiOrControls(displayName) ||
+    INVISIBLE_FORMAT_CHARACTER.test(displayName) ||
+    sanitizeForInlineCode(displayName) !== displayName
+  ) {
     return { ok: false, reason: "unsafe-filename" };
   }
 

@@ -94,11 +94,13 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20appli
 
 `permissions=326417632256` 就是下面這些權限。這個數字已向 Discord API 驗證過，會**原樣**解析成這一組、不多不少。
 
+> **平台可用性：** 對外 Discord 檔案傳送僅支援 Windows。Linux、macOS 與其他主機仍能正常執行 session，但刻意不提供 `/file` 送檔或 `discord_send_file`，所以那些平台的 bot 不需要 **Attach Files**。
+
 | 權限 | 為什麼需要 |
 | --- | --- |
 | View Channel | 看得到工作頻道。 |
 | Send Messages | 一般 bot 慣例會給；這個 bot 自己的訊息**只發在討論串**。父頻道的回覆都是 ephemeral 互動回應。想再精簡的話這是第一個可以試著拿掉的。 |
-| Attach Files | `/file` 的刻意上傳，以及 agent 提議的 `discord_send_file` 經核准後送檔，都需要它；少了這個權限時，文字功能仍可用，但檔案傳送一定失敗。 |
+| Attach Files | 在 Windows 上，`/file` 的刻意上傳，以及 agent 提議的 `discord_send_file` 經核准後送檔，都需要它；少了這個權限時，文字功能仍可用，但檔案傳送一定失敗。 |
 | Embed Links | 權限卡片是 embed。 |
 | Read Message History | 串流輸出時要編輯自己先前的訊息。 |
 | Create Public Threads | `/new` 開討論串。 |

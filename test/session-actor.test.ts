@@ -453,6 +453,35 @@ describe("SessionActor config hardening", () => {
     expect(resumed.resumeArgs?.cfg["availableTools"]).toBeUndefined();
   });
 
+  it("keeps session creation available but exposes no file capability on a non-Windows platform", async () => {
+    const retained = retainedRootDependencies(defaultWorkingDirectory);
+    const s = await setup({}, {
+      secureOpen: retained.dependencies.secureOpen,
+      fileDeliveryPlatform: "linux",
+    });
+
+    expect(retained.openDirectory).not.toHaveBeenCalled();
+    expect(retained.close).not.toHaveBeenCalled();
+    expect(s.config["tools"]).toEqual([]);
+    await expect(s.actor.resolveFileForDelivery("artifact.txt", "operator")).resolves.toEqual({
+      ok: false,
+      reason: "unavailable",
+    });
+    expect(s.session.sent).toEqual([]);
+  });
+
+  it("keeps descriptor-backed file delivery available in forced Windows test mode", async () => {
+    const retained = retainedRootDependencies(defaultWorkingDirectory);
+    const s = await setup({}, {
+      secureOpen: retained.dependencies.secureOpen,
+      fileDeliveryPlatform: "win32",
+    });
+
+    expect(retained.openDirectory).toHaveBeenCalledExactlyOnceWith(defaultWorkingDirectory);
+    expect(s.config["tools"]).toHaveLength(1);
+    expect(fileDeliveryTool(s).name).toBe(FILE_DELIVERY_TOOL);
+  });
+
   it("loads explicit repo and user skill roots without enabling config discovery", async () => {
     const root = mkdtempSync(join(tmpdir(), "dcs-session-skills-"));
     const home = join(root, "home");
@@ -840,6 +869,81 @@ describe("SessionActor trusted roots", () => {
     }
   }
 
+  it("bounds post-RPC root-fence cleanup, still deletes a new session, and closes the root", async () => {
+    const stableProof = {
+      finalPath: defaultWorkingDirectory,
+      validationPath: defaultWorkingDirectory,
+      identity: "captured-root",
+      directory: true,
+    };
+    const replacementProof = {
+      finalPath: `${defaultWorkingDirectory}-replacement`,
+      identity: "replacement-root",
+      directory: true,
+    };
+    let revalidations = 0;
+    const rootClose = vi.fn(async () => undefined);
+    const backend: SecureOpenBackend = {
+      open: async () => {
+        throw new Error("actor initialization must not open an outbound file");
+      },
+      openDirectory: async () => ({
+        ...stableProof,
+        revalidate: async () => {
+          revalidations++;
+          return revalidations === 3 ? replacementProof : stableProof;
+        },
+        close: rootClose,
+      }),
+    };
+    let releaseDisconnect: (() => void) | undefined;
+    const session = new FakeSession();
+    session.disconnect = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseDisconnect = resolve;
+        })
+    );
+    const createSession = vi.fn(async () => session);
+    const deleteSession = vi.fn(async () => undefined);
+    const client = {
+      createSession,
+      resumeSession: async () => session,
+      deleteSession,
+    } as unknown as CopilotClient;
+
+    const creating = SessionActor.createForTest(
+      client,
+      {
+        sessionKey: "root-cleanup-timeout",
+        workingDirectory: defaultWorkingDirectory,
+        skillsHomeDirectory: join(tmpdir(), `discord-copilot-sdk-no-skills-${Math.random()}`),
+        broker: new PendingInteractionBroker(),
+        transport: new FakeTransport(),
+        policy: new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`)),
+        initialFileDeliveryBytes: 0,
+        fileDeliverySessionId: "root-cleanup-timeout",
+        reserveFileDeliveryBytes: () => true,
+      },
+      { secureOpen: { backend }, postRpcCleanupTimeoutMs: 1 }
+    );
+    const outcome = await Promise.race([
+      creating.then(
+        () => "resolved" as const,
+        (error: unknown) => error
+      ),
+      new Promise<"still-pending">((resolve) => setTimeout(() => resolve("still-pending"), 50)),
+    ]);
+    releaseDisconnect?.();
+    await expect(creating).rejects.toThrow(/trusted-root|root/i);
+
+    expect(outcome).toBeInstanceOf(Error);
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(session.disconnect).toHaveBeenCalledTimes(1);
+    expect(deleteSession).toHaveBeenCalledExactlyOnceWith("fake-session-id");
+    expect(rootClose).toHaveBeenCalledTimes(1);
+  });
+
   it("uses the retained root capability when a later pathname reopen would resolve a replacement", async () => {
     const root = defaultWorkingDirectory;
     const candidate = join(root, "artifact.txt");
@@ -940,7 +1044,7 @@ describe("SessionActor permission handling", () => {
         expect(view.canOfferSession).toBe(false);
         expect(view.scopeCommands).toEqual([]);
         expect(view.summary).toContain("report.txt");
-        expect(view.summary).toContain("Path: report.txt");
+        expect(view.summary).toContain("Path: `report.txt`");
         expect(view.summary).toContain("6 bytes");
         expect(view.summary).toContain("finished 'report' for review");
         expect(view.summary).not.toMatch(/generated/i);
@@ -965,13 +1069,13 @@ describe("SessionActor permission handling", () => {
 
         const first = requestFilePermission(s, { path: draftPath }, "draft-report");
         const draftCard = await latestFilePermission(s, 0);
-        expect(draftCard.summary).toContain(`Path: ${draftPath}`);
+        expect(draftCard.summary).toContain(`Path: \`${draftPath}\``);
         s.transport.deliverDecision(draftCard.nonce, "deny", "u1");
         await expect(first).resolves.toEqual({ kind: "reject" });
 
         const second = requestFilePermission(s, { path: finalPath }, "final-report");
         const finalCard = await latestFilePermission(s, 1);
-        expect(finalCard.summary).toContain(`Path: ${finalPath}`);
+        expect(finalCard.summary).toContain(`Path: \`${finalPath}\``);
         expect(finalCard.summary).not.toBe(draftCard.summary);
         s.transport.deliverDecision(finalCard.nonce, "deny", "u1");
         await expect(second).resolves.toEqual({ kind: "reject" });

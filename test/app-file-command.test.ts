@@ -516,4 +516,41 @@ describe("/file", () => {
     expect(interaction.edits).toEqual(["檔案傳送已取消。"]);
     expect(transport.sentFiles).toHaveLength(1);
   });
+
+  it("refuses /file before resolution when the injected platform does not support safe delivery", async () => {
+    const transport = new FakeTransport();
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as CopilotClient,
+      transport,
+      new SessionStore(storeFile),
+      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json")),
+      { fileDeliveryPlatform: "linux" }
+    );
+    const workDir = path.join(reposRoot, "repo");
+    const filePath = path.join(workDir, "report.txt");
+    mkdirSync(workDir, { recursive: true });
+    writeFileSync(filePath, "hello");
+    const resolver = actorResolving({
+      ok: true,
+      file: {
+        absPath: filePath,
+        displayName: "report.txt",
+        relativePath: "report.txt",
+        size: 5,
+        fingerprint: "artifact-identity:5:1",
+        digest: "sha256:test",
+        bytes: Buffer.from("hello"),
+      },
+    });
+    sessionsOf(app).set(THREAD, session(workDir, resolver.actor));
+    const interaction = slash({ pathValue: "report.txt" });
+
+    await invokeInteraction(app, interaction);
+
+    expect(interaction.edits).toEqual(["檔案傳送在此平台無法使用（僅支援 Windows）。"]);
+    expect(resolver.resolveFileForDelivery).not.toHaveBeenCalled();
+    expect(transport.sentFiles).toHaveLength(0);
+  });
 });

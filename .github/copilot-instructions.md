@@ -114,7 +114,7 @@ an answer; a summary that is too long or contains bidi/control characters is aut
 than shown partially; and the approval reaches the SDK only *after* Discord acknowledges the click
 (`resolveButtonAck`) and only when the click came from the owning thread (`decisionBindsToChannel`
 plus `pending.sessionKey === interaction.channelId`). File delivery is a third outbound UI path,
-but only for validated workdir files aimed at the owning thread. Two paths deliberately skip the
+but only for validated workdir files aimed at the owning thread. Outbound Discord file delivery is available only on Windows. The SDK accepts only a mutable pathname `workingDirectory`, not a retained descriptor, so Linux, macOS, and other platforms must expose no `discord_send_file`, make `/file` safely unavailable, and skip all trusted-root capture machinery while normal sessions continue. Two paths deliberately skip the
 card and must stay explicit when you touch this code: an executable already approved via
 `ApprovalPolicy`, and per-session **YOLO** mode, which approves every permission before the
 kind/length/bidi checks.

@@ -112,6 +112,8 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 
 當你要刻意把 session workdir 內、經驗證的檔案上傳回擁有它的 Discord thread 時，用 `/file path:<path>`。agent 也可以提議 `discord_send_file({path,comment?})`，但它一定會顯示獨立的 Allow once / Deny 卡片、只能送 workdir 內檔案，且同樣受 Discord 8 MiB 上傳上限限制。這兩條路都需要 Discord 的 **Attach Files** 權限；所有送檔都會抑制 mentions，而 YOLO 會快速拒絕 agent 的送檔請求並提示改用 `/file`。
 
+> **平台可用性：** 對外 Discord 檔案傳送僅支援 Windows。在 Linux、macOS 與其他平台，session 和所有非送檔 bot 功能仍會正常運作，但 `/file` 會安全地回覆不可用，且不會暴露 `discord_send_file`。這是刻意的取捨：SDK 只接受 pathname `workingDirectory`，不接受保留的 descriptor，因此 POSIX 無法安全防止 create 或 resume 期間的 swap-and-restore。
+
 從既有 clone：
 
 ```bash
