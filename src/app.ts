@@ -354,9 +354,9 @@ export async function applyYoloToggle(
  * YOLO removes the human approval boundary that normally constrains this risk. */
 export function yoloOnWarning(repoSkillsLoaded: boolean): string {
   return (
-    "⚠️ **YOLO ON for this thread** — every permission request is auto-approved with **no prompt**, " +
-    "including file writes and other kinds that are normally refused. Tools run as your OS user with no sandbox.\n" +
-    "• Any approval card already waiting still needs your decision.\n" +
+    "⚠️ **YOLO ON for this thread** — other permission requests are auto-approved with **no prompt**. " +
+    "Tools run as your OS user with no sandbox.\n" +
+    "• `discord_send_file` is fast-denied in YOLO; to deliver a file, use `/file path:<file>`.\n" +
     "• This is **not** persisted: a restart or session recovery resets it to OFF.\n" +
     (repoSkillsLoaded
       ? "• ⚠️ This session loaded repository skills. Their text can steer the agent, and YOLO removes the Discord approval gate that normally constrains that risk.\n"
@@ -3220,7 +3220,7 @@ export class DiscordCopilotApp {
       // `/yolo off` may have superseded it).
       if (enabled) {
         await this.transport
-          .notice(interaction.channelId, "⚡ **YOLO mode ON** — permissions are now auto-approved for this session.")
+          .notice(interaction.channelId, "⚡ **YOLO mode ON** — other permissions are now auto-approved for this session; `discord_send_file` is fast-denied, so use `/file path:<file>` to deliver files.")
           .catch(() => {});
       }
     });

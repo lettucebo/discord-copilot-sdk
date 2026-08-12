@@ -211,10 +211,23 @@ describe("applyYoloToggle (ack-before-allow for blanket approval)", () => {
 });
 
 describe("yoloOnWarning", () => {
-  it("makes the repository-skill and YOLO risk explicit when both are active", () => {
-    expect(yoloOnWarning(true)).toMatch(/repository skills/i);
-    expect(yoloOnWarning(true)).toMatch(/YOLO/i);
-    expect(yoloOnWarning(true)).toMatch(/Discord approval gate/i);
+  it("states that YOLO auto-approves other permissions but fast-denies discord_send_file", () => {
+    const warning = yoloOnWarning(false);
+    expect(warning).toMatch(/other permission requests are auto-approved/i);
+    expect(warning).toMatch(/discord_send_file/i);
+    expect(warning).toMatch(/fast-denied/i);
+    expect(warning).toMatch(/\/file path:</i);
+    expect(warning).not.toMatch(/already waiting still needs your decision/i);
+    expect(warning).not.toMatch(/including file writes and other kinds that are normally refused/i);
+  });
+
+  it("preserves the repository-skill warning while staying truthful about file delivery", () => {
+    const warning = yoloOnWarning(true);
+    expect(warning).toMatch(/repository skills/i);
+    expect(warning).toMatch(/YOLO/i);
+    expect(warning).toMatch(/Discord approval gate/i);
+    expect(warning).toMatch(/discord_send_file/i);
+    expect(warning).toMatch(/\/file path:</i);
   });
 
   it("does not claim repository skills when none were loaded", () => {
