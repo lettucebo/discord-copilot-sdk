@@ -30,6 +30,7 @@ import { validateBinding, describeBindingProblem, type DevMode } from "./core/bi
 import { RepoProvisioner, sweepStaleStaging } from "./core/repo-provision.js";
 import { gitDiffSummary } from "./core/git.js";
 import { downloadBounded } from "./core/download.js";
+import { MAX_DISCORD_UPLOAD_BYTES, resolveOutboundFile, type OutboundRefusal } from "./core/outbound-file.js";
 import { SessionStore, type SessionRecord } from "./core/session-store.js";
 import {
   planReconcile,
@@ -802,6 +803,11 @@ export class DiscordCopilotApp {
         )
         .toJSON(),
       new SlashCommandBuilder()
+        .setName("file")
+        .setDescription("Send one file from this session's workdir")
+        .addStringOption((o) => o.setName("path").setDescription("Path inside this session workdir").setRequired(true))
+        .toJSON(),
+      new SlashCommandBuilder()
         .setName("todos")
         .setDescription("Show the agent's current todo checklist")
         .toJSON(),
@@ -921,6 +927,7 @@ export class DiscordCopilotApp {
         else if (c === "usage") await this.cmdUsage(interaction);
         else if (c === "approvals") await this.cmdApprovals(interaction);
         else if (c === "diff") await this.cmdDiff(interaction);
+        else if (c === "file") await this.cmdFile(interaction);
         else if (c === "todos") await this.cmdTodos(interaction);
         else if (c === "yolo") await this.cmdYolo(interaction);
         else if (c === "rename") await this.cmdRename(interaction);
@@ -3292,6 +3299,58 @@ export class DiscordCopilotApp {
         content: `⚠️ 無法取得 git diff：${err instanceof Error ? err.message : String(err)}`,
       });
     }
+  }
+
+  private fileRefusalMessage(reason: OutboundRefusal): string {
+    switch (reason) {
+      case "outside-workdir":
+        return "無法傳送這個檔案：路徑不在這個 session 的工作目錄內。";
+      case "not-found":
+        return "找不到指定檔案。";
+      case ".git-internal":
+        return "不能傳送 Git 內部檔案。";
+      case "not-regular-file":
+        return "指定路徑不是一般檔案。";
+      case "empty-file":
+        return "不能傳送空檔案。";
+      case "too-large":
+        return "檔案太大，無法傳送到 Discord。";
+      case "unsafe-filename":
+        return "檔名不安全，無法傳送。";
+      case "disallowed-extension":
+        return "這種檔案類型不允許直接傳送。";
+      case "unreadable":
+      default:
+        return "無法讀取這個檔案。";
+    }
+  }
+
+  private async cmdFile(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
+      await this.refuseUnauthorized(interaction);
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const session = this.sessions.get(interaction.channelId);
+    if (!session) {
+      await interaction.editReply({ content: "這個討論串沒有進行中的 session，無法傳送檔案。" });
+      return;
+    }
+    const requestedPath = interaction.options.getString("path", true);
+    const resolved = await resolveOutboundFile(session.workDir, requestedPath, {
+      policy: "operator",
+      maxBytes: MAX_DISCORD_UPLOAD_BYTES,
+    });
+    if (!resolved.ok) {
+      await interaction.editReply({ content: this.fileRefusalMessage(resolved.reason) });
+      return;
+    }
+    const sent = await this.transport.sendFile(interaction.channelId, resolved.file);
+    if (!sent.ok) {
+      await interaction.editReply({ content: "檔案已解析，但傳送到 Discord 失敗。" });
+      return;
+    }
+    await interaction.editReply({ content: "已將檔案傳送到這個討論串。" });
   }
 
   private async cmdTodos(interaction: ChatInputCommandInteraction): Promise<void> {

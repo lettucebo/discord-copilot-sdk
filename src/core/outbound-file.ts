@@ -50,6 +50,7 @@ const AGENT_ALLOWED_EXTENSIONS = new Set([
 ]);
 
 export const DISCORD_BLOCKED_EXECUTABLE_EXTENSIONS = new Set([".exe", ".bat", ".cmd", ".scr", ".msi", ".com"]);
+export const MAX_DISCORD_UPLOAD_BYTES = 8 * 1024 * 1024;
 
 function isGitInternalRelative(rel: string): boolean {
   const segs = rel.split(/[\\/]+/).filter(Boolean);
