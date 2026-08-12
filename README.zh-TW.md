@@ -108,6 +108,10 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 
 完整指引在 [`INSTALL.zh-TW.md`](INSTALL.zh-TW.md)。Discord bot 本身的設定——application、必要的 Message Content intent、invite permissions 與四個 ID——在 [`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md)。
 
+### 檔案傳送
+
+當你要刻意把 session workdir 內、經驗證的檔案上傳回擁有它的 Discord thread 時，用 `/file path:<path>`。agent 也可以提議 `discord_send_file({path,comment?})`，但它一定會顯示獨立的 Allow once / Deny 卡片、只能送 workdir 內檔案，且同樣受 Discord 8 MiB 上傳上限限制。這兩條路都需要 Discord 的 **Attach Files** 權限；所有送檔都會抑制 mentions，而 YOLO 會快速拒絕 agent 的送檔請求並提示改用 `/file`。
+
 從既有 clone：
 
 ```bash

@@ -85,26 +85,29 @@ Discord 不允許「私有 App」帶著公開安裝連結，所以**順序是反
 把下面網址中的 `YOUR_APP_ID` 換成 **General Information** 分頁的 **Application ID**：
 
 ```text
-https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20applications.commands&permissions=326417599488
+https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20applications.commands&permissions=326417632256
 ```
 
 在瀏覽器開啟 → 選你的伺服器 → **Authorize**。
 
 ### 這串數字是什麼
 
-`permissions=326417599488` 就是下面這些權限。這個數字已向 Discord API 驗證過，會**原樣**解析成這一組、不多不少。
+`permissions=326417632256` 就是下面這些權限。這個數字已向 Discord API 驗證過，會**原樣**解析成這一組、不多不少。
 
 | 權限 | 為什麼需要 |
 | --- | --- |
 | View Channel | 看得到工作頻道。 |
 | Send Messages | 一般 bot 慣例會給；這個 bot 自己的訊息**只發在討論串**。父頻道的回覆都是 ephemeral 互動回應。想再精簡的話這是第一個可以試著拿掉的。 |
+| Attach Files | `/file` 的刻意上傳，以及 agent 提議的 `discord_send_file` 經核准後送檔，都需要它；少了這個權限時，文字功能仍可用，但檔案傳送一定失敗。 |
 | Embed Links | 權限卡片是 embed。 |
 | Read Message History | 串流輸出時要編輯自己先前的訊息。 |
 | Create Public Threads | `/new` 開討論串。 |
 | Send Messages in Threads | **在討論串發言**。`Send Messages` 對討論串無效。 |
 | Manage Threads | 只用在一件事：`/new` 失敗時清掉剛建的空討論串。 |
 
-**想給更少權限**：拿掉 `Manage Threads`，改用 `permissions=309237730304`。所有功能照常，**唯一差別**是 `/new` 中途失敗時會留下一個空討論串要你自己刪。
+**已經邀請過 bot？** 如果你之前用的是舊的安裝連結，bot 身分組**不會**自動多出 `Attach Files`；你需要重新授權這個 application，或手動在工作頻道補上該權限。舊的 thread 文字功能仍可用，但 `/file` 與核准後的送檔在補權限前都會失敗。
+
+**想給更少權限**：拿掉 `Manage Threads`，改用 `permissions=309237763072`。所有功能照常，**唯一差別**是 `/new` 中途失敗時會留下一個空討論串要你自己刪。
 
 > 改討論串名稱（自動命名與 `/rename`）**不需要** `Manage Threads` —— Discord 允許討論串的建立者改自己的討論串名稱，而討論串正是這個 bot 建的。
 

@@ -603,3 +603,43 @@ unsupported kinds 繼續送 `{kind:"user-not-available"}`。`reject` 沒有 `for
 explicit repo skill 載入、empty source 真的移除 tool、`allowed-tools` 不繞過 permission host、
 `reject` 被 runtime 接受、nested repo / linked user skill 是否可載入，以及 resume 是否套用
 explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次升級 Copilot CLI 必跑。
+
+## 18. 檔案傳送：`/file` + `discord_send_file`（2026-08-12）
+
+### 18.1 採納方案
+
+採用**雙路徑、同一安全邊界**：
+
+1. 使用者明示的 `/file path:<path>`：只允許 session workdir 內、經 canonical path 驗證的檔案，直接送回擁有該 session 的 Discord thread。
+2. agent tool `discord_send_file({path,comment?})`：由 host 註冊、repo extension allow-list 控制、每次都要獨立 Allow once / Deny 卡，不提供 session-scope 擴權。
+
+我建議這個方案，因為它把「人主動送檔」與「agent 建議送檔」分開：前者保留明確操作捷徑，後者保留審批與可追溯性；兩者共用 workdir/root 綁定、內容驗證與 Discord 送檔事實回報，風險面最小，也最符合既有 fail-closed/一次一授權模型。
+
+### 18.2 否決方案與取捨
+
+1. **自動送檔、沒有卡片**：優點是 friction 最低；缺點是 agent 只要拿到檔案路徑就能直接把內容送出 Discord，等同新增一條無人工確認的外流通道。與現有 approval model 衝突，故否決。
+2. **把 `discord_send_file` 納入 YOLO 自動核准**：優點是行為一致；缺點是 YOLO 本來就已移除最後一道 Discord permission gate，而送檔是額外 outbound exfiltration path，風險明顯更高。故刻意 fast-deny 並提示改用 `/file`。
+3. **使用未記錄/未文件化的雲端上傳或暫存轉交**：理論上可繞過部分本機限制，但缺點是平台行為、權限、保留期限與審計語義都不穩定，且會引入第三條未揭露的資料流。因缺乏可驗證契約，故否決。
+
+### 18.3 安全與競態防護
+
+- **root handle capability**：每個檔案送出都綁定到 session 當下的 workdir root；不接受 root 外、跨 repo、或利用相對路徑跳脫的檔案。
+- **content digest / endpoint truth**：送出前先固定內容與 digest；成功與否以 Discord 端點回應為準。即使取消發生在送出接近完成時，也只能回報 endpoint 真實結果，不得樂觀宣稱成功。
+- **YOLO fast deny**：`discord_send_file` 在 YOLO 下不是「自動允許」，而是立即拒絕並告知改走 `/file`。這是刻意把 outbound file capability 排除在 YOLO 的風險接受之外。
+- **allow-once only**：agent 路徑沒有 repo/session 級常駐授權；每次送檔都重新決定。
+- **mentions suppression**：所有 attachment sends 都必須保留 `allowedMentions:{parse:[]}`，避免 agent 藉檔案說明或 UI 路徑 ping 人。
+
+### 18.4 平台事實與殘留風險
+
+- **8 MiB 上限**：以 Discord 實際上傳上限為準；超過即拒絕。
+- **取消不是回溯刪除保證**：若取消發生在 endpoint 已接近完成時，檔案可能短暫可見；但這種 late visibility **不得**被報告成成功，也不得算入成功計數。
+- **thread visibility / CDN expiry**：檔案一旦成功送出，誰看得到由 Discord thread 權限決定；附件 CDN 存續時間與快取失效屬平台行為，本程式只能如實揭露，不能保證立即失效。
+- **best-effort late deletion / platform availability**：若後續清理由 Discord API 或平台狀態限制而失敗，只能 best effort 嘗試並誠實回報；不能把未刪除說成已收回。
+
+### 18.5 §9 測試對照補記
+
+| §9 需求 / 新增風險 | 覆蓋 |
+| --- | --- |
+| `/channel enable` 缺權限診斷包含 `Attach Files` | `test/app-channels.test.ts` |
+| 所有 attachment sends 都 suppress mentions | `test/transport.test.ts` |
+| `discord_send_file` Allow once / Deny、YOLO fast deny、root/content/digest 綁定、endpoint truth、late cancellation 不算成功 | `test/session-actor.test.ts`、`test/app-file.test.ts`（若後續拆分檔案，仍需保持此對照） |

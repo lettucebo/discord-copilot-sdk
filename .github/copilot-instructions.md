@@ -2,9 +2,11 @@
 
 A Discord bot that drives the **local** GitHub Copilot engine through the official
 `@github/copilot-sdk` (JSON-RPC). One Discord thread ⇄ one Copilot session. The agent's
-messages and tool calls stream into the thread; **shell** permission requests, `ask_user`
-questions and exit-plan actions get Discord button UI. Every other permission kind, and
-`onElicitationRequest`, are registered but deliberately fail closed (deny / cancel + notice).
+messages and tool calls stream into the thread; outbound UI is limited to thread renders,
+Discord decision cards, and validated file sends into the owning thread. **shell** permission
+requests, `ask_user` questions and exit-plan actions get Discord button UI. Every other
+permission kind, and `onElicitationRequest`, are registered but deliberately fail closed
+(deny / cancel + notice).
 
 ## Commands
 
@@ -111,12 +113,16 @@ kinds deny; timeouts and aborts resolve to deny/cancel; `ask_user` throws rather
 an answer; a summary that is too long or contains bidi/control characters is auto-denied rather
 than shown partially; and the approval reaches the SDK only *after* Discord acknowledges the click
 (`resolveButtonAck`) and only when the click came from the owning thread (`decisionBindsToChannel`
-plus `pending.sessionKey === interaction.channelId`). Two paths deliberately skip the card and
-must stay explicit when you touch this code: an executable already approved via `ApprovalPolicy`,
-and per-session **YOLO** mode, which approves every permission before the kind/length/bidi checks.
+plus `pending.sessionKey === interaction.channelId`). File delivery is a third outbound UI path,
+but only for validated workdir files aimed at the owning thread. Two paths deliberately skip the
+card and must stay explicit when you touch this code: an executable already approved via
+`ApprovalPolicy`, and per-session **YOLO** mode, which approves every permission before the
+kind/length/bidi checks.
 
 **YOLO mode is never persisted.** It is actor-local and volatile so a restart or resume always
-comes back OFF; enabling it only takes effect after Discord acknowledges the warning.
+comes back OFF; enabling it only takes effect after Discord acknowledges the warning. The
+`discord_send_file` tool is an explicit exception: YOLO never auto-approves it and instead
+fast-denies with guidance to use `/file`.
 
 **Do not re-enable broad SDK discovery or file hooks.** `enableFileHooks` and
 `enableConfigDiscovery` stay `false`, and `skipCustomInstructions` stays `true` in

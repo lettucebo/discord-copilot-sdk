@@ -85,26 +85,29 @@ Removing the install link does **not** affect a bot already in your server: slas
 Replace `YOUR_APP_ID` below with the **Application ID** from the **General Information** tab:
 
 ```text
-https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20applications.commands&permissions=326417599488
+https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20applications.commands&permissions=326417632256
 ```
 
 Open it in a browser → pick your server → **Authorize**.
 
 ### What that number is
 
-`permissions=326417599488` is exactly the set below. The integer was verified against the Discord API: it round-trips to precisely these permissions, no more.
+`permissions=326417632256` is exactly the set below. The integer was verified against the Discord API: it round-trips to precisely these permissions, no more.
 
 | Permission | Why |
 | --- | --- |
 | View Channel | See the work channel. |
 | Send Messages | Conventionally granted; this bot's own messages go **only into threads**. Parent-channel replies are ephemeral interaction responses. If you want to trim further, this is the first one to try removing. |
+| Attach Files | Required for deliberate `/file` uploads and agent-proposed `discord_send_file` approvals; without it, file delivery fails even when the thread itself works. |
 | Embed Links | Approval cards are embeds. |
 | Read Message History | Edit its own earlier messages while streaming. |
 | Create Public Threads | `/new` opens a thread. |
 | Send Messages in Threads | **Talk in threads**. `Send Messages` has no effect there. |
 | Manage Threads | One job only: deleting the empty thread left by a failed `/new`. |
 
-**Want to grant less**: drop `Manage Threads` and use `permissions=309237730304`. Everything still works; the **only** difference is that a failed `/new` leaves an empty thread for you to delete.
+**Already invited the bot?** If you used an older install link, the bot role does **not** gain `Attach Files` until you re-authorize the application (or grant the channel permission manually). Existing threads keep working for text, but `/file` and approved file sends will fail until that permission is added.
+
+**Want to grant less**: drop `Manage Threads` and use `permissions=309237763072`. Everything still works; the **only** difference is that a failed `/new` leaves an empty thread for you to delete.
 
 > Renaming threads (auto-title and `/rename`) does **not** need `Manage Threads` — Discord lets a thread's creator rename it, and the bot is the creator.
 

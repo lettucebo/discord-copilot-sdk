@@ -190,6 +190,10 @@ Full instructions are in [`INSTALL.md`](INSTALL.md). Setting up the Discord bot 
 application, the required Message Content intent, invite permissions, and the
 four IDs — is in [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md).
 
+### File delivery
+
+Use `/file path:<path>` when you deliberately want to upload a validated file from the session's workdir to the owning Discord thread. Agents can also propose `discord_send_file({path,comment?})`, but it always requires its own Allow once / Deny card, is limited to workdir files, and shares the same 8 MiB Discord upload cap. The bot needs Discord's **Attach Files** permission for both paths, all file sends suppress mentions, and YOLO fast-denies agent file-send requests with a notice to use `/file` instead.
+
 From an existing clone:
 
 ```bash

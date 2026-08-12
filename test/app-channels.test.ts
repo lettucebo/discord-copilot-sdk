@@ -253,6 +253,7 @@ describe("/channel", () => {
     await enabling;
 
     expect(interaction.edits.join("\n")).toContain("缺少這些權限");
+    expect(interaction.edits.join("\n")).toContain("Attach Files");
     expect(registry.has(SECONDARY)).toBe(true);
     const snapshot: AuthPolicy = {
       allowedUserIds: new Set([OWNER]),

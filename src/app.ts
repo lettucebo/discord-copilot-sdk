@@ -137,6 +137,7 @@ const REQUIRED_CHANNEL_PERMISSIONS: ReadonlyArray<{ flag: bigint; label: string 
   { flag: PermissionFlagsBits.SendMessages, label: "Send Messages" },
   { flag: PermissionFlagsBits.CreatePublicThreads, label: "Create Public Threads" },
   { flag: PermissionFlagsBits.SendMessagesInThreads, label: "Send Messages in Threads" },
+  { flag: PermissionFlagsBits.AttachFiles, label: "Attach Files" },
   { flag: PermissionFlagsBits.EmbedLinks, label: "Embed Links" },
   { flag: PermissionFlagsBits.ReadMessageHistory, label: "Read Message History" },
 ];
