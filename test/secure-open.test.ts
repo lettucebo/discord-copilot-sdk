@@ -67,7 +67,12 @@ async function secureOpenForTest(
   options: { maxBytes: number },
   dependencies: SecureOpenDependencies = {}
 ) {
-  return secureOpen(candidate, await captureTrustedRoot(root, dependencies), options, dependencies);
+  const trustedRoot = await captureTrustedRoot(root, dependencies);
+  try {
+    return await secureOpen(candidate, trustedRoot, options);
+  } finally {
+    await trustedRoot.close();
+  }
 }
 
 function posixStat(options: {
@@ -95,62 +100,124 @@ afterEach(() => {
 });
 
 describe("secureOpen", () => {
-  it("refuses a replaced root before an external candidate can be opened", async () => {
+  it("retains one opaque root handle and never reopens a replacement root pathname", async () => {
     const lexicalRoot = "/work/session";
     const originalRoot = "/canonical/original-session";
-    const replacementRoot = "/attacker/external-session";
-    const candidateOpen = vi.fn(async (): Promise<SecureOpenedFile> => {
-      throw new Error("a replaced root must not open a candidate");
+    const candidate = `${lexicalRoot}/artifact.txt`;
+    const rootClose = vi.fn(async () => undefined);
+    const candidateClose = vi.fn(async () => undefined);
+    const candidateOpen = vi.fn(async (_candidate: string, _maxBytes: number): Promise<SecureOpenedFile> => {
+      return {
+        finalPath: `${originalRoot}/artifact.txt`,
+        regular: true,
+        size: 6,
+        linkCount: 1,
+        identity: "candidate:1",
+        modifiedAt: "candidate-time",
+        read: async () => Buffer.from("inside"),
+        close: candidateClose,
+      };
     });
-    const captureClose = vi.fn(async () => undefined);
-    const deliveryClose = vi.fn(async () => undefined);
+    const revalidate = vi.fn(async () => ({
+      finalPath: originalRoot,
+      identity: "7:101",
+      directory: true,
+    }));
+    const openDirectory = vi
+      .fn()
+      .mockResolvedValueOnce({
+        finalPath: originalRoot,
+        identity: "7:101",
+        directory: true,
+        openCandidate: candidateOpen,
+        revalidate,
+        close: rootClose,
+      })
+      .mockRejectedValue(new Error("the mutable root pathname must never be reopened"));
     const backend: SecureOpenBackend = {
-      open: candidateOpen,
-      openDirectory: vi
-        .fn()
-        .mockResolvedValueOnce({
-          finalPath: originalRoot,
-          identity: "7:101",
-          directory: true,
-          revalidate: async () => ({
-            finalPath: originalRoot,
-            identity: "7:101",
-            directory: true,
-          }),
-          close: captureClose,
-        })
-        .mockResolvedValueOnce({
-          finalPath: replacementRoot,
-          identity: "9:202",
-          directory: true,
-          openCandidate: candidateOpen,
-          revalidate: async () => ({
-            finalPath: replacementRoot,
-            identity: "9:202",
-            directory: true,
-          }),
-          close: deliveryClose,
-        }),
+      open: vi.fn(async () => {
+        throw new Error("a POSIX candidate must use the retained root descriptor");
+      }),
+      openDirectory,
     };
     const dependencies = posixHandlePathDependencies(backend);
 
     const anchor = await captureTrustedRoot(lexicalRoot, dependencies);
 
-    expect(JSON.parse(JSON.stringify(anchor))).toEqual({
-      originalPath: lexicalRoot,
-      finalPath: originalRoot,
-      identity: "7:101",
+    expect(JSON.parse(JSON.stringify(anchor))).toEqual({});
+    const CapabilityConstructor = anchor.constructor as unknown as new (...args: unknown[]) => unknown;
+    expect(() =>
+      new CapabilityConstructor({
+        originalPath: lexicalRoot,
+        finalPath: originalRoot,
+        identity: "7:101",
+      })
+    ).toThrow(/trusted root capability/i);
+    expect(rootClose).not.toHaveBeenCalled();
+    await expect(secureOpen(candidate, anchor, { maxBytes: 64 })).resolves.toMatchObject({
+      finalPath: `${originalRoot}/artifact.txt`,
+      bytes: Buffer.from("inside"),
     });
-    await expect(
-      secureOpen(`${lexicalRoot}/artifact.txt`, anchor, { maxBytes: 64 }, dependencies)
-    ).rejects.toMatchObject({
+    expect(openDirectory).toHaveBeenCalledTimes(1);
+    expect(openDirectory).toHaveBeenCalledWith(lexicalRoot);
+    expect(candidateOpen).toHaveBeenCalledWith(candidate, 64);
+    expect(revalidate).toHaveBeenCalledTimes(2);
+    expect(rootClose).not.toHaveBeenCalled();
+
+    await anchor.close();
+    await anchor.close();
+    expect(candidateClose).toHaveBeenCalledTimes(1);
+    expect(rootClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the captured root handle open across multiple resolutions then fences use after close", async () => {
+    const root = "/trusted-worktree";
+    const candidate = `${root}/artifact.txt`;
+    const rootClose = vi.fn(async () => undefined);
+    const candidateClose = vi.fn(async () => undefined);
+    const openCandidate = vi.fn(async (): Promise<SecureOpenedFile> => ({
+      finalPath: candidate,
+      regular: true,
+      size: 6,
+      linkCount: 1,
+      identity: "candidate:1",
+      modifiedAt: "candidate-time",
+      read: async () => Buffer.from("inside"),
+      close: candidateClose,
+    }));
+    const proof = {
+      finalPath: root,
+      identity: "root:1",
+      directory: true,
+    };
+    const backend: SecureOpenBackend = {
+      open: vi.fn(async () => {
+        throw new Error("candidate lookup must remain rooted in the retained handle");
+      }),
+      openDirectory: vi.fn(async () => ({
+        ...proof,
+        openCandidate,
+        revalidate: async () => proof,
+        close: rootClose,
+      })),
+    };
+    const dependencies = posixHandlePathDependencies(backend);
+    const anchor = await captureTrustedRoot(root, dependencies);
+
+    await expect(secureOpen(candidate, anchor, { maxBytes: 64 })).resolves.toMatchObject({
+      bytes: Buffer.from("inside"),
+    });
+    await expect(secureOpen(candidate, anchor, { maxBytes: 64 })).resolves.toMatchObject({
+      bytes: Buffer.from("inside"),
+    });
+    expect(backend.openDirectory).toHaveBeenCalledTimes(1);
+    expect(rootClose).not.toHaveBeenCalled();
+
+    await anchor.close();
+    await expect(secureOpen(candidate, anchor, { maxBytes: 64 })).rejects.toMatchObject({
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
-    expect(candidateOpen).not.toHaveBeenCalled();
-    expect(backend.openDirectory).toHaveBeenNthCalledWith(1, lexicalRoot);
-    expect(backend.openDirectory).toHaveBeenNthCalledWith(2, lexicalRoot);
-    expect(captureClose).toHaveBeenCalledTimes(1);
-    expect(deliveryClose).toHaveBeenCalledTimes(1);
+    expect(rootClose).toHaveBeenCalledTimes(1);
   });
 
   it("returns bytes and handle-derived metadata for an ordinary file inside the trusted root", async () => {
@@ -179,14 +246,24 @@ describe("secureOpen", () => {
     const closeRoot = vi.fn(async () => {
       events.push("close root");
     });
-    const revalidate = vi.fn(async () => {
-      events.push("revalidate root");
-      return {
-        finalPath: replacementRoot,
-        identity: "root-handle",
-        directory: true,
-      };
-    });
+    const revalidate = vi
+      .fn()
+      .mockImplementationOnce(async () => {
+        events.push("revalidate root");
+        return {
+          finalPath: root,
+          identity: "root-handle",
+          directory: true,
+        };
+      })
+      .mockImplementationOnce(async () => {
+        events.push("revalidate root");
+        return {
+          finalPath: replacementRoot,
+          identity: "root-handle",
+          directory: true,
+        };
+      });
     const backend: SecureOpenBackend = {
       open: vi.fn(async (): Promise<SecureOpenedFile> => {
         events.push("open candidate");
@@ -217,11 +294,10 @@ describe("secureOpen", () => {
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
     expect(read).not.toHaveBeenCalled();
-    expect(revalidate).toHaveBeenCalledTimes(1);
+    expect(revalidate).toHaveBeenCalledTimes(2);
     expect(events).toEqual([
       "open root",
-      "close root",
-      "open root",
+      "revalidate root",
       "open candidate",
       "revalidate root",
       "close candidate",
@@ -240,14 +316,24 @@ describe("secureOpen", () => {
     const closeRoot = vi.fn(async () => {
       events.push("close root");
     });
-    const revalidate = vi.fn(async () => {
-      events.push("revalidate root");
-      return {
-        finalPath: `${root} (deleted)`,
-        identity: "root-handle",
-        directory: false,
-      };
-    });
+    const revalidate = vi
+      .fn()
+      .mockImplementationOnce(async () => {
+        events.push("revalidate root");
+        return {
+          finalPath: root,
+          identity: "root-handle",
+          directory: true,
+        };
+      })
+      .mockImplementationOnce(async () => {
+        events.push("revalidate root");
+        return {
+          finalPath: `${root} (deleted)`,
+          identity: "root-handle",
+          directory: false,
+        };
+      });
     const backend: SecureOpenBackend = {
       open: vi.fn(async (): Promise<SecureOpenedFile> => {
         events.push("open candidate");
@@ -278,11 +364,10 @@ describe("secureOpen", () => {
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
     expect(read).not.toHaveBeenCalled();
-    expect(revalidate).toHaveBeenCalledTimes(1);
+    expect(revalidate).toHaveBeenCalledTimes(2);
     expect(events).toEqual([
       "open root",
-      "close root",
-      "open root",
+      "revalidate root",
       "open candidate",
       "revalidate root",
       "close candidate",
@@ -334,10 +419,10 @@ describe("secureOpen", () => {
     await expect(secureOpenForTest(candidate, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
       reason: "outside-root",
     } satisfies Partial<SecureOpenError>);
-    expect(events).toEqual(["root", "root", "candidate"]);
+    expect(events).toEqual(["root", "candidate"]);
     expect(read).not.toHaveBeenCalled();
     expect(closeCandidate).toHaveBeenCalledTimes(1);
-    expect(closeRoot).toHaveBeenCalledTimes(2);
+    expect(closeRoot).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a case-distinct Win32 handle path sibling", async () => {
@@ -386,11 +471,18 @@ describe("secureOpen", () => {
         finalPath: root,
         identity: "root-handle",
         directory: true,
-        revalidate: async () => ({
-          finalPath: String.raw`C:\work\repo`,
-          identity: "root-handle",
-          directory: true,
-        }),
+        revalidate: vi
+          .fn()
+          .mockResolvedValueOnce({
+            finalPath: root,
+            identity: "root-handle",
+            directory: true,
+          })
+          .mockResolvedValueOnce({
+            finalPath: String.raw`C:\work\repo`,
+            identity: "root-handle",
+            directory: true,
+          }),
         close: closeRoot,
       })),
     };
@@ -402,7 +494,7 @@ describe("secureOpen", () => {
     } satisfies Partial<SecureOpenError>);
     expect(read).not.toHaveBeenCalled();
     expect(closeCandidate).toHaveBeenCalledTimes(1);
-    expect(closeRoot).toHaveBeenCalledTimes(2);
+    expect(closeRoot).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a three-phase swap from the opened handle path before reading external bytes", async () => {
@@ -567,7 +659,7 @@ describe("secureOpen", () => {
     expect(close).toHaveBeenCalledTimes(2);
     expect(close).toHaveBeenCalledWith(42);
     expect(close).toHaveBeenCalledWith(43);
-    expect(rootHandle.close).toHaveBeenCalledTimes(2);
+    expect(rootHandle.close).toHaveBeenCalledTimes(1);
   });
 
   it("rejects an intermediate POSIX symlink without reading a candidate fd", async () => {

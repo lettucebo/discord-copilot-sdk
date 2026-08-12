@@ -13,7 +13,7 @@ import {
   type OutboundFilePolicy,
   type ResolveOutboundFileResult,
 } from "../core/outbound-file.js";
-import { captureTrustedRoot, type TrustedRoot } from "../core/secure-open.js";
+import { captureTrustedRoot, type SecureOpenDependencies, type TrustedRoot } from "../core/secure-open.js";
 
 const PERMISSION_TIMEOUT_MS = 5 * 60_000;
 const TURN_WATCHDOG_MS = 15 * 60_000;
@@ -165,6 +165,12 @@ export interface SessionActorOpts {
   skillsHomeDirectory?: string;
 }
 
+/** @internal Test-only seams for the OS-handle security boundary. Production
+ * callers use the platform backend captured by secure-open itself. */
+export interface SessionActorCreateDependencies {
+  secureOpen?: SecureOpenDependencies;
+}
+
 /** A raw-bytes attachment for send() — Discord images become blobs (P5). */
 export interface BlobAttachment {
   type: "blob";
@@ -189,8 +195,9 @@ export interface BlobAttachment {
  */
 export class SessionActor {
   private session!: CopilotSession;
-  /** Captured before the SDK session starts, then reused for every file lookup. */
-  private trustedRoot!: TrustedRoot;
+  /** Captured before the SDK session starts, then owned until one teardown path
+   * releases it. Clearing this field fences every later file lookup. */
+  private trustedRoot?: TrustedRoot;
   private renderer = new TurnRenderer();
   /** True after send() accepts a prompt and until runTurn() observes its terminal outcome. */
   private turnActive = false;
@@ -280,22 +287,46 @@ export class SessionActor {
   /** Per-nonce exit-plan metadata (actions for index→action mapping). */
   private readonly pendingPlan = new Map<string, { actions: string[] }>();
 
-  private constructor(private readonly opts: SessionActorOpts) {
+  private constructor(
+    private readonly opts: SessionActorOpts,
+    private readonly dependencies: SessionActorCreateDependencies
+  ) {
     this.generation = opts.generation ?? 1;
     this.currentModel = opts.model;
     this.currentContext = opts.contextTier;
     this.auditLog = opts.auditLog ?? new AuditLog();
   }
 
-  static async create(client: CopilotClient, opts: SessionActorOpts): Promise<SessionActor> {
-    const actor = new SessionActor(opts);
-    await actor.initTrustedRoot();
-    await actor.init(client);
-    return actor;
+  static async create(
+    client: CopilotClient,
+    opts: SessionActorOpts,
+    dependencies: SessionActorCreateDependencies = {}
+  ): Promise<SessionActor> {
+    const actor = new SessionActor(opts, dependencies);
+    try {
+      await actor.initTrustedRoot();
+      await actor.init(client);
+      return actor;
+    } catch (error) {
+      try {
+        await actor.closeTrustedRoot();
+      } catch {
+        // The actor is never returned after initialization fails; the original
+        // SDK error remains the actionable failure and close was attempted once.
+      }
+      throw error;
+    }
   }
 
   private async initTrustedRoot(): Promise<void> {
-    this.trustedRoot = await captureTrustedRoot(this.opts.workingDirectory);
+    this.trustedRoot = await captureTrustedRoot(this.opts.workingDirectory, this.dependencies.secureOpen);
+  }
+
+  private async closeTrustedRoot(): Promise<void> {
+    const trustedRoot = this.trustedRoot;
+    if (!trustedRoot) return;
+    this.trustedRoot = undefined;
+    await trustedRoot.close();
   }
 
   private async init(client: CopilotClient): Promise<void> {
@@ -557,7 +588,11 @@ export class SessionActor {
     requestedPath: string,
     policy: OutboundFilePolicy
   ): Promise<ResolveOutboundFileResult> {
-    return resolveOutboundFile(this.trustedRoot, requestedPath, {
+    const trustedRoot = this.trustedRoot;
+    if (this.lifecycle !== "active" || !trustedRoot) {
+      return { ok: false, reason: "unreadable" };
+    }
+    return resolveOutboundFile(trustedRoot, requestedPath, {
       policy,
       maxBytes: MAX_DISCORD_UPLOAD_BYTES,
     });
@@ -1474,24 +1509,40 @@ export class SessionActor {
     this.unsubscribeChoice?.();
     this.unsubscribePlan?.();
     this.clearTodosTimer();
-    // Transition to `closed` ONLY after the RPC confirms; on failure become a
-    // permanent fault fence and rethrow, so a retry can't masquerade as success.
-    this.disconnectPromise = this.session.disconnect().then(
-      () => {
-        this.lifecycle = "closed";
-        // Release anyone waiting for a `session.idle` that can no longer arrive
-        // (e.g. /new tore this session down mid-turn). Without this the old
-        // runTurn sits until its watchdog fires and then posts a bogus
-        // "did not stop cleanly" notice into a thread the user has left.
-        this.releaseIdleWaiters();
-      },
-      (err) => {
+    // Transition to `closed` ONLY after the RPC and retained-root close both
+    // confirm. A failed RPC still releases the root capability: retaining a
+    // live directory handle after this actor becomes a permanent fault fence
+    // would leak it (and can block Windows worktree cleanup indefinitely).
+    this.disconnectPromise = (async () => {
+      let failed = false;
+      let failure: unknown;
+      try {
+        await this.session.disconnect();
+      } catch (error) {
+        failed = true;
+        failure = error;
+      }
+      try {
+        await this.closeTrustedRoot();
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          failure = error;
+        }
+      }
+
+      // Release anyone waiting for a `session.idle` that can no longer arrive
+      // (e.g. /new tore this session down mid-turn). Without this the old
+      // runTurn sits until its watchdog fires and then posts a bogus
+      // "did not stop cleanly" notice into a thread the user has left.
+      this.releaseIdleWaiters();
+      if (failed) {
         this.lifecycle = "faulted";
         this.disconnectPromise = undefined;
-        this.releaseIdleWaiters();
-        throw err;
+        throw failure;
       }
-    );
+      this.lifecycle = "closed";
+    })();
     return this.disconnectPromise;
   }
 
@@ -1517,6 +1568,12 @@ export class SessionActor {
     this.unsubscribeChoice?.();
     this.unsubscribePlan?.();
     this.clearTodosTimer();
+    // Fence new resolutions and start draining the retained handle, but do not
+    // let a stuck read defer the bounded SDK disconnect below. The capability
+    // itself waits for that read before issuing its one close.
+    void this.closeTrustedRoot().catch(() => {
+      // The actor is already a permanent fault fence; close was attempted once.
+    });
     const timeout = new Promise<void>((res) => {
       const t = setTimeout(res, FAULT_DISCONNECT_MS);
       (t as { unref?: () => void }).unref?.();

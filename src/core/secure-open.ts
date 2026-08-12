@@ -41,23 +41,6 @@ export interface SecureOpenOptions {
   maxBytes: number;
 }
 
-declare const trustedRootBrand: unique symbol;
-
-/**
- * A scalar snapshot of the directory an actor was allowed to use. The hidden
- * type brand prevents ordinary callers from constructing a root from a mutable
- * pathname; its enumerable fields intentionally remain JSON-serializable.
- */
-export interface TrustedRoot {
-  /** Absolute lexical pathname captured for component derivation and reopening. */
-  readonly originalPath: string;
-  /** Exact normalized final path reported by the capture-time directory handle. */
-  readonly finalPath: string;
-  /** Handle-derived directory identity (`dev:ino` or volume/file index). */
-  readonly identity: string;
-  readonly [trustedRootBrand]: true;
-}
-
 /**
  * The platform backend must expose facts from exactly one still-open OS handle.
  * It must not re-resolve `finalPath` through a pathname after opening.
@@ -102,6 +85,61 @@ export interface SecureOpenDependencies {
   /** Test-only lexical grammar for fake handle paths; production always uses the native default. */
   pathMode?: "win32" | "posix";
 }
+
+interface TrustedRootState {
+  readonly originalPath: string;
+  readonly finalPath: string;
+  readonly identity: string;
+  readonly openedRoot: SecureOpenedDirectory;
+  readonly backend: SecureOpenBackend;
+  readonly pathMode: "win32" | "posix";
+  activeUses: number;
+  closing: boolean;
+  closePromise?: Promise<void>;
+  closeWaiter?: () => void;
+}
+
+const trustedRootStates = new WeakMap<object, TrustedRootState>();
+const trustedRootConstructionToken = Symbol("trusted-root-capability");
+
+/**
+ * A non-serializable capability over one live, capture-time directory handle.
+ * Its constructor is deliberately module-private: a pathname and scalar file
+ * id must never be sufficient to manufacture a trusted root.
+ */
+class TrustedRootCapability {
+  // Gives the exported alias nominal runtime/type identity without exposing
+  // any mutable path or proof fields to callers.
+  readonly #opaque = true;
+
+  constructor(token: symbol, state: TrustedRootState) {
+    if (token !== trustedRootConstructionToken) {
+      throw refusal("unreadable", "Only captureTrustedRoot can create a trusted root capability.");
+    }
+    trustedRootStates.set(this, state);
+  }
+
+  /** Lexical input anchor only; secure resolution remains handle-bound. */
+  get originalPath(): string {
+    return trustedRootState(this).originalPath;
+  }
+
+  /** True from the instant teardown begins, including while active reads drain. */
+  get closed(): boolean {
+    return trustedRootState(this).closing;
+  }
+
+  /**
+   * Releases the retained handle exactly once. New resolutions fail immediately;
+   * a resolution already using the handle drains before its close runs.
+   */
+  close(): Promise<void> {
+    return closeTrustedRootState(trustedRootState(this));
+  }
+}
+
+/** Opaque live root capability, constructible only by captureTrustedRoot(). */
+export type TrustedRoot = TrustedRootCapability;
 
 const WIN32_FILE_TYPE_DISK = 1;
 const WIN32_FILE_ATTRIBUTE_DIRECTORY = 0x10;
@@ -232,17 +270,50 @@ function captureDirectoryProof(
   };
 }
 
-function capturedRootValues(
-  trustedRoot: TrustedRoot,
-  pathMode: "win32" | "posix"
-): { originalPath: string; finalPath: string; identity: string } {
-  const originalPath = lexicalRootPath(trustedRoot.originalPath, pathMode);
-  const finalPath = normalizedFinalPath(trustedRoot.finalPath, pathMode);
-  const identity = stableDirectoryIdentity(trustedRoot.identity);
-  if (originalPath !== trustedRoot.originalPath || finalPath !== trustedRoot.finalPath) {
-    throw refusal("unreadable", "The trusted-root anchor is not canonical.");
+function trustedRootState(trustedRoot: TrustedRoot): TrustedRootState {
+  if (!(trustedRoot instanceof TrustedRootCapability)) {
+    throw refusal("unreadable", "The trusted root is not a live capability.");
   }
-  return { originalPath, finalPath, identity };
+  const state = trustedRootStates.get(trustedRoot);
+  if (!state) throw refusal("unreadable", "The trusted root capability is unavailable.");
+  return state;
+}
+
+function closeTrustedRootState(state: TrustedRootState): Promise<void> {
+  if (state.closePromise) return state.closePromise;
+  state.closing = true;
+  state.closePromise = (async () => {
+    if (state.activeUses > 0) {
+      await new Promise<void>((resolve) => {
+        state.closeWaiter = resolve;
+      });
+    }
+    await state.openedRoot.close();
+  })();
+  return state.closePromise;
+}
+
+function acquireTrustedRootUse(trustedRoot: TrustedRoot): {
+  state: TrustedRootState;
+  release(): void;
+} {
+  const state = trustedRootState(trustedRoot);
+  if (state.closing) throw refusal("unreadable", "The trusted root capability is closed.");
+  state.activeUses += 1;
+  let released = false;
+  return {
+    state,
+    release(): void {
+      if (released) return;
+      released = true;
+      state.activeUses -= 1;
+      if (state.activeUses === 0) {
+        const waiter = state.closeWaiter;
+        state.closeWaiter = undefined;
+        waiter?.();
+      }
+    },
+  };
 }
 
 function assertCapturedRoot(
@@ -252,7 +323,7 @@ function assertCapturedRoot(
 ): void {
   const current = captureDirectoryProof(proof, pathMode);
   if (current.finalPath !== trustedRoot.finalPath || current.identity !== trustedRoot.identity) {
-    throw refusal("unreadable", "The trusted-root pathname no longer resolves to its captured directory.");
+    throw refusal("unreadable", "The retained trusted-root handle no longer matches its captured proof.");
   }
 }
 
@@ -1119,7 +1190,11 @@ function defaultBackend(): SecureOpenBackend {
   };
 }
 
-/** Capture the directory identity before a session can trust it for file delivery. */
+/**
+ * Opens and retains the directory capability before a session can trust it for
+ * file delivery. The caller owns close(): releasing this handle is the only
+ * teardown path, never a later pathname reopen plus scalar-id comparison.
+ */
 export async function captureTrustedRoot(
   workDir: string,
   dependencies: SecureOpenDependencies = {}
@@ -1131,47 +1206,53 @@ export async function captureTrustedRoot(
   try {
     openedRoot = await backend.openDirectory(originalPath);
     const proof = captureDirectoryProof(openedRoot, pathMode);
-    return {
+    return new TrustedRootCapability(trustedRootConstructionToken, {
       originalPath,
       finalPath: proof.finalPath,
       identity: proof.identity,
-    } as TrustedRoot;
+      openedRoot,
+      backend,
+      pathMode,
+      activeUses: 0,
+      closing: false,
+    });
   } catch (error) {
+    if (openedRoot) {
+      try {
+        await openedRoot.close();
+      } catch {
+        // The attempted close cannot make the failed capture safe to use.
+      }
+    }
     throw classifyOpenError(error);
-  } finally {
-    if (openedRoot) await openedRoot.close();
   }
 }
 
 /**
- * Reads a regular file only after the current root pathname is proven to
- * resolve to the identity captured for this actor, and the candidate's final
- * path is derived from the same open handle.
+ * Reads a regular file from the retained root handle. The capability chooses
+ * the backend/path grammar captured with that handle; a later caller cannot
+ * redirect resolution by supplying another mutable root pathname or backend.
  */
 export async function secureOpen(
   candidate: string,
   trustedRoot: TrustedRoot,
-  options: SecureOpenOptions,
-  dependencies: SecureOpenDependencies = {}
+  options: SecureOpenOptions
 ): Promise<SecureOpenResult> {
   if (!validSize(options.maxBytes)) throw refusal("unreadable", "The file size limit is invalid.");
 
-  const backend = dependencies.backend ?? defaultBackend();
-  const pathMode = dependencies.pathMode ?? defaultHandlePathMode();
-  const capturedRoot = capturedRootValues(trustedRoot, pathMode);
-  let openedRoot: SecureOpenedDirectory | undefined;
+  const lease = acquireTrustedRootUse(trustedRoot);
+  const { state: capturedRoot } = lease;
   let opened: SecureOpenedFile | undefined;
   try {
-    openedRoot = await backend.openDirectory(capturedRoot.originalPath);
-    assertCapturedRoot(openedRoot, capturedRoot, pathMode);
+    assertCapturedRoot(await capturedRoot.openedRoot.revalidate(), capturedRoot, capturedRoot.pathMode);
 
-    opened = openedRoot.openCandidate
-      ? await openedRoot.openCandidate(candidate, options.maxBytes)
-      : await backend.open(candidate);
-    const revalidatedRoot = await openedRoot.revalidate();
-    assertCapturedRoot(revalidatedRoot, capturedRoot, pathMode);
-    const finalPath = normalizedFinalPath(opened.finalPath, pathMode);
-    const relativePath = relativePathInsideCanonical(finalPath, capturedRoot.finalPath, pathMode);
+    opened = capturedRoot.openedRoot.openCandidate
+      ? await capturedRoot.openedRoot.openCandidate(candidate, options.maxBytes)
+      : await capturedRoot.backend.open(candidate);
+    const revalidatedRoot = await capturedRoot.openedRoot.revalidate();
+    assertCapturedRoot(revalidatedRoot, capturedRoot, capturedRoot.pathMode);
+    const finalPath = normalizedFinalPath(opened.finalPath, capturedRoot.pathMode);
+    const relativePath = relativePathInsideCanonical(finalPath, capturedRoot.finalPath, capturedRoot.pathMode);
     if (!relativePath) {
       throw refusal("outside-root", "The opened handle resolves outside the trusted root.");
     }
@@ -1202,7 +1283,7 @@ export async function secureOpen(
     try {
       if (opened) await opened.close();
     } finally {
-      if (openedRoot) await openedRoot.close();
+      lease.release();
     }
   }
 }

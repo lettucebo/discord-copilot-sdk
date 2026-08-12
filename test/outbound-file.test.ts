@@ -54,7 +54,12 @@ async function resolveForTest(
   requestedPath: string,
   options: Parameters<typeof resolveOutboundFile>[2]
 ) {
-  return resolveOutboundFile(await captureTrustedRoot(root), requestedPath, options);
+  const trustedRoot = await captureTrustedRoot(root);
+  try {
+    return await resolveOutboundFile(trustedRoot, requestedPath, options);
+  } finally {
+    await trustedRoot.close();
+  }
 }
 
 afterEach(() => {
@@ -70,10 +75,15 @@ describe("resolveOutboundFile", () => {
     const abs = write(root, requestedPath, "hello report");
     const trustedRoot = await captureTrustedRoot(root);
 
-    const result = await resolveOutboundFile(trustedRoot, requestedPath, {
-      maxBytes: 1024,
-      policy: "agent",
-    });
+    let result: Awaited<ReturnType<typeof resolveOutboundFile>>;
+    try {
+      result = await resolveOutboundFile(trustedRoot, requestedPath, {
+        maxBytes: 1024,
+        policy: "agent",
+      });
+    } finally {
+      await trustedRoot.close();
+    }
 
     expect(result).toEqual({
       ok: true,

@@ -269,7 +269,7 @@ describe("/file", () => {
     expect(transport.sentFiles).toHaveLength(0);
   });
 
-  it("uses the actor resolver and safely reports a refused file", async () => {
+  it("uses the actor-owned resolver rather than rebinding a mutable session workDir", async () => {
     const transport = new FakeTransport();
     const app = DiscordCopilotApp.createForTest(
       config(reposRoot),
@@ -291,6 +291,7 @@ describe("/file", () => {
     await invokeInteraction(app, interaction);
 
     expect(resolver.resolveFileForDelivery).toHaveBeenCalledWith("..\\..\\outside\\secret.txt", "operator");
+    expect(resolver.resolveFileForDelivery).toHaveBeenCalledTimes(1);
     expect(interaction.edits).toEqual(["無法傳送這個檔案：路徑不在這個 session 的工作目錄內。"]);
     expect(transport.sentFiles).toHaveLength(0);
   });

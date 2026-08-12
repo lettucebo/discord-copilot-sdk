@@ -1,8 +1,9 @@
-import { afterAll, describe, it, expect, vi } from "vitest";
-import { SessionActor, formatTodos } from "../src/copilot/session-actor.js";
+import { afterAll, afterEach, describe, it, expect, vi } from "vitest";
+import { SessionActor, formatTodos, type SessionActorCreateDependencies } from "../src/copilot/session-actor.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { ApprovalPolicy } from "../src/core/approval-policy.js";
 import type { AuditEntry, AuditSink } from "../src/core/audit-log.js";
+import type { SecureOpenBackend, SecureOpenedFile } from "../src/core/secure-open.js";
 import type { CopilotClient, Tool, ToolInvocation, ToolResultObject } from "@github/copilot-sdk";
 import type {
   Decision,
@@ -17,13 +18,45 @@ import type { RenderState } from "../src/core/turn-render.js";
 import { MAX_DISCORD_UPLOAD_BYTES, type OutboundFile } from "../src/core/outbound-file.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdirSync, mkdtempSync, promises as fs, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, promises as fs, rmSync as nativeRmSync, writeFileSync } from "node:fs";
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 const defaultWorkingDirectory = mkdtempSync(join(tmpdir(), "dcs-session-actor-default-"));
+const liveActors = new Set<SessionActor>();
+const pendingTreeRemovals: Array<{ path: string; options?: Parameters<typeof nativeRmSync>[1] }> = [];
+
+/**
+ * Actors now retain a real directory handle. Test-local directories must stay
+ * present until after actor teardown, especially on Windows where the handle
+ * intentionally prevents root replacement/deletion while the actor is active.
+ */
+function rmSync(path: string, options?: Parameters<typeof nativeRmSync>[1]): void {
+  pendingTreeRemovals.push({ path, options });
+}
+
+async function releaseLiveActors(): Promise<void> {
+  const actors = [...liveActors];
+  liveActors.clear();
+  await Promise.all(
+    actors.map(async (actor) => {
+      try {
+        await actor.disconnect();
+      } catch {
+        // Faulted actors have already closed their retained root capability.
+      }
+    })
+  );
+}
+
+afterEach(async () => {
+  await releaseLiveActors();
+  for (const { path, options } of pendingTreeRemovals.splice(0)) {
+    nativeRmSync(path, options);
+  }
+});
 
 afterAll(() => {
-  rmSync(defaultWorkingDirectory, { recursive: true, force: true });
+  nativeRmSync(defaultWorkingDirectory, { recursive: true, force: true });
 });
 
 class FakeSession {
@@ -201,7 +234,46 @@ interface Setup {
   resumeArgs?: { id: string; cfg: Record<string, unknown> };
 }
 
-async function setup(extra: Record<string, unknown> = {}): Promise<Setup> {
+function retainedRootDependencies(root: string): {
+  dependencies: SessionActorCreateDependencies;
+  close: ReturnType<typeof vi.fn>;
+  openDirectory: ReturnType<typeof vi.fn>;
+} {
+  const close = vi.fn(async () => undefined);
+  const proof = {
+    finalPath: root,
+    identity: "retained-root:1",
+    directory: true,
+  };
+  const openDirectory = vi.fn(async () => ({
+    ...proof,
+    revalidate: async () => proof,
+    close,
+  }));
+  const backend: SecureOpenBackend = {
+    open: async () => {
+      throw new Error("this lifecycle probe must not open a candidate");
+    },
+    openDirectory,
+  };
+  return { dependencies: { secureOpen: { backend } }, close, openDirectory };
+}
+
+function createActor(
+  client: CopilotClient,
+  opts: Parameters<typeof SessionActor.create>[1],
+  dependencies?: SessionActorCreateDependencies
+): Promise<SessionActor> {
+  return SessionActor.create(client, opts, dependencies).then((actor) => {
+    liveActors.add(actor);
+    return actor;
+  });
+}
+
+async function setup(
+  extra: Record<string, unknown> = {},
+  dependencies?: SessionActorCreateDependencies
+): Promise<Setup> {
   const session = new FakeSession();
   const transport = new FakeTransport();
   const broker = new PendingInteractionBroker();
@@ -220,17 +292,21 @@ async function setup(extra: Record<string, unknown> = {}): Promise<Setup> {
       return session;
     },
   } as unknown as CopilotClient;
-  const actor = await SessionActor.create(client, {
-    sessionKey: "t",
-    workingDirectory: defaultWorkingDirectory,
-    // Keep unit tests independent of the developer's actual ~/.copilot/skills.
-    skillsHomeDirectory: join(tmpdir(), `discord-copilot-sdk-no-skills-${Math.random()}`),
-    broker,
-    transport,
-    policy,
-    auditLog,
-    ...extra,
-  });
+  const actor = await createActor(
+    client,
+    {
+      sessionKey: "t",
+      workingDirectory: defaultWorkingDirectory,
+      // Keep unit tests independent of the developer's actual ~/.copilot/skills.
+      skillsHomeDirectory: join(tmpdir(), `discord-copilot-sdk-no-skills-${Math.random()}`),
+      broker,
+      transport,
+      policy,
+      auditLog,
+      ...extra,
+    },
+    dependencies
+  );
   return { actor, session, transport, broker, policy, auditLog, config, resumeArgs: box.resumeArgs };
 }
 
@@ -559,35 +635,165 @@ describe("SessionActor trusted roots", () => {
     expect(createSession).not.toHaveBeenCalled();
   });
 
-  it("uses its captured root for file-tool validation after the worktree pathname is replaced", async () => {
-    const parent = mkdtempSync(join(tmpdir(), "dcs-file-delivery-root-anchor-"));
-    const root = join(parent, "work");
-    const movedRoot = join(parent, "original-work");
-    try {
-      mkdirSync(root);
-      writeArtifact(root, "artifact.txt", "original");
-      const s = await setup({ workingDirectory: root });
-      renameSync(root, movedRoot);
-      mkdirSync(root);
-      writeArtifact(root, "artifact.txt", "external");
-      const showPermission = s.transport.showPermission.bind(s.transport);
-      s.transport.showPermission = async (view: PermissionView): Promise<void> => {
-        await showPermission(view);
-        s.transport.deliverDecision(view.nonce, "deny", "u1");
-      };
+  it("retains the root capability until disconnect and closes it exactly once", async () => {
+    const retained = retainedRootDependencies(defaultWorkingDirectory);
+    const s = await setup({}, retained.dependencies);
 
-      await expect(s.actor.resolveFileForDelivery("artifact.txt", "agent")).resolves.toEqual({
-        ok: false,
-        reason: "unreadable",
-      });
-      await expect(requestFilePermission(s, { path: "artifact.txt" }, "replaced-root")).resolves.toEqual({
-        kind: "user-not-available",
-      });
-      expect(s.transport.permissions).toHaveLength(0);
-      expect(s.transport.sentFiles).toHaveLength(0);
+    expect(retained.openDirectory).toHaveBeenCalledTimes(1);
+    expect(retained.close).not.toHaveBeenCalled();
+    await s.actor.disconnect();
+    await s.actor.disconnect();
+
+    expect(retained.close).toHaveBeenCalledTimes(1);
+    await expect(s.actor.resolveFileForDelivery("artifact.txt", "agent")).resolves.toEqual({
+      ok: false,
+      reason: "unreadable",
+    });
+    expect(retained.openDirectory).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the root capability exactly once when a failed disconnect faults the actor", async () => {
+    const retained = retainedRootDependencies(defaultWorkingDirectory);
+    const s = await setup({}, retained.dependencies);
+    s.session.disconnect = async () => {
+      throw new Error("rpc down");
+    };
+
+    await expect(s.actor.disconnect()).rejects.toThrow("rpc down");
+    expect(s.actor.isFaulted()).toBe(true);
+    await expect(s.actor.disconnect()).rejects.toThrow(/faulted/);
+    expect(retained.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the root capability on the watchdog fault path", async () => {
+    const retained = retainedRootDependencies(defaultWorkingDirectory);
+    const s = await setup({}, retained.dependencies);
+    const fault = s.actor as unknown as { markFaulted(): Promise<void> };
+
+    await fault.markFaulted();
+
+    expect(s.actor.isFaulted()).toBe(true);
+    expect(s.session.disconnected).toBe(1);
+    expect(retained.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let a draining root capability delay the bounded watchdog disconnect", async () => {
+    let releaseRootClose: (() => void) | undefined;
+    const rootClose = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseRootClose = resolve;
+        })
+    );
+    const proof = {
+      finalPath: defaultWorkingDirectory,
+      identity: "retained-root:1",
+      directory: true,
+    };
+    const backend: SecureOpenBackend = {
+      open: async () => {
+        throw new Error("this lifecycle probe must not open a candidate");
+      },
+      openDirectory: async () => ({
+        ...proof,
+        revalidate: async () => proof,
+        close: rootClose,
+      }),
+    };
+    const s = await setup({}, { secureOpen: { backend } });
+    const fault = (s.actor as unknown as { markFaulted(): Promise<void> }).markFaulted();
+
+    try {
+      await tick();
+      expect(rootClose).toHaveBeenCalledTimes(1);
+      expect(s.session.disconnected).toBe(1);
     } finally {
-      rmSync(parent, { recursive: true, force: true });
+      releaseRootClose?.();
+      await fault;
     }
+  });
+
+  it("closes the captured root capability when SDK createSession throws", async () => {
+    const retained = retainedRootDependencies(defaultWorkingDirectory);
+    const createSession = vi.fn(async () => {
+      throw new Error("SDK create failed");
+    });
+    const client = {
+      createSession,
+      resumeSession: async () => new FakeSession(),
+    } as unknown as CopilotClient;
+
+    await expect(
+      createActor(
+        client,
+        {
+          sessionKey: "t",
+          workingDirectory: defaultWorkingDirectory,
+          skillsHomeDirectory: join(tmpdir(), `dcs-no-skills-${Math.random()}`),
+          broker: new PendingInteractionBroker(),
+          transport: new FakeTransport(),
+          policy: new ApprovalPolicy(join(tmpdir(), `dcs-test-approvals-${Math.random()}.json`)),
+        },
+        retained.dependencies
+      )
+    ).rejects.toThrow("SDK create failed");
+
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(retained.openDirectory).toHaveBeenCalledTimes(1);
+    expect(retained.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the retained root capability when a later pathname reopen would resolve a replacement", async () => {
+    const root = defaultWorkingDirectory;
+    const candidate = join(root, "artifact.txt");
+    const rootClose = vi.fn(async () => undefined);
+    const candidateClose = vi.fn(async () => undefined);
+    const openCandidate = vi.fn(async (): Promise<SecureOpenedFile> => ({
+      finalPath: candidate,
+      regular: true,
+      size: 8,
+      linkCount: 1,
+      identity: "original-artifact",
+      modifiedAt: "original-time",
+      read: async () => Buffer.from("original"),
+      close: candidateClose,
+    }));
+    const proof = {
+      finalPath: root,
+      identity: "original-root",
+      directory: true,
+    };
+    const openDirectory = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ...proof,
+        openCandidate,
+        revalidate: async () => proof,
+        close: rootClose,
+      })
+      .mockRejectedValue(new Error("a replacement root pathname must not be reopened"));
+    const backend: SecureOpenBackend = {
+      open: async () => {
+        throw new Error("candidate resolution must stay below the retained root");
+      },
+      openDirectory,
+    };
+    const s = await setup({}, { secureOpen: { backend } });
+
+    await expect(s.actor.resolveFileForDelivery("artifact.txt", "agent")).resolves.toMatchObject({
+      ok: true,
+      file: {
+        bytes: Buffer.from("original"),
+        displayName: "artifact.txt",
+      },
+    });
+    expect(openDirectory).toHaveBeenCalledTimes(1);
+    expect(openCandidate).toHaveBeenCalledWith(candidate, MAX_DISCORD_UPLOAD_BYTES);
+    expect(rootClose).not.toHaveBeenCalled();
+
+    await s.actor.disconnect();
+    expect(candidateClose).toHaveBeenCalledTimes(1);
+    expect(rootClose).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -2139,7 +2345,7 @@ describe("SessionActor resume/create-id seam (P2)", () => {
       createSession: async () => session,
       resumeSession: async () => session,
     } as unknown as CopilotClient;
-    const actor = await SessionActor.create(client, {
+    const actor = await createActor(client, {
       sessionKey: "t",
       workingDirectory: defaultWorkingDirectory,
       broker: new PendingInteractionBroker(),

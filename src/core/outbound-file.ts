@@ -103,9 +103,10 @@ function mapSecureOpenRefusal(error: unknown): OutboundRefusal {
 }
 
 /**
- * Resolve an artifact only from the actor's capture-time root identity. The
- * secure-open boundary proves the reopened root still matches that anchor
- * before candidate lookup, then derives final path and bytes from one handle.
+ * Resolve an artifact only through the actor's retained capture-time root
+ * capability. The secure-open boundary revalidates that same live directory
+ * handle before and after candidate lookup, then derives final path and bytes
+ * from one candidate handle.
  */
 export async function resolveOutboundFile(
   trustedRoot: TrustedRoot,
