@@ -276,6 +276,34 @@ describe("/channel", () => {
     );
   });
 
+  it("does not diagnose Attach Files when file delivery is unavailable on this platform", async () => {
+    const reposRoot = join(FIXTURES, "repos-nonwin-permissions");
+    mkdirSync(reposRoot, { recursive: true });
+    const registry = new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels-nonwin-permissions.json"));
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as unknown as CopilotClient,
+      new FakeTransport(),
+      new SessionStore(join(FIXTURES, "sessions-nonwin-permissions.json")),
+      registry,
+      { fileDeliveryPlatform: "linux" }
+    );
+    const interaction = slash({ channelId: SECONDARY, subcommand: "enable" });
+    patchChannelFetch(app, async () => ({
+      type: ChannelType.GuildText,
+      guildId: GUILD,
+      guild: { members: { me: {} } },
+      permissionsFor: () => ({ has: () => false }),
+    }));
+
+    await cmdChannel(app, asInteraction(interaction));
+
+    expect(interaction.edits.join("\n")).toContain("缺少這些權限");
+    expect(interaction.edits.join("\n")).not.toContain("Attach Files");
+    expect(registry.has(SECONDARY)).toBe(true);
+  });
+
   it.each([
     ["thread", ChannelType.PublicThread],
     ["forum", ChannelType.GuildForum],

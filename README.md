@@ -100,7 +100,9 @@ card — including the kinds that normally fail closed (file writes, etc.). It e
   A Discord render is best effort, but the on-disk log is authoritative; if it cannot be
   written, YOLO and existing-rule auto-approvals deny that request rather than run without an
   audit trail;
-- an approval card that was **already waiting** still needs your decision;
+- Already-posted ordinary permission cards are not retroactively changed by YOLO; file-delivery cards are different:
+  turning YOLO on immediately revokes any pending `discord_send_file` approval, and later agent file-send requests
+  are fast-denied with guidance to use `/file`;
 - `ask_user` and exit-plan still ask — YOLO approves *permissions*, it does not answer questions or
   pick plan actions;
 - `/stop` still wins: teardown fails closed regardless of YOLO;
@@ -192,7 +194,7 @@ four IDs — is in [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md).
 
 ### File delivery
 
-Use `/file path:<path>` when you deliberately want to upload a validated file from the session's workdir to the owning Discord thread. Agents can also propose `discord_send_file({path,comment?})`, but it always requires its own Allow once / Deny card, is limited to workdir files, and shares the same 8 MiB Discord upload cap. The bot needs Discord's **Attach Files** permission for both paths, all file sends suppress mentions, and YOLO fast-denies agent file-send requests with a notice to use `/file` instead.
+Use `/file path:<path>` when you deliberately want to upload a validated file from the session's workdir to the owning Discord thread. Agents can also propose `discord_send_file({path,comment?})`, which normally requires its own Allow once / Deny card, is limited to workdir files, and shares the same 8 MiB Discord upload cap. The bot needs Discord's **Attach Files** permission for both paths, and all file sends suppress mentions. YOLO is deliberately different from generic pending cards: enabling it revokes an already-pending file-delivery card and fast-denies later agent file-send requests with a notice to use `/file` instead.
 
 > **Platform availability:** Outbound Discord file delivery is available only on Windows. On Linux, macOS, and other platforms, sessions and every non-file bot feature continue normally, but `/file` safely reports unavailable and `discord_send_file` is not exposed. This is deliberate: the SDK accepts only a pathname `workingDirectory`, not a retained descriptor, so POSIX cannot safely prevent a swap-and-restore during create or resume.
 

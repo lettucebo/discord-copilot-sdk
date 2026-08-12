@@ -10,12 +10,16 @@ class FakeMessage {
   content?: string;
   opts?: Record<string, unknown>;
   deleted = false;
+  deleteError: unknown;
+  deleteGate?: Promise<void>;
   constructor(public id: string) {}
   async edit(o: Record<string, unknown>): Promise<void> {
     this.content = o["content"] as string;
     this.opts = o;
   }
   async delete(): Promise<void> {
+    if (this.deleteGate) await this.deleteGate;
+    if (this.deleteError !== undefined) throw this.deleteError;
     this.deleted = true;
   }
 }
@@ -534,6 +538,49 @@ describe("DiscordTransport sendFile", () => {
 
     expect(ch.sent).toHaveLength(1);
     expect(ch.sent[0]!.deleted).toBe(true);
+  });
+
+  it("reports an unconfirmed late attachment retraction and warns the owning thread", async () => {
+    const ch = new FakeChannel();
+    let current = true;
+    ch.afterSend = (message) => {
+      if (message.id !== "m1") return;
+      current = false;
+      message.deleteError = new Error("Discord rejected deletion");
+    };
+    const t = new DiscordTransport(fakeClient(ch));
+
+    await expect(
+      t.sendFile("thread", outboundFile(), undefined, { canSend: () => current })
+    ).resolves.toEqual({ ok: false, reason: "retraction-unconfirmed" });
+
+    expect(ch.sent[0]!.deleted).toBe(false);
+    expect(ch.sent).toHaveLength(2);
+    expect(ch.sent[1]!.content).toMatch(/可能仍.*(?:可見|看見)|may remain/i);
+    expect(ch.sent[1]!.opts!["allowedMentions"]).toEqual({ parse: [] });
+  });
+
+  it("reports an unconfirmed late attachment retraction when bounded deletion times out", async () => {
+    const ch = new FakeChannel();
+    let current = true;
+    ch.afterSend = (message) => {
+      if (message.id !== "m1") return;
+      current = false;
+      message.deleteGate = new Promise<void>(() => {});
+    };
+    const t = new DiscordTransport(fakeClient(ch));
+
+    vi.useFakeTimers();
+    try {
+      const sending = t.sendFile("thread", outboundFile(), undefined, { canSend: () => current });
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await expect(sending).resolves.toEqual({ ok: false, reason: "retraction-unconfirmed" });
+      expect(ch.sent[0]!.deleted).toBe(false);
+      expect(ch.sent[1]!.content).toMatch(/可能仍.*(?:可見|看見)|may remain/i);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("fails closed on missing Attach Files permission and posts one deduplicated Chinese notice", async () => {

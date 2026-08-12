@@ -296,6 +296,11 @@ export class SessionActor {
   /** In-flight disconnect (single-flight), so concurrent/retried disconnects
    *  share one RPC instead of re-hitting a possibly-hung endpoint. */
   private disconnectPromise?: Promise<void>;
+  /** A fault-path termination attempt. It can outlive the watchdog's bounded
+   * wait; only its confirmed completion may release the retained root lock. */
+  private faultDisconnectPromise?: Promise<void>;
+  /** The SDK has positively confirmed termination after this actor faulted. */
+  private faultDisconnectConfirmed = false;
   /** Per-nonce request metadata for building session/location approvals. */
   private readonly pendingPerms = new Map<string, PendingPermMeta>();
   /** A file can be delivered only by the exact custom-tool invocation whose
@@ -424,8 +429,8 @@ export class SessionActor {
   private async closeTrustedRoot(): Promise<void> {
     const trustedRoot = this.trustedRoot;
     if (!trustedRoot) return;
-    this.trustedRoot = undefined;
     await trustedRoot.close();
+    if (this.trustedRoot === trustedRoot) this.trustedRoot = undefined;
   }
 
   private async assertCurrentRootForSdk(): Promise<void> {
@@ -1132,14 +1137,27 @@ export class SessionActor {
       }
       return fileDeliveryFailure("Discord file delivery failed before the upload could be confirmed.");
     }
-    if (!this.fileDeliveryIsCurrent(approval)) {
-      return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
-    }
     if (!sent.ok) {
+      if (sent.reason === "retraction-unconfirmed") {
+        return fileDeliveryFailure(
+          "Discord accepted the attachment after cancellation, but its retraction could not be confirmed; it may remain visible in the Discord thread."
+        );
+      }
+      if (!this.fileDeliveryIsCurrent(approval)) {
+        return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
+      }
       if (sent.reason === "cancelled") {
         return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
       }
       return fileDeliveryFailure(`Discord file delivery failed: ${sent.reason}.`);
+    }
+    if (!this.fileDeliveryIsCurrent(approval)) {
+      // A Transport that reported success may have accepted the attachment just
+      // before this lifecycle fence changed. It cannot now retract it safely,
+      // so do not describe the result as a completed cancellation.
+      return fileDeliveryFailure(
+        "Discord may have accepted the attachment before cancellation; it may remain visible in the Discord thread."
+      );
     }
     this.successfulFileDeliveriesThisTurn++;
     return {
@@ -1716,9 +1734,11 @@ export class SessionActor {
   async disconnect(): Promise<void> {
     if (this.lifecycle === "closed") return; // confirmed torn down — no-op
     if (this.lifecycle === "faulted") {
-      // A prior teardown failed: never report success (which would let /new
-      // delete the fence over a maybe-live runtime). Stay a fence.
-      throw new Error("session has faulted; disconnect cannot be confirmed");
+      // A fault remains terminal for prompts and file delivery, but a later
+      // teardown/shutdown is allowed to ask the SDK again. Only a RESOLVED RPC
+      // releases the Windows root capability; an error leaves the fence held.
+      if (this.faultDisconnectConfirmed) return;
+      return this.confirmFaultedTermination();
     }
     if (this.disconnectPromise) return this.disconnectPromise; // single-flight
     this.lifecycle = "closing";
@@ -1731,40 +1751,62 @@ export class SessionActor {
     this.unsubscribePlan?.();
     this.clearTodosTimer();
     // Transition to `closed` ONLY after the RPC and retained-root close both
-    // confirm. A failed RPC still releases the root capability: retaining a
-    // live directory handle after this actor becomes a permanent fault fence
-    // would leak it (and can block Windows worktree cleanup indefinitely).
+    // confirm. A failed/unconfirmed RPC MUST retain the root capability: on
+    // Windows that lock is the only fence preventing a maybe-live SDK process
+    // from having its working tree renamed or deleted underneath it.
     this.disconnectPromise = (async () => {
-      let failed = false;
-      let failure: unknown;
       try {
         await this.session.disconnect();
       } catch (error) {
-        failed = true;
-        failure = error;
+        this.lifecycle = "faulted";
+        this.releaseIdleWaiters();
+        this.disconnectPromise = undefined;
+        throw error;
       }
-      try {
-        await this.closeTrustedRoot();
-      } catch (error) {
-        if (!failed) {
-          failed = true;
-          failure = error;
-        }
-      }
-
       // Release anyone waiting for a `session.idle` that can no longer arrive
       // (e.g. /new tore this session down mid-turn). Without this the old
       // runTurn sits until its watchdog fires and then posts a bogus
       // "did not stop cleanly" notice into a thread the user has left.
-      this.releaseIdleWaiters();
-      if (failed) {
+      try {
+        await this.closeTrustedRoot();
+      } catch (error) {
         this.lifecycle = "faulted";
+        this.releaseIdleWaiters();
         this.disconnectPromise = undefined;
-        throw failure;
+        throw error;
       }
+      this.releaseIdleWaiters();
       this.lifecycle = "closed";
     })();
     return this.disconnectPromise;
+  }
+
+  /** Retry a terminal actor's teardown without making it usable again. A
+   * faulted actor can be detached from the app map only after this resolves,
+   * because its root must protect a runtime that may still be alive. */
+  private confirmFaultedTermination(): Promise<void> {
+    if (this.faultDisconnectPromise) return this.faultDisconnectPromise;
+    const attempt = (async () => {
+      try {
+        await this.session.disconnect();
+      } catch (error) {
+        throw new Error(
+          `session has faulted; disconnect cannot be confirmed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      await this.closeTrustedRoot();
+      this.faultDisconnectConfirmed = true;
+    })();
+    this.faultDisconnectPromise = attempt;
+    void attempt.then(
+      () => {
+        this.faultDisconnectPromise = undefined;
+      },
+      () => {
+        this.faultDisconnectPromise = undefined;
+      }
+    );
+    return attempt;
   }
 
   /** Resolve every pending `nextIdle()` waiter. Used on teardown, where the
@@ -1789,18 +1831,16 @@ export class SessionActor {
     this.unsubscribeChoice?.();
     this.unsubscribePlan?.();
     this.clearTodosTimer();
-    // Fence new resolutions and start draining the retained handle, but do not
-    // let a stuck read defer the bounded SDK disconnect below. The capability
-    // itself waits for that read before issuing its one close.
-    void this.closeTrustedRoot().catch(() => {
-      // The actor is already a permanent fault fence; close was attempted once.
-    });
+    // Keep the retained root until the SDK confirms it stopped. Releasing it
+    // first would let a hung runtime lose Windows' rename/delete protection
+    // while it may still be operating in that worktree.
+    const termination = this.confirmFaultedTermination();
     const timeout = new Promise<void>((res) => {
       const t = setTimeout(res, FAULT_DISCONNECT_MS);
       (t as { unref?: () => void }).unref?.();
     });
     await Promise.race([
-      (this.session.disconnect() as Promise<unknown>).catch(() => {}),
+      termination.catch(() => {}),
       timeout,
     ]);
   }

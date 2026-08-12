@@ -7,6 +7,10 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (...parts: string[]): string => readFileSync(join(root, ...parts), "utf8");
 const EN_AVAILABILITY = "Outbound Discord file delivery is available only on Windows.";
 const ZH_AVAILABILITY = "對外 Discord 檔案傳送僅支援 Windows。";
+const EN_YOLO_FILE_REVOCATION =
+  "Already-posted ordinary permission cards are not retroactively changed by YOLO; file-delivery cards are different";
+const ZH_YOLO_FILE_REVOCATION =
+  "已貼出的一般 permission card 不會因 YOLO 被追溯改寫；檔案傳送卡則不同";
 const EN_MASKS = [
   "**Windows normal:** `326417632256`",
   "**Non-Windows normal:** `326417599488`",
@@ -35,5 +39,10 @@ describe("file-delivery documentation", () => {
     const zh = read("docs", "DISCORD-SETUP.zh-TW.md");
     for (const mask of EN_MASKS) expect(en).toContain(mask);
     for (const mask of ZH_MASKS) expect(zh).toContain(mask);
+  });
+
+  it("distinguishes ordinary pending YOLO cards from revoked file-delivery cards in both READMEs", () => {
+    expect(read("README.md")).toContain(EN_YOLO_FILE_REVOCATION);
+    expect(read("README.zh-TW.md")).toContain(ZH_YOLO_FILE_REVOCATION);
   });
 });

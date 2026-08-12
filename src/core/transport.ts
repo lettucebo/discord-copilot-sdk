@@ -89,7 +89,16 @@ export type SendFileResult =
   | { ok: true }
   | {
       ok: false;
-      reason: "no-attach-permission" | "too-large" | "blocked" | "unavailable" | "transient" | "cancelled";
+      reason:
+        | "no-attach-permission"
+        | "too-large"
+        | "blocked"
+        | "unavailable"
+        | "transient"
+        | "cancelled"
+        /** Discord accepted a stale attachment, but bounded deletion did not
+         * confirm it was retracted, so it may still be publicly visible. */
+        | "retraction-unconfirmed";
     };
 
 /** ask_user prompt: a question with optional multiple-choice buttons; freeform

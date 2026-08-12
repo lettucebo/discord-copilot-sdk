@@ -427,20 +427,34 @@ function isFileDeliveryBytes(value: unknown): value is number {
 function readRecords(v: unknown): { sessions: SessionRecord[]; highWater: number } | undefined {
   if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
   const o = v as Record<string, unknown>;
-  if (Array.isArray(o["sessions"])) {
+  if (Object.hasOwn(o, "sessions")) {
+    if (!Array.isArray(o["sessions"])) return undefined;
+    const containerVersion = readSchemaVersion(o["schemaVersion"]);
+    // A multi-row file is an explicit container. Its rows must agree with its
+    // version: accepting a v3 row inside v4 would reinterpret a torn/downgraded
+    // current record as legacy and reopen its attachment quota at zero.
+    if (containerVersion === undefined || containerVersion < 2 || containerVersion > SCHEMA_VERSION) {
+      return undefined;
+    }
     const out: SessionRecord[] = [];
     for (const item of o["sessions"]) {
-      const r = asRecord(item);
+      const r = asRecord(item, containerVersion);
       if (!r) return undefined; // one bad row invalidates the file — fail closed
       out.push(r);
     }
     const hw = typeof o["generationHighWater"] === "number" ? o["generationHighWater"] : 0;
     return { sessions: out, highWater: Math.max(hw, ...out.map((r) => r.generation), 0) };
   }
-  // v1: a single bare record at the top level.
-  const single = asRecord(o);
+  // Only an actual v1 bare record is legacy. A later-version object without
+  // the multi-session container is corrupt, not an invitation to infer fields.
+  if (readSchemaVersion(o["schemaVersion"]) !== 1) return undefined;
+  const single = asRecord(o, 1);
   if (!single) return undefined;
   return { sessions: [single], highWater: single.generation };
+}
+
+function readSchemaVersion(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
 }
 
 /**
@@ -466,13 +480,13 @@ function readRecords(v: unknown): { sessions: SessionRecord[]; highWater: number
  * here would either need a subprocess inside a synchronous read, or would have
  * to mark the whole file corrupt and refuse to start over one bad row.
  */
-function asRecord(v: unknown): SessionRecord | undefined {
+function asRecord(v: unknown, containerVersion: number): SessionRecord | undefined {
   if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
   const r = v as Record<string, unknown>;
   const str = (k: string): string | undefined => (typeof r[k] === "string" ? (r[k] as string) : undefined);
   const num = (k: string): number | undefined => (typeof r[k] === "number" ? (r[k] as number) : undefined);
 
-  const schemaVersion = num("schemaVersion");
+  const schemaVersion = readSchemaVersion(r["schemaVersion"]);
   const threadId = str("threadId");
   const sessionId = str("sessionId");
   const generation = num("generation");
@@ -487,7 +501,7 @@ function asRecord(v: unknown): SessionRecord | undefined {
       : undefined;
 
   if (
-    schemaVersion === undefined ||
+    schemaVersion !== containerVersion ||
     threadId === undefined ||
     sessionId === undefined ||
     generation === undefined ||
@@ -511,7 +525,7 @@ function asRecord(v: unknown): SessionRecord | undefined {
   // lease — getting it wrong puts two agents in one checkout.
   const devMode: DevMode | undefined = isDevMode(rawMode)
     ? rawMode
-    : schemaVersion >= 3
+    : containerVersion >= 3
       ? undefined
       : branch
         ? "worktree"
@@ -524,7 +538,7 @@ function asRecord(v: unknown): SessionRecord | undefined {
   // a thread's attachment budget after a hand edit or torn upgrade.
   const fileDeliveryBytes =
     rawFileDeliveryBytes === undefined
-      ? schemaVersion < SCHEMA_VERSION
+      ? containerVersion < SCHEMA_VERSION
         ? 0
         : undefined
       : isFileDeliveryBytes(rawFileDeliveryBytes)

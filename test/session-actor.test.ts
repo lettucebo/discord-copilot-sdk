@@ -701,17 +701,26 @@ describe("SessionActor trusted roots", () => {
     expect(retained.openDirectory).toHaveBeenCalledTimes(1);
   });
 
-  it("closes the root capability exactly once when a failed disconnect faults the actor", async () => {
+  it("retains the root capability until a faulted disconnect is later confirmed", async () => {
     const retained = retainedRootDependencies(defaultWorkingDirectory);
     const s = await setup({}, retained.dependencies);
+    let attempts = 0;
     s.session.disconnect = async () => {
-      throw new Error("rpc down");
+      attempts++;
+      if (attempts === 1) throw new Error("rpc down");
     };
 
     await expect(s.actor.disconnect()).rejects.toThrow("rpc down");
     expect(s.actor.isFaulted()).toBe(true);
-    await expect(s.actor.disconnect()).rejects.toThrow(/faulted/);
+    expect(retained.close).not.toHaveBeenCalled();
+
+    await s.actor.disconnect();
     expect(retained.close).toHaveBeenCalledTimes(1);
+    await expect(s.actor.send("must stay terminal")).rejects.toThrow(/closed|faulted/);
+    await expect(s.actor.resolveFileForDelivery("artifact.txt", "agent")).resolves.toEqual({
+      ok: false,
+      reason: "unreadable",
+    });
   });
 
   it("closes the root capability on the watchdog fault path", async () => {
@@ -724,6 +733,43 @@ describe("SessionActor trusted roots", () => {
     expect(s.actor.isFaulted()).toBe(true);
     expect(s.session.disconnected).toBe(1);
     expect(retained.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the root lock through a timed-out fault disconnect until it later confirms", async () => {
+    const retained = retainedRootDependencies(defaultWorkingDirectory);
+    const s = await setup({}, retained.dependencies);
+    let releaseDisconnect!: () => void;
+    s.session.disconnect = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseDisconnect = resolve;
+        })
+    );
+    const fault = s.actor as unknown as { markFaulted(): Promise<void> };
+
+    vi.useFakeTimers();
+    try {
+      const faulting = fault.markFaulted();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await faulting;
+
+      expect(s.actor.isFaulted()).toBe(true);
+      expect(retained.close).not.toHaveBeenCalled();
+      await expect(s.actor.send("must stay terminal")).rejects.toThrow(/closed|faulted/);
+      await expect(s.actor.resolveFileForDelivery("artifact.txt", "agent")).resolves.toEqual({
+        ok: false,
+        reason: "unreadable",
+      });
+
+      releaseDisconnect();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(retained.close).toHaveBeenCalledTimes(1);
+      await s.actor.disconnect();
+      expect(retained.close).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not let a draining root capability delay the bounded watchdog disconnect", async () => {
@@ -1534,6 +1580,31 @@ describe("SessionActor permission handling", () => {
       }
     });
 
+    it("reports an unconfirmed late attachment retraction as failure without consuming success quota", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-retraction-unconfirmed-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        await approveFilePermission(s, { path: "artifact.txt" }, "late-retraction");
+        s.transport.sendFileResult = { ok: false, reason: "retraction-unconfirmed" };
+
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "late-retraction")).resolves.toMatchObject({
+          resultType: "failure",
+          error: expect.stringMatching(/may remain|retraction could not be confirmed/i),
+        });
+
+        s.transport.sendFileResult = { ok: true };
+        for (const toolCallId of ["normal-after-retraction-1", "normal-after-retraction-2", "normal-after-retraction-3"]) {
+          await approveFilePermission(s, { path: "artifact.txt" }, toolCallId);
+          await expect(invokeFileDelivery(s, { path: "artifact.txt" }, toolCallId)).resolves.toMatchObject({
+            resultType: "success",
+          });
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it.each([
       ["a newer user turn", async (s: Setup): Promise<void> => s.actor.send("begin a newer turn")],
       ["stop", async (s: Setup): Promise<void> => {
@@ -1543,7 +1614,7 @@ describe("SessionActor permission handling", () => {
         await s.actor.disconnect();
       }],
     ] as const)(
-      "returns a failure rather than stale upload success when %s starts during a delayed transport send",
+      "reports uncertain attachment visibility rather than stale upload success when %s starts during a delayed transport send",
       async (_boundary, invalidate) => {
         const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-delayed-send-"));
         try {
@@ -1569,7 +1640,7 @@ describe("SessionActor permission handling", () => {
 
           await expect(delivery).resolves.toMatchObject({
             resultType: "failure",
-            error: expect.stringMatching(/cancelled/i),
+            error: expect.stringMatching(/may remain|before cancellation/i),
           });
           expect(s.transport.sentFiles[0]!.options?.canSend).toBeTypeOf("function");
           expect(s.transport.sentFiles[0]!.options?.canSend?.()).toBe(false);
@@ -2530,16 +2601,21 @@ describe("SessionActor abort + teardown", () => {
     }); // no reasoningEffort sent
   });
 
-  it("a FAILED disconnect faults the actor and never reports success on retry", async () => {
+  it("a failed disconnect keeps the actor faulted until a later retry confirms teardown", async () => {
     const s = await setup();
+    let attempts = 0;
     s.session.disconnect = async () => {
-      throw new Error("rpc down");
+      attempts++;
+      if (attempts <= 2) throw new Error("rpc down");
     };
     await expect(s.actor.disconnect()).rejects.toThrow(/rpc down/);
     expect(s.actor.isFaulted()).toBe(true);
-    // The retry must REJECT (fence), not resolve — else /new would delete a
-    // session whose runtime may still be live.
+    // An unconfirmed retry must reject — else /new would delete a session whose
+    // runtime may still be live.
     await expect(s.actor.disconnect()).rejects.toThrow(/faulted/);
+    // A later confirmed teardown may release the retained root, but the actor
+    // remains terminal and never becomes reusable.
+    await s.actor.disconnect();
   });
 });
 

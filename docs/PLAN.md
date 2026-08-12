@@ -662,6 +662,25 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   `Transport.sendFile({canSend})`、及 success reply 前都重查 map identity 與 actor file lifecycle。
   `/end`、rebind 或新 session 取代舊 session 時，transport 走既有 late-cancel/delete 路徑，
   不可留下 attachment success claim。
+- **`/end` 對 rebind 的 instance ownership fence**：rebind 會先捕捉舊 `Session` 物件；`/end`
+  在第一個 await 前把該實例標記為 ended。rebind 在每個 git／root／SDK async 邊界後，且在 reserve、
+  commit、map swap 前，都必須重驗 map identity + ended 標記。若已 stale，只清理本次新建 actor、
+  root、record、lease 與 worktree，絕不 rollback 恢復舊 record／lease／file fence；swap 後也以新
+  instance 重驗，故 `/end` 永遠優先且不會被晚到的 rebind 重新建立。即使 commit 失敗而非 `/end`
+  造成的 rollback，也不能丟棄尚未確認 teardown 的 replacement：保留它與 root，確認後才清 target
+  worktree，同時可安全還原舊 record。
+- **faulted actor 的 Windows root lock**：fault path 的 bounded disconnect 只限制等待時間，不能在
+  SDK 尚未確認終止時關閉 retained root。actor 維持 faulted（不能 prompt／送檔），root 作為
+  rename/delete fence 留在原處；同一個或稍後 retry 的 disconnect 一旦真的 resolve，才 close 一次
+  root，讓 `/end`／shutdown 安全釋放。
+- **late attachment retraction truthfulness**：Discord 已接受附件後才 stale 時，transport 會等待有
+  上限的 delete；只有 delete 確認才回 `cancelled`。失敗或 timeout 回結構化
+  `retraction-unconfirmed`、盡力在原 thread 發不 mention 的「附件可能仍可見」警告；actor 與 `/file`
+  將它當 failure，不計入成功送檔額度。若 transport 回 `ok` 後 caller 的最後 lifecycle fence 才
+  變 stale，也同樣回「可能已在取消前接受」而非聲稱已取消／收回。
+- **quota schema provenance**：帶 `sessions` 的 container 必須有一致的 row schema version；v4
+  container 裡的 v3 row／缺 quota 是 corruption，不是 legacy。只有明確 v1 bare record 或版本一致的
+  舊 container 才能遷移，避免手動 downgrade 或 torn write 把 quota 重設為 0。
 - **mentions suppression**：所有 attachment sends 都必須保留 `allowedMentions:{parse:[]}`，避免 agent 藉檔案說明或 UI 路徑 ping 人。
 
 ### 18.4 平台事實與殘留風險
@@ -672,7 +691,9 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   transport 失敗、取消或 late deletion 仍消耗預留額度；不做 fragile rollback，以免 crash/restart
   使同一 thread 反覆重開配額。代價是未成功的送檔也可能耗盡該 thread 的剩餘額度。
 - **thread visibility / CDN expiry**：檔案一旦成功送出，誰看得到由 Discord thread 權限決定；附件 CDN 存續時間與快取失效屬平台行為，本程式只能如實揭露，不能保證立即失效。
-- **best-effort late deletion / platform availability**：若後續清理由 Discord API 或平台狀態限制而失敗，只能 best effort 嘗試並誠實回報；不能把未刪除說成已收回。
+- **bounded late deletion / platform availability**：若取消發生在 Discord 已接受附件後，會有上限地等待
+  delete；失敗或 timeout 不會稱為已收回，而以 `retraction-unconfirmed` 與可見警告說明附件可能仍
+  公開。警告本身也可能因 thread 已刪除而無法送出，故 caller 的 structured failure 才是權威。
 - **Windows-only descriptor boundary**：對外 Discord 檔案傳送僅支援 Windows。Windows 依賴 `CreateFileW`
   root handle 排除 delete/rename，因而不能在 proof 與 actor transfer 間替換其 final path。Linux 的
   `/proc/self/fd/<fd>` 與 Darwin 的 `/dev/fd/<fd>` 雖可驗證 retained handle，但 SDK API 只接受 pathname，
@@ -689,5 +710,9 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | Windows `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root-relative inline-code card path、同 basename 路徑辨別、U+200B 拒絕、root/content/digest/path 綁定、endpoint truth、late cancellation 不算成功；非 Windows 無 tool 且 `/file` 拒絕 | `test/outbound-file.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
 | 24 MiB 持久化保守預留、舊 record 遷移、session-id + generation CAS、rebind fence/單調 rollback、YOLO/abort rollback 不永久停用 `/file`、restart total、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
 | `/file` resolve/send interleaving（end、rebind-style replacement）不可附件或成功回覆 | `test/app-file-command.test.ts`、`test/transport.test.ts` |
+| `/end` 穿插 rebind 的 binding、replacement actor、map-swap 三階段都不能復活 map／record／worktree；commit rollback 的 unconfirmed replacement 會 retain/retry | `test/app-rebind.test.ts` |
+| faulted/hung SDK disconnect 保留 root lock，確認終止後只 close 一次且 actor 仍拒絕 prompt／送檔 | `test/session-actor.test.ts` |
+| 已送出後 delete reject/timeout 的 `retraction-unconfirmed`、thread warning、transport `ok` 後才 stale 的可見性警告、actor failure 與 `/file` 誠實訊息 | `test/transport.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
+| v4 container mixed/downgraded row fail-closed；非 Windows 不診斷 Attach Files；YOLO 普通卡與撤銷檔案卡文字一致 | `test/session-store.test.ts`、`test/app-channels.test.ts`、`test/file-delivery-docs.test.ts` |
 | session dispose 後可重新顯示一次 Attach Files 缺權限提示 | `test/transport.test.ts` |
 | README / Discord setup 中英雙檔、PLAN 與 instructions 都如實說明 Windows-only availability | `test/file-delivery-docs.test.ts` |

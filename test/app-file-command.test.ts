@@ -29,6 +29,7 @@ class FakeTransport implements Transport {
   sendFileResult: SendFileResult = { ok: true };
   sendFileGate?: Promise<void>;
   sendFileStarted?: () => void;
+  ignoreCurrentness = false;
   async render(): Promise<void> {}
   async sendFile(
     sessionKey: string,
@@ -38,7 +39,9 @@ class FakeTransport implements Transport {
   ): Promise<SendFileResult> {
     this.sendFileStarted?.();
     if (this.sendFileGate) await this.sendFileGate;
-    if (options?.canSend && !options.canSend()) return { ok: false, reason: "cancelled" };
+    if (!this.ignoreCurrentness && options?.canSend && !options.canSend()) {
+      return { ok: false, reason: "cancelled" };
+    }
     this.sentFiles.push({
       key: sessionKey,
       file,
@@ -444,6 +447,55 @@ describe("/file", () => {
     expect(interaction.edits).toEqual(["檔案傳送已取消。"]);
   });
 
+  it("warns that an attachment may remain visible when a stale send reports success", async () => {
+    const transport = new FakeTransport();
+    transport.ignoreCurrentness = true;
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as CopilotClient,
+      transport,
+      new SessionStore(storeFile),
+      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+    );
+    const workDir = path.join(reposRoot, "repo");
+    const filePath = path.join(workDir, "report.txt");
+    mkdirSync(workDir, { recursive: true });
+    writeFileSync(filePath, "hello");
+    const resolver = actorResolving({
+      ok: true,
+      file: {
+        absPath: filePath,
+        displayName: "report.txt",
+        relativePath: "report.txt",
+        size: 5,
+        fingerprint: "artifact-identity:5:1",
+        digest: "sha256:test",
+        bytes: Buffer.from("hello"),
+      },
+    });
+    sessionsOf(app).set(THREAD, session(workDir, resolver.actor));
+    let releaseSend!: () => void;
+    transport.sendFileGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    const sendStarted = new Promise<void>((resolve) => {
+      transport.sendFileStarted = resolve;
+    });
+    const interaction = slash({ pathValue: "report.txt" });
+
+    const command = invokeInteraction(app, interaction);
+    await sendStarted;
+    sessionsOf(app).delete(THREAD);
+    releaseSend();
+    await command;
+
+    expect(transport.sentFiles).toHaveLength(1);
+    expect(interaction.edits).toHaveLength(1);
+    expect(interaction.edits[0]).toMatch(/可能仍.*(?:可見|看見)/);
+    expect(interaction.edits[0]).not.toContain("已將檔案傳送");
+  });
+
   it("reports transport failure honestly", async () => {
     const transport = new FakeTransport();
     transport.sendFileResult = { ok: false, reason: "transient" };
@@ -515,6 +567,43 @@ describe("/file", () => {
 
     expect(interaction.edits).toEqual(["檔案傳送已取消。"]);
     expect(transport.sentFiles).toHaveLength(1);
+  });
+
+  it("reports an unconfirmed late attachment retraction without claiming cancellation was complete", async () => {
+    const transport = new FakeTransport();
+    transport.sendFileResult = { ok: false, reason: "retraction-unconfirmed" };
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as CopilotClient,
+      transport,
+      new SessionStore(storeFile),
+      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+    );
+    const workDir = path.join(reposRoot, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const filePath = path.join(workDir, "report.txt");
+    writeFileSync(filePath, "hello");
+    const resolver = actorResolving({
+      ok: true,
+      file: {
+        absPath: filePath,
+        displayName: "report.txt",
+        relativePath: "report.txt",
+        size: 5,
+        fingerprint: "artifact-identity:5:1",
+        digest: "sha256:test",
+        bytes: Buffer.from("hello"),
+      },
+    });
+    sessionsOf(app).set(THREAD, session(workDir, resolver.actor));
+    const interaction = slash({ pathValue: "report.txt" });
+
+    await invokeInteraction(app, interaction);
+
+    expect(interaction.edits).toHaveLength(1);
+    expect(interaction.edits[0]).toMatch(/無法確認.*收回|可能仍.*可見/);
+    expect(interaction.edits[0]).not.toContain("已將檔案傳送");
   });
 
   it("refuses /file before resolution when the injected platform does not support safe delivery", async () => {

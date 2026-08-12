@@ -46,7 +46,7 @@ discord-copilot-sdk v1 **僅限實驗環境**。它會**以啟動 bot 的使用�
 - 它是**per-session**（單一 thread）且**永不 persist**——restart 或 session recovery 都會回到 **OFF**，recovery notice 會明講；
 - 啟用只有在 Discord 確認警告後才生效，所以 reply 失敗不會讓 session 默默失去防護；
 - 每次 auto-approval 都會先同步 append + fsync 一筆有界紀錄（kind + target，絕不含 payload）到 `~/.discord-copilot-sdk/<instance>.audit.jsonl`，再顯示精簡 timeline 行。Discord render 是 **best effort**，但本機 log 才是權威；若 log 無法寫入，YOLO 與既有規則的自動核准都會拒絕該請求，不會在沒有稽核紀錄下執行；
-- 已經在等待中的 approval card 仍需要你的決定；
+- 已貼出的一般 permission card 不會因 YOLO 被追溯改寫；檔案傳送卡則不同：開啟 YOLO 會立即撤銷任何待處理的 `discord_send_file` 核准，之後的 agent 送檔請求會快速拒絕並提示改用 `/file`；
 - `ask_user` 與 exit-plan 仍會詢問——YOLO 核准的是 *permissions*，不會替你回答問題或選 plan actions；
 - `/stop` 仍優先：teardown 不論 YOLO 都 fail closed；
 - `/usage` 會顯示 `⚡ YOLO: ON`，讓你一眼看出。用 `/yolo mode:off` 關閉。
@@ -110,7 +110,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 
 ### 檔案傳送
 
-當你要刻意把 session workdir 內、經驗證的檔案上傳回擁有它的 Discord thread 時，用 `/file path:<path>`。agent 也可以提議 `discord_send_file({path,comment?})`，但它一定會顯示獨立的 Allow once / Deny 卡片、只能送 workdir 內檔案，且同樣受 Discord 8 MiB 上傳上限限制。這兩條路都需要 Discord 的 **Attach Files** 權限；所有送檔都會抑制 mentions，而 YOLO 會快速拒絕 agent 的送檔請求並提示改用 `/file`。
+當你要刻意把 session workdir 內、經驗證的檔案上傳回擁有它的 Discord thread 時，用 `/file path:<path>`。agent 也可以提議 `discord_send_file({path,comment?})`；正常情況下它會顯示獨立的 Allow once / Deny 卡片、只能送 workdir 內檔案，且同樣受 Discord 8 MiB 上傳上限限制。這兩條路都需要 Discord 的 **Attach Files** 權限，且所有送檔都會抑制 mentions。YOLO 對檔案卡是刻意的例外：開啟時會撤銷已待處理的送檔卡，並快速拒絕之後的 agent 送檔請求，提示改用 `/file`。
 
 > **平台可用性：** 對外 Discord 檔案傳送僅支援 Windows。在 Linux、macOS 與其他平台，session 和所有非送檔 bot 功能仍會正常運作，但 `/file` 會安全地回覆不可用，且不會暴露 `discord_send_file`。這是刻意的取捨：SDK 只接受 pathname `workingDirectory`，不接受保留的 descriptor，因此 POSIX 無法安全防止 create 或 resume 期間的 swap-and-restore。
 

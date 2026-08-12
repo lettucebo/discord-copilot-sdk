@@ -349,6 +349,24 @@ describe("SessionStore — durable file delivery quota", () => {
     expect(restarted.all()).toEqual([]);
   });
 
+  it("rejects a downgraded row in a v4 container instead of migrating its missing quota", () => {
+    const f = tmpFile();
+    const store = new SessionStore(f);
+    expect(store.reserve(bind("t1"))).toBe(true);
+    const persisted = JSON.parse(readFileSync(f, "utf8")) as {
+      schemaVersion: number;
+      sessions: Array<Record<string, unknown>>;
+    };
+    expect(persisted.schemaVersion).toBe(4);
+    persisted.sessions[0]!.schemaVersion = 3;
+    delete persisted.sessions[0]!.fileDeliveryBytes;
+    writeFileSync(f, JSON.stringify(persisted), "utf8");
+
+    const restarted = new SessionStore(f);
+    expect(restarted.isCorrupt()).toBe(true);
+    expect(restarted.all()).toEqual([]);
+  });
+
   it("keeps the prior byte total in memory when its durable reservation fails", () => {
     const dir = mkdtempSync(join(tmpdir(), "dcs-store-quota-ro-"));
     const f = join(dir, "s.json");

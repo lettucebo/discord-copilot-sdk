@@ -12,10 +12,13 @@ import { canonicalPathOr } from "../src/core/repo.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
 import { ApprovalPolicy } from "../src/core/approval-policy.js";
 import type { CopilotClient } from "@github/copilot-sdk";
+import type { ChatInputCommandInteraction } from "discord.js";
 import { SessionActor, type SessionActorOpts } from "../src/copilot/session-actor.js";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import type { DevMode } from "../src/core/binding.js";
 import type { SecureOpenBackend } from "../src/core/secure-open.js";
+import { worktreePath } from "../src/core/worktree.js";
+import { worktreeRoot } from "../src/core/paths.js";
 
 const run = promisify(execFile);
 
@@ -39,6 +42,8 @@ class FakeActor {
   suspendFileDeliveryCalls = 0;
   resumeFileDeliveryCalls: number[] = [];
   onSuspendFileDelivery?: () => void;
+  onDisconnect?: () => void;
+  disconnectGate?: Promise<void>;
   oldQuotaReserve?: boolean;
   isFaulted(): boolean {
     return false;
@@ -48,6 +53,8 @@ class FakeActor {
   }
   async disconnect(): Promise<void> {
     this.disconnectCalls++;
+    this.onDisconnect?.();
+    if (this.disconnectGate) await this.disconnectGate;
     if (this.disconnectFails) throw new Error("runtime did not answer");
   }
   async stop(): Promise<boolean> {
@@ -237,6 +244,26 @@ const blocker = (
     }
   ).rebindBlocker("t1", session, target);
 
+function endInteraction(): ChatInputCommandInteraction {
+  return {
+    user: { id: "u1" },
+    guildId: "g1",
+    channelId: "t1",
+    channel: { isThread: () => true, parentId: "c1" },
+    options: { getString: () => null },
+    reply: async () => {},
+    deferReply: async () => {},
+    editReply: async () => {},
+  } as unknown as ChatInputCommandInteraction;
+}
+
+const endThread = (app: DiscordCopilotApp): Promise<void> =>
+  (
+    app as unknown as {
+      cmdEnd(i: ChatInputCommandInteraction): Promise<void>;
+    }
+  ).cmdEnd(endInteraction());
+
 /** A REAL git repo: the rebind path runs `git worktree add`, `git status` and
  *  `git symbolic-ref` for real, and a `.git` directory alone makes all of them
  *  fail — which the code correctly treats as "refuse to touch anything". */
@@ -379,6 +406,39 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     expect(store.get("t1")?.sessionId).toBe("s1");
     expect(leases(app).get(leaseKeyOf(repoA))).toBe("t1"); // lease restored
     expect(leases(app).get(leaseKeyOf(repoB))).toBeUndefined();
+  });
+
+  it("retains and retries a replacement when commit failure cannot confirm its teardown", async () => {
+    const { app, store, actor } = harness();
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    const originalCreate = SessionActor.create;
+    let replacementDisconnect: ReturnType<typeof vi.spyOn> | undefined;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation(async (client, options) => {
+      const replacement = await originalCreate(client, options);
+      replacementDisconnect = vi.spyOn(replacement, "disconnect");
+      replacementDisconnect.mockRejectedValueOnce(new Error("first teardown attempt unconfirmed"));
+      return replacement;
+    });
+    const commitSpy = vi.spyOn(store, "commit").mockReturnValue(false);
+
+    try {
+      await expect(applyRebind(app, { repoPath: repoB, devMode: "worktree" })).resolves.toMatch(/commit 失敗/);
+
+      expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
+      expect(store.get("t1")?.sessionId).toBe("s1");
+      await vi.waitFor(() => expect(replacementDisconnect).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() =>
+        expect(
+          (app as unknown as { staleRebindActors: Map<SessionActor, unknown> }).staleRebindActors.size
+        ).toBe(0)
+      );
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+    } finally {
+      commitSpy.mockRestore();
+      createSpy.mockRestore();
+      await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
   });
 
   it("suspends old file delivery before rebinding and restores it only after a failed rollback", async () => {
@@ -703,6 +763,126 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       expect(fs.existsSync(oldWt)).toBe(true);
     } finally {
       fs.rmSync(path.dirname(oldWt), { recursive: true, force: true });
+    }
+  });
+
+  it("/end wins while target binding is still pending and removes the unowned worktree", async () => {
+    const { app, store, actor } = harness();
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    let releaseBinding!: () => void;
+    const bindingGate = new Promise<void>((resolve) => {
+      releaseBinding = resolve;
+    });
+    let bindingStarted!: () => void;
+    const bindingStartedPromise = new Promise<void>((resolve) => {
+      bindingStarted = resolve;
+    });
+    (app as unknown as { bindingCheck: unknown }).bindingCheck = async () => {
+      bindingStarted();
+      await bindingGate;
+      return { ok: true };
+    };
+    const createSpy = vi.spyOn(SessionActor, "create");
+
+    try {
+      const rebinding = applyRebind(app, { repoPath: repoB, devMode: "worktree" });
+      await bindingStartedPromise;
+
+      await endThread(app);
+      releaseBinding();
+      await expect(rebinding).resolves.toMatch(/已結束/);
+
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(sessions(app).get("t1")).toBeUndefined();
+      expect(store.get("t1")).toBeUndefined();
+      expect(actor.disconnectCalls).toBe(1);
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+    } finally {
+      createSpy.mockRestore();
+      releaseBinding?.();
+      await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
+  it("/end cleans a replacement actor and record created after its rebind reservation", async () => {
+    const { app, store } = harness();
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    const originalCreate = SessionActor.create;
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    let replacementCreated!: () => void;
+    const replacementCreatedPromise = new Promise<void>((resolve) => {
+      replacementCreated = resolve;
+    });
+    let replacementDisconnect: ReturnType<typeof vi.spyOn> | undefined;
+    const createSpy = vi.spyOn(SessionActor, "create").mockImplementation(async (client, options) => {
+      const replacement = await originalCreate(client, options);
+      replacementDisconnect = vi.spyOn(replacement, "disconnect");
+      replacementDisconnect.mockRejectedValueOnce(new Error("first teardown attempt unconfirmed"));
+      replacementCreated();
+      await createGate;
+      return replacement;
+    });
+
+    try {
+      const rebinding = applyRebind(app, { repoPath: repoB, devMode: "worktree" });
+      await replacementCreatedPromise;
+      expect(store.get("t1")?.state).toBe("creating");
+
+      await endThread(app);
+      releaseCreate();
+      await expect(rebinding).resolves.toMatch(/已結束/);
+
+      await vi.waitFor(() => expect(replacementDisconnect).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() =>
+        expect(
+          (app as unknown as { staleRebindActors: Map<SessionActor, unknown> }).staleRebindActors.size
+        ).toBe(0)
+      );
+      expect(sessions(app).get("t1")).toBeUndefined();
+      expect(store.get("t1")).toBeUndefined();
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+    } finally {
+      createSpy.mockRestore();
+      releaseCreate?.();
+      await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
+  it("/end invalidates a rebind after its map swap so it cannot recreate the session", async () => {
+    const { app, store, actor } = harness();
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    let releaseOldDisconnect!: () => void;
+    const oldDisconnectGate = new Promise<void>((resolve) => {
+      releaseOldDisconnect = resolve;
+    });
+    let oldDisconnectStarted!: () => void;
+    const oldDisconnectStartedPromise = new Promise<void>((resolve) => {
+      oldDisconnectStarted = resolve;
+    });
+    actor.disconnectGate = oldDisconnectGate;
+    actor.onDisconnect = oldDisconnectStarted;
+
+    try {
+      const rebinding = applyRebind(app, { repoPath: repoB, devMode: "worktree" });
+      await oldDisconnectStartedPromise;
+      expect(sessions(app).get("t1")?.actor).not.toBe(actor as unknown as Session["actor"]);
+
+      await endThread(app);
+      releaseOldDisconnect();
+      await expect(rebinding).resolves.toMatch(/已結束/);
+
+      expect(sessions(app).get("t1")).toBeUndefined();
+      expect(store.get("t1")).toBeUndefined();
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+    } finally {
+      releaseOldDisconnect?.();
+      await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
     }
   });
 

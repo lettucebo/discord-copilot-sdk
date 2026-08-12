@@ -30,6 +30,9 @@ export { sanitizeForCodeBlock };
 /** Never let agent-produced text ping anyone. */
 const NO_MENTIONS = { allowedMentions: { parse: [] as never[] } };
 const RENDER_INTERVAL_MS = 1000;
+/** A stale attachment is already public. Do not let an unavailable delete API
+ * stall a turn forever, but never report it as retracted without confirmation. */
+const LATE_ATTACHMENT_DELETE_TIMEOUT_MS = 5_000;
 
 interface SessionRender {
   msgIds: string[];
@@ -258,11 +261,14 @@ export class DiscordTransport implements Transport {
       if (!canSendFile(options)) return { ok: false, reason: "cancelled" };
       const message = await channel.send(payload);
       if (!canSendFile(options)) {
-        // A turn can end while Discord accepts the attachment. Start deletion
-        // without making cleanup availability decide whether the caller learns
-        // the delivery was cancelled.
-        void message.delete().catch(() => {});
-        return { ok: false, reason: "cancelled" };
+        // Discord can accept an attachment in the gap after the lifecycle check.
+        // `cancelled` is truthful only once deletion confirms the public object
+        // is gone; otherwise tell every caller it may still be visible.
+        if (await this.retractLateAttachment(message)) {
+          return { ok: false, reason: "cancelled" };
+        }
+        await this.postUnconfirmedRetractionWarning(channel);
+        return { ok: false, reason: "retraction-unconfirmed" };
       }
       return { ok: true };
     } catch (error: unknown) {
@@ -382,6 +388,37 @@ export class DiscordTransport implements Transport {
     }
   }
 
+  /** Try to retract a stale upload before reporting cancellation. A Discord
+   * delete failure or timeout is deliberately observable: hiding it would tell
+   * the operator an attachment was withdrawn while it could remain public. */
+  private async retractLateAttachment(message: MinimalMessage): Promise<boolean> {
+    try {
+      await withTimeout(Promise.resolve().then(() => message.delete()), LATE_ATTACHMENT_DELETE_TIMEOUT_MS);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Surface the residual exposure in the owning thread when Discord still
+   * accepts text there. This is best effort, but bounded so the original tool
+   * result cannot hang behind a second broken Discord request. */
+  private async postUnconfirmedRetractionWarning(channel: MinimalTextChannel): Promise<void> {
+    try {
+      await withTimeout(
+        channel.send({
+          content:
+            "⚠️ 檔案傳送已取消，但 Discord 接受附件後無法確認已收回；附件可能仍可在這個討論串中看見。",
+          ...NO_MENTIONS,
+        }),
+        LATE_ATTACHMENT_DELETE_TIMEOUT_MS
+      );
+    } catch {
+      // The structured result remains truthful even when this visible warning
+      // cannot be posted (for example, the thread was deleted with `/end`).
+    }
+  }
+
   private classifySendFileError(error: unknown): SendFileResult {
     if (!isDiscordLikeError(error)) return { ok: false, reason: "transient" };
     if (error.code === 50013) return { ok: false, reason: "no-attach-permission" };
@@ -402,6 +439,23 @@ function canSendFile(options: SendFileOptions | undefined): boolean {
   } catch {
     return false;
   }
+}
+
+function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("operation timed out")), timeoutMs);
+    (timer as { unref?: () => void }).unref?.();
+    operation.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 function isPlatformBlockedUploadError(error: DiscordLikeError): boolean {
