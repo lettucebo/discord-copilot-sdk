@@ -5,10 +5,16 @@ import path from "node:path";
 import { MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import { DiscordCopilotApp, type Session } from "../src/app.js";
+import type { SessionActor } from "../src/copilot/session-actor.js";
 import type { Config } from "../src/config.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
-import { MAX_DISCORD_UPLOAD_BYTES, type OutboundFile } from "../src/core/outbound-file.js";
+import {
+  MAX_DISCORD_UPLOAD_BYTES,
+  type OutboundFile,
+  type OutboundFilePolicy,
+  type ResolveOutboundFileResult,
+} from "../src/core/outbound-file.js";
 import { SessionStore } from "../src/core/session-store.js";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 
@@ -154,9 +160,22 @@ function invokeInteraction(app: DiscordCopilotApp, interaction: FakeSlash): Prom
   );
 }
 
-function session(workDir: string): Session {
+type FileResolverActor = Pick<SessionActor, "resolveFileForDelivery">;
+
+function actorResolving(result: ResolveOutboundFileResult): {
+  actor: FileResolverActor;
+  resolveFileForDelivery: ReturnType<typeof vi.fn>;
+} {
+  const resolveFileForDelivery = vi.fn(async (_path: string, _policy: OutboundFilePolicy) => result);
   return {
-    actor: {} as unknown as Session["actor"],
+    actor: { resolveFileForDelivery },
+    resolveFileForDelivery,
+  };
+}
+
+function session(workDir: string, actor: FileResolverActor): Session {
+  return {
+    actor: actor as SessionActor,
     broker: new PendingInteractionBroker(),
     running: false,
     titled: true,
@@ -240,7 +259,7 @@ describe("/file", () => {
     expect(transport.sentFiles).toHaveLength(0);
   });
 
-  it("refuses a path outside the session workdir using the resolver boundary", async () => {
+  it("uses the actor resolver and safely reports a refused file", async () => {
     const transport = new FakeTransport();
     const app = DiscordCopilotApp.createForTest(
       config(reposRoot),
@@ -255,11 +274,13 @@ describe("/file", () => {
     mkdirSync(workDir, { recursive: true });
     mkdirSync(outsideRoot, { recursive: true });
     writeFileSync(path.join(outsideRoot, "secret.txt"), "nope");
-    sessionsOf(app).set(THREAD, session(workDir));
+    const resolver = actorResolving({ ok: false, reason: "outside-workdir" });
+    sessionsOf(app).set(THREAD, session(workDir, resolver.actor));
     const interaction = slash({ pathValue: "..\\..\\outside\\secret.txt" });
 
     await invokeInteraction(app, interaction);
 
+    expect(resolver.resolveFileForDelivery).toHaveBeenCalledWith("..\\..\\outside\\secret.txt", "operator");
     expect(interaction.edits).toEqual(["無法傳送這個檔案：路徑不在這個 session 的工作目錄內。"]);
     expect(transport.sentFiles).toHaveLength(0);
   });
@@ -278,12 +299,24 @@ describe("/file", () => {
     mkdirSync(path.join(workDir, "artifacts"), { recursive: true });
     const filePath = path.join(workDir, "artifacts", "report.txt");
     writeFileSync(filePath, "hello");
-    sessionsOf(app).set(THREAD, session(workDir));
+    const resolver = actorResolving({
+      ok: true,
+      file: {
+        absPath: filePath,
+        displayName: "report.txt",
+        size: 5,
+        fingerprint: "artifact-identity:5:1",
+        digest: "sha256:test",
+        bytes: Buffer.from("hello"),
+      },
+    });
+    sessionsOf(app).set(THREAD, session(workDir, resolver.actor));
     const interaction = slash({ pathValue: "artifacts\\report.txt" });
 
     await invokeInteraction(app, interaction);
 
     expect(interaction.edits).toEqual(["已將檔案傳送到這個討論串。"]);
+    expect(resolver.resolveFileForDelivery).toHaveBeenCalledWith("artifacts\\report.txt", "operator");
     expect(transport.sentFiles).toHaveLength(1);
     expect(transport.sentFiles[0]).toMatchObject({
       key: THREAD,
@@ -309,13 +342,26 @@ describe("/file", () => {
     );
     const workDir = path.join(reposRoot, "repo");
     mkdirSync(workDir, { recursive: true });
-    writeFileSync(path.join(workDir, "report.txt"), "hello");
-    sessionsOf(app).set(THREAD, session(workDir));
+    const filePath = path.join(workDir, "report.txt");
+    writeFileSync(filePath, "hello");
+    const resolver = actorResolving({
+      ok: true,
+      file: {
+        absPath: filePath,
+        displayName: "report.txt",
+        size: 5,
+        fingerprint: "artifact-identity:5:1",
+        digest: "sha256:test",
+        bytes: Buffer.from("hello"),
+      },
+    });
+    sessionsOf(app).set(THREAD, session(workDir, resolver.actor));
     const interaction = slash({ pathValue: "report.txt" });
 
     await invokeInteraction(app, interaction);
 
     expect(interaction.edits).toEqual(["檔案已解析，但傳送到 Discord 失敗。"]);
+    expect(resolver.resolveFileForDelivery).toHaveBeenCalledWith("report.txt", "operator");
     expect(transport.sentFiles).toHaveLength(1);
   });
 });

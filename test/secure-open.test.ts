@@ -3,6 +3,7 @@ import os from "node:os";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  captureTrustedRoot,
   createDarwinBackend,
   createLinuxBackend,
   LINUX_POSIX_OPEN_FLAGS,
@@ -34,9 +35,11 @@ function fakeBackend(opened: SecureOpenedFile): SecureOpenBackend {
     open: vi.fn(async () => opened),
     openDirectory: vi.fn(async (trustedRoot: string) => ({
       finalPath: trustedRoot,
+      identity: `root:${trustedRoot}`,
       directory: true,
       revalidate: async () => ({
         finalPath: trustedRoot,
+        identity: `root:${trustedRoot}`,
         directory: true,
       }),
       close: async () => undefined,
@@ -54,6 +57,15 @@ function posixHandlePathDependencies(
   backend: SecureOpenBackend
 ): SecureOpenDependencies {
   return { backend, pathMode: "posix" };
+}
+
+async function secureOpenForTest(
+  candidate: string,
+  root: string,
+  options: { maxBytes: number },
+  dependencies: SecureOpenDependencies = {}
+) {
+  return secureOpen(candidate, await captureTrustedRoot(root, dependencies), options, dependencies);
 }
 
 function posixStat(options: {
@@ -81,11 +93,69 @@ afterEach(() => {
 });
 
 describe("secureOpen", () => {
+  it("refuses a replaced root before an external candidate can be opened", async () => {
+    const lexicalRoot = "/work/session";
+    const originalRoot = "/canonical/original-session";
+    const replacementRoot = "/attacker/external-session";
+    const candidateOpen = vi.fn(async (): Promise<SecureOpenedFile> => {
+      throw new Error("a replaced root must not open a candidate");
+    });
+    const captureClose = vi.fn(async () => undefined);
+    const deliveryClose = vi.fn(async () => undefined);
+    const backend: SecureOpenBackend = {
+      open: candidateOpen,
+      openDirectory: vi
+        .fn()
+        .mockResolvedValueOnce({
+          finalPath: originalRoot,
+          identity: "7:101",
+          directory: true,
+          revalidate: async () => ({
+            finalPath: originalRoot,
+            identity: "7:101",
+            directory: true,
+          }),
+          close: captureClose,
+        })
+        .mockResolvedValueOnce({
+          finalPath: replacementRoot,
+          identity: "9:202",
+          directory: true,
+          openCandidate: candidateOpen,
+          revalidate: async () => ({
+            finalPath: replacementRoot,
+            identity: "9:202",
+            directory: true,
+          }),
+          close: deliveryClose,
+        }),
+    };
+    const dependencies = posixHandlePathDependencies(backend);
+
+    const anchor = await captureTrustedRoot(lexicalRoot, dependencies);
+
+    expect(JSON.parse(JSON.stringify(anchor))).toEqual({
+      originalPath: lexicalRoot,
+      finalPath: originalRoot,
+      identity: "7:101",
+    });
+    await expect(
+      secureOpen(`${lexicalRoot}/artifact.txt`, anchor, { maxBytes: 64 }, dependencies)
+    ).rejects.toMatchObject({
+      reason: "unreadable",
+    } satisfies Partial<SecureOpenError>);
+    expect(candidateOpen).not.toHaveBeenCalled();
+    expect(backend.openDirectory).toHaveBeenNthCalledWith(1, lexicalRoot);
+    expect(backend.openDirectory).toHaveBeenNthCalledWith(2, lexicalRoot);
+    expect(captureClose).toHaveBeenCalledTimes(1);
+    expect(deliveryClose).toHaveBeenCalledTimes(1);
+  });
+
   it("returns bytes and handle-derived metadata for an ordinary file inside the trusted root", async () => {
     const root = makeRoot();
     const target = write(root, "artifacts\\report.txt", "inside bytes");
 
-    const result = await secureOpen(target, root, { maxBytes: 1024 });
+    const result = await secureOpenForTest(target, root, { maxBytes: 1024 });
 
     expect(result).toMatchObject({
       finalPath: process.platform === "darwin" ? expect.stringMatching(/report\.txt$/) : target,
@@ -111,6 +181,7 @@ describe("secureOpen", () => {
       events.push("revalidate root");
       return {
         finalPath: replacementRoot,
+        identity: "root-handle",
         directory: true,
       };
     });
@@ -131,6 +202,7 @@ describe("secureOpen", () => {
         events.push("open root");
         return {
           finalPath: root,
+          identity: "root-handle",
           directory: true,
           revalidate,
           close: closeRoot,
@@ -138,12 +210,20 @@ describe("secureOpen", () => {
       }),
     };
 
-    await expect(secureOpen(candidate, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
+    await expect(secureOpenForTest(candidate, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
     expect(read).not.toHaveBeenCalled();
     expect(revalidate).toHaveBeenCalledTimes(1);
-    expect(events).toEqual(["open root", "open candidate", "revalidate root", "close candidate", "close root"]);
+    expect(events).toEqual([
+      "open root",
+      "close root",
+      "open root",
+      "open candidate",
+      "revalidate root",
+      "close candidate",
+      "close root",
+    ]);
   });
 
   it("rejects a deleted trusted root after candidate opening before reading", async () => {
@@ -161,6 +241,7 @@ describe("secureOpen", () => {
       events.push("revalidate root");
       return {
         finalPath: `${root} (deleted)`,
+        identity: "root-handle",
         directory: false,
       };
     });
@@ -181,6 +262,7 @@ describe("secureOpen", () => {
         events.push("open root");
         return {
           finalPath: root,
+          identity: "root-handle",
           directory: true,
           revalidate,
           close: closeRoot,
@@ -188,12 +270,20 @@ describe("secureOpen", () => {
       }),
     };
 
-    await expect(secureOpen(candidate, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
+    await expect(secureOpenForTest(candidate, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
     expect(read).not.toHaveBeenCalled();
     expect(revalidate).toHaveBeenCalledTimes(1);
-    expect(events).toEqual(["open root", "open candidate", "revalidate root", "close candidate", "close root"]);
+    expect(events).toEqual([
+      "open root",
+      "close root",
+      "open root",
+      "open candidate",
+      "revalidate root",
+      "close candidate",
+      "close root",
+    ]);
   });
 
   it("uses the opened root handle final path and refuses a root-side swap before reading", async () => {
@@ -224,9 +314,11 @@ describe("secureOpen", () => {
           // The pathname still points at `root`, but its opened handle proves a
           // replacement root. A pathname realpath anchor would allow candidate.
           finalPath: replacementRoot,
+          identity: "replacement-root",
           directory: true,
           revalidate: async () => ({
             finalPath: replacementRoot,
+            identity: "replacement-root",
             directory: true,
           }),
           close: closeRoot,
@@ -234,13 +326,13 @@ describe("secureOpen", () => {
       }),
     };
 
-    await expect(secureOpen(candidate, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
+    await expect(secureOpenForTest(candidate, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
       reason: "outside-root",
     } satisfies Partial<SecureOpenError>);
-    expect(events).toEqual(["root", "candidate"]);
+    expect(events).toEqual(["root", "root", "candidate"]);
     expect(read).not.toHaveBeenCalled();
     expect(closeCandidate).toHaveBeenCalledTimes(1);
-    expect(closeRoot).toHaveBeenCalledTimes(1);
+    expect(closeRoot).toHaveBeenCalledTimes(2);
   });
 
   it("rejects a case-distinct Win32 handle path sibling", async () => {
@@ -259,7 +351,7 @@ describe("secureOpen", () => {
     });
 
     await expect(
-      secureOpen(candidate, root, { maxBytes: 64 }, win32HandlePathDependencies(backend))
+      secureOpenForTest(candidate, root, { maxBytes: 64 }, win32HandlePathDependencies(backend))
     ).rejects.toMatchObject({
       reason: "outside-root",
     } satisfies Partial<SecureOpenError>);
@@ -285,9 +377,11 @@ describe("secureOpen", () => {
       })),
       openDirectory: vi.fn(async () => ({
         finalPath: root,
+        identity: "root-handle",
         directory: true,
         revalidate: async () => ({
           finalPath: String.raw`C:\work\repo`,
+          identity: "root-handle",
           directory: true,
         }),
         close: closeRoot,
@@ -295,13 +389,13 @@ describe("secureOpen", () => {
     };
 
     await expect(
-      secureOpen(candidate, root, { maxBytes: 64 }, win32HandlePathDependencies(backend))
+      secureOpenForTest(candidate, root, { maxBytes: 64 }, win32HandlePathDependencies(backend))
     ).rejects.toMatchObject({
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
     expect(read).not.toHaveBeenCalled();
     expect(closeCandidate).toHaveBeenCalledTimes(1);
-    expect(closeRoot).toHaveBeenCalledTimes(1);
+    expect(closeRoot).toHaveBeenCalledTimes(2);
   });
 
   it("rejects a three-phase swap from the opened handle path before reading external bytes", async () => {
@@ -321,7 +415,7 @@ describe("secureOpen", () => {
       close,
     });
 
-    await expect(secureOpen(inside, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
+    await expect(secureOpenForTest(inside, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
       reason: "outside-root",
     } satisfies Partial<SecureOpenError>);
     expect(read).not.toHaveBeenCalled();
@@ -343,7 +437,7 @@ describe("secureOpen", () => {
       close,
     });
 
-    await expect(secureOpen(target, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
+    await expect(secureOpenForTest(target, root, { maxBytes: 64 }, { backend })).rejects.toMatchObject({
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
     expect(read).toHaveBeenCalledTimes(1);
@@ -392,7 +486,7 @@ describe("secureOpen", () => {
       }
     );
 
-    const result = await secureOpen(candidate, root, { maxBytes: 64 }, posixHandlePathDependencies(backend));
+    const result = await secureOpenForTest(candidate, root, { maxBytes: 64 }, posixHandlePathDependencies(backend));
 
     expect(result.bytes).toEqual(Buffer.from("inside"));
     expect(openat).toHaveBeenNthCalledWith(1, 41, "nested", LINUX_POSIX_OPEN_FLAGS.intermediate);
@@ -400,7 +494,7 @@ describe("secureOpen", () => {
     expect(close).toHaveBeenCalledTimes(2);
     expect(close).toHaveBeenCalledWith(42);
     expect(close).toHaveBeenCalledWith(43);
-    expect(rootHandle.close).toHaveBeenCalledTimes(1);
+    expect(rootHandle.close).toHaveBeenCalledTimes(2);
   });
 
   it("rejects an intermediate POSIX symlink without reading a candidate fd", async () => {
@@ -425,7 +519,7 @@ describe("secureOpen", () => {
     );
 
     await expect(
-      secureOpen(
+      secureOpenForTest(
         "/trusted-worktree/escape/loot.txt",
         root,
         { maxBytes: 64 },
@@ -466,7 +560,7 @@ describe("secureOpen", () => {
     );
 
     await expect(
-      secureOpen(`${root}/first/second/file.txt`, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
+      secureOpenForTest(`${root}/first/second/file.txt`, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
     ).rejects.toMatchObject({
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
@@ -501,7 +595,7 @@ describe("secureOpen", () => {
     );
 
     await expect(
-      secureOpen(`${root}/pipe`, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
+      secureOpenForTest(`${root}/pipe`, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
     ).rejects.toMatchObject({
       reason: "not-regular-file",
     } satisfies Partial<SecureOpenError>);
@@ -541,7 +635,7 @@ describe("secureOpen", () => {
     );
 
     await expect(
-      secureOpen(`${root}/growing.txt`, root, { maxBytes: 4 }, posixHandlePathDependencies(backend))
+      secureOpenForTest(`${root}/growing.txt`, root, { maxBytes: 4 }, posixHandlePathDependencies(backend))
     ).rejects.toMatchObject({
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
@@ -584,19 +678,22 @@ describe("secureOpen", () => {
     );
 
     await expect(
-      secureOpen(target, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
+      secureOpenForTest(target, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
     ).resolves.toMatchObject({
       finalPath: "/trusted-root/artifact.txt",
       size: 6,
       bytes: Buffer.from("inside"),
     });
 
-    const [initialRoot, candidate, revalidatedRoot] = calls;
-    if (!initialRoot || !candidate || !revalidatedRoot) throw new Error("Darwin fcntl calls were incomplete");
-    expect(calls).toHaveLength(3);
+    const [captureRoot, initialRoot, candidate, revalidatedRoot] = calls;
+    if (!captureRoot || !initialRoot || !candidate || !revalidatedRoot) {
+      throw new Error("Darwin fcntl calls were incomplete");
+    }
+    expect(calls).toHaveLength(4);
+    expect(captureRoot.fd).toBe(initialRoot.fd);
     expect(initialRoot.fd).toBe(revalidatedRoot.fd);
     expect(candidate.fd).not.toBe(initialRoot.fd);
-    expect(calls.map(({ command }) => command)).toEqual([50, 50, 50]);
+    expect(calls.map(({ command }) => command)).toEqual([50, 50, 50, 50]);
     expect(calls.every(({ capacity }) => capacity >= 1024)).toBe(true);
   });
 
@@ -624,7 +721,7 @@ describe("secureOpen", () => {
     );
 
     await expect(
-      secureOpen(target, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
+      secureOpenForTest(target, root, { maxBytes: 64 }, posixHandlePathDependencies(backend))
     ).rejects.toMatchObject({
       reason: "unreadable",
     } satisfies Partial<SecureOpenError>);
@@ -639,7 +736,7 @@ describe("secureOpen", () => {
       const link = path.join(root, "escape");
       symlinkSync(outsideRoot, link, "dir");
 
-      await expect(secureOpen(path.join(link, "loot.txt"), root, { maxBytes: 64 })).rejects.toMatchObject({
+      await expect(secureOpenForTest(path.join(link, "loot.txt"), root, { maxBytes: 64 })).rejects.toMatchObject({
         reason: "outside-root",
       } satisfies Partial<SecureOpenError>);
     }
@@ -649,7 +746,7 @@ describe("secureOpen", () => {
     const root = makeRoot();
     const target = write(root, "artifact.txt", "inside");
 
-    await expect(secureOpen(target, root, { maxBytes: 64 })).resolves.toMatchObject({
+    await expect(secureOpenForTest(target, root, { maxBytes: 64 })).resolves.toMatchObject({
       relativePath: "artifact.txt",
       bytes: Buffer.from("inside"),
     });
@@ -659,7 +756,7 @@ describe("secureOpen", () => {
     const root = makeRoot();
     const target = write(root, "artifact.txt", "inside");
 
-    await expect(secureOpen(target, root, { maxBytes: 64 })).resolves.toMatchObject({
+    await expect(secureOpenForTest(target, root, { maxBytes: 64 })).resolves.toMatchObject({
       relativePath: "artifact.txt",
       bytes: Buffer.from("inside"),
     });
@@ -671,7 +768,7 @@ describe("secureOpen", () => {
       const root = makeRoot();
       const target = write(root, "artifact.txt", "inside");
 
-      await expect(secureOpen(target, root, { maxBytes: 64 })).rejects.toMatchObject({
+      await expect(secureOpenForTest(target, root, { maxBytes: 64 })).rejects.toMatchObject({
         reason: "unsupported-platform",
       } satisfies Partial<SecureOpenError>);
     }

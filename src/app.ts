@@ -30,7 +30,7 @@ import { validateBinding, describeBindingProblem, type DevMode } from "./core/bi
 import { RepoProvisioner, sweepStaleStaging } from "./core/repo-provision.js";
 import { gitDiffSummary } from "./core/git.js";
 import { downloadBounded } from "./core/download.js";
-import { MAX_DISCORD_UPLOAD_BYTES, resolveOutboundFile, type OutboundRefusal } from "./core/outbound-file.js";
+import type { OutboundRefusal } from "./core/outbound-file.js";
 import { SessionStore, type SessionRecord } from "./core/session-store.js";
 import {
   planReconcile,
@@ -3337,10 +3337,13 @@ export class DiscordCopilotApp {
       return;
     }
     const requestedPath = interaction.options.getString("path", true);
-    const resolved = await resolveOutboundFile(session.workDir, requestedPath, {
-      policy: "operator",
-      maxBytes: MAX_DISCORD_UPLOAD_BYTES,
-    });
+    let resolved: Awaited<ReturnType<SessionActor["resolveFileForDelivery"]>>;
+    try {
+      resolved = await session.actor.resolveFileForDelivery(requestedPath, "operator");
+    } catch {
+      await interaction.editReply({ content: this.fileRefusalMessage("unreadable") });
+      return;
+    }
     if (!resolved.ok) {
       await interaction.editReply({ content: this.fileRefusalMessage(resolved.reason) });
       return;

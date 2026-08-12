@@ -1,7 +1,7 @@
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { hasBidiOrControls, sanitizeForInlineCode } from "./text-safety.js";
-import { SecureOpenError, secureOpen } from "./secure-open.js";
+import { SecureOpenError, secureOpen, type TrustedRoot } from "./secure-open.js";
 
 export type OutboundFilePolicy = "agent" | "operator";
 
@@ -68,16 +68,16 @@ function isGitName(name: string): boolean {
   return (process.platform === "win32" ? name.toLowerCase() : name) === ".git";
 }
 
-function candidatePath(workDir: string, requestedPath: string): string {
-  return path.isAbsolute(requestedPath) ? requestedPath : path.join(workDir, requestedPath);
+function candidatePath(trustedRoot: TrustedRoot, requestedPath: string): string {
+  return path.isAbsolute(requestedPath) ? requestedPath : path.join(trustedRoot.originalPath, requestedPath);
 }
 
 function extensionAllowed(ext: string, policy: OutboundFilePolicy): boolean {
   return policy === "agent" ? AGENT_ALLOWED_EXTENSIONS.has(ext) : !DISCORD_BLOCKED_EXECUTABLE_EXTENSIONS.has(ext);
 }
 
-function isLexicallyOutside(workDir: string, candidate: string): boolean {
-  const root = path.resolve(workDir);
+function isLexicallyOutside(trustedRoot: TrustedRoot, candidate: string): boolean {
+  const root = path.resolve(trustedRoot.originalPath);
   const resolvedCandidate = path.resolve(candidate);
   const relative = path.relative(
     process.platform === "win32" ? root.toLowerCase() : root,
@@ -103,28 +103,27 @@ function mapSecureOpenRefusal(error: unknown): OutboundRefusal {
 }
 
 /**
- * Resolve an agent-requested artifact without using a post-open pathname as
- * containment proof. The secure-open boundary derives the final path and bytes
- * from one OS handle; re-stat'ing a restored name would reintroduce the swap
- * race that can otherwise deliver an external file.
+ * Resolve an artifact only from the actor's capture-time root identity. The
+ * secure-open boundary proves the reopened root still matches that anchor
+ * before candidate lookup, then derives final path and bytes from one handle.
  */
 export async function resolveOutboundFile(
-  workDir: string,
+  trustedRoot: TrustedRoot,
   requestedPath: string,
   options: ResolveOutboundFileOptions
 ): Promise<ResolveOutboundFileResult> {
-  const requested = candidatePath(workDir, requestedPath);
-  const lexicalRelative = path.relative(path.resolve(workDir), path.resolve(requested));
+  const requested = candidatePath(trustedRoot, requestedPath);
+  const lexicalRelative = path.relative(path.resolve(trustedRoot.originalPath), path.resolve(requested));
   if (isGitInternalRelative(lexicalRelative) || isGitName(path.basename(requested))) {
     return { ok: false, reason: ".git-internal" };
   }
-  if (isLexicallyOutside(workDir, requested)) {
+  if (isLexicallyOutside(trustedRoot, requested)) {
     return { ok: false, reason: "outside-workdir" };
   }
 
   let opened: Awaited<ReturnType<typeof secureOpen>>;
   try {
-    opened = await secureOpen(requested, workDir, { maxBytes: options.maxBytes });
+    opened = await secureOpen(requested, trustedRoot, { maxBytes: options.maxBytes });
   } catch (error) {
     return { ok: false, reason: mapSecureOpenRefusal(error) };
   }

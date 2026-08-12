@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterAll, describe, it, expect, vi } from "vitest";
 import { SessionActor, formatTodos } from "../src/copilot/session-actor.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { ApprovalPolicy } from "../src/core/approval-policy.js";
@@ -16,9 +16,14 @@ import type { RenderState } from "../src/core/turn-render.js";
 import { MAX_DISCORD_UPLOAD_BYTES, type OutboundFile } from "../src/core/outbound-file.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdirSync, mkdtempSync, promises as fs, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, promises as fs, renameSync, rmSync, writeFileSync } from "node:fs";
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+const defaultWorkingDirectory = mkdtempSync(join(tmpdir(), "dcs-session-actor-default-"));
+
+afterAll(() => {
+  rmSync(defaultWorkingDirectory, { recursive: true, force: true });
+});
 
 class FakeSession {
   handlers = new Map<string, (e: unknown) => void>();
@@ -206,7 +211,7 @@ async function setup(extra: Record<string, unknown> = {}): Promise<Setup> {
   } as unknown as CopilotClient;
   const actor = await SessionActor.create(client, {
     sessionKey: "t",
-    workingDirectory: "C:\\repo",
+    workingDirectory: defaultWorkingDirectory,
     // Keep unit tests independent of the developer's actual ~/.copilot/skills.
     skillsHomeDirectory: join(tmpdir(), `discord-copilot-sdk-no-skills-${Math.random()}`),
     broker,
@@ -302,7 +307,7 @@ describe("SessionActor config hardening", () => {
     expect(s.config["enableConfigDiscovery"]).toBe(false);
     expect(s.config["enableSkills"]).toBe(false);
     expect(s.config["excludedTools"]).toEqual(["skill"]);
-    expect(s.config["workingDirectory"]).toBe("C:\\repo");
+    expect(s.config["workingDirectory"]).toBe(defaultWorkingDirectory);
     expect(s.config["streaming"]).toBe(true);
     expect(s.config["reasoningSummary"]).toBe("detailed");
     for (const cb of [
@@ -518,6 +523,60 @@ describe("SessionActor config hardening", () => {
     s.transport.plan!(nonce, "reject", "u1");
     await tick();
     expect(s.broker.size).toBe(0);
+  });
+});
+
+describe("SessionActor trusted roots", () => {
+  it("fails creation before starting an SDK session when trusted-root capture fails", async () => {
+    const createSession = vi.fn(async () => new FakeSession());
+    const client = {
+      createSession,
+      resumeSession: async () => new FakeSession(),
+    } as unknown as CopilotClient;
+
+    await expect(
+      SessionActor.create(client, {
+        sessionKey: "t",
+        workingDirectory: join(tmpdir(), `dcs-missing-root-${Math.random()}`, "work"),
+        skillsHomeDirectory: join(tmpdir(), `dcs-no-skills-${Math.random()}`),
+        broker: new PendingInteractionBroker(),
+        transport: new FakeTransport(),
+        policy: new ApprovalPolicy(join(tmpdir(), `dcs-test-approvals-${Math.random()}.json`)),
+      })
+    ).rejects.toThrow();
+
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("uses its captured root for file-tool validation after the worktree pathname is replaced", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "dcs-file-delivery-root-anchor-"));
+    const root = join(parent, "work");
+    const movedRoot = join(parent, "original-work");
+    try {
+      mkdirSync(root);
+      writeArtifact(root, "artifact.txt", "original");
+      const s = await setup({ workingDirectory: root });
+      renameSync(root, movedRoot);
+      mkdirSync(root);
+      writeArtifact(root, "artifact.txt", "external");
+      const showPermission = s.transport.showPermission.bind(s.transport);
+      s.transport.showPermission = async (view: PermissionView): Promise<void> => {
+        await showPermission(view);
+        s.transport.deliverDecision(view.nonce, "deny", "u1");
+      };
+
+      await expect(s.actor.resolveFileForDelivery("artifact.txt", "agent")).resolves.toEqual({
+        ok: false,
+        reason: "unreadable",
+      });
+      await expect(requestFilePermission(s, { path: "artifact.txt" }, "replaced-root")).resolves.toEqual({
+        kind: "user-not-available",
+      });
+      expect(s.transport.permissions).toHaveLength(0);
+      expect(s.transport.sentFiles).toHaveLength(0);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1323,7 +1382,7 @@ describe("SessionActor permission handling", () => {
     expect(view.scopeCommands).toEqual(["git"]); // discloses the executable, not the full command
     s.transport.decision!(view.nonce, "session", "u1");
     expect(await r1).toEqual({ kind: "approve-once" }); // SDK gets approve-once; discord-copilot-sdk stored the rule
-    expect(s.policy.isApproved("t", "C:\\repo", ["git"])).toBe(true);
+    expect(s.policy.isApproved("t", defaultWorkingDirectory, ["git"])).toBe(true);
     // A DIFFERENT git command is now auto-approved WITHOUT a new card.
     const before = s.transport.permissions.length;
     const r2 = await perm(s)({ kind: "shell", fullCommandText: "git log --oneline -5", commands: [{ identifier: "git log --oneline -5" }] });
@@ -1344,7 +1403,7 @@ describe("SessionActor permission handling", () => {
     await tick();
     s.transport.decision!(s.transport.permissions.at(-1)!.nonce, "always", "u1");
     expect(await r).toEqual({ kind: "approve-once" });
-    expect(s.policy.repoApprovals("C:\\repo")).toContain("npm");
+    expect(s.policy.repoApprovals(defaultWorkingDirectory)).toContain("npm");
   });
 
   it("never auto-approves a non-simple command (shell metachars), even if all executables are trusted", async () => {
@@ -1635,25 +1694,34 @@ describe("SessionActor abort + teardown", () => {
     // approvals on the working directory would silently re-prompt for a command
     // the operator already trusted in this repository — and, worse, scatter the
     // persisted grants across per-session paths.
-    const s = await setup({ workingDirectory: "C:\\wt\\thread-1", approvalKey: "C:\\repo" });
-    s.actor.setYolo(false);
-    void perm(s)({ kind: "shell", fullCommandText: "git status", commands: [{ identifier: "git" }] });
-    await tick();
-    const nonce = s.transport.permissions.at(-1)!.nonce;
-    s.transport.deliverDecision(nonce, "always", "u1");
-    await tick();
-    // Stored under the REPO, not the worktree.
-    expect(s.policy.repoApprovals("C:\\repo")).toContain("git");
-    expect(s.policy.repoApprovals("C:\\wt\\thread-1")).toEqual([]);
+    const root = mkdtempSync(join(tmpdir(), "dcs-approval-key-"));
+    const worktree = join(root, "thread-1");
+    const repo = join(root, "repo");
+    try {
+      mkdirSync(worktree);
+      mkdirSync(repo);
+      const s = await setup({ workingDirectory: worktree, approvalKey: repo });
+      s.actor.setYolo(false);
+      void perm(s)({ kind: "shell", fullCommandText: "git status", commands: [{ identifier: "git" }] });
+      await tick();
+      const nonce = s.transport.permissions.at(-1)!.nonce;
+      s.transport.deliverDecision(nonce, "always", "u1");
+      await tick();
+      // Stored under the REPO, not the worktree.
+      expect(s.policy.repoApprovals(repo)).toContain("git");
+      expect(s.policy.repoApprovals(worktree)).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("falls back to the working directory when no approvalKey is given", async () => {
-    const s = await setup({ workingDirectory: "C:\\repo" });
+    const s = await setup({ workingDirectory: defaultWorkingDirectory });
     void perm(s)({ kind: "shell", fullCommandText: "git status", commands: [{ identifier: "git" }] });
     await tick();
     s.transport.deliverDecision(s.transport.permissions.at(-1)!.nonce, "always", "u1");
     await tick();
-    expect(s.policy.repoApprovals("C:\\repo")).toContain("git");
+    expect(s.policy.repoApprovals(defaultWorkingDirectory)).toContain("git");
   });
 
   it("disconnect() unsubscribes the decision handler and disconnects", async () => {
@@ -1975,7 +2043,7 @@ describe("SessionActor resume/create-id seam (P2)", () => {
     } as unknown as CopilotClient;
     const actor = await SessionActor.create(client, {
       sessionKey: "t",
-      workingDirectory: "C:\\repo",
+      workingDirectory: defaultWorkingDirectory,
       broker: new PendingInteractionBroker(),
       transport: new FakeTransport(),
       policy: new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`)),

@@ -7,7 +7,13 @@ import { sanitizeForCodeBlock, sanitizeForInlineCode, hasBidiOrControls } from "
 import { ApprovalPolicy, commandExecutable } from "../core/approval-policy.js";
 import { projectSkillDirectories, resolveSkillDirectories } from "../core/skills.js";
 import { AuditLog, type AuditSink } from "../core/audit-log.js";
-import { MAX_DISCORD_UPLOAD_BYTES, resolveOutboundFile } from "../core/outbound-file.js";
+import {
+  MAX_DISCORD_UPLOAD_BYTES,
+  resolveOutboundFile,
+  type OutboundFilePolicy,
+  type ResolveOutboundFileResult,
+} from "../core/outbound-file.js";
+import { captureTrustedRoot, type TrustedRoot } from "../core/secure-open.js";
 
 const PERMISSION_TIMEOUT_MS = 5 * 60_000;
 const TURN_WATCHDOG_MS = 15 * 60_000;
@@ -183,6 +189,8 @@ export interface BlobAttachment {
  */
 export class SessionActor {
   private session!: CopilotSession;
+  /** Captured before the SDK session starts, then reused for every file lookup. */
+  private trustedRoot!: TrustedRoot;
   private renderer = new TurnRenderer();
   /** True after send() accepts a prompt and until runTurn() observes its terminal outcome. */
   private turnActive = false;
@@ -281,8 +289,13 @@ export class SessionActor {
 
   static async create(client: CopilotClient, opts: SessionActorOpts): Promise<SessionActor> {
     const actor = new SessionActor(opts);
+    await actor.initTrustedRoot();
     await actor.init(client);
     return actor;
+  }
+
+  private async initTrustedRoot(): Promise<void> {
+    this.trustedRoot = await captureTrustedRoot(this.opts.workingDirectory);
   }
 
   private async init(client: CopilotClient): Promise<void> {
@@ -539,6 +552,17 @@ export class SessionActor {
     return { model: this.currentModel, effort: this.currentEffort, context: this.currentContext };
   }
 
+  /** Resolves delivery candidates against the immutable root captured for this actor. */
+  async resolveFileForDelivery(
+    requestedPath: string,
+    policy: OutboundFilePolicy
+  ): Promise<ResolveOutboundFileResult> {
+    return resolveOutboundFile(this.trustedRoot, requestedPath, {
+      policy,
+      maxBytes: MAX_DISCORD_UPLOAD_BYTES,
+    });
+  }
+
   /**
    * Replace the cached config with the RUNTIME's own view
    * (`session.rpc.model.getCurrent`, which the SDK documents as restored from
@@ -641,12 +665,9 @@ export class SessionActor {
     owner: symbol
   ): Promise<ApprovedFileDelivery | undefined> {
     if (!this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) return undefined;
-    let resolved: Awaited<ReturnType<typeof resolveOutboundFile>>;
+    let resolved: ResolveOutboundFileResult;
     try {
-      resolved = await resolveOutboundFile(this.opts.workingDirectory, requestedPath, {
-        policy: "agent",
-        maxBytes: MAX_DISCORD_UPLOAD_BYTES,
-      });
+      resolved = await this.resolveFileForDelivery(requestedPath, "agent");
     } catch {
       if (this.fileDeliveryPermissionIsCurrent(owner, turnEpoch)) {
         void this.addTimelineNotice("Auto-denied: the requested file could not be validated.").catch(() => {});
@@ -821,12 +842,9 @@ export class SessionActor {
       return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
     }
 
-    let resolved: Awaited<ReturnType<typeof resolveOutboundFile>>;
+    let resolved: ResolveOutboundFileResult;
     try {
-      resolved = await resolveOutboundFile(this.opts.workingDirectory, approval.requestedPath, {
-        policy: "agent",
-        maxBytes: MAX_DISCORD_UPLOAD_BYTES,
-      });
+      resolved = await this.resolveFileForDelivery(approval.requestedPath, "agent");
     } catch {
       return fileDeliveryFailure("The approved file could not be validated for delivery.");
     }

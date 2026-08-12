@@ -41,6 +41,23 @@ export interface SecureOpenOptions {
   maxBytes: number;
 }
 
+declare const trustedRootBrand: unique symbol;
+
+/**
+ * A scalar snapshot of the directory an actor was allowed to use. The hidden
+ * type brand prevents ordinary callers from constructing a root from a mutable
+ * pathname; its enumerable fields intentionally remain JSON-serializable.
+ */
+export interface TrustedRoot {
+  /** Absolute lexical pathname captured for component derivation and reopening. */
+  readonly originalPath: string;
+  /** Exact normalized final path reported by the capture-time directory handle. */
+  readonly finalPath: string;
+  /** Handle-derived directory identity (`dev:ino` or volume/file index). */
+  readonly identity: string;
+  readonly [trustedRootBrand]: true;
+}
+
 /**
  * The platform backend must expose facts from exactly one still-open OS handle.
  * It must not re-resolve `finalPath` through a pathname after opening.
@@ -58,6 +75,7 @@ export interface SecureOpenedFile {
 /** Metadata sourced from one still-open trusted-root directory handle. */
 export interface SecureDirectoryProof {
   finalPath: string;
+  identity: string;
   directory: boolean;
 }
 
@@ -187,10 +205,51 @@ function normalizedFinalPath(value: string, pathMode: "win32" | "posix"): string
   return normalized;
 }
 
-function equivalentHandlePaths(left: string, right: string): boolean {
-  // Windows can make siblings case-distinct, so two root-handle paths must
-  // agree exactly before the candidate is trusted.
-  return left === right;
+function lexicalRootPath(value: string, pathMode: "win32" | "posix"): string {
+  const pathApi = pathMode === "win32" ? path.win32 : path.posix;
+  return pathApi.resolve(value);
+}
+
+function stableDirectoryIdentity(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw refusal("unreadable", "The trusted-root handle did not provide a stable identity.");
+  }
+  return value;
+}
+
+function captureDirectoryProof(
+  proof: SecureDirectoryProof,
+  pathMode: "win32" | "posix"
+): { finalPath: string; identity: string } {
+  if (!proof.directory) throw refusal("unreadable", "The trusted root handle is not a directory.");
+  return {
+    finalPath: normalizedFinalPath(proof.finalPath, pathMode),
+    identity: stableDirectoryIdentity(proof.identity),
+  };
+}
+
+function capturedRootValues(
+  trustedRoot: TrustedRoot,
+  pathMode: "win32" | "posix"
+): { originalPath: string; finalPath: string; identity: string } {
+  const originalPath = lexicalRootPath(trustedRoot.originalPath, pathMode);
+  const finalPath = normalizedFinalPath(trustedRoot.finalPath, pathMode);
+  const identity = stableDirectoryIdentity(trustedRoot.identity);
+  if (originalPath !== trustedRoot.originalPath || finalPath !== trustedRoot.finalPath) {
+    throw refusal("unreadable", "The trusted-root anchor is not canonical.");
+  }
+  return { originalPath, finalPath, identity };
+}
+
+function assertCapturedRoot(
+  proof: SecureDirectoryProof,
+  trustedRoot: { finalPath: string; identity: string },
+  pathMode: "win32" | "posix"
+): void {
+  const current = captureDirectoryProof(proof, pathMode);
+  if (current.finalPath !== trustedRoot.finalPath || current.identity !== trustedRoot.identity) {
+    throw refusal("unreadable", "The trusted-root pathname no longer resolves to its captured directory.");
+  }
 }
 
 function validSize(value: number): boolean {
@@ -376,6 +435,7 @@ async function posixDirectoryProof(
   assertPosixHandleLinked(stat);
   return {
     finalPath,
+    identity: `${stablePosixStatField(stat.dev)}:${stablePosixStatField(stat.ino)}`,
     directory: stat.isDirectory(),
   };
 }
@@ -912,9 +972,11 @@ function win32DirectoryProof(api: Win32Api, handle: Win32Handle): SecureDirector
   }
   const attributes = asUint32(fileInformation["dwFileAttributes"]);
   if (attributes === undefined) throw refusal("unreadable", "The Win32 trusted-root handle has invalid attributes.");
+  const { identity } = win32FileIdentity(fileInformation);
 
   return {
     finalPath: win32FinalPath(api, handle),
+    identity,
     directory: (attributes & WIN32_FILE_ATTRIBUTE_DIRECTORY) !== 0,
   };
 }
@@ -972,13 +1034,38 @@ function defaultBackend(): SecureOpenBackend {
   };
 }
 
+/** Capture the directory identity before a session can trust it for file delivery. */
+export async function captureTrustedRoot(
+  workDir: string,
+  dependencies: SecureOpenDependencies = {}
+): Promise<TrustedRoot> {
+  const backend = dependencies.backend ?? defaultBackend();
+  const pathMode = dependencies.pathMode ?? defaultHandlePathMode();
+  const originalPath = lexicalRootPath(workDir, pathMode);
+  let openedRoot: SecureOpenedDirectory | undefined;
+  try {
+    openedRoot = await backend.openDirectory(originalPath);
+    const proof = captureDirectoryProof(openedRoot, pathMode);
+    return {
+      originalPath,
+      finalPath: proof.finalPath,
+      identity: proof.identity,
+    } as TrustedRoot;
+  } catch (error) {
+    throw classifyOpenError(error);
+  } finally {
+    if (openedRoot) await openedRoot.close();
+  }
+}
+
 /**
- * Reads a regular file only after its final path is derived from the same open
- * handle and proven to be strictly below the trusted root.
+ * Reads a regular file only after the current root pathname is proven to
+ * resolve to the identity captured for this actor, and the candidate's final
+ * path is derived from the same open handle.
  */
 export async function secureOpen(
   candidate: string,
-  trustedRoot: string,
+  trustedRoot: TrustedRoot,
   options: SecureOpenOptions,
   dependencies: SecureOpenDependencies = {}
 ): Promise<SecureOpenResult> {
@@ -986,28 +1073,20 @@ export async function secureOpen(
 
   const backend = dependencies.backend ?? defaultBackend();
   const pathMode = dependencies.pathMode ?? defaultHandlePathMode();
+  const capturedRoot = capturedRootValues(trustedRoot, pathMode);
   let openedRoot: SecureOpenedDirectory | undefined;
   let opened: SecureOpenedFile | undefined;
   try {
-    openedRoot = await backend.openDirectory(trustedRoot);
-    if (!openedRoot.directory) {
-      throw refusal("unreadable", "The trusted root handle is not a directory.");
-    }
-    const initialRoot = normalizedFinalPath(openedRoot.finalPath, pathMode);
+    openedRoot = await backend.openDirectory(capturedRoot.originalPath);
+    assertCapturedRoot(openedRoot, capturedRoot, pathMode);
 
     opened = openedRoot.openCandidate
       ? await openedRoot.openCandidate(candidate, options.maxBytes)
       : await backend.open(candidate);
     const revalidatedRoot = await openedRoot.revalidate();
-    if (!revalidatedRoot.directory) {
-      throw refusal("unreadable", "The trusted root handle is no longer a directory.");
-    }
-    const canonicalRoot = normalizedFinalPath(revalidatedRoot.finalPath, pathMode);
-    if (!equivalentHandlePaths(initialRoot, canonicalRoot)) {
-      throw refusal("unreadable", "The trusted root changed while the candidate was being opened.");
-    }
+    assertCapturedRoot(revalidatedRoot, capturedRoot, pathMode);
     const finalPath = normalizedFinalPath(opened.finalPath, pathMode);
-    const relativePath = relativePathInsideCanonical(finalPath, canonicalRoot, pathMode);
+    const relativePath = relativePathInsideCanonical(finalPath, capturedRoot.finalPath, pathMode);
     if (!relativePath) {
       throw refusal("outside-root", "The opened handle resolves outside the trusted root.");
     }

@@ -12,6 +12,7 @@ import {
   resolveOutboundFile,
   DISCORD_BLOCKED_EXECUTABLE_EXTENSIONS,
 } from "../src/core/outbound-file.js";
+import { captureTrustedRoot } from "../src/core/secure-open.js";
 
 const roots: string[] = [];
 
@@ -28,6 +29,14 @@ function write(root: string, rel: string, content: Buffer | string): string {
   return abs;
 }
 
+async function resolveForTest(
+  root: string,
+  requestedPath: string,
+  options: Parameters<typeof resolveOutboundFile>[2]
+) {
+  return resolveOutboundFile(await captureTrustedRoot(root), requestedPath, options);
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
@@ -38,8 +47,9 @@ describe("resolveOutboundFile", () => {
   it("returns a normal agent artifact with bytes and sanitized display name", async () => {
     const root = makeRoot();
     const abs = write(root, "artifacts\\report.txt", "hello report");
+    const trustedRoot = await captureTrustedRoot(root);
 
-    const result = await resolveOutboundFile(root, "artifacts\\report.txt", {
+    const result = await resolveOutboundFile(trustedRoot, "artifacts\\report.txt", {
       maxBytes: 1024,
       policy: "agent",
     });
@@ -61,7 +71,7 @@ describe("resolveOutboundFile", () => {
     const root = makeRoot();
     const abs = write(root, "logs\\session.log", "ok");
 
-    const result = await resolveOutboundFile(root, abs, { maxBytes: 64, policy: "agent" });
+    const result = await resolveForTest(root, abs, { maxBytes: 64, policy: "agent" });
 
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.file.absPath).toBe(abs);
@@ -72,7 +82,7 @@ describe("resolveOutboundFile", () => {
     const outsideRoot = makeRoot();
     write(outsideRoot, "secret.txt", "nope");
 
-    const result = await resolveOutboundFile(root, path.join("..", path.basename(outsideRoot), "secret.txt"), {
+    const result = await resolveForTest(root, path.join("..", path.basename(outsideRoot), "secret.txt"), {
       maxBytes: 64,
       policy: "agent",
     });
@@ -91,7 +101,7 @@ describe("resolveOutboundFile", () => {
       return;
     }
 
-    const result = await resolveOutboundFile(root, "escape\\loot.txt", {
+    const result = await resolveForTest(root, "escape\\loot.txt", {
       maxBytes: 64,
       policy: "agent",
     });
@@ -103,7 +113,7 @@ describe("resolveOutboundFile", () => {
     const root = makeRoot();
     write(root, ".git", "gitdir: C:\\elsewhere");
 
-    const result = await resolveOutboundFile(root, ".git", { maxBytes: 64, policy: "operator" });
+    const result = await resolveForTest(root, ".git", { maxBytes: 64, policy: "operator" });
 
     expect(result).toEqual({ ok: false, reason: ".git-internal" });
   });
@@ -112,7 +122,7 @@ describe("resolveOutboundFile", () => {
     const root = makeRoot();
     mkdirSync(path.join(root, "folder"), { recursive: true });
 
-    const result = await resolveOutboundFile(root, "folder", { maxBytes: 64, policy: "operator" });
+    const result = await resolveForTest(root, "folder", { maxBytes: 64, policy: "operator" });
 
     expect(result).toEqual({
       ok: false,
@@ -127,11 +137,11 @@ describe("resolveOutboundFile", () => {
     write(root, "empty.txt", "");
     write(root, "big.txt", Buffer.alloc(9, 1));
 
-    await expect(resolveOutboundFile(root, "empty.txt", { maxBytes: 8, policy: "agent" })).resolves.toEqual({
+    await expect(resolveForTest(root, "empty.txt", { maxBytes: 8, policy: "agent" })).resolves.toEqual({
       ok: false,
       reason: "empty-file",
     });
-    await expect(resolveOutboundFile(root, "big.txt", { maxBytes: 8, policy: "agent" })).resolves.toEqual({
+    await expect(resolveForTest(root, "big.txt", { maxBytes: 8, policy: "agent" })).resolves.toEqual({
       ok: false,
       reason: "too-large",
     });
@@ -142,7 +152,7 @@ describe("resolveOutboundFile", () => {
     const badName = `bad\u202Egnp.txt`;
     write(root, badName, "x");
 
-    const result = await resolveOutboundFile(root, badName, { maxBytes: 8, policy: "agent" });
+    const result = await resolveForTest(root, badName, { maxBytes: 8, policy: "agent" });
 
     expect(result).toEqual({ ok: false, reason: "unsafe-filename" });
   });
@@ -154,15 +164,15 @@ describe("resolveOutboundFile", () => {
 
     expect(DISCORD_BLOCKED_EXECUTABLE_EXTENSIONS.has(".exe")).toBe(true);
 
-    await expect(resolveOutboundFile(root, "artifact.exe", { maxBytes: 8, policy: "operator" })).resolves.toEqual({
+    await expect(resolveForTest(root, "artifact.exe", { maxBytes: 8, policy: "operator" })).resolves.toEqual({
       ok: false,
       reason: "disallowed-extension",
     });
-    await expect(resolveOutboundFile(root, "notes.bin", { maxBytes: 8, policy: "agent" })).resolves.toEqual({
+    await expect(resolveForTest(root, "notes.bin", { maxBytes: 8, policy: "agent" })).resolves.toEqual({
       ok: false,
       reason: "disallowed-extension",
     });
-    await expect(resolveOutboundFile(root, "notes.bin", { maxBytes: 8, policy: "operator" })).resolves.toMatchObject({
+    await expect(resolveForTest(root, "notes.bin", { maxBytes: 8, policy: "operator" })).resolves.toMatchObject({
       ok: true,
       file: { displayName: "notes.bin" },
     });
@@ -172,14 +182,14 @@ describe("resolveOutboundFile", () => {
     const root = makeRoot();
     const abs = write(root, "artifact.txt", "first");
 
-    const first = await resolveOutboundFile(root, "artifact.txt", { maxBytes: 64, policy: "agent" });
+    const first = await resolveForTest(root, "artifact.txt", { maxBytes: 64, policy: "agent" });
     expect(first.ok).toBe(true);
     if (!first.ok) return;
 
     await new Promise((r) => setTimeout(r, 20));
     writeFileSync(abs, "second-version");
 
-    const second = await resolveOutboundFile(root, "artifact.txt", { maxBytes: 64, policy: "agent" });
+    const second = await resolveForTest(root, "artifact.txt", { maxBytes: 64, policy: "agent" });
     expect(second.ok).toBe(true);
     if (!second.ok) return;
 
@@ -189,13 +199,13 @@ describe("resolveOutboundFile", () => {
   it("changes digest after an equal-size replacement", async () => {
     const root = makeRoot();
     const abs = write(root, "artifact.txt", "original");
-    const first = await resolveOutboundFile(root, "artifact.txt", { maxBytes: 64, policy: "agent" });
+    const first = await resolveForTest(root, "artifact.txt", { maxBytes: 64, policy: "agent" });
     expect(first.ok).toBe(true);
     if (!first.ok) return;
 
     writeFileSync(abs, "replaced");
 
-    const second = await resolveOutboundFile(root, "artifact.txt", { maxBytes: 64, policy: "agent" });
+    const second = await resolveForTest(root, "artifact.txt", { maxBytes: 64, policy: "agent" });
     expect(second.ok).toBe(true);
     if (!second.ok) return;
 
@@ -206,7 +216,7 @@ describe("resolveOutboundFile", () => {
 
   it("refuses missing paths", async () => {
     const root = makeRoot();
-    const missing = await resolveOutboundFile(root, "ghost.txt", { maxBytes: 64, policy: "agent" });
+    const missing = await resolveForTest(root, "ghost.txt", { maxBytes: 64, policy: "agent" });
     expect(missing).toEqual({ ok: false, reason: "not-found" });
   });
 });
