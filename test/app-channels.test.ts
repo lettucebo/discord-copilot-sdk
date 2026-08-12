@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ChannelType, type ChatInputCommandInteraction } from "discord.js";
+import { ChannelType, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import { DiscordCopilotApp, type Session } from "../src/app.js";
 import type { Config } from "../src/config.js";
@@ -25,7 +25,7 @@ class FakeTransport implements Transport {
   async showPermission(): Promise<void> {}
   async showUserInput(): Promise<void> {}
   async showPlan(): Promise<void> {}
-  async notice(): Promise<void> {}
+  async notice(..._args: Parameters<Transport["notice"]>): Promise<void> {}
   async noticeDelivered(): Promise<boolean> {
     return true;
   }
@@ -54,6 +54,7 @@ interface FakeSlash {
   options: {
     getSubcommand: () => string;
     getString: (name: string) => string | null;
+    getBoolean: (name: string) => boolean | null;
   };
   replies: unknown[];
   defers: unknown[];
@@ -97,6 +98,7 @@ function slash(
     options: {
       getSubcommand: () => over.subcommand ?? "list",
       getString: (name) => over.strings?.[name] ?? null,
+      getBoolean: () => null,
     },
     replies,
     defers,
@@ -169,6 +171,14 @@ function cmdChannel(app: DiscordCopilotApp, interaction: ChatInputCommandInterac
   ).cmdChannel(interaction);
 }
 
+function cmdYolo(app: DiscordCopilotApp, interaction: ChatInputCommandInteraction): Promise<void> {
+  return (
+    app as unknown as {
+      cmdYolo(i: ChatInputCommandInteraction): Promise<void>;
+    }
+  ).cmdYolo(interaction);
+}
+
 type DiscordForTest = {
   discord: {
     channels: {
@@ -218,6 +228,7 @@ function binding(threadId: string, parentChannelId: string): SessionBinding {
 beforeEach(() => {
   rmSync(FIXTURES, { recursive: true, force: true });
   mkdirSync(FIXTURES, { recursive: true });
+
 });
 
 afterEach(() => {
@@ -368,4 +379,92 @@ describe("/channel", () => {
     expect(textOf(interaction.replies[0])).toContain("不等於");
     expect(textOf(interaction.replies[0])).toContain("Server Settings → Integrations");
   });
+  it("keeps /yolo mode:on gated on the ack and then emits the live notice with file guidance", async () => {
+    const notices: Array<{ key: string; text: string }> = [];
+    class NoticeTransport extends FakeTransport {
+      override async notice(key: string, text: string): Promise<void> {
+        notices.push({ key, text });
+      }
+    }
+
+    const reposRoot = join(FIXTURES, "repos");
+    mkdirSync(reposRoot, { recursive: true });
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as unknown as CopilotClient,
+      new NoticeTransport(),
+      new SessionStore(join(FIXTURES, "sessions-yolo.json")),
+      new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels-yolo.json"))
+    );
+
+    const state = { on: false, epoch: 0 };
+    const actor = {
+      hasRepoSkills: () => false,
+      yoloEpochValue: () => state.epoch,
+      setYolo: (on: boolean) => {
+        state.epoch++;
+        state.on = on;
+      },
+      enableYoloIfCurrent: async (epoch: number) => {
+        await Promise.resolve();
+        if (epoch !== state.epoch) return false;
+        state.on = true;
+        return true;
+      },
+    } as unknown as Pick<Session["actor"], "hasRepoSkills" | "yoloEpochValue" | "setYolo" | "enableYoloIfCurrent">;
+
+    sessionsOf(app).set("thread-yolo", {
+      actor: actor as Session["actor"],
+      broker: new PendingInteractionBroker(),
+      running: false,
+      titled: true,
+      titleEpoch: 0,
+      queue: [],
+      workDir: join(FIXTURES, "repo"),
+      repoPath: join(FIXTURES, "repo"),
+      devMode: "local",
+      parentChannelId: SEED,
+      hasRunTurn: false,
+    });
+
+    let releaseAck!: () => void;
+    const ack = new Promise<void>((resolve) => {
+      releaseAck = resolve;
+    });
+    const interaction = slash({
+      channelId: "thread-yolo",
+      threadParentId: SEED,
+      strings: { mode: "on" },
+      defer: () => ack,
+    });
+
+    const enabling = cmdYolo(app, asInteraction(interaction));
+    await Promise.resolve();
+
+    expect(interaction.replies).toHaveLength(1);
+    expect(state.on).toBe(false);
+    expect(notices).toEqual([]);
+
+    releaseAck();
+    await Promise.resolve();
+
+    expect(interaction.replies).toEqual([
+      expect.objectContaining({
+        content: expect.stringMatching(/discord_send_file/i),
+        flags: MessageFlags.Ephemeral,
+      }),
+    ]);
+    expect(interaction.replies[0]).toEqual(expect.objectContaining({ content: expect.stringMatching(/\/file path:</i) }));
+    await enabling;
+
+    expect(state.on).toBe(true);
+    expect(notices).toEqual([
+      {
+        key: "thread-yolo",
+        text: "⚡ **YOLO mode ON** — other permissions are now auto-approved for this session; `discord_send_file` is fast-denied, so use `/file path:<file>` to deliver files.",
+      },
+    ]);
+  });
+
 });
