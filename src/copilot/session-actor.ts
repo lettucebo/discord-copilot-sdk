@@ -1,12 +1,13 @@
-import type { CopilotClient, CopilotSession } from "@github/copilot-sdk";
+import { defineTool, type CopilotClient, type CopilotSession, type ToolInvocation, type ToolResultObject } from "@github/copilot-sdk";
 import { PendingInteractionBroker } from "../core/broker.js";
 import { TurnRenderer } from "../core/turn-render.js";
-import type { Decision, Transport } from "../core/transport.js";
+import type { Decision, SendFileResult, Transport } from "../core/transport.js";
 import { normalizeSdkEvent } from "./normalize.js";
 import { sanitizeForCodeBlock, sanitizeForInlineCode, hasBidiOrControls } from "../core/text-safety.js";
 import { ApprovalPolicy, commandExecutable } from "../core/approval-policy.js";
 import { projectSkillDirectories, resolveSkillDirectories } from "../core/skills.js";
 import { AuditLog, type AuditSink } from "../core/audit-log.js";
+import { MAX_DISCORD_UPLOAD_BYTES, resolveOutboundFile, type OutboundFile } from "../core/outbound-file.js";
 
 const PERMISSION_TIMEOUT_MS = 5 * 60_000;
 const TURN_WATCHDOG_MS = 15 * 60_000;
@@ -27,6 +28,10 @@ const REASONING_SUMMARY = "detailed" as const;
 /** Debounce window for the signal-only session.todos_changed event: the agent
  *  may write its todos table many times per turn, so we coalesce bursts. */
 const TODOS_DEBOUNCE_MS = 700;
+const FILE_DELIVERY_TOOL = "discord_send_file";
+const FILE_DELIVERY_TURN_LIMIT = 3;
+const FILE_DELIVERY_SESSION_BYTE_LIMIT = 24 * 1024 * 1024;
+const FILE_DELIVERY_COMMENT_MAX = 1900;
 
 /** Safe-default permission result (deny). Used for timeout/abort and for
  *  permission kinds discord-copilot-sdk has no UI for (fail-closed). */
@@ -47,6 +52,77 @@ const NO_ANSWER = Symbol("no-answer");
 interface PendingPermMeta {
   executable: string;
   canOfferSession: boolean;
+}
+
+interface FileDeliveryArgs {
+  path: string;
+  comment?: string;
+}
+
+interface ApprovedFileDelivery {
+  requestedPath: string;
+  fingerprint: string;
+  displayName: string;
+  size: number;
+  comment?: string;
+  turnEpoch: number;
+}
+
+const FILE_DELIVERY_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    path: { type: "string" },
+    comment: { type: "string" },
+  },
+  required: ["path"],
+  additionalProperties: false,
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Validate the same narrow argument shape at permission and invocation time.
+ * The host SDK normally validates the schema, but handler input is still
+ * untrusted at this boundary and must not widen an earlier approval. */
+function parseFileDeliveryArgs(value: unknown): FileDeliveryArgs | undefined {
+  if (!isRecord(value)) return undefined;
+  try {
+    const keys = Object.keys(value);
+    if (keys.some((key) => key !== "path" && key !== "comment")) return undefined;
+    const requestedPath = value["path"];
+    if (typeof requestedPath !== "string" || requestedPath.trim().length === 0) return undefined;
+    const rawComment = value["comment"];
+    if (rawComment === undefined) return { path: requestedPath };
+    if (typeof rawComment !== "string" || rawComment.length > FILE_DELIVERY_COMMENT_MAX) return undefined;
+    if (hasBidiOrControls(rawComment)) return undefined;
+    const comment = sanitizeForInlineCode(rawComment, FILE_DELIVERY_COMMENT_MAX);
+    return { path: requestedPath, ...(comment ? { comment } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
+function sameFileDeliveryArgs(left: FileDeliveryArgs, right: FileDeliveryArgs): boolean {
+  return left.path === right.path && left.comment === right.comment;
+}
+
+function approvedOnce(result: unknown): boolean {
+  return isRecord(result) && result["kind"] === "approve-once";
+}
+
+function fileDeliveryFailure(text: string): ToolResultObject {
+  return { resultType: "failure", textResultForLlm: text, error: text };
+}
+
+function fileDeliverySummary(file: OutboundFile, comment?: string): string {
+  return [
+    "Send this generated file to the owning Discord thread.",
+    `File: ${file.displayName}`,
+    `Size: ${file.size} bytes`,
+    ...(comment ? [`Comment: ${comment}`] : []),
+    "Warning: anyone who can view this thread or its parent channel can download this file.",
+  ].join("\n");
 }
 
 export interface SessionActorOpts {
@@ -141,6 +217,16 @@ export class SessionActor {
   private disconnectPromise?: Promise<void>;
   /** Per-nonce request metadata for building session/location approvals. */
   private readonly pendingPerms = new Map<string, PendingPermMeta>();
+  /** A file can be delivered only by the exact custom-tool invocation whose
+   * permission card validated this immutable fingerprint. */
+  private readonly approvedFileDeliveries = new Map<string, ApprovedFileDelivery>();
+  /** Incremented whenever a pending approval becomes stale (new turn/teardown). */
+  private fileApprovalEpoch = 0;
+  private successfulFileDeliveriesThisTurn = 0;
+  private successfulFileDeliveryBytes = 0;
+  /** Serializes sends so a concurrent pair cannot both pass a quota that is
+   * intentionally counted only after Discord confirms success. */
+  private fileDeliveryChain: Promise<void> = Promise.resolve();
   /** True while a /stop abort is in flight — new permissions fail closed. */
   private aborting = false;
   /** YOLO mode: auto-approve EVERY SDK permission request for this session.
@@ -246,6 +332,16 @@ export class SessionActor {
       // instructions — the same trust-boundary hole enableFileHooks:false closes
       // for permission hooks.
       skipCustomInstructions: true,
+      tools: [
+        defineTool<FileDeliveryArgs>(FILE_DELIVERY_TOOL, {
+          description:
+            "Sends only a generated file in the current workdir to the owning Discord thread. " +
+            "Requires explicit operator approval and is unavailable in YOLO mode.",
+          parameters: FILE_DELIVERY_PARAMETERS,
+          defer: "never",
+          handler: (args, invocation) => this.handleFileDelivery(args, invocation),
+        }),
+      ],
       onPermissionRequest: (req: unknown) => this.handlePermission(req),
       // Interactive UIs (P3): ask_user → choice buttons + freeform; exit-plan →
       // action buttons + reject. Elicitation stays fail-closed (cancel) with a
@@ -494,6 +590,194 @@ export class SessionActor {
      this.renderer.adoptTools(inFlightTools);
    }
 
+  private clearFileDeliveryApprovals(): void {
+    this.fileApprovalEpoch++;
+    this.approvedFileDeliveries.clear();
+  }
+
+  private fileDeliveryIsCurrent(approval: ApprovedFileDelivery): boolean {
+    return (
+      this.lifecycle === "active" &&
+      !this.aborting &&
+      approval.turnEpoch === this.fileApprovalEpoch
+    );
+  }
+
+  private async handleFileDeliveryPermission(r: Record<string, unknown>): Promise<unknown> {
+    const toolCallId = typeof r["toolCallId"] === "string" && r["toolCallId"].length > 0 ? r["toolCallId"] : undefined;
+    const args = parseFileDeliveryArgs(r["args"]);
+    if (!toolCallId || !args) {
+      await this.addTimelineNotice("Auto-denied an invalid file-delivery request.");
+      return DENY_UNAVAILABLE;
+    }
+    // A runtime retry with the same id must never inherit an older approval.
+    this.approvedFileDeliveries.delete(toolCallId);
+    const turnEpoch = this.fileApprovalEpoch;
+
+    let resolved: Awaited<ReturnType<typeof resolveOutboundFile>>;
+    try {
+      resolved = await resolveOutboundFile(this.opts.workingDirectory, args.path, {
+        policy: "agent",
+        maxBytes: MAX_DISCORD_UPLOAD_BYTES,
+      });
+    } catch {
+      await this.addTimelineNotice("Auto-denied: the requested file could not be validated.");
+      return DENY_UNAVAILABLE;
+    }
+    if (!resolved.ok) {
+      await this.addTimelineNotice("Auto-denied: the requested file is not eligible for agent delivery.");
+      return DENY_UNAVAILABLE;
+    }
+    if (
+      this.lifecycle !== "active" ||
+      this.aborting ||
+      turnEpoch !== this.fileApprovalEpoch
+    ) {
+      return DENY_UNAVAILABLE;
+    }
+    const { nonce, promise } = this.opts.broker.register<unknown>({
+      sessionKey: this.opts.sessionKey,
+      generation: this.generation,
+      kind: "custom-tool",
+      timeoutMs: PERMISSION_TIMEOUT_MS,
+      onDefault: () => DENY_UNAVAILABLE,
+    });
+    this.pendingPerms.set(nonce, { executable: "", canOfferSession: false });
+    try {
+      try {
+        await this.beginInteractionCard();
+        if (
+          this.lifecycle !== "active" ||
+          this.aborting ||
+          turnEpoch !== this.fileApprovalEpoch
+        ) {
+          this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
+        } else {
+          await this.opts.transport.showPermission({
+            nonce,
+            sessionKey: this.opts.sessionKey,
+            kind: "custom-tool",
+            summary: fileDeliverySummary(resolved.file, args.comment),
+            supported: true,
+            canOfferSession: false,
+            scopeCommands: [],
+          });
+        }
+      } catch {
+        this.opts.broker.settle(nonce, DENY_UNAVAILABLE, this.generation);
+        await this.addTimelineNotice("Auto-denied: could not render the file-delivery approval card.").catch(() => {});
+      }
+
+      const decision = await promise;
+      if (
+        approvedOnce(decision) &&
+        this.lifecycle === "active" &&
+        !this.aborting &&
+        turnEpoch === this.fileApprovalEpoch
+      ) {
+        this.approvedFileDeliveries.set(toolCallId, {
+          requestedPath: args.path,
+          fingerprint: resolved.file.fingerprint,
+          displayName: resolved.file.displayName,
+          size: resolved.file.size,
+          ...(args.comment ? { comment: args.comment } : {}),
+          turnEpoch,
+        });
+      }
+      return decision;
+    } finally {
+      this.pendingPerms.delete(nonce);
+    }
+  }
+
+  private async handleFileDelivery(args: FileDeliveryArgs, invocation: ToolInvocation): Promise<ToolResultObject> {
+    let release: () => void = () => {};
+    const previous = this.fileDeliveryChain;
+    this.fileDeliveryChain = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await this.sendApprovedFileDelivery(args, invocation);
+    } finally {
+      release();
+    }
+  }
+
+  private async sendApprovedFileDelivery(args: FileDeliveryArgs, invocation: ToolInvocation): Promise<ToolResultObject> {
+    const toolCallId =
+      invocation.toolName === FILE_DELIVERY_TOOL && typeof invocation.toolCallId === "string" && invocation.toolCallId.length > 0
+        ? invocation.toolCallId
+        : undefined;
+    if (!toolCallId) return fileDeliveryFailure("File delivery failed because its tool call identity was invalid.");
+
+    const approval = this.approvedFileDeliveries.get(toolCallId);
+    if (!approval) return fileDeliveryFailure("File delivery was not approved by the operator.");
+    // A host custom-tool call is single-use. Consume its approval before any
+    // asynchronous work so duplicate handler delivery cannot upload twice.
+    this.approvedFileDeliveries.delete(toolCallId);
+
+    const requested = parseFileDeliveryArgs(args);
+    if (!requested || !sameFileDeliveryArgs(requested, { path: approval.requestedPath, comment: approval.comment })) {
+      return fileDeliveryFailure("File delivery request no longer matches the approved request.");
+    }
+    if (!this.fileDeliveryIsCurrent(approval)) {
+      return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
+    }
+
+    let resolved: Awaited<ReturnType<typeof resolveOutboundFile>>;
+    try {
+      resolved = await resolveOutboundFile(this.opts.workingDirectory, approval.requestedPath, {
+        policy: "agent",
+        maxBytes: MAX_DISCORD_UPLOAD_BYTES,
+      });
+    } catch {
+      return fileDeliveryFailure("The approved file could not be validated for delivery.");
+    }
+    if (!resolved.ok) {
+      return fileDeliveryFailure("The approved file no longer passes delivery validation.");
+    }
+    const { file } = resolved;
+    if (
+      file.fingerprint !== approval.fingerprint ||
+      file.displayName !== approval.displayName ||
+      file.size !== approval.size
+    ) {
+      return fileDeliveryFailure("The approved file changed after approval and was not delivered.");
+    }
+    if (!this.fileDeliveryIsCurrent(approval)) {
+      return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
+    }
+    if (
+      this.successfulFileDeliveriesThisTurn >= FILE_DELIVERY_TURN_LIMIT ||
+      this.successfulFileDeliveryBytes + file.size > FILE_DELIVERY_SESSION_BYTE_LIMIT
+    ) {
+      return fileDeliveryFailure("File delivery limit reached; the file was not delivered.");
+    }
+
+    await this.beginInteractionCard();
+    if (!this.fileDeliveryIsCurrent(approval)) {
+      return fileDeliveryFailure("File delivery was cancelled because the session is no longer active.");
+    }
+
+    let sent: SendFileResult;
+    try {
+      sent = await this.opts.transport.sendFile(this.opts.sessionKey, file, approval.comment);
+    } catch {
+      return fileDeliveryFailure("Discord file delivery failed before the upload could be confirmed.");
+    }
+    if (!sent.ok) {
+      return fileDeliveryFailure(`Discord file delivery failed: ${sent.reason}.`);
+    }
+
+    this.successfulFileDeliveriesThisTurn++;
+    this.successfulFileDeliveryBytes += file.size;
+    return {
+      resultType: "success",
+      textResultForLlm: "The file was delivered to the Discord thread.",
+    };
+  }
+
   private async handlePermission(req: unknown): Promise<unknown> {
     const r = (req ?? {}) as Record<string, unknown>;
     const kind = typeof r["kind"] === "string" ? (r["kind"] as string) : "unknown";
@@ -505,6 +789,13 @@ export class SessionActor {
     // YOLO there is no card. The durable audit write DOES gate approval; only
     // the Discord timeline render is best effort, so an outage cannot block it.
     if (this.yolo) {
+      if (kind === "custom-tool" && r["toolName"] === FILE_DELIVERY_TOOL) {
+        this.postAudit(
+          "⚠️ YOLO auto-denied file delivery — file delivery needs explicit operator approval. " +
+            "Use `/file path:<file>`."
+        );
+        return DENY_UNAVAILABLE;
+      }
       // Building the descriptor must never break the approval path (a hostile
       // request object could throw from a property getter), so it is guarded and
       // degrades to a generic entry.
@@ -518,6 +809,9 @@ export class SessionActor {
         return DENY_UNAVAILABLE;
       }
       return APPROVE_ONCE;
+    }
+    if (kind === "custom-tool" && r["toolName"] === FILE_DELIVERY_TOOL) {
+      return this.handleFileDeliveryPermission(r);
     }
     if (kind !== "shell") {
       await this.addTimelineNotice(`Auto-denied an unsupported permission (${kind}) — P1 supports shell only.`);
@@ -795,6 +1089,8 @@ export class SessionActor {
     // flag. Without this reset a stray /stop on an idle session silently
     // auto-denies EVERY permission of the next turn with no card and no notice.
     this.aborting = false;
+    this.clearFileDeliveryApprovals();
+    this.successfulFileDeliveriesThisTurn = 0;
     this.renderer = new TurnRenderer();
     this.turnActive = true;
     const payload: Record<string, unknown> = { prompt };
@@ -961,6 +1257,7 @@ export class SessionActor {
    *  abort call itself succeeded. */
   async stop(): Promise<boolean> {
     this.aborting = true;
+    this.clearFileDeliveryApprovals();
     this.opts.broker.abortSession(this.opts.sessionKey);
     const s = this.session as unknown as { abort?: () => Promise<unknown> };
     try {
@@ -1045,6 +1342,7 @@ export class SessionActor {
     if (this.disconnectPromise) return this.disconnectPromise; // single-flight
     this.lifecycle = "closing";
     this.aborting = true;
+    this.clearFileDeliveryApprovals();
     this.opts.broker.abortSession(this.opts.sessionKey);
     this.opts.policy.clearSession(this.opts.sessionKey);
     this.unsubscribeDecision?.();
@@ -1087,6 +1385,7 @@ export class SessionActor {
     if (this.lifecycle !== "active") return;
     this.lifecycle = "faulted";
     this.aborting = true;
+    this.clearFileDeliveryApprovals();
     this.opts.broker.abortSession(this.opts.sessionKey);
     this.opts.policy.clearSession(this.opts.sessionKey);
     this.unsubscribeDecision?.();

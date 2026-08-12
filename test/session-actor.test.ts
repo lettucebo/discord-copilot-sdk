@@ -3,10 +3,17 @@ import { SessionActor, formatTodos } from "../src/copilot/session-actor.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { ApprovalPolicy } from "../src/core/approval-policy.js";
 import type { AuditEntry, AuditSink } from "../src/core/audit-log.js";
-import type { CopilotClient } from "@github/copilot-sdk";
-import type { Decision, PermissionView, PlanView, Transport, UserInputView } from "../src/core/transport.js";
+import type { CopilotClient, Tool, ToolInvocation, ToolResultObject } from "@github/copilot-sdk";
+import type {
+  Decision,
+  PermissionView,
+  PlanView,
+  SendFileResult,
+  Transport,
+  UserInputView,
+} from "../src/core/transport.js";
 import type { RenderState } from "../src/core/turn-render.js";
-import type { OutboundFile } from "../src/core/outbound-file.js";
+import { MAX_DISCORD_UPLOAD_BYTES, type OutboundFile } from "../src/core/outbound-file.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -73,6 +80,10 @@ class FakeTransport implements Transport {
   userInputs: UserInputView[] = [];
   plans: PlanView[] = [];
   notices: string[] = [];
+  sentFiles: Array<{ sessionKey: string; file: OutboundFile; note?: string }> = [];
+  sendFileResult: SendFileResult = { ok: true };
+  fileOperations: string[] = [];
+  private permissionWaiters: Array<{ after: number; resolve: (view: PermissionView) => void }> = [];
   decision?: (nonce: string, decision: Decision, userId: string) => void;
   choice?: (nonce: string, index: number, userId: string) => void;
   plan?: (nonce: string, action: number | "reject", userId: string) => void;
@@ -80,16 +91,35 @@ class FakeTransport implements Transport {
     this.renders.push(s);
   }
   async sendFile(
-    _k: string,
-    _file: OutboundFile
-  ): Promise<{ ok: true } | { ok: false; reason: "no-attach-permission" | "too-large" | "blocked" | "unavailable" | "transient" }> {
-    return { ok: false, reason: "unavailable" };
+    sessionKey: string,
+    file: OutboundFile,
+    note?: string
+  ): Promise<SendFileResult> {
+    this.fileOperations.push("sendFile");
+    this.sentFiles.push({ sessionKey, file, ...(note === undefined ? {} : { note }) });
+    return this.sendFileResult;
   }
-  async flush(): Promise<void> {}
-  resetTurn(): void {}
+  async flush(): Promise<void> {
+    this.fileOperations.push("flush");
+  }
+  resetTurn(): void {
+    this.fileOperations.push("resetTurn");
+  }
   dispose(): void {}
   async showPermission(v: PermissionView): Promise<void> {
     this.permissions.push(v);
+    const waiters = this.permissionWaiters;
+    this.permissionWaiters = [];
+    for (const waiter of waiters) {
+      const next = this.permissions[waiter.after];
+      if (next) waiter.resolve(next);
+      else this.permissionWaiters.push(waiter);
+    }
+  }
+  waitForPermissionAfter(count: number): Promise<PermissionView> {
+    const next = this.permissions[count];
+    if (next) return Promise.resolve(next);
+    return new Promise((resolve) => this.permissionWaiters.push({ after: count, resolve }));
   }
   async showUserInput(v: UserInputView): Promise<void> {
     this.userInputs.push(v);
@@ -192,6 +222,79 @@ async function setup(extra: Record<string, unknown> = {}): Promise<Setup> {
 const perm = (s: Setup): ((r: unknown) => Promise<unknown>) =>
   s.config["onPermissionRequest"] as (r: unknown) => Promise<unknown>;
 
+interface FileDeliveryArgs {
+  path: string;
+  comment?: string;
+}
+
+const FILE_DELIVERY_TOOL = "discord_send_file";
+
+function fileDeliveryTool(s: Setup): Tool<FileDeliveryArgs> {
+  const tools = s.config["tools"];
+  if (!Array.isArray(tools)) throw new Error("discord_send_file was not registered");
+  const tool = tools.find(
+    (candidate): candidate is Tool<FileDeliveryArgs> =>
+      typeof candidate === "object" &&
+      candidate !== null &&
+      "name" in candidate &&
+      candidate.name === FILE_DELIVERY_TOOL
+  );
+  if (!tool) throw new Error("discord_send_file was not registered");
+  return tool;
+}
+
+function requestFilePermission(
+  s: Setup,
+  args: FileDeliveryArgs | Record<string, unknown>,
+  toolCallId = "file-call"
+): Promise<unknown> {
+  return perm(s)({
+    kind: "custom-tool",
+    toolName: FILE_DELIVERY_TOOL,
+    toolDescription: "Send a generated file.",
+    toolCallId,
+    args,
+  });
+}
+
+async function latestFilePermission(s: Setup, before: number): Promise<PermissionView> {
+  return s.transport.waitForPermissionAfter(before);
+}
+
+async function approveFilePermission(
+  s: Setup,
+  args: FileDeliveryArgs,
+  toolCallId = "file-call"
+): Promise<unknown> {
+  const before = s.transport.permissions.length;
+  const approval = requestFilePermission(s, args, toolCallId);
+  const view = await latestFilePermission(s, before);
+  s.transport.deliverDecision(view.nonce, "once", "u1");
+  return approval;
+}
+
+async function invokeFileDelivery(
+  s: Setup,
+  args: FileDeliveryArgs,
+  toolCallId = "file-call"
+): Promise<ToolResultObject> {
+  const handler = fileDeliveryTool(s).handler;
+  if (!handler) throw new Error("discord_send_file has no handler");
+  const invocation: ToolInvocation = {
+    sessionId: s.session.sessionId,
+    toolCallId,
+    toolName: FILE_DELIVERY_TOOL,
+    arguments: args,
+  };
+  return (await handler(args, invocation)) as ToolResultObject;
+}
+
+function writeArtifact(root: string, name: string, body: string | Buffer): string {
+  const target = join(root, name);
+  writeFileSync(target, body);
+  return target;
+}
+
 describe("SessionActor config hardening", () => {
   it("disables file hooks + sets working directory + streaming + all callbacks", async () => {
     const s = await setup();
@@ -210,6 +313,35 @@ describe("SessionActor config hardening", () => {
     ]) {
       expect(typeof s.config[cb]).toBe("function");
     }
+  });
+
+  it("registers exactly one always-loaded file-delivery host tool on create and resume", async () => {
+    const s = await setup();
+    const tool = fileDeliveryTool(s);
+    expect(s.config["tools"]).toHaveLength(1);
+    expect(tool.name).toBe(FILE_DELIVERY_TOOL);
+    expect(tool.defer).toBe("never");
+    expect("skipPermission" in tool).toBe(false);
+    expect(tool.description).toMatch(/generated file.*current workdir/i);
+    expect(tool.description).toMatch(/explicit operator approval/i);
+    expect(tool.description).toMatch(/unavailable in YOLO mode/i);
+    expect(tool.parameters).toEqual({
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        comment: { type: "string" },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    });
+    expect(s.config["excludedTools"]).toEqual(["skill"]);
+    expect(s.config["availableTools"]).toBeUndefined();
+
+    const resumed = await setup({ resumeSessionId: "resume-file-tool" });
+    expect(resumed.resumeArgs?.cfg["tools"]).toHaveLength(1);
+    expect(fileDeliveryTool({ ...resumed, config: resumed.resumeArgs!.cfg }).defer).toBe("never");
+    expect(resumed.resumeArgs?.cfg["excludedTools"]).toEqual(["skill"]);
+    expect(resumed.resumeArgs?.cfg["availableTools"]).toBeUndefined();
   });
 
   it("loads explicit repo and user skill roots without enabling config discovery", async () => {
@@ -416,6 +548,363 @@ describe("SessionActor turn lifecycle", () => {
 });
 
 describe("SessionActor permission handling", () => {
+  describe("discord_send_file custom tool", () => {
+    it("shows a once-or-deny-only card with the validated file details", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-card-"));
+      try {
+        writeArtifact(root, "report.txt", "report");
+        const s = await setup({ workingDirectory: root });
+        const before = s.transport.permissions.length;
+        const approval = requestFilePermission(
+          s,
+          { path: "report.txt", comment: "finished `report`\nfor review" },
+          "card-file"
+        );
+        const view = await latestFilePermission(s, before);
+        expect(view.kind).toBe("custom-tool");
+        expect(view.supported).toBe(true);
+        expect(view.canOfferSession).toBe(false);
+        expect(view.scopeCommands).toEqual([]);
+        expect(view.summary).toContain("report.txt");
+        expect(view.summary).toContain("6 bytes");
+        expect(view.summary).toContain("finished 'report' for review");
+        expect(view.summary).toMatch(/anyone who can view this thread or its parent channel can download/i);
+        s.transport.deliverDecision(view.nonce, "once", "u1");
+        await expect(approval).resolves.toEqual({ kind: "approve-once" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("denies unrelated custom tools without showing a card", async () => {
+      const s = await setup();
+      await expect(
+        perm(s)({
+          kind: "custom-tool",
+          toolName: "other_host_tool",
+          toolDescription: "Unexpected host capability",
+          toolCallId: "other-tool",
+          args: {},
+        })
+      ).resolves.toEqual({ kind: "user-not-available" });
+      expect(s.transport.permissions).toHaveLength(0);
+      expect(s.broker.size).toBe(0);
+    });
+
+    it("rejects malformed, unsafe, and outside file requests before presenting a card", async () => {
+      const parent = mkdtempSync(join(tmpdir(), "dcs-file-delivery-invalid-"));
+      const root = join(parent, "work");
+      try {
+        mkdirSync(root);
+        writeArtifact(parent, "secret.txt", "secret");
+        const s = await setup({ workingDirectory: root });
+        for (const [toolCallId, args] of [
+          ["malformed", { path: 7 }],
+          ["unsafe-comment", { path: "report.txt", comment: "spoof\u202eline" }],
+          ["outside", { path: join("..", "secret.txt") }],
+        ] as const) {
+          await expect(requestFilePermission(s, args, toolCallId)).resolves.toEqual({ kind: "user-not-available" });
+        }
+        expect(s.transport.permissions).toHaveLength(0);
+        const result = await invokeFileDelivery(s, { path: join("..", "secret.txt") }, "outside");
+        expect(result.resultType).toBe("failure");
+        expect(s.transport.sentFiles).toHaveLength(0);
+      } finally {
+        rmSync(parent, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects a file request when a new turn starts during pre-card validation", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-stale-validation-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        let showedCard = false;
+        const originalShowPermission = s.transport.showPermission.bind(s.transport);
+        s.transport.showPermission = async (view: PermissionView): Promise<void> => {
+          showedCard = true;
+          await originalShowPermission(view);
+          s.transport.deliverDecision(view.nonce, "once", "u1");
+        };
+
+        const approval = requestFilePermission(s, { path: "artifact.txt" }, "stale-before-card");
+        await s.actor.send("start a newer user turn");
+
+        await expect(approval).resolves.toEqual({ kind: "user-not-available" });
+        expect(showedCard).toBe(false);
+        expect(s.broker.size).toBe(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("sends an approved, fingerprinted artifact through Transport after the card fence", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-send-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact body");
+        const s = await setup({ workingDirectory: root });
+        await expect(
+          approveFilePermission(s, { path: "artifact.txt", comment: "please review" }, "send-approved")
+        ).resolves.toEqual({ kind: "approve-once" });
+
+        const result = await invokeFileDelivery(s, { path: "artifact.txt", comment: "please review" }, "send-approved");
+        expect(result).toEqual({
+          resultType: "success",
+          textResultForLlm: expect.stringMatching(/delivered.*Discord thread/i),
+        });
+        expect(result.textResultForLlm).not.toMatch(/https?:\/\//i);
+        expect(s.transport.sentFiles).toEqual([
+          expect.objectContaining({
+            sessionKey: "t",
+            file: expect.objectContaining({ displayName: "artifact.txt", size: 13 }),
+            note: "please review",
+          }),
+        ]);
+        expect(s.transport.fileOperations.slice(-3)).toEqual(["flush", "resetTurn", "sendFile"]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("does not send when the permission is denied, times out, or cannot be presented", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-deny-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const denied = await setup({ workingDirectory: root });
+        const before = denied.transport.permissions.length;
+        const denial = requestFilePermission(denied, { path: "artifact.txt" }, "deny-file");
+        const view = await latestFilePermission(denied, before);
+        denied.transport.deliverDecision(view.nonce, "deny", "u1");
+        await expect(denial).resolves.toEqual({ kind: "reject" });
+        await expect(invokeFileDelivery(denied, { path: "artifact.txt" }, "deny-file")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+        expect(denied.transport.sentFiles).toHaveLength(0);
+
+        const unavailable = await setup({ workingDirectory: root });
+        unavailable.transport.showPermission = async () => {
+          throw new Error("thread unavailable");
+        };
+        await expect(requestFilePermission(unavailable, { path: "artifact.txt" }, "card-failed")).resolves.toEqual({
+          kind: "user-not-available",
+        });
+        await expect(invokeFileDelivery(unavailable, { path: "artifact.txt" }, "card-failed")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+        expect(unavailable.transport.sentFiles).toHaveLength(0);
+
+        vi.useFakeTimers();
+        try {
+          const timedOut = await setup({ workingDirectory: root });
+          const before = timedOut.transport.permissions.length;
+          const timeout = requestFilePermission(timedOut, { path: "artifact.txt" }, "timed-out");
+          await timedOut.transport.waitForPermissionAfter(before);
+          expect(timedOut.broker.size).toBe(1);
+          await vi.advanceTimersByTimeAsync(5 * 60_000);
+          await expect(timeout).resolves.toEqual({ kind: "user-not-available" });
+          await expect(invokeFileDelivery(timedOut, { path: "artifact.txt" }, "timed-out")).resolves.toMatchObject({
+            resultType: "failure",
+          });
+          expect(timedOut.transport.sentFiles).toHaveLength(0);
+        } finally {
+          vi.useRealTimers();
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("fails if the artifact changes after approval and never uploads the replacement", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-mutate-"));
+      try {
+        const target = writeArtifact(root, "artifact.txt", "original");
+        const s = await setup({ workingDirectory: root });
+        await approveFilePermission(s, { path: "artifact.txt" }, "mutated-file");
+        writeFileSync(target, "replacement with a different size");
+
+        await expect(invokeFileDelivery(s, { path: "artifact.txt" }, "mutated-file")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+        expect(s.transport.sentFiles).toHaveLength(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("returns a ToolResultObject failure when the handler has no approved record", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-no-record-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        const result = await invokeFileDelivery(s, { path: "artifact.txt" }, "never-approved");
+        expect(result.resultType).toBe("failure");
+        expect(result.error).toMatch(/approv/i);
+        expect(s.transport.sentFiles).toHaveLength(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("maps a structured transport refusal to a tool failure", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-transport-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        await approveFilePermission(s, { path: "artifact.txt" }, "transport-refusal");
+        s.transport.sendFileResult = { ok: false, reason: "blocked" };
+
+        const result = await invokeFileDelivery(s, { path: "artifact.txt" }, "transport-refusal");
+        expect(result.resultType).toBe("failure");
+        expect(result.error).toMatch(/blocked/i);
+        expect(s.transport.sentFiles).toHaveLength(1);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("enforces three successful sends per turn and 24 MiB per session", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-quota-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const turnLimited = await setup({ workingDirectory: root });
+        await turnLimited.actor.send("deliver artifacts");
+        for (let index = 1; index <= 3; index++) {
+          const id = `turn-${index}`;
+          await approveFilePermission(turnLimited, { path: "artifact.txt" }, id);
+          await expect(invokeFileDelivery(turnLimited, { path: "artifact.txt" }, id)).resolves.toMatchObject({
+            resultType: "success",
+          });
+        }
+        await approveFilePermission(turnLimited, { path: "artifact.txt" }, "turn-4");
+        await expect(invokeFileDelivery(turnLimited, { path: "artifact.txt" }, "turn-4")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+        expect(turnLimited.transport.sentFiles).toHaveLength(3);
+
+        writeArtifact(root, "large.zip", Buffer.alloc(MAX_DISCORD_UPLOAD_BYTES, 7));
+        writeArtifact(root, "small.txt", "x");
+        const byteLimited = await setup({ workingDirectory: root });
+        for (let index = 1; index <= 3; index++) {
+          const id = `bytes-${index}`;
+          await approveFilePermission(byteLimited, { path: "large.zip" }, id);
+          await expect(invokeFileDelivery(byteLimited, { path: "large.zip" }, id)).resolves.toMatchObject({
+            resultType: "success",
+          });
+        }
+        await byteLimited.actor.send("a new user turn resets only the per-turn quota");
+        await approveFilePermission(byteLimited, { path: "small.txt" }, "over-session-bytes");
+        await expect(
+          invokeFileDelivery(byteLimited, { path: "small.txt" }, "over-session-bytes")
+        ).resolves.toMatchObject({ resultType: "failure" });
+        expect(byteLimited.transport.sentFiles).toHaveLength(3);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("fast-denies only the file tool in YOLO mode and normal mode still cards it", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-yolo-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        s.actor.setYolo(true);
+        await expect(
+          requestFilePermission(s, { path: "artifact.txt" }, "yolo-file")
+        ).resolves.toEqual({ kind: "user-not-available" });
+        await tick();
+        expect(s.transport.permissions).toHaveLength(0);
+        expect(s.broker.size).toBe(0);
+        expect(s.transport.notices.join("\n")).toMatch(/explicit.*approval/i);
+        expect(s.transport.notices.join("\n")).toContain("/file path:<file>");
+        expect(s.transport.sentFiles).toHaveLength(0);
+        await expect(
+          perm(s)({
+            kind: "custom-tool",
+            toolName: "another_custom_tool",
+            toolDescription: "Not file delivery",
+            toolCallId: "generic-yolo-custom",
+            args: {},
+          })
+        ).resolves.toEqual({ kind: "approve-once" });
+
+        s.actor.setYolo(false);
+        const before = s.transport.permissions.length;
+        const normal = requestFilePermission(s, { path: "artifact.txt" }, "normal-file");
+        const card = await latestFilePermission(s, before);
+        s.transport.deliverDecision(card.nonce, "once", "u1");
+        await expect(normal).resolves.toEqual({ kind: "approve-once" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("clears approvals at the next user turn, stop, and disconnect", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-cleanup-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+
+        const newTurn = await setup({ workingDirectory: root });
+        await approveFilePermission(newTurn, { path: "artifact.txt" }, "new-turn");
+        await newTurn.actor.send("new user turn");
+        await expect(invokeFileDelivery(newTurn, { path: "artifact.txt" }, "new-turn")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+
+        const stopped = await setup({ workingDirectory: root });
+        await approveFilePermission(stopped, { path: "artifact.txt" }, "stopped");
+        await stopped.actor.stop();
+        await expect(invokeFileDelivery(stopped, { path: "artifact.txt" }, "stopped")).resolves.toMatchObject({
+          resultType: "failure",
+        });
+
+        const disconnected = await setup({ workingDirectory: root });
+        await approveFilePermission(disconnected, { path: "artifact.txt" }, "disconnected");
+        await disconnected.actor.disconnect();
+        await expect(
+          invokeFileDelivery(disconnected, { path: "artifact.txt" }, "disconnected")
+        ).resolves.toMatchObject({ resultType: "failure" });
+
+        expect(newTurn.transport.sentFiles).toHaveLength(0);
+        expect(stopped.transport.sentFiles).toHaveLength(0);
+        expect(disconnected.transport.sentFiles).toHaveLength(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("rechecks abort/lifecycle state after the attachment fence before sending", async () => {
+      const root = mkdtempSync(join(tmpdir(), "dcs-file-delivery-abort-fence-"));
+      try {
+        writeArtifact(root, "artifact.txt", "artifact");
+        const s = await setup({ workingDirectory: root });
+        await approveFilePermission(s, { path: "artifact.txt" }, "fenced-file");
+
+        let releaseFlush: (() => void) | undefined;
+        let flushStarted: (() => void) | undefined;
+        const flushGate = new Promise<void>((resolve) => {
+          releaseFlush = resolve;
+        });
+        const started = new Promise<void>((resolve) => {
+          flushStarted = resolve;
+        });
+        s.transport.flush = async (): Promise<void> => {
+          flushStarted?.();
+          await flushGate;
+        };
+
+        const invocation = invokeFileDelivery(s, { path: "artifact.txt" }, "fenced-file");
+        await started;
+        await s.actor.stop();
+        releaseFlush?.();
+
+        await expect(invocation).resolves.toMatchObject({ resultType: "failure" });
+        expect(s.transport.sentFiles).toHaveLength(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("shows a shell card and approves once when the user taps Allow once", async () => {
     const s = await setup();
     const result = perm(s)({ kind: "shell", intention: "branch", fullCommandText: "git branch" });
