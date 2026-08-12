@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterAll, afterEach } from "vitest";
 import { DiscordCopilotApp } from "../src/app.js";
+import type { SessionActor } from "../src/copilot/session-actor.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
 import type { CopilotClient } from "@github/copilot-sdk";
@@ -7,7 +8,7 @@ import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { tmpdir } from "node:os";
 import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
-import { rmSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
 
 // The app owns durable state beneath os.homedir(). Redirect it before any
 // fixture calls stateDir(), so this suite never reads a developer's registry
@@ -144,6 +145,36 @@ function fakeCopilot(
   } as unknown as CopilotClient;
 }
 
+/** `start()` uses this same constructor without createForTest's test-only
+ * dependency injection. Keep this harness narrow: it proves the production
+ * construction path cannot silently acquire the fake trusted-root backend. */
+function productionStyleApp(
+  copilot: CopilotClient,
+  transport: Transport,
+  store: SessionStore
+): DiscordCopilotApp {
+  const AppConstructor = DiscordCopilotApp as unknown as {
+    new (
+      config: Parameters<typeof DiscordCopilotApp.createForTest>[0],
+      client: CopilotClient,
+      lock: { path: string; release(): Promise<void> },
+      transportOverride: Transport,
+      storeOverride: SessionStore,
+      channelsOverride: ChannelRegistry
+    ): DiscordCopilotApp;
+  };
+  const app = new AppConstructor(
+    cfg,
+    copilot,
+    { path: "(production-style-test)", release: async () => {} },
+    transport,
+    store,
+    new ChannelRegistry("c1", "g1", join(fakeHome, "production-style-channels.json"))
+  );
+  (app as unknown as { reposRoot: string }).reposRoot = REPOS_ROOT;
+  return app;
+}
+
 function sessionsOf(app: DiscordCopilotApp): Map<string, unknown> {
   return (app as unknown as { sessions: Map<string, unknown> }).sessions;
 }
@@ -179,6 +210,50 @@ function classifyThread(
 }
 
 describe("reconcileOnStartup (app-level wiring, P2)", () => {
+  it("createForTest resumes a nonexistent workdir with a root that refuses candidate opens", async () => {
+    const f = tmpFile();
+    const missingWorkDir = join(REPOS_ROOT, `nonexistent-workdir-${Math.random().toString(36).slice(2)}`);
+    try {
+      expect(existsSync(missingWorkDir)).toBe(false);
+      const store = new SessionStore(f);
+      store.reserve(bind({ repoPath: missingWorkDir, workDir: missingWorkDir }));
+      store.commit("t1");
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+
+      await reconcile(app, async () => "valid");
+
+      const resumed = sessionsOf(app).get("t1") as
+        | { actor: Pick<SessionActor, "resolveFileForDelivery"> }
+        | undefined;
+      expect(resumed).toBeDefined();
+      await expect(resumed!.actor.resolveFileForDelivery("artifact.txt", "operator")).resolves.toEqual({
+        ok: false,
+        reason: "unreadable",
+      });
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
+  it("production-style construction does not inject the test-only trusted root", async () => {
+    const f = tmpFile();
+    const missingWorkDir = join(REPOS_ROOT, `production-workdir-${Math.random().toString(36).slice(2)}`);
+    try {
+      expect(existsSync(missingWorkDir)).toBe(false);
+      const store = new SessionStore(f);
+      store.reserve(bind({ repoPath: missingWorkDir, workDir: missingWorkDir }));
+      store.commit("t1");
+      const app = productionStyleApp(fakeCopilot(), new FakeTransport(), store);
+
+      await reconcile(app, async () => "valid");
+
+      expect(sessionsOf(app).has("t1")).toBe(false);
+      expect(store.get("t1")?.state).toBe("active");
+    } finally {
+      rmSync(f, { force: true });
+    }
+  });
+
   it("active + valid thread → resumes under its recorded parent, registers, keeps active, posts recovery notice", async () => {
     const f = tmpFile();
     try {

@@ -59,7 +59,12 @@ import { sendUnlessAborted } from "./core/turn-gate.js";
 import { shouldResetEffort, validateEffort, EFFORT_LEVELS } from "./core/effort.js";
 import { createCopilotClient, checkSdkCompat } from "./copilot/sdk.js";
 import { PendingInteractionBroker, type PendingView } from "./core/broker.js";
-import { SessionActor, type BlobAttachment, formatTodos } from "./copilot/session-actor.js";
+import {
+  SessionActor,
+  type BlobAttachment,
+  type SessionActorCreateDependencies,
+  formatTodos,
+} from "./copilot/session-actor.js";
 import { ApprovalPolicy } from "./core/approval-policy.js";
 import { DiscordTransport } from "./platforms/discord/discord-transport.js";
 import {
@@ -73,6 +78,7 @@ import {
 import { isAuthorized, isOwner, type AuthContext, type AuthPolicy } from "./platforms/discord/auth.js";
 import { ChannelRegistry } from "./core/channel-registry.js";
 import type { Decision, Transport } from "./core/transport.js";
+import type { SecureOpenBackend } from "./core/secure-open.js";
 
 /** One live Discord thread ↔ Copilot session. Exported so tests can build a
  *  TYPED fixture — an untyped `as Record<string, unknown>` fixture is how a
@@ -366,6 +372,36 @@ export function yoloOnWarning(repoSkillsLoaded: boolean): string {
 }
 
 /**
+ * App state-machine tests intentionally use synthetic workdirs. Their actors
+ * need an opaque root capability to reach SDK wiring, but must never gain file
+ * resolution: a candidate open is always rejected and no OS handle is held.
+ */
+function createForTestActorDependencies(): SessionActorCreateDependencies {
+  const backend: SecureOpenBackend = {
+    async open(): Promise<never> {
+      throw new Error("createForTest roots must not open file candidates.");
+    },
+    async openDirectory(trustedRoot) {
+      if (!path.isAbsolute(trustedRoot)) {
+        throw new Error("createForTest roots require an absolute workdir.");
+      }
+      const finalPath = path.resolve(trustedRoot);
+      const proof = Object.freeze({
+        finalPath,
+        identity: `create-for-test:${finalPath}`,
+        directory: true,
+      });
+      return {
+        ...proof,
+        revalidate: async () => proof,
+        close: async () => {},
+      };
+    },
+  };
+  return { secureOpen: { backend } };
+}
+
+/**
  * Composition root: owns the single-instance lock, the Copilot SDK client, the
  * Discord gateway connection, and the per-thread SessionActor map. Wires the
  * three input surfaces (slash commands, thread messages, permission buttons)
@@ -409,6 +445,9 @@ export class DiscordCopilotApp {
    *  reconcile state machine can be exercised without building real repos on
    *  disk for every case. */
   private bindingCheck: typeof validateBinding = validateBinding;
+  /** Only createForTest sets this. Production must capture a native trusted
+   * root, while app state-machine fixtures receive an opaque fail-closed root. */
+  private actorCreateDependencies?: SessionActorCreateDependencies;
   /** Threads with a clone/init in flight. A clone can take minutes, during which
    *  a second one in the same thread would race for the same destination. */
   private readonly provisioning = new Set<string>();
@@ -522,6 +561,7 @@ export class DiscordCopilotApp {
     const noopLock: InstanceLock = { path: "(test)", release: async () => {} };
     const app = new DiscordCopilotApp(config, copilot, noopLock, transport, store, channels);
     app.reposRoot = reposRoot;
+    app.actorCreateDependencies = createForTestActorDependencies();
     return app;
   }
 
@@ -1265,7 +1305,7 @@ export class DiscordCopilotApp {
           generation,
           createSessionId: sessionId,
           ...this.skillSourceOptions(),
-        });
+        }, this.actorCreateDependencies);
       } catch (err) {
         // Create failed. The RPC may or may not have created the assigned id, so
         // best-effort DELETE it to remove any dormant runtime session (it has no
@@ -2320,7 +2360,7 @@ export class DiscordCopilotApp {
         generation,
         createSessionId: sessionId,
         ...this.skillSourceOptions(),
-      });
+      }, this.actorCreateDependencies);
     } catch (err) {
       // The OLD session is still live and registered — nothing has been swapped
       // yet — so restoring its record puts everything back exactly as it was.
@@ -2883,7 +2923,7 @@ export class DiscordCopilotApp {
         generation: rec.generation,
         resumeSessionId: rec.sessionId,
         ...this.skillSourceOptions(),
-      });
+      }, this.actorCreateDependencies);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (classifyResumeError(msg) === "session-lost") {
