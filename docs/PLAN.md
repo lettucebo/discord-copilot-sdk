@@ -684,7 +684,10 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   才以同一 persist-first CAS 同步 reconcile primary fallback 與 paired stale rows。identity mismatch 或寫入
   失敗時兩者與 actor ownership 都保留，並封鎖新 rebind，不能把 target `creating` row 當成一般 previous
   session。`/end` 在第一個 await 前把 restore 計畫翻成 remove，且會 retry 已追蹤的 fallback；restore
-  成功才移除 pre-swap `/end` routing marker，避免下一次 `/end` 留下會 restart 的 primary row；沒有 live
+  成功才移除 pre-swap `/end` routing marker，避免下一次 `/end` 留下會 restart 的 primary row。若 `/end`
+  在 commit-failure replacement 初次 disconnect await 期間勝出，fallback 即使尚未註冊也必須在排程 retry
+  前依失去 ownership 改為 remove；後續 abandon 要 join 同一 tracker，不能另以 `removeIfCurrent` 先刪 target，
+  因為 CAS／寫入失敗時必須同時保留 target barrier 與 tracker。沒有 live
   map entry 的後續 `/end` 也必須先 retry tracker，未成功對帳時不可走 generic stale-record reaper 刪掉 fallback。
 - **faulted actor 的 Windows root lock**：fault path 的 bounded disconnect 只限制等待時間，不能在
   SDK 尚未確認終止時關閉 retained root。actor 維持 faulted（不能 prompt／送檔），root 作為
@@ -728,6 +731,7 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | Windows handle-bound validation path、local/worktree git proof、approval key 僅在 descriptor proof 後導出、root swap 拒絕、actor ownership/close-once；非 Windows 不開 root 卻能建立 session | `test/secure-open.test.ts`、`test/binding.test.ts`、`test/app-channels-race.test.ts`、`test/app-rebind.test.ts`、`test/app-reconcile.test.ts`、`test/session-actor.test.ts` |
 | Windows `discord_send_file` Allow once / Deny、YOLO fast deny、YOLO 後舊 file card deny/inert、root-relative inline-code card path、同 basename 路徑辨別、U+200B 拒絕、root/content/digest/path 綁定、endpoint truth、late cancellation 不算成功；非 Windows 無 tool 且 `/file` 拒絕 | `test/outbound-file.test.ts`、`test/session-actor.test.ts`、`test/app-file-command.test.ts` |
 | 24 MiB 持久化保守預留、舊 record 遷移、session-id + generation CAS、rebind fence/單調 rollback、YOLO/abort rollback 不永久停用 `/file`、restart total、寫入失敗 fail-closed、resume/rebind/new wiring | `test/session-store.test.ts`、`test/session-actor.test.ts`、`test/app-reconcile.test.ts`、`test/app-rebind.test.ts`、`test/app-channels-race.test.ts` |
+| `/end` 在 commit-failure replacement 初次 teardown 與 fallback 註冊之間勝出；retry 只以 remove CAS 釋放 primary，disconnect／CAS 失敗保留 barrier + tracker | `test/app-rebind.test.ts` |
 | `/file` resolve/send interleaving（end、rebind-style replacement）不可附件或成功回覆 | `test/app-file-command.test.ts`、`test/transport.test.ts` |
 | `/end` 穿插 rebind 的 binding、replacement actor、map-swap 三階段都不能復活 map／record／worktree；commit rollback 的 unconfirmed replacement 會 retain/retry，terminal stale row 寫入失敗時 target reservation 先作 durable barrier，確認 teardown + worktree cleanup 後只以 target identity CAS restore live original 或在 `/end` 勝出時 remove、並同步移除 paired stale rows；CAS／寫入失敗保留 barrier/tracker、封鎖新 rebind，restart 不 resume fallback creating row；`/end` 會擁有兩個 incarnation 並 retry 已追蹤 fallback，沒有 live map 的後續 `/end` 也不得 generic-reap 未對帳 barrier，restore 後的下一次 `/end` 不可留下 primary row | `test/app-rebind.test.ts`、`test/session-store.test.ts`、`test/app-reconcile.test.ts` |
 | faulted/hung SDK disconnect 保留 root lock，確認終止後只 close 一次且 actor 仍拒絕 prompt／送檔 | `test/session-actor.test.ts` |

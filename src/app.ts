@@ -2712,12 +2712,19 @@ export class DiscordCopilotApp {
     for (const entry of this.staleRebindActors.values()) {
       const fallback = entry.fallbackPrimary;
       if (!fallback || entry.threadId !== threadId) continue;
-      fallback.action = "remove";
-      fallback.original = undefined;
-      fallback.canRestore = undefined;
-      fallback.afterRestore = undefined;
-      fallback.resumeFileDelivery = undefined;
+      this.setFallbackPrimaryRemoval(fallback);
     }
+  }
+
+  /** Once `/end` owns the thread, a fallback may only remove its exact target.
+   * Clear every restore-only callback before any teardown await, because a
+   * retry can otherwise observe the old plan after the owner has gone away. */
+  private setFallbackPrimaryRemoval(fallback: FallbackPrimaryReconciliationPlan): void {
+    fallback.action = "remove";
+    fallback.original = undefined;
+    fallback.canRestore = undefined;
+    fallback.afterRestore = undefined;
+    fallback.resumeFileDelivery = undefined;
   }
 
   /** Persist and strongly retain an actor that has already failed a disconnect
@@ -2934,8 +2941,25 @@ export class DiscordCopilotApp {
      * session. Crucially this never restores the old record or file fence:
      * `/end` is the winner, not a failed rebind rollback. */
     const abandonEndedRebind = async (): Promise<string> => {
+      // The first commit-failure disconnect may have raced `/end` before its
+      // fallback tracker was registered. Flip an existing plan synchronously;
+      // a plan created below is removal-only as well.
+      this.markFallbackPrimaryEnded(threadId);
+      const trackedReplacement =
+        replacementActor === undefined ? undefined : this.staleRebindActors.get(replacementActor);
+      if (trackedReplacement?.fallbackPrimary) {
+        // The fallback owns BOTH the primary reservation and the terminal
+        // tracker. Its cleanup must run through one CAS transaction: removing
+        // the primary here would strand the tracker if its later reconciliation
+        // loses the target or cannot persist.
+        const teardown = await this.disconnectStaleRebindActor(trackedReplacement);
+        releaseTargetLease();
+        return `${endedRebind}${teardown.tail}`;
+      }
+
       let replacementClosed = true;
       let replacementDurablyRetained = true;
+      let fallbackPrimaryRetained = false;
       if (replacementActor) {
         try {
           await withTimeout(replacementActor.disconnect(), TEARDOWN_TIMEOUT_MS);
@@ -2944,13 +2968,17 @@ export class DiscordCopilotApp {
           // Retain the actor and root fence until a retry can CONFIRM teardown;
           // do not let a timed-out `/end` turn it into an invisible writer.
           if (replacementBinding) {
+            const fallback = this.fallbackPrimaryPlan(replacementBinding);
+            this.setFallbackPrimaryRemoval(fallback);
+            const stale = this.staleRebindActor(replacementActor, replacementBinding, true);
             replacementDurablyRetained = this.retainStaleRebindActor(
-              this.staleRebindActor(replacementActor, replacementBinding, true),
+              stale,
               "rebind-teardown-unconfirmed",
               // `/end` already claimed the old session. If persistence fails,
               // retry may remove only this exact target reservation.
-              this.fallbackPrimaryPlan(replacementBinding)
+              fallback
             );
+            fallbackPrimaryRetained = stale.fallbackPrimary !== undefined;
           } else {
             // This should be unreachable: a replacement actor is created only
             // after reserve has produced its immutable binding. Do not close a
@@ -2965,12 +2993,14 @@ export class DiscordCopilotApp {
       // If the terminal stale row could not be written, the target reservation
       // is the only crash-surviving pointer to this possibly-live replacement.
       // Never remove it until teardown is durably represented elsewhere.
-      if (reservedIdentity && (replacementClosed || replacementDurablyRetained)) {
-        this.store.removeIfCurrent(threadId, reservedIdentity.sessionId, reservedIdentity.generation);
-      } else if (reservedIdentity) {
-        console.warn(
-          `rebind: retaining target reservation ${reservedIdentity.sessionId} as fallback after stale ownership write failure`
-        );
+      if (!fallbackPrimaryRetained) {
+        if (reservedIdentity && (replacementClosed || replacementDurablyRetained)) {
+          this.store.removeIfCurrent(threadId, reservedIdentity.sessionId, reservedIdentity.generation);
+        } else if (reservedIdentity) {
+          console.warn(
+            `rebind: retaining target reservation ${reservedIdentity.sessionId} as fallback after stale ownership write failure`
+          );
+        }
       }
       releaseTargetLease();
       if (replacementClosed) await undoWorktree();
@@ -3152,23 +3182,28 @@ export class DiscordCopilotApp {
         // target worktree. Otherwise a live SDK process could become invisible
         // while its working directory is deleted underneath it.
         if (replacementBinding) {
+          const fallback = this.fallbackPrimaryPlan(
+            replacementBinding,
+            previous,
+            ownsOldSession,
+            () => {
+              if (oldStale && this.pendingRebindOlds.get(session) === oldStale) {
+                this.pendingRebindOlds.delete(session);
+              }
+            },
+            restoreOldFileDelivery
+          );
+          // `/end` can claim the old actor while the initial teardown await is
+          // pending. Install the removal plan BEFORE retain schedules a retry,
+          // so that retry never sees a stale restore callback.
+          if (!ownsOldSession()) this.setFallbackPrimaryRemoval(fallback);
           replacementDurablyRetained = this.retainStaleRebindActor(
             this.staleRebindActor(actor, replacementBinding, true),
             "rebind-teardown-unconfirmed",
             // The old actor is still current here. If this terminal row cannot
             // persist, a later confirmed retry may restore only this snapshot
             // under the target reservation's exact CAS.
-            this.fallbackPrimaryPlan(
-              replacementBinding,
-              previous,
-              ownsOldSession,
-              () => {
-                if (oldStale && this.pendingRebindOlds.get(session) === oldStale) {
-                  this.pendingRebindOlds.delete(session);
-                }
-              },
-              restoreOldFileDelivery
-            )
+            fallback
           );
         } else {
           console.warn("rebind: commit-failed replacement lost its durable binding before teardown");
