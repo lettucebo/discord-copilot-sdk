@@ -136,8 +136,9 @@ describe("resolveOutboundFile", () => {
   it("returns a normal agent artifact with bytes and sanitized display name", async () => {
     const root = makeRoot();
     const requestedPath = path.join("artifacts", "report.txt");
-    const abs = write(root, requestedPath, "hello report");
+    write(root, requestedPath, "hello report");
     const trustedRoot = await captureTrustedRoot(root);
+    const expectedAbs = path.join(trustedRoot.finalPath, requestedPath);
 
     let result: Awaited<ReturnType<typeof resolveOutboundFile>>;
     try {
@@ -152,7 +153,7 @@ describe("resolveOutboundFile", () => {
     expect(result).toEqual({
       ok: true,
       file: {
-        absPath: abs,
+        absPath: expectedAbs,
         displayName: "report.txt",
         relativePath: requestedPath,
         size: 12,
@@ -166,11 +167,17 @@ describe("resolveOutboundFile", () => {
   it("accepts an absolute path that stays inside the worktree", async () => {
     const root = makeRoot();
     const abs = write(root, path.join("logs", "session.log"), "ok");
-
-    const result = await resolveForTest(root, abs, { maxBytes: 64, policy: "agent" });
+    const trustedRoot = await captureTrustedRoot(root);
+    const expectedAbs = path.join(trustedRoot.finalPath, "logs", "session.log");
+    let result: Awaited<ReturnType<typeof resolveOutboundFile>>;
+    try {
+      result = await resolveOutboundFile(trustedRoot, abs, { maxBytes: 64, policy: "agent" });
+    } finally {
+      await trustedRoot.close();
+    }
 
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.file.absPath).toBe(abs);
+    if (result.ok) expect(result.file.absPath).toBe(expectedAbs);
   });
 
   it("refuses traversal that resolves outside the worktree", async () => {

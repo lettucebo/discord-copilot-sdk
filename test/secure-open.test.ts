@@ -303,12 +303,18 @@ describe("secureOpen", () => {
 
   it("returns bytes and handle-derived metadata for an ordinary file inside the trusted root", async () => {
     const root = makeRoot();
-    const target = write(root, "artifacts\\report.txt", "inside bytes");
-
-    const result = await secureOpenForTest(target, root, { maxBytes: 1024 });
+    const relativePath = path.join("artifacts", "report.txt");
+    const target = write(root, relativePath, "inside bytes");
+    const trustedRoot = await captureTrustedRoot(root);
+    let result: Awaited<ReturnType<typeof secureOpen>>;
+    try {
+      result = await secureOpen(target, trustedRoot, { maxBytes: 1024 });
+    } finally {
+      await trustedRoot.close();
+    }
 
     expect(result).toMatchObject({
-      finalPath: process.platform === "darwin" ? expect.stringMatching(/report\.txt$/) : target,
+      finalPath: path.join(trustedRoot.finalPath, relativePath),
       size: 12,
       bytes: Buffer.from("inside bytes"),
       identity: expect.any(String),
