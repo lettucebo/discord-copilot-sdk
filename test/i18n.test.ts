@@ -160,6 +160,28 @@ describe("update messages", () => {
 
     expect(placeholders(MESSAGES.zh[key])).toEqual(placeholders(MESSAGES.en[key]));
   });
+
+  it("uses phase-neutral recovery wording in both languages while preserving restore guidance", () => {
+    expect(MESSAGES.en.updateIncompleteRestartLabel).toBe("Update finalization");
+    expect(MESSAGES.en.updateIncompleteRestart).toBe("did not complete");
+    expect(MESSAGES.en.updatePendingRestore).toBe(
+      "Warning: a previous update left a recovery record; run node scripts/update.mjs --restore."
+    );
+    expect(MESSAGES.en.updateFailed).toBe(
+      "Update did not complete; update finalization did not complete. Fix the cause, then run node scripts/update.mjs --restore."
+    );
+    expect(MESSAGES.en.updatePendingRestore).not.toContain("automatic recovery");
+    expect(MESSAGES.en.updateFailed).not.toContain("automatic recovery");
+
+    expect(MESSAGES.zh.updateIncompleteRestartLabel).toBe("更新收尾");
+    expect(MESSAGES.zh.updateIncompleteRestart).toBe("未完成");
+    expect(MESSAGES.zh.updatePendingRestore).toBe("警告：先前的更新留下了復原記錄；請執行 node scripts/update.mjs --restore。");
+    expect(MESSAGES.zh.updateFailed).toBe(
+      "更新未完成；更新收尾未完成。修正原因後執行 node scripts/update.mjs --restore。"
+    );
+    expect(MESSAGES.zh.updatePendingRestore).not.toContain("自動復原");
+    expect(MESSAGES.zh.updateFailed).not.toContain("自動復原");
+  });
 });
 
 describe("skill source messages", () => {

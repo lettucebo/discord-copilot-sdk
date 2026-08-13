@@ -448,7 +448,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
 
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain("Already up to date:");
-    expect(result.stdout).toContain("Warning: a failed update still awaits --restore; automatic recovery did not complete.");
+    expect(result.stdout).toContain("Warning: a previous update left a recovery record; run node scripts/update.mjs --restore.");
   });
 
   it("does not warn a checkout about another checkout's pending restore state", async () => {
@@ -585,7 +585,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
       expect(result.stdout).toContain(`0.9.0 (${localSha.slice(0, 12)})`);
       expect(result.stdout).toContain(`1.0.0 (${remoteSha.slice(0, 12)})`);
       expect(result.stdout).toContain(instance);
-      expect(result.stdout).toContain("Automatic recovery");
+      expect(result.stdout).toContain("Update finalization");
       expect(result.stdout).toContain("did not complete");
       expect(result.stdout).toContain("node scripts/update.mjs --restore");
       expect(result.stdout).not.toContain("Restored the pre-update running state.");
@@ -676,7 +676,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
       expect(result.stdout).toContain(`1.0.1 (${localSha.slice(0, 12)})`);
       expect(result.stdout).toContain(`1.1.0 (${remoteSha.slice(0, 12)})`);
       expect(result.stdout).toContain(instance);
-      expect(result.stdout).toContain("Automatic recovery");
+      expect(result.stdout).toContain("Update finalization");
       expect(result.stdout).toContain("did not complete");
       expect(result.stdout).toContain("Recovery command");
       expect(result.stdout).toContain("node scripts/update.mjs --restore");
