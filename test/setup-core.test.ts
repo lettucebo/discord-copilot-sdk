@@ -296,15 +296,14 @@ describe("reportLogInfo (installer completion report log target)", () => {
 
   describe("writeChunkToSinks", () => {
     it("pauses the source until every backpressured sink drains", () => {
-      const events = [];
+      const events: Array<"pause" | "resume"> = [];
       const source = {
         pause: () => events.push("pause"),
         resume: () => events.push("resume"),
       };
-      const logSink = new EventEmitter();
-      logSink.write = () => false;
-      const verboseSink = new EventEmitter();
-      verboseSink.write = () => false;
+      type DrainSink = EventEmitter & { write: (text: string) => boolean };
+      const logSink: DrainSink = Object.assign(new EventEmitter(), { write: () => false });
+      const verboseSink: DrainSink = Object.assign(new EventEmitter(), { write: () => false });
 
       writeChunkToSinks(source, "chunk", [logSink, verboseSink]);
       expect(events).toEqual(["pause"]);

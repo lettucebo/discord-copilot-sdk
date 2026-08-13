@@ -17,6 +17,11 @@ const isWin = process.platform === "win32";
 const FIXTURE_VERSION = "9.8.7";
 const SETUP_LOG_PREFIX = "setup-";
 
+type RunSetupOptions = {
+  env?: NodeJS.ProcessEnv;
+  keepHome?: boolean;
+};
+
 // REPOS_ROOT is filled in per-fixture (see makeFixture) — it must be a REAL
 // directory that is NOT itself a git repo, because setup.mjs enforces that
 // unconditionally (interactive AND --yes), mirroring src/core/repo.ts's
@@ -69,7 +74,7 @@ function stubBuiltDist(repo) {
   fs.writeFileSync(path.join(repo, "dist", "core", "repo.js"), "export function resolveReposRoot(value) { return value; }\n");
 }
 
-function runSetup(repo, args, options = {}) {
+function runSetup(repo: string, args: readonly string[], options: RunSetupOptions = {}) {
   const { env: envOverrides = {}, keepHome = false } = options;
   // Isolate HOME/USERPROFILE so any accidental STATE_DIR write (~/.discord-copilot-sdk)
   // lands in the fixture, never the real home, and would be observable.
@@ -110,6 +115,12 @@ function listSetupLogs(home) {
     .readdirSync(dir)
     .filter((name) => name.startsWith(SETUP_LOG_PREFIX))
     .map((name) => path.join(dir, name));
+}
+
+function firstLogPath(logs: string[]): string {
+  const [logPath] = logs;
+  if (logPath === undefined) throw new Error("expected one setup log path");
+  return logPath;
 }
 
 function numberLines(prefix, count) {
@@ -480,8 +491,9 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       expect(out).not.toContain("\r");
       expect(out).not.toContain("DEP0190");
       expect(logs).toHaveLength(1);
-      expect(logs[0].startsWith(setupLogDir(home))).toBe(true);
-      const logText = fs.readFileSync(logs[0], "utf8");
+      const logPath = firstLogPath(logs);
+      expect(logPath.startsWith(setupLogDir(home))).toBe(true);
+      const logText = fs.readFileSync(logPath, "utf8");
       expect(logText).toContain("install-stdout-marker");
       expect(logText).toContain("install-stderr-marker");
       expect(logText).toContain("build-stdout-marker");
@@ -638,7 +650,7 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       expect(out).not.toContain("[4/5] Config validation and .env write");
       expect(out).not.toContain("Action summary");
       expect(logs).toHaveLength(1);
-      const logText = fs.readFileSync(logs[0], "utf8");
+      const logText = fs.readFileSync(firstLogPath(logs), "utf8");
       expect(logText).toContain("tail-01");
       expect(logText).toContain("tail-60");
     } finally {
@@ -693,7 +705,7 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       expect(out).not.toContain("�");
       expect(out).not.toContain("DEP0190");
       expect(logs).toHaveLength(1);
-      const logText = fs.readFileSync(logs[0], "utf8");
+      const logText = fs.readFileSync(firstLogPath(logs), "utf8");
       expect(logText).toContain("你好");
       expect(logText).not.toContain("�");
     } finally {
