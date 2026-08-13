@@ -155,9 +155,11 @@ async function createFetchBarrier(binDir: string, record: string): Promise<strin
       'const fs = require("node:fs");',
       'const path = require("node:path");',
       'const { spawnSync } = require("node:child_process");',
-      'if (path.basename(process.execPath).toLowerCase() === "git.exe") {',
-      "  const args = process.argv.slice(1);",
-      "  args[0] = path.basename(args[0]);",
+      'const invokedAsGitExe = path.basename(process.execPath).toLowerCase() === "git.exe";',
+      'const invokedAsScript = process.argv.length > 1 && path.resolve(process.argv[1]) === __filename;',
+      "if (invokedAsGitExe || invokedAsScript) {",
+      "  const args = invokedAsGitExe ? process.argv.slice(1) : process.argv.slice(2);",
+      "  if (invokedAsGitExe && args[0]) args[0] = path.basename(args[0]);",
       '  if (args[0] === "fetch") {',
       '    fs.writeFileSync(process.env.DCS_FETCH_BARRIER_RECORD, JSON.stringify(args));',
       '    const pushed = spawnSync(process.env.DCS_FETCH_BARRIER_GIT, ["-C", process.env.DCS_FETCH_BARRIER_SOURCE, "push", "-q", "origin", "main"], { stdio: "inherit" });',
@@ -496,6 +498,28 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(result.stdout).not.toContain("[1/4] Stop");
     expect(fs.existsSync(path.join(home, ".discord-copilot-sdk"))).toBe(false);
     expect((await git(local, "for-each-ref", "--format=%(refname)", "refs/dcs-update")).stdout.trim()).toBe("");
+  });
+
+  it("forwards Unix-style shim argv to the real git binary", async () => {
+    const local = await cloneTarget("unix-fetch-barrier-argv");
+    const barrierBin = path.join(root, `fetch-barrier-argv-${serial}`);
+    const fetchRecord = path.join(barrierBin, "fetch-args.json");
+    const shim = await createFetchBarrier(barrierBin, fetchRecord);
+
+    const result = await exec(process.execPath, [shim, "rev-parse", "--git-dir"], {
+      cwd: local,
+      env: {
+        ...process.env,
+        DCS_FETCH_BARRIER_GIT: realGitPath(),
+        DCS_FETCH_BARRIER_RECORD: fetchRecord,
+        DCS_FETCH_BARRIER_SOURCE: source,
+      },
+      encoding: "utf8",
+    });
+
+    expect(result.stderr).toBe("");
+    expect(result.stdout.trim()).toBe(".git");
+    expect(fs.existsSync(fetchRecord)).toBe(false);
   });
 
   it("displays target metadata from the fetched SHA instead of another fetched object", async () => {
