@@ -134,6 +134,16 @@ async function runUpdate(
   }
 }
 
+function expectInOrder(output: string, ...parts: string[]) {
+  let previous = -1;
+  for (const part of parts) {
+    const index = output.indexOf(part);
+    expect(index, `missing output fragment: ${part}\n${output}`).toBeGreaterThanOrEqual(0);
+    expect(index, `out-of-order output fragment: ${part}\n${output}`).toBeGreaterThan(previous);
+    previous = index;
+  }
+}
+
 beforeAll(async () => {
   root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dcs-update-git-"));
   source = path.join(root, "source");
@@ -297,7 +307,12 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(result.stdout).toContain(`root ${local}`);
     expect(result.stdout).toContain("checkout branch-clean (main)");
     expect(result.stdout).toContain("requested main -> refs/heads/main @");
+    expect(result.stdout).toContain("\nUpdate status\n");
+    expect(result.stdout).toContain("Current version");
+    expect(result.stdout).toContain("Repository root");
+    expect(result.stdout).toContain("Requested ref");
     expect(result.stdout).toContain("Already up to date: 0.1.0 (");
+    expectInOrder(result.stdout, "Update status", "Already up to date: 0.1.0 (");
     expect(fs.existsSync(fetchHead)).toBe(false);
   });
 
@@ -311,8 +326,12 @@ describe("git update data paths", { timeout: 60_000 }, () => {
 
     expect(result.code, result.stderr).toBe(2);
     expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("\nUpdate status\n");
+    expect(result.stdout).toContain("Current version");
+    expect(result.stdout).toContain("Instance");
     expect(result.stdout).toContain(`Update available: 0.2.0 (${localSha.slice(0, 12)}) -> 0.3.0 (${remoteSha.slice(0, 12)}).`);
     expect(result.stdout).toContain("Apply it with: node scripts/update.mjs");
+    expectInOrder(result.stdout, "Update status", `Update available: 0.2.0 (${localSha.slice(0, 12)}) -> 0.3.0 (${remoteSha.slice(0, 12)}).`);
     expect(fs.existsSync(path.join(local, ".git", "FETCH_HEAD"))).toBe(true);
   });
 
@@ -332,6 +351,24 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain("Update available: 0.4.0 (");
     expect(result.stdout).not.toContain("Target release notes for 0.4.1:");
+  });
+
+  it("falls back to an unknown target version when fetched metadata is not trustworthy", async () => {
+    await advanceToVersion("0.4.2");
+    const local = await cloneTarget("check-unknown-target-version");
+    const localSha = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+    await fs.promises.writeFile(path.join(source, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version: "not-semver" }));
+    await git(source, "add", "package.json");
+    await git(source, "commit", "-q", "-m", "break package metadata");
+    await git(source, "push", "-q", "origin", "main");
+    const brokenSha = (await git(source, "rev-parse", "HEAD")).stdout.trim();
+
+    const result = await runUpdate(local, ["--check", "--lang", "en"]);
+
+    expect(result.code, result.stderr).toBe(2);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain(`Update available: 0.4.2 (${localSha.slice(0, 12)}) -> unknown (${brokenSha.slice(0, 12)}).`);
+    expect(result.stdout).not.toContain(`Update available: 0.4.2 (${localSha.slice(0, 12)}) -> 0.4.2 (${brokenSha.slice(0, 12)}).`);
   });
 
   it("warns when a current source still has a failed update awaiting restore", async () => {
@@ -416,6 +453,10 @@ describe("git update data paths", { timeout: 60_000 }, () => {
 
     expect(result.code, result.stderr).toBe(0);
     expect((await git(local, "rev-parse", "HEAD")).stdout.trim()).toBe(expected);
+    expect(result.stdout).toContain("\nUpdate plan\n");
+    expect(result.stdout).toContain("Target version");
+    expect(result.stdout).toContain("Target instances");
+    expectInOrder(result.stdout, "Update plan", "[1/4] Stop");
     expect(result.stdout).toContain(`Source updated: ${beforeVersion} (`);
     expect(result.stdout).toContain(` -> 0.2.0 (${expected.slice(0, 12)}).`);
     expect(result.stdout).toContain(`${instancePrefix}-${serial} remains stopped because of --no-restart. Start manually:`);
@@ -425,6 +466,26 @@ describe("git update data paths", { timeout: 60_000 }, () => {
       expect(result.stdout).toContain(`DISCORD_COPILOT_SDK_INSTANCE_ID=${instancePrefix}-${serial} bash "`);
     }
     expect(result.stdout).toContain("Update succeeded; --no-restart leaves it stopped.");
+  });
+
+  it("shows an unknown target version in the apply plan when fetched metadata cannot be parsed", async () => {
+    await advanceToVersion("0.6.0");
+    const local = await cloneTarget("apply-unknown-target-version");
+    const localSha = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+    await fs.promises.writeFile(path.join(source, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version: "invalid-version" }));
+    await fs.promises.writeFile(path.join(source, "scripts", "setup.mjs"), "process.exit(0);\n");
+    await git(source, "add", "package.json", "scripts/setup.mjs");
+    await git(source, "commit", "-q", "-m", "break target package metadata");
+    await git(source, "push", "-q", "origin", "main");
+    const remoteSha = (await git(source, "rev-parse", "HEAD")).stdout.trim();
+
+    const result = await runUpdate(local, ["--yes", "--no-restart", "--lang", "en"]);
+
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain("\nUpdate plan\n");
+    expect(result.stdout).toContain(`0.6.0 (${localSha.slice(0, 12)})`);
+    expect(result.stdout).toContain(`unknown (${remoteSha.slice(0, 12)})`);
+    expectInOrder(result.stdout, "Update plan", "Target version", `unknown (${remoteSha.slice(0, 12)})`, "[1/4] Stop");
   });
 
   it("states that a bot stopped before the update remains stopped", async () => {

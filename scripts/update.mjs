@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Safe local updater. The ordering is deliberate:
 //
-//   read-only preflight -> stop residency -> stop bot -> move HEAD -> setup -> restore
+//   read-only preflight -> fetch -> branch/config proof -> show plan -> active-thread guard
+//   -> stop residency -> stop bot -> move HEAD -> setup -> restore
 //
 // npm may replace files held by a live bot on Windows, while residency restarts
 // a killed process. Moving either stop step earlier is how an update becomes an
@@ -32,6 +33,7 @@ import {
 import { extractChangelogSection } from "./lib/release-core.mjs";
 import { nodeVersionOk } from "./lib/setup-core.mjs";
 import { detectLang, formatMessage, t } from "./lib/i18n.mjs";
+import { formatKeyValue, formatSection, formatStage, formatSummary } from "./lib/ui.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const requestedRoot = process.env.DISCORD_COPILOT_SDK_UPDATE_ROOT;
@@ -45,6 +47,64 @@ class UpdateError extends Error {}
 const flags = parseUpdateArgs(process.argv.slice(2));
 const lang = flags.lang ?? detectLang(process.env);
 const message = (key, ...values) => formatMessage(t(key, lang), values);
+const UPDATE_STAGE_TOTAL = 4;
+
+function shortSha(sha) {
+  return typeof sha === "string" && /^[0-9a-f]{4,64}$/i.test(sha) ? sha.slice(0, 12) : "unknown";
+}
+
+function formatVersionAndSha(version, sha) {
+  return `${version} (${shortSha(sha)})`;
+}
+
+function residencyStateLabel(residency) {
+  if (!residency?.known) return t("updateResidencyUnknownState", lang);
+  if (!residency.registered) return t("updateResidencyNotRegisteredState", lang);
+  return residency.enabled ? t("updateResidencyEnabled", lang) : t("updateResidencyDisabledState", lang);
+}
+
+function instanceStatusLabel(instance, isRunning, residency) {
+  return formatMessage(t("updateInstanceStatus", lang), [
+    instance,
+    t(isRunning ? "updateRunning" : "updateStoppedState", lang),
+    residencyStateLabel(residency),
+  ]);
+}
+
+function printUpdateStatus({ packageVersion, localSha, checkout, ref, remote, instance, isRunning, residency }) {
+  console.log(formatSection(t("updateStatusHeader", lang)));
+  console.log(
+    formatSummary([
+      [t("updateStatusCurrentVersion", lang), formatVersionAndSha(packageVersion, localSha)],
+      [t("updateStatusRepositoryRoot", lang), REPO_ROOT],
+      [t("updateStatusCheckout", lang), `${checkout.kind} (${checkout.branch ?? "detached"})`],
+      [t("updateStatusRequestedRef", lang), `${ref} -> ${remote?.ref ?? "unknown"} @ ${shortSha(remote?.sha)}`],
+      [t("updateStatusInstance", lang), instanceStatusLabel(instance, isRunning, residency)],
+    ])
+  );
+}
+
+function printUpdatePlan({ currentVersion, localSha, targetVersion, remoteSha, instances }) {
+  const lines = [
+    formatKeyValue(t("updatePlanCurrentVersion", lang), formatVersionAndSha(currentVersion, localSha)),
+    formatKeyValue(t("updatePlanTargetVersion", lang), formatVersionAndSha(targetVersion, remoteSha)),
+    formatKeyValue(t("updatePlanTargetInstances", lang), instances.map(({ instance }) => instance).join(", ")),
+  ];
+  for (const [index, entry] of instances.entries()) {
+    lines.push(
+      formatKeyValue(
+        index === 0 ? t("updatePlanInstanceState", lang) : "",
+        instanceStatusLabel(entry.instance, entry.wasRunning, entry.residency)
+      )
+    );
+  }
+  console.log(formatSection(t("updatePlanHeader", lang)));
+  console.log(lines.join("\n"));
+}
+
+function printUpdateStage(current, titleKey) {
+  console.log(formatStage(current, UPDATE_STAGE_TOTAL, t(titleKey, lang)));
+}
 
 function run(command, args, opts = {}) {
   return execFileSync(command, args, {
@@ -355,9 +415,13 @@ function readWindowsResidency(instance) {
   const output = tryRun(ps, [
     "-NoProfile",
     "-Command",
-    `$t=Get-ScheduledTask -TaskName '${name}' -ErrorAction SilentlyContinue;if($t){if($t.Settings.Enabled){'enabled'}else{'disabled'}}`,
+    `$t=Get-ScheduledTask -TaskName '${name}' -ErrorAction SilentlyContinue;if($t){if($t.Settings.Enabled){'enabled'}else{'disabled'}}else{'missing'}`,
   ]);
-  return { registered: output !== null && /^(enabled|disabled)\s*$/i.test(output), enabled: /^enabled\s*$/i.test(output ?? "") };
+  const trimmed = output?.trim().toLowerCase();
+  if (trimmed === "enabled") return { registered: true, enabled: true, known: true };
+  if (trimmed === "disabled") return { registered: true, enabled: false, known: true };
+  if (trimmed === "missing") return { registered: false, enabled: false, known: true };
+  return { registered: false, enabled: false, known: false };
 }
 
 function residencyState(instance) {
@@ -365,14 +429,19 @@ function residencyState(instance) {
   if (process.platform === "darwin") {
     const uid = String(process.getuid?.() ?? "");
     const label = `com.discord-copilot-sdk.${instance}`;
+    const registered = fs.existsSync(path.join(os.homedir(), "Library", "LaunchAgents", `${label}.plist`));
+    const enabledProbe = tryRun("launchctl", ["print", `gui/${uid}/${label}`]);
     return {
-      registered: fs.existsSync(path.join(os.homedir(), "Library", "LaunchAgents", `${label}.plist`)),
-      enabled: tryRun("launchctl", ["print", `gui/${uid}/${label}`]) !== null,
+      registered,
+      enabled: enabledProbe !== null,
+      known: registered || enabledProbe !== null,
     };
   }
   const unit = `discord-copilot-sdk-${instance}.service`;
-  const enabled = tryRun("systemctl", ["--user", "is-enabled", unit])?.trim() === "enabled";
-  return { registered: enabled || tryRun("systemctl", ["--user", "cat", unit]) !== null, enabled };
+  const enabledOutput = tryRun("systemctl", ["--user", "is-enabled", unit])?.trim();
+  const catOutput = tryRun("systemctl", ["--user", "cat", unit]);
+  const enabled = enabledOutput === "enabled";
+  return { registered: enabled || catOutput !== null, enabled, known: enabledOutput !== undefined || catOutput !== null };
 }
 
 function writeState(instance, state) {
@@ -585,11 +654,12 @@ async function main() {
   }
 
   const packageText = ensureRepo();
+  const currentVersion = parsePackageVersion(packageText);
   ensurePrerequisites();
   const ref = flags.ref ?? process.env.DISCORD_COPILOT_SDK_REF ?? "main";
   const local = localSha();
   const checkout = checkoutFacts();
-  console.log(message("updateSourceIdentity", parsePackageVersion(packageText), local.slice(0, 12)));
+  console.log(message("updateSourceIdentity", currentVersion, local.slice(0, 12)));
   console.log(message("updateRoot", REPO_ROOT));
   console.log(message("updateCheckout", checkout.kind, checkout.branch ?? "detached"));
   const remote = remoteFor(ref);
@@ -598,6 +668,17 @@ async function main() {
   const savedState = restoreStateStatus(instance);
   const pendingRestore = savedState.kind === "current" || savedState.kind === "unreadable";
   const live = liveInstances();
+  const selectedResidency = residencyState(instance);
+  printUpdateStatus({
+    packageVersion: currentVersion,
+    localSha: local,
+    checkout,
+    ref,
+    remote,
+    instance,
+    isRunning: live.some((entry) => entry.instance === instance),
+    residency: selectedResidency,
+  });
   const otherLive = live.filter((entry) => entry.instance !== instance);
   if (otherLive.length && !flags.allInstances) {
     throw new UpdateError(`other instance(s) are running: ${otherLive.map((entry) => entry.instance).join(", ")}; re-run with --all-instances`);
@@ -619,7 +700,7 @@ async function main() {
     );
   }
   if (decision.action === "up-to-date") {
-    console.log(message("updateAlreadyCurrent", parsePackageVersion(packageText), local.slice(0, 12)));
+    console.log(message("updateAlreadyCurrent", currentVersion, local.slice(0, 12)));
     if (pendingRestore) console.log(message("updatePendingRestore"));
     return;
   }
@@ -628,7 +709,7 @@ async function main() {
     fetchResolved(remote, checkout.kind, { quiet: true });
     const targetVersion = fetchedPackageVersion();
     const targetNotes = fetchedTargetNotes(targetVersion);
-    console.log(message("updateAvailable", parsePackageVersion(packageText), local.slice(0, 12), targetVersion, remote.sha.slice(0, 12)));
+    console.log(message("updateAvailable", currentVersion, local.slice(0, 12), targetVersion, remote.sha.slice(0, 12)));
     if (targetNotes) {
       console.log(message("updateTargetNotes", targetVersion));
       console.log(targetNotes);
@@ -651,7 +732,6 @@ async function main() {
     if (dangling) console.log(message("updateManagedDangling", dangling));
   }
   await precheckIncomingConfig();
-  await confirmActiveThreads(activeThreadSummary());
 
   const targetIds = [...new Set([instance, ...(flags.allInstances ? live.map((entry) => entry.instance) : [])])];
   const state = {
@@ -666,6 +746,14 @@ async function main() {
       residency: residencyState(id),
     })),
   };
+  printUpdatePlan({
+    currentVersion,
+    localSha: local,
+    targetVersion: fetchedPackageVersion(),
+    remoteSha: remote.sha,
+    instances: state.instances,
+  });
+  await confirmActiveThreads(activeThreadSummary());
 
   const releaseLock = acquireUpdateLock(instance);
   writeState(instance, state);
@@ -674,7 +762,7 @@ async function main() {
     // `stop-bot` is the identity-aware lifecycle path. Do not duplicate its PID
     // trust checks here; verify afterward because its user-facing scripts return
     // success when they decline to stop a stale/reused PID.
-    console.log(message("updatePhaseStop"));
+    printUpdateStage(1, "updateStageStop");
     for (const id of targetIds) stopInstance(id);
     await verifyStopped(live.filter((entry) => targetIds.includes(entry.instance)));
     for (const entry of state.instances) {
@@ -683,20 +771,20 @@ async function main() {
         console.log(message("updateResidencyDisabled", entry.instance));
       }
     }
-    console.log(message("updatePhaseSource"));
+    printUpdateStage(2, "updateStageSource");
     applySource(checkout.kind);
-    console.log(message("updatePhaseSetup"));
+    printUpdateStage(3, "updateStageSetup");
     runSetup();
     setupSucceeded = true;
     const now = localSha();
-    console.log(message("updateApplied", parsePackageVersion(packageText), local.slice(0, 12), currentPackageVersion(), now.slice(0, 12)));
+    console.log(message("updateApplied", currentVersion, local.slice(0, 12), currentPackageVersion(), now.slice(0, 12)));
     if (flags.noRestart) {
       if (!shouldRetainRestoreState(setupSucceeded)) fs.rmSync(statePath(instance), { force: true });
       for (const entry of state.instances) console.log(message("updateNoRestartInstance", entry.instance, startCommand(entry.instance)));
       console.log(message("updateNoRestart"));
       return;
     }
-    console.log(message("updatePhaseRestore"));
+    printUpdateStage(4, "updateStageRestore");
     await restoreState(state);
     fs.rmSync(statePath(instance), { force: true });
     console.log(message("updateComplete"));
