@@ -29,6 +29,7 @@ import {
   targetInstancesStopped,
   updateLockRelativePath,
 } from "./lib/update-core.mjs";
+import { extractChangelogSection } from "./lib/release-core.mjs";
 import { nodeVersionOk } from "./lib/setup-core.mjs";
 import { detectLang, formatMessage, t } from "./lib/i18n.mjs";
 
@@ -133,6 +134,29 @@ function currentPackageVersion() {
   }
 }
 
+function fetchedText(file, options = {}) {
+  const content = tryRun("git", ["show", `FETCH_HEAD:${file}`]);
+  if (content === null) {
+    if (options.optional) return null;
+    throw new UpdateError(`the fetched revision does not contain readable ${file}`);
+  }
+  return content;
+}
+
+function fetchedPackageVersion() {
+  return parsePackageVersion(fetchedText("package.json"));
+}
+
+function fetchedTargetNotes(version) {
+  if (version === "unknown") return null;
+  const changelog = fetchedText("CHANGELOG.md", { optional: true });
+  return changelog === null ? null : extractChangelogSection(changelog, version);
+}
+
+function applyCommand(ref) {
+  return ref === "main" ? "node scripts/update.mjs" : `node scripts/update.mjs --ref ${ref}`;
+}
+
 function onPath(command) {
   const probe = process.platform === "win32" ? "where" : "which";
   try {
@@ -174,12 +198,20 @@ function remoteFor(ref) {
   return resolveRemoteSha(parseLsRemote(output), ref);
 }
 
-function fetchResolved(remote, checkoutKind) {
+function fetchResolved(remote, checkoutKind, options = {}) {
   const ref = remote.ref.replace(/\^\{\}$/, "");
   const args = ["fetch"];
   if (checkoutKind === "managed") args.push("--depth", "1");
   args.push("origin", ref);
-  runInherited("git", args);
+  try {
+    if (options.quiet) {
+      run("git", args);
+      return;
+    }
+    runInherited("git", args);
+  } catch {
+    throw new UpdateError(`could not fetch origin ${ref}`);
+  }
 }
 
 function preflightBranchFastForward() {
@@ -587,12 +619,21 @@ async function main() {
     );
   }
   if (decision.action === "up-to-date") {
-    console.log(message("updateAlreadyCurrent", remote.ref));
+    console.log(message("updateAlreadyCurrent", parsePackageVersion(packageText), local.slice(0, 12)));
     if (pendingRestore) console.log(message("updatePendingRestore"));
     return;
   }
 
   if (decision.action === "check") {
+    fetchResolved(remote, checkout.kind, { quiet: true });
+    const targetVersion = fetchedPackageVersion();
+    const targetNotes = fetchedTargetNotes(targetVersion);
+    console.log(message("updateAvailable", parsePackageVersion(packageText), local.slice(0, 12), targetVersion, remote.sha.slice(0, 12)));
+    if (targetNotes) {
+      console.log(message("updateTargetNotes", targetVersion));
+      console.log(targetNotes);
+    }
+    console.log(message("updateApplyHint", applyCommand(ref)));
     process.exitCode = 2; // useful to a monitor: an update exists, no action taken
     return;
   }

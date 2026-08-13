@@ -84,6 +84,9 @@ describe("update messages", () => {
     "updateCheckout",
     "updateRequested",
     "updatePendingRestore",
+    "updateAvailable",
+    "updateApplyHint",
+    "updateTargetNotes",
     "updatePhaseStop",
     "updatePhaseSource",
     "updatePhaseSetup",
@@ -108,6 +111,18 @@ describe("update messages", () => {
     "updateCancelled",
   ])("defines the bilingual %s update message", (key) => {
     for (const lang of LANGS) expect(t(key, lang)).not.toBe(key);
+  });
+
+  it.each([
+    "updateAlreadyCurrent",
+    "updateAvailable",
+    "updateApplyHint",
+    "updateTargetNotes",
+  ])("keeps zh/en placeholder arity aligned for %s", (key) => {
+    const placeholders = (text: string) =>
+      [...text.matchAll(/\{(\d+)\}/g)].map((match) => Number(match[1])).sort((a, b) => a - b);
+
+    expect(placeholders(MESSAGES.zh[key])).toEqual(placeholders(MESSAGES.en[key]));
   });
 });
 

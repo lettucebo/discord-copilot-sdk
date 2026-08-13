@@ -60,10 +60,13 @@ async function advanceRemote(label: string): Promise<string> {
   return (await git(source, "rev-parse", "HEAD")).stdout.trim();
 }
 
-async function advanceToVersion(version: string): Promise<string> {
+async function advanceToVersion(version: string, options: { changelog?: string } = {}): Promise<string> {
   serial++;
   await fs.promises.mkdir(path.join(source, "scripts"), { recursive: true });
   await fs.promises.writeFile(path.join(source, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version }));
+  if (options.changelog !== undefined) {
+    await fs.promises.writeFile(path.join(source, "CHANGELOG.md"), options.changelog);
+  }
   await fs.promises.writeFile(path.join(source, "scripts", "setup.mjs"), "process.exit(0);\n");
   await fs.promises.writeFile(
     path.join(source, "run-bot.ps1"),
@@ -281,18 +284,54 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(result.stdout).toContain("Restored the pre-update running state.");
   });
 
-  it("reports source identity and the resolved ref when the source is already current", async () => {
+  it("reports already-up-to-date status with the installed version and skips fetch", async () => {
+    await advanceToVersion("0.1.0");
     const local = await cloneTarget("up-to-date");
+    const fetchHead = path.join(local, ".git", "FETCH_HEAD");
 
     const result = await runUpdate(local, ["--check", "--lang", "en"]);
 
     expect(result.code, result.stderr).toBe(0);
     expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("discord-copilot-sdk unknown (");
+    expect(result.stdout).toContain("discord-copilot-sdk 0.1.0 (");
     expect(result.stdout).toContain(`root ${local}`);
     expect(result.stdout).toContain("checkout branch-clean (main)");
     expect(result.stdout).toContain("requested main -> refs/heads/main @");
-    expect(result.stdout).toContain("Source HEAD already matches refs/heads/main; no update is needed.");
+    expect(result.stdout).toContain("Already up to date: 0.1.0 (");
+    expect(fs.existsSync(fetchHead)).toBe(false);
+  });
+
+  it("reports the current and target versions when --check finds an update", async () => {
+    await advanceToVersion("0.2.0");
+    const local = await cloneTarget("update-available");
+    const localSha = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+    const remoteSha = await advanceToVersion("0.3.0");
+
+    const result = await runUpdate(local, ["--check", "--lang", "en"]);
+
+    expect(result.code, result.stderr).toBe(2);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain(`Update available: 0.2.0 (${localSha.slice(0, 12)}) -> 0.3.0 (${remoteSha.slice(0, 12)}).`);
+    expect(result.stdout).toContain("Apply it with: node scripts/update.mjs");
+    expect(fs.existsSync(path.join(local, ".git", "FETCH_HEAD"))).toBe(true);
+  });
+
+  it("does not fail a check when the target changelog has no matching release section", async () => {
+    await advanceToVersion("0.4.0");
+    const local = await cloneTarget("check-without-target-notes");
+    await advanceToVersion(
+      "0.4.1",
+      {
+        changelog: ["# Changelog", "", "## [0.4.0] - 2026-01-01", "", "- previous release", ""].join("\n"),
+      }
+    );
+
+    const result = await runUpdate(local, ["--check", "--lang", "en"]);
+
+    expect(result.code, result.stderr).toBe(2);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("Update available: 0.4.0 (");
+    expect(result.stdout).not.toContain("Target release notes for 0.4.1:");
   });
 
   it("warns when a current source still has a failed update awaiting restore", async () => {
@@ -314,7 +353,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     });
 
     expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("Source HEAD already matches refs/heads/main; no update is needed.");
+    expect(result.stdout).toContain("Already up to date:");
     expect(result.stdout).toContain("Warning: a failed update still awaits --restore; the bot remains stopped.");
   });
 
@@ -332,7 +371,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     });
 
     expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("Source HEAD already matches refs/heads/main; no update is needed.");
+    expect(result.stdout).toContain("Already up to date:");
     expect(result.stdout).not.toContain("Warning: a failed update still awaits --restore");
   });
 
