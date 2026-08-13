@@ -14,6 +14,7 @@ import fs from "node:fs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REAL_SCRIPTS = path.join(HERE, "..", "scripts");
 const isWin = process.platform === "win32";
+const FIXTURE_VERSION = "9.8.7";
 
 // REPOS_ROOT is filled in per-fixture (see makeFixture) — it must be a REAL
 // directory that is NOT itself a git repo, because setup.mjs enforces that
@@ -42,7 +43,7 @@ let binDir; // stub-bin prepended to PATH
 function makeFixture(withEnv) {
   const repo = fs.mkdtempSync(path.join(tmpdir(), "dp-int-"));
   fs.cpSync(REAL_SCRIPTS, path.join(repo, "scripts"), { recursive: true });
-  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version: "0.0.0" }));
+  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version: FIXTURE_VERSION }));
   fs.writeFileSync(path.join(repo, ".env.example"), "DISCORD_BOT_TOKEN=\nDEV_GUILD_ID=\n");
   if (withEnv) {
     // A separate directory from the fixture root itself, so it can't be
@@ -123,10 +124,20 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       const before = fs.readFileSync(path.join(repo, ".env"), "utf8");
       const r = runSetup(repo, ["--dry-run", "--yes", "--skip-auth", "--lang", "en"]);
       const out = (r.stdout || "") + (r.stderr || "");
+      const shell = isWin ? "ps1" : "sh";
 
       expect(r.status).toBe(0);
+      expect(out).toContain(`== discord-copilot-sdk installer ${FIXTURE_VERSION} ==`);
       expect(out).toContain("Config to write (token masked)");
       expect(out).toContain("DISCORD_BOT_TOKEN=********");
+      expect(out).toContain(`Start: ./run-bot.${shell}`);
+      expect(out).toContain(`Stop: ./stop-bot.${shell}`);
+      expect(out).toContain("View logs: after the first start, ");
+      expect(out).toContain("run-bot.default.log");
+      expect(out).toContain(`Update: ./update.${shell}`);
+      expect(out).toContain(`Uninstall: ./uninstall.${shell}`);
+      expect(out).toContain("Final step (manual): send a test message in your Discord channel, or use /new to begin.");
+      expect(out).toContain("Safety: use a private server, enable 2FA, and never commit .env / your token.");
       // The real secret must NEVER appear in output.
       expect(out).not.toContain("tok_UNIQUE_SENTINEL_do_not_leak_9f3c");
       // Dry-run is read-only: .env unchanged, no temp/backup left behind.
@@ -145,6 +156,31 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       expect(r.status).toBe(0);
       expect(out).toContain("token 已遮蔽"); // zh preview header
       expect(out).not.toContain("tok_UNIQUE_SENTINEL_do_not_leak_9f3c");
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("dry-run residency preview shows both the manual log and the residency log convention", () => {
+    const repo = makeFixture(true);
+    try {
+      const r = runSetup(repo, ["--dry-run", "--yes", "--skip-auth", "--lang", "en", "--residency"]);
+      const out = (r.stdout || "") + (r.stderr || "");
+
+      expect(r.status).toBe(0);
+      expect(out).toContain("View logs: after the first start, ");
+      expect(out).toContain("run-bot.default.log");
+      if (isWin) {
+        expect(out).toContain("View logs: if residency is enabled, ");
+        expect(out).toContain("discord-copilot-sdk-default.log");
+      } else {
+        expect(out).toContain("View logs: if residency is enabled, ");
+        expect(out).toContain(
+          process.platform === "linux"
+            ? "journalctl --user -u discord-copilot-sdk-default.service -f"
+            : "discord-copilot-sdk-default.log"
+        );
+      }
     } finally {
       fs.rmSync(repo, { recursive: true, force: true });
     }

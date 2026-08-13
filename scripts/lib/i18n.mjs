@@ -4,6 +4,8 @@
 
 export const LANGS = ["zh", "en"];
 
+const UNKNOWN = "unknown";
+
 /** Detect the preferred installer language from environment locale hints.
  *  install.ps1 sets DISCORD_COPILOT_SDK_LOCALE from Get-Culture on Windows (where LANG is
  *  usually absent); unix shells expose LC_ALL/LC_MESSAGES/LANGUAGE/LANG. Anything
@@ -109,9 +111,14 @@ const MESSAGES = {
     residencySkip: "已略過常駐設定。",
     residencyDry: "（--dry-run）僅顯示常駐計畫，未實際註冊：",
     doneHeader: "✅ 安裝完成",
+    doneVersion: "版本：",
     doneStart: "啟動：",
     doneStop: "停止：",
     doneLog: "查看記錄：",
+    doneLogAfterStart: "第一次啟動後：{0}",
+    doneLogResidency: "若啟用常駐：{0}",
+    doneUpdate: "更新：",
+    doneUninstall: "解除安裝：",
     doneManual: "最後一步（需手動）：到 Discord 你的頻道送一則測試訊息或用 /new 開始。",
     doneSafety: "安全提醒：使用私人伺服器、開啟 2FA，且切勿把 .env／token 提交到版控。",
     dryNote: "（--dry-run：不會變更任何檔案或系統狀態。）",
@@ -228,9 +235,14 @@ const MESSAGES = {
     residencySkip: "Skipped residency setup.",
     residencyDry: "(--dry-run) residency plan only, nothing registered: ",
     doneHeader: "✅ Installation complete",
+    doneVersion: "Installed version: ",
     doneStart: "Start: ",
     doneStop: "Stop: ",
     doneLog: "View logs: ",
+    doneLogAfterStart: "after the first start, {0}",
+    doneLogResidency: "if residency is enabled, {0}",
+    doneUpdate: "Update: ",
+    doneUninstall: "Uninstall: ",
     doneManual: "Final step (manual): send a test message in your Discord channel, or use /new to begin.",
     doneSafety: "Safety: use a private server, enable 2FA, and never commit .env / your token.",
     dryNote: "(--dry-run: no files or system state will be changed.)",
@@ -303,3 +315,4 @@ export function messageKeys() {
 }
 
 export { MESSAGES };
+export { UNKNOWN };

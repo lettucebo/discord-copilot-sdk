@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildWindowsRegisterScript, chooseResidencyMode } from "../scripts/lib/residency.mjs";
+import { buildWindowsRegisterScript, chooseResidencyMode, hasResidencyRegistration } from "../scripts/lib/residency.mjs";
 
 const base = {
   name: "discord-copilot-sdk-default",
@@ -102,5 +102,64 @@ describe("buildWindowsRegisterScript", () => {
       mode: "logon",
     });
     expect(s).toContain("C:\\Users\\O''Brien\\run-bot.ps1");
+  });
+});
+
+describe("hasResidencyRegistration", () => {
+  it("checks the actual platform-specific residency registration target", () => {
+    expect(
+      hasResidencyRegistration({
+        platform: "win32",
+        instance: "default",
+        execFileSyncFn: () => Buffer.from("ok"),
+      })
+    ).toBe(true);
+
+    expect(
+      hasResidencyRegistration({
+        platform: "darwin",
+        instance: "default",
+        uid: 501,
+        execFileSyncFn: (command, args) => {
+          expect(command).toBe("launchctl");
+          expect(args).toEqual(["print", "gui/501/com.discord-copilot-sdk.default"]);
+          return Buffer.from("loaded");
+        },
+      })
+    ).toBe(true);
+
+    expect(
+      hasResidencyRegistration({
+        platform: "linux",
+        instance: "ops",
+        execFileSyncFn: (command, args) => {
+          expect(command).toBe("systemctl");
+          expect(args).toEqual(["--user", "is-enabled", "discord-copilot-sdk-ops.service"]);
+          return Buffer.from("enabled");
+        },
+      })
+    ).toBe(true);
+  });
+
+  it("fails closed when the residency registration is absent or unreadable", () => {
+    expect(
+      hasResidencyRegistration({
+        platform: "win32",
+        instance: "default",
+        execFileSyncFn: () => {
+          throw new Error("missing");
+        },
+      })
+    ).toBe(false);
+    expect(
+      hasResidencyRegistration({
+        platform: "darwin",
+        instance: "default",
+        uid: 501,
+        execFileSyncFn: () => {
+          throw new Error("missing");
+        },
+      })
+    ).toBe(false);
   });
 });

@@ -144,3 +144,36 @@ export function livePidFromLock(lockPath, fsMod, killFn) {
     return undefined;
   }
 }
+
+/**
+ * Log target shown in the installer's completion report.
+ *
+ * Manual launches write `run-bot.<instance>.log`, but residency uses its own
+ * platform-specific target: a named file for Windows/macOS, the user journal on
+ * Linux. The completion report must name the log for the launch mode setup just
+ * configured, not a different one the operator might never use.
+ *
+ * @param {{platform:string, stateDir:string, instance:string, residencyInstalled:boolean}} input
+ * @param {{join:Function}} pathMod node:path (injectable)
+ */
+export function reportLogInfo({ platform, stateDir, instance, residencyInstalled }, pathMod) {
+  if (residencyInstalled) {
+    if (platform === "linux") {
+      return {
+        kind: "command",
+        value: `journalctl --user -u discord-copilot-sdk-${instance}.service -f`,
+        afterFirstStart: false,
+      };
+    }
+    return {
+      kind: "path",
+      value: pathMod.join(stateDir, "logs", `discord-copilot-sdk-${instance}.log`),
+      afterFirstStart: false,
+    };
+  }
+  return {
+    kind: "path",
+    value: pathMod.join(stateDir, "logs", `run-bot.${instance}.log`),
+    afterFirstStart: true,
+  };
+}

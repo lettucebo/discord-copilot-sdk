@@ -12,10 +12,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, execSync } from "node:child_process";
 import { mergeEnv, dropEnvKeys } from "./lib/env-file.mjs";
 import { secureWrite, secureBackup, hardenExisting } from "./lib/secure-file.mjs";
-import { nodeVersionOk, reposRootProblem, livePidFromLock } from "./lib/setup-core.mjs";
-import { t, detectLang, normalizeLang } from "./lib/i18n.mjs";
+import { nodeVersionOk, reposRootProblem, livePidFromLock, reportLogInfo } from "./lib/setup-core.mjs";
+import { UNKNOWN, formatMessage, t, detectLang, normalizeLang } from "./lib/i18n.mjs";
+import { parsePackageVersion } from "./lib/update-core.mjs";
 import { MANAGED_KEYS, validateConfig, REMOVED_KEYS } from "./lib/validate.mjs";
-import { setupResidency, residencyName, chooseResidencyMode, instanceId } from "./lib/residency.mjs";
+import { setupResidency, residencyName, chooseResidencyMode, hasResidencyRegistration, instanceId } from "./lib/residency.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
@@ -278,7 +279,8 @@ async function residencyMode(lang, interactive) {
 async function main() {
   const lang = await resolveLanguage();
   if (interactive) ok(t("langChosen", lang));
-  info(c(36, "== " + t("banner", lang) + " =="));
+  const installedVersion = packageVersion();
+  info(c(36, "== " + bannerTitle(lang, installedVersion) + " =="));
   warn(t("labWarning", lang));
   if (FLAGS.dryRun) info(c(90, t("dryNote", lang)));
 
@@ -366,11 +368,13 @@ async function main() {
   const baseText = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : exampleText;
   const merged = mergeEnv(dropEnvKeys(baseText, REMOVED_KEYS), values);
 
+  const dryRunResidencyInstalled = hasResidencyRegistration() || FLAGS.residency === true || FLAGS.residency247 === true;
+
   // 6) Dry-run stops here — nothing mutated. Never print the token.
   if (FLAGS.dryRun) {
     info("\n" + c(90, previewMasked(values, lang)));
     info(c(90, t("residencyDry", lang) + residencyName()));
-    info("\n" + c(32, t("doneHeader", lang)) + " (dry-run)");
+    report(lang, installedVersion, { dryRun: true, residencyInstalled: dryRunResidencyInstalled });
     return;
   }
 
@@ -450,14 +454,16 @@ async function main() {
   //     login-keepalive (default) vs true 24/7 (needs a stored password).
   const wantResidency =
     FLAGS.residency ?? FLAGS.residency247 ?? (interactive ? /^y/i.test(await ask(t("residencyPrompt", lang) + " ", "")) : false);
+  let residencyInstalled = hasResidencyRegistration();
   if (wantResidency) {
-    await setupResidency(lang, await residencyMode(lang, interactive));
+    residencyInstalled = await setupResidency(lang, await residencyMode(lang, interactive));
+    residencyInstalled = hasResidencyRegistration() || residencyInstalled;
   } else {
     info(t("residencySkip", lang));
   }
 
   // 10) Report.
-  report(lang);
+  report(lang, installedVersion, { residencyInstalled });
 }
 
 // ---- helpers -------------------------------------------------------------
@@ -466,6 +472,14 @@ function readJson(p) {
     return JSON.parse(fs.readFileSync(p, "utf8"));
   } catch {
     return undefined;
+  }
+}
+
+function packageVersion() {
+  try {
+    return parsePackageVersion(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
+  } catch {
+    return UNKNOWN;
   }
 }
 
@@ -592,10 +606,44 @@ function run(cmd, args, env) {
   }
 }
 
-function report(lang) {
-  const start = process.platform === "win32" ? "npm run start" : "npm run start";
-  info("\n" + c(32, t("doneHeader", lang)));
-  info(t("doneStart", lang) + start);
+function bannerTitle(lang, version) {
+  return version === UNKNOWN ? `${t("banner", lang)} (${UNKNOWN})` : `${t("banner", lang)} ${version}`;
+}
+
+function report(lang, version, options = {}) {
+  const shell = process.platform === "win32" ? "ps1" : "sh";
+  const manualLogInfo = reportLogInfo(
+    {
+      platform: process.platform,
+      stateDir: STATE_DIR,
+      instance: instanceId(),
+      residencyInstalled: false,
+    },
+    path
+  );
+  const manualLogDetail =
+    manualLogInfo.kind === "path" && manualLogInfo.afterFirstStart && !fs.existsSync(manualLogInfo.value)
+      ? formatMessage(t("doneLogAfterStart", lang), [manualLogInfo.value])
+      : manualLogInfo.value;
+  info("\n" + c(32, t("doneHeader", lang)) + (options.dryRun ? " (dry-run)" : ""));
+  info(t("doneVersion", lang) + version);
+  info(t("doneStart", lang) + `./run-bot.${shell}`);
+  info(t("doneStop", lang) + `./stop-bot.${shell}`);
+  info(t("doneLog", lang) + manualLogDetail);
+  if (options.residencyInstalled) {
+    const residencyLogInfo = reportLogInfo(
+      {
+        platform: process.platform,
+        stateDir: STATE_DIR,
+        instance: instanceId(),
+        residencyInstalled: true,
+      },
+      path
+    );
+    info(t("doneLog", lang) + formatMessage(t("doneLogResidency", lang), [residencyLogInfo.value]));
+  }
+  info(t("doneUpdate", lang) + `./update.${shell}`);
+  info(t("doneUninstall", lang) + `./uninstall.${shell}`);
   info(t("doneManual", lang));
   info(c(33, t("doneSafety", lang)));
 }

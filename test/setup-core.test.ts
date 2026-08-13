@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { nodeVersionOk, reposRootProblem, livePidFromLock } from "../scripts/lib/setup-core.mjs";
+import { nodeVersionOk, reposRootProblem, livePidFromLock, reportLogInfo } from "../scripts/lib/setup-core.mjs";
 import { resolveReposRoot } from "../src/core/repo.js";
 
 describe("nodeVersionOk (engines: ^20.19 || >=22.12)", () => {
@@ -244,5 +244,36 @@ describe("livePidFromLock (installer's running-bot guard)", () => {
         /* ignore */
       }
     }
+  });
+});
+
+describe("reportLogInfo (installer completion report log target)", () => {
+  it("uses the manual launcher log until the bot has actually been started", () => {
+    expect(reportLogInfo({ platform: "win32", stateDir: "C:\\State", instance: "default", residencyInstalled: false }, path)).toEqual({
+      kind: "path",
+      value: path.join("C:\\State", "logs", "run-bot.default.log"),
+      afterFirstStart: true,
+    });
+  });
+
+  it("uses the residency log file when Windows or macOS residency was installed", () => {
+    expect(reportLogInfo({ platform: "win32", stateDir: "C:\\State", instance: "default", residencyInstalled: true }, path)).toEqual({
+      kind: "path",
+      value: path.join("C:\\State", "logs", "discord-copilot-sdk-default.log"),
+      afterFirstStart: false,
+    });
+    expect(reportLogInfo({ platform: "darwin", stateDir: "/state", instance: "qa", residencyInstalled: true }, path)).toEqual({
+      kind: "path",
+      value: path.join("/state", "logs", "discord-copilot-sdk-qa.log"),
+      afterFirstStart: false,
+    });
+  });
+
+  it("uses the systemd journal command when Linux residency was installed", () => {
+    expect(reportLogInfo({ platform: "linux", stateDir: "/state", instance: "ops", residencyInstalled: true }, path)).toEqual({
+      kind: "command",
+      value: "journalctl --user -u discord-copilot-sdk-ops.service -f",
+      afterFirstStart: false,
+    });
   });
 });
