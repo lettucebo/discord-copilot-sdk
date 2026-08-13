@@ -122,6 +122,8 @@ describe("update messages", () => {
     "updateAvailable",
     "updateApplyHint",
     "updateTargetNotes",
+    "updateTargetNotesOmitted",
+    "updateCompareLink",
     "updatePhaseStop",
     "updatePhaseSource",
     "updatePhaseSetup",
@@ -154,6 +156,8 @@ describe("update messages", () => {
     "updateAvailable",
     "updateApplyHint",
     "updateTargetNotes",
+    "updateTargetNotesOmitted",
+    "updateCompareLink",
   ])("keeps zh/en placeholder arity aligned for %s", (key) => {
     const placeholders = (text: string) =>
       [...text.matchAll(/\{(\d+)\}/g)].map((match) => Number(match[1])).sort((a, b) => a - b);

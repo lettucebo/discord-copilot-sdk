@@ -1,6 +1,8 @@
 // Pure update planning helpers. The updater must decide whether it is safe to
 // stop the bot before it changes HEAD, so this module has no filesystem or
 // subprocess side effects and is covered independently.
+import { truncateDisplayWidth } from "./ui.mjs";
+
 
 /** @typedef {"managed" | "branch-clean" | "branch-dirty" | "unknown"} CheckoutKind */
 
@@ -204,6 +206,50 @@ export function parseUpdateArgs(args) {
   if (result.check && result.dryRun) return { ...result, error: "check-and-dry-run-conflict" };
   if (result.restore && (result.check || result.dryRun)) return { ...result, error: "restore-with-read-only-mode" };
   return result;
+}
+
+const FULL_SHA = /^[0-9a-f]{40,64}$/i;
+const COMPARE_URL = "https://github.com/lettucebo/discord-copilot-sdk/compare/";
+const ANSI_SEQUENCE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-Z\\-_])|\u009b[0-?]*[ -/]*[@-~]/g;
+const UNSAFE_CONTROLS = /[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+const TARGET_NOTES_LINE_LIMIT = 16;
+const TARGET_NOTES_WIDTH = 160;
+
+function stripUnsafeTerminalSequences(text) {
+  return String(text).replace(ANSI_SEQUENCE, "").replace(UNSAFE_CONTROLS, "");
+}
+
+/**
+ * Bound and neutralize target changelog notes before they reach the terminal.
+ * The updater reads changelog content from an untrusted fetched revision, so
+ * every emitted line must be width-limited and free of terminal controls.
+ *
+ * @param {{
+ *   version: string,
+ *   changelogSection: string | null,
+ *   localSha: string,
+ *   remoteSha: string
+ * }} input
+ * @returns {{notes: string[], omittedCount: number, compareUrl: string | null}}
+ */
+export function summarizeTargetNotes({ version, changelogSection, localSha, remoteSha }) {
+  const compareUrl = FULL_SHA.test(localSha) && FULL_SHA.test(remoteSha) ? `${COMPARE_URL}${localSha}...${remoteSha}` : null;
+  if (version === "unknown" || typeof changelogSection !== "string") {
+    return { notes: [], omittedCount: 0, compareUrl };
+  }
+
+  const notes = changelogSection
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => stripUnsafeTerminalSequences(line))
+    .filter((line) => line.trim() !== "")
+    .map((line) => truncateDisplayWidth(line, TARGET_NOTES_WIDTH));
+
+  return {
+    notes: notes.slice(0, TARGET_NOTES_LINE_LIMIT),
+    omittedCount: Math.max(0, notes.length - TARGET_NOTES_LINE_LIMIT),
+    compareUrl,
+  };
 }
 
 /** A namespace distinct from `<instance>.lock`, which only the bot may own. */

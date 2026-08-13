@@ -368,6 +368,79 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(fs.existsSync(path.join(local, ".git", "FETCH_HEAD"))).toBe(true);
   });
 
+  it("shows fetched target notes from FETCH_HEAD instead of the stale local changelog during --check", async () => {
+    await advanceToVersion(
+      "0.8.0",
+      {
+        changelog: ["# Changelog", "", "## [0.8.0] - 2026-01-01", "", "- stale local note", ""].join("\n"),
+      }
+    );
+    const local = await cloneTarget("check-fetched-target-notes");
+    const localSha = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+    const remoteSha = await advanceToVersion(
+      "0.9.0",
+      {
+        changelog: ["# Changelog", "", "## [0.9.0] - 2026-02-02", "", "- fetched target note", ""].join("\n"),
+      }
+    );
+
+    const result = await runUpdate(local, ["--check", "--lang", "en"]);
+    const compareUrl = `https://github.com/lettucebo/discord-copilot-sdk/compare/${localSha}...${remoteSha}`;
+
+    expect(result.code, result.stderr).toBe(2);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("Target release notes for 0.9.0:");
+    expect(result.stdout).toContain("- fetched target note");
+    expect(result.stdout).not.toContain("- stale local note");
+    expect(result.stdout).toContain(compareUrl);
+    expect(result.stdout).not.toContain("/releases/tag/0.9.0");
+    expectInOrder(
+      result.stdout,
+      `Update available: 0.8.0 (${localSha.slice(0, 12)}) -> 0.9.0 (${remoteSha.slice(0, 12)}).`,
+      "Target release notes for 0.9.0:",
+      compareUrl,
+      "Apply it with: node scripts/update.mjs"
+    );
+  });
+
+  it("bounds fetched target notes, reports omitted lines, and strips terminal controls during --check", async () => {
+    await advanceToVersion("2.0.0");
+    const local = await cloneTarget("check-bounded-target-notes");
+    const localSha = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+    const remoteSha = await advanceToVersion(
+      "2.1.0",
+      {
+        changelog: [
+          "# Changelog",
+          "",
+          "## [2.1.0] - 2026-04-04",
+          "",
+          "\u001b[31m- fetched target line\u001b[0m",
+          "\u0007- control-prefixed line",
+          `- ${"x".repeat(200)}`,
+          ...Array.from({ length: 15 }, (_, index) => `- later line ${index + 1}`),
+          "",
+        ].join("\n"),
+      }
+    );
+
+    const result = await runUpdate(local, ["--check", "--lang", "en"]);
+    const compareUrl = `https://github.com/lettucebo/discord-copilot-sdk/compare/${localSha}...${remoteSha}`;
+
+    expect(result.code, result.stderr).toBe(2);
+    expect(result.stdout).toContain("Target release notes for 2.1.0:");
+    expect(result.stdout).toContain("- fetched target line");
+    expect(result.stdout).toContain("- control-prefixed line");
+    expect(result.stdout).toContain("... 2 more non-empty line(s) omitted.");
+    expect(result.stdout).toContain(compareUrl);
+    expect(result.stdout).toContain("…");
+    expect(result.stdout).toContain("- later line 13");
+    expect(result.stdout).not.toContain("- later line 14");
+    expect(result.stdout).not.toContain("\u001b");
+    expect(result.stdout).not.toContain("\u0007");
+  });
+
+
   it("keeps --dry-run read-only while showing the dry-run plan and its limits", async () => {
     const local = await cloneTarget("dry-run");
     await advanceToVersion("0.7.0");
@@ -395,12 +468,14 @@ describe("git update data paths", { timeout: 60_000 }, () => {
   it("does not fail a check when the target changelog has no matching release section", async () => {
     await advanceToVersion("0.4.0");
     const local = await cloneTarget("check-without-target-notes");
+    const localSha = (await git(local, "rev-parse", "HEAD")).stdout.trim();
     await advanceToVersion(
       "0.4.1",
       {
         changelog: ["# Changelog", "", "## [0.4.0] - 2026-01-01", "", "- previous release", ""].join("\n"),
       }
     );
+    const remoteSha = (await git(source, "rev-parse", "HEAD")).stdout.trim();
 
     const result = await runUpdate(local, ["--check", "--lang", "en"]);
 
@@ -408,6 +483,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain("Update available: 0.4.0 (");
     expect(result.stdout).not.toContain("Target release notes for 0.4.1:");
+    expect(result.stdout).toContain(`https://github.com/lettucebo/discord-copilot-sdk/compare/${localSha}...${remoteSha}`);
   });
 
   it("falls back to an unknown target version when fetched metadata is not trustworthy", async () => {
@@ -498,6 +574,27 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect((await git(source, "rev-parse", "HEAD")).stdout.trim()).toBe(expected);
   });
 
+  it("shows the fetched target notes between the update plan and the stop phase", async () => {
+    await advanceToVersion("1.2.0");
+    const local = await cloneTarget("apply-target-notes-placement");
+    const localSha = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+    const remoteSha = await advanceToVersion(
+      "1.3.0",
+      {
+        changelog: ["# Changelog", "", "## [1.3.0] - 2026-03-03", "", "- apply target note", ""].join("\n"),
+      }
+    );
+
+    const result = await runUpdate(local, ["--yes", "--no-restart", "--lang", "en"]);
+    const compareUrl = `https://github.com/lettucebo/discord-copilot-sdk/compare/${localSha}...${remoteSha}`;
+
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain("\nUpdate plan\n");
+    expect(result.stdout).toContain("Target release notes for 1.3.0:");
+    expect(result.stdout).toContain("- apply target note");
+    expect(result.stdout).toContain(compareUrl);
+    expectInOrder(result.stdout, "Update plan", "Target release notes for 1.3.0:", compareUrl, "[1/4] Stop");
+  });
   it("reports the version and source transition even when --no-restart is selected", async () => {
     const local = await cloneTarget("successful-no-restart");
     const beforeMetadata = JSON.parse(await fs.promises.readFile(path.join(local, "package.json"), "utf8")) as {

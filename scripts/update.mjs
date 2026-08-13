@@ -27,6 +27,7 @@ import {
   resolveRemoteSha,
   readyMarkerMatches,
   shouldRetainRestoreState,
+  summarizeTargetNotes,
   targetInstancesStopped,
   updateLockRelativePath,
 } from "./lib/update-core.mjs";
@@ -114,6 +115,16 @@ function printDryRunPlan({ currentVersion, localSha, remote, instances }) {
       t("updateDryRun", lang),
     ].join("\n")
   );
+}
+
+function printTargetNotes({ targetVersion, changelogSection, localSha, remoteSha }) {
+  const summary = summarizeTargetNotes({ version: targetVersion, changelogSection, localSha, remoteSha });
+  if (summary.notes.length) {
+    console.log(message("updateTargetNotes", targetVersion));
+    console.log(summary.notes.join("\n"));
+    if (summary.omittedCount > 0) console.log(message("updateTargetNotesOmitted", summary.omittedCount));
+  }
+  if (summary.compareUrl) console.log(message("updateCompareLink", summary.compareUrl));
 }
 
 function printRestoreStatus({ instance, repoRoot, oldSha, createdAt, currentVersion }) {
@@ -766,10 +777,7 @@ async function main() {
     const targetVersion = fetchedPackageVersion();
     const targetNotes = fetchedTargetNotes(targetVersion);
     console.log(message("updateAvailable", currentVersion, local.slice(0, 12), targetVersion, remote.sha.slice(0, 12)));
-    if (targetNotes) {
-      console.log(message("updateTargetNotes", targetVersion));
-      console.log(targetNotes);
-    }
+    printTargetNotes({ targetVersion, changelogSection: targetNotes, localSha: local, remoteSha: remote.sha });
     console.log(message("updateApplyHint", applyCommand(ref)));
     process.exitCode = 2; // useful to a monitor: an update exists, no action taken
     return;
@@ -807,6 +815,7 @@ async function main() {
       residency: residencyState(id),
     })),
   };
+  const targetNotes = fetchedTargetNotes(targetVersion);
   printUpdatePlan({
     currentVersion,
     localSha: local,
@@ -814,6 +823,7 @@ async function main() {
     remoteSha: remote.sha,
     instances: state.instances,
   });
+  printTargetNotes({ targetVersion, changelogSection: targetNotes, localSha: local, remoteSha: remote.sha });
   await confirmActiveThreads(activeThreadSummary());
 
   const releaseLock = acquireUpdateLock(instance);

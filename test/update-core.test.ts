@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import {
   classifyCheckout,
   readyMarkerMatches,
+  summarizeTargetNotes,
   targetInstancesStopped,
   orderUpdateSteps,
   parsePackageVersion,
@@ -16,6 +17,7 @@ import {
   shouldRetainRestoreState,
   updateLockRelativePath,
 } from "../scripts/lib/update-core.mjs";
+import { displayWidth } from "../scripts/lib/ui.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const forbiddenModule = "(?:node:)?(?:fs(?:/promises)?|child_process|process)";
@@ -65,6 +67,54 @@ describe("parsePackageVersion", () => {
     expect(parsePackageVersion(metadata)).toBe("unknown");
   });
 });
+
+
+describe("summarizeTargetNotes", () => {
+  it("uses the full commit comparison URL even when target notes are omitted", () => {
+    const localSha = "a".repeat(40);
+    const remoteSha = "b".repeat(40);
+
+    expect(
+      summarizeTargetNotes({
+        version: "unknown",
+        changelogSection: "- should be omitted",
+        localSha,
+        remoteSha,
+      })
+    ).toEqual({
+      notes: [],
+      omittedCount: 0,
+      compareUrl: `https://github.com/lettucebo/discord-copilot-sdk/compare/${localSha}...${remoteSha}`,
+    });
+  });
+
+  it("bounds displayed changelog lines and strips terminal control sequences", () => {
+    const lines = [
+      "\u001b[31m- fetched target line\u001b[0m",
+      "\u0007- control-prefixed line",
+      `- ${"x".repeat(200)}`,
+      ...Array.from({ length: 15 }, (_, index) => `- later line ${index + 1}`),
+    ];
+    const summary = summarizeTargetNotes({
+      version: "1.2.3",
+      changelogSection: lines.flatMap((line) => [line, ""]).join("\n"),
+      localSha: "c".repeat(40),
+      remoteSha: "d".repeat(40),
+    });
+
+    expect(summary.notes).toHaveLength(16);
+    expect(summary.notes[0]).toBe("- fetched target line");
+    expect(summary.notes[1]).toBe("- control-prefixed line");
+    expect(summary.notes.some((line) => line.endsWith("…"))).toBe(true);
+    expect(summary.omittedCount).toBe(2);
+    for (const line of summary.notes) {
+      expect(displayWidth(line)).toBeLessThanOrEqual(160);
+      expect(line).not.toMatch(/[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f]/);
+      expect(line).not.toContain("\u001b");
+    }
+  });
+});
+
 
 describe("classifyCheckout", () => {
   it("recognizes a clean detached checkout as bootstrap-managed", () => {
