@@ -89,3 +89,18 @@ describe("supportsDynamicProgress", () => {
     expect(supportsDynamicProgress({ isTTY: false, noColor: true })).toBe(false);
   });
 });
+
+describe("supportsColor", () => {
+  it("treats even an empty NO_COLOR as present and independently gates stdout and stderr", async () => {
+    const { noColorRequested, supportsColor, supportsDynamicProgress } = await loadUi();
+    const noColorEnv = { NO_COLOR: "" };
+    const colorEnv = {};
+
+    expect(noColorRequested(noColorEnv)).toBe(true);
+    expect(noColorRequested(colorEnv)).toBe(false);
+    expect(supportsColor({ isTTY: true, env: noColorEnv })).toBe(false);
+    expect(supportsColor({ isTTY: true, env: colorEnv })).toBe(true);
+    expect(supportsColor({ isTTY: false, env: colorEnv })).toBe(false);
+    expect(supportsDynamicProgress({ isTTY: true, noColor: noColorRequested(noColorEnv) })).toBe(false);
+  });
+});

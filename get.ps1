@@ -58,6 +58,7 @@ param(
   [switch]$Residency24x7,
   [switch]$NoResidency,
   [switch]$SkipAuth,
+  [switch]$Verbose,
   [string]$Dir,
   [string]$Ref
 )
@@ -65,7 +66,7 @@ param(
 & {
   param(
     [string]$Lang, [switch]$Yes, [switch]$DryRun, [switch]$Residency,
-    [switch]$Residency24x7, [switch]$NoResidency, [switch]$SkipAuth,
+    [switch]$Residency24x7, [switch]$NoResidency, [switch]$SkipAuth, [switch]$Verbose,
     [string]$Dir, [string]$Ref
   )
   # Set in this child scope only — does not leak into the caller's session.
@@ -90,6 +91,7 @@ param(
   foreach ($n in 'Yes', 'DryRun', 'Residency', 'Residency24x7', 'NoResidency', 'SkipAuth') {
     if ($PSBoundParameters.ContainsKey($n) -and $PSBoundParameters[$n]) { $forward += "-$n" }
   }
+  if ($Verbose) { $forward += '-Verbose' }
   if ($Lang) { $forward += @('-Lang', $Lang) }
 
   $repoUrl = 'https://github.com/lettucebo/discord-copilot-sdk.git'

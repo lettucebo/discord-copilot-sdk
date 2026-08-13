@@ -23,7 +23,7 @@ import {
   writeChunkToSinks,
 } from "./lib/setup-core.mjs";
 import { UNKNOWN, formatMessage, t, detectLang, normalizeLang } from "./lib/i18n.mjs";
-import { formatSection, formatStage, formatKeyValue, formatSummary, supportsDynamicProgress } from "./lib/ui.mjs";
+import { formatSection, formatStage, formatKeyValue, formatSummary, noColorRequested, supportsColor, supportsDynamicProgress } from "./lib/ui.mjs";
 import { parsePackageVersion } from "./lib/update-core.mjs";
 import { MANAGED_KEYS, validateConfig, REMOVED_KEYS } from "./lib/validate.mjs";
 import { setupResidency, residencyName, chooseResidencyMode, hasResidencyRegistration, instanceId } from "./lib/residency.mjs";
@@ -57,12 +57,15 @@ const interactive = process.stdin.isTTY && process.stdout.isTTY && !FLAGS.yes;
 const TOTAL_STAGES = 5;
 
 // ---- tiny UI -------------------------------------------------------------
-const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
+const noColor = noColorRequested(process.env);
+const useColor = supportsColor({ isTTY: process.stdout.isTTY, env: process.env });
+const useErrorColor = supportsColor({ isTTY: process.stderr.isTTY, env: process.env });
 const c = (code, s) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
+const cError = (code, s) => (useErrorColor ? `\x1b[${code}m${s}\x1b[0m` : s);
 const info = (s) => process.stdout.write(s + "\n");
 const ok = (s) => info(c(32, "✓ ") + s);
 const warn = (s) => info(c(33, "! ") + s);
-const err = (s) => process.stderr.write(c(31, "✗ ") + s + "\n");
+const err = (s) => process.stderr.write(cError(31, "✗ ") + s + "\n");
 
 class SetupError extends Error {}
 
@@ -801,7 +804,8 @@ function spawnChild(cmd, args, env) {
 async function run(cmd, args, env, lang, log) {
   const label = commandLabel(cmd, args);
   const startedAt = Date.now();
-  const useDynamic = !FLAGS.verbose && supportsDynamicProgress({ isTTY: process.stdout.isTTY, noColor: !!process.env.NO_COLOR });
+  const useDynamic =
+    !FLAGS.verbose && supportsDynamicProgress({ isTTY: process.stdout.isTTY, noColor });
   const startMessage = formatMessage(t("buildStepStarting", lang), [label]);
   let ticker;
   if (useDynamic) {

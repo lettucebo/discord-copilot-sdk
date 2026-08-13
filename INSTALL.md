@@ -143,7 +143,8 @@ and residency. The completion summary names the installed version plus exact
 start, stop, log, update, and uninstall commands. Successful build output is
 kept in an owner-only log under `~/.discord-copilot-sdk/logs`; it is shown on
 failure only as a bounded tail, together with the full log path. Pass
-`--verbose` to stream the underlying npm/build output directly.
+`--verbose` to a shell script, or `-Verbose` to a PowerShell script, to stream
+the underlying npm/build output directly.
 
 ---
 

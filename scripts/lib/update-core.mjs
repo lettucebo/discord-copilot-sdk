@@ -93,6 +93,47 @@ export function resolveRemoteSha(records, requestedRef) {
   return find(`refs/heads/${requestedRef}`) ?? find(`refs/tags/${requestedRef}^{}`) ?? find(`refs/tags/${requestedRef}`);
 }
 
+export function displayRemoteRef(ref) {
+  return typeof ref === "string" ? ref.replace(/\^\{\}$/, "") : "unknown";
+}
+
+function quotePowerShell(value) {
+  return String(value).replace(/'/g, "''");
+}
+
+function quoteShell(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function quoteShellPath(value) {
+  return String(value).replace(/["\\$`]/g, "\\$&");
+}
+
+/**
+ * Render a command that preserves the instance and scope selected during a
+ * read-only update check. The updater passes only validated instances and
+ * parsed refs, while quoting ref text again prevents an output hint from
+ * becoming a shell injection sink.
+ *
+ * @param {{
+ *   platform: string,
+ *   updateScript: string,
+ *   ref: string,
+ *   instance: string,
+ *   allInstances: boolean
+ * }} input
+ */
+export function buildApplyCommand({ platform, updateScript, ref, instance, allInstances }) {
+  const args = [];
+  if (ref !== "main") args.push("--ref", platform === "win32" ? `'${quotePowerShell(ref)}'` : quoteShell(ref));
+  if (allInstances) args.push("--all-instances");
+  const suffix = args.length ? ` ${args.join(" ")}` : "";
+  if (platform === "win32") {
+    return `$env:DISCORD_COPILOT_SDK_INSTANCE_ID = '${quotePowerShell(instance)}'; & '${quotePowerShell(updateScript)}'${suffix}`;
+  }
+  return `DISCORD_COPILOT_SDK_INSTANCE_ID=${instance} bash "${quoteShellPath(updateScript)}"${suffix}`;
+}
+
 /**
  * Expand a requested ref to the exact remote refs needed to resolve it.
  *

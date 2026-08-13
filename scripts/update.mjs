@@ -18,7 +18,9 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseEnv } from "node:util";
 import {
+  buildApplyCommand,
   classifyCheckout,
+  displayRemoteRef,
   parseLsRemote,
   parsePackageVersion,
   parseUpdateArgs,
@@ -79,7 +81,7 @@ function printUpdateStatus({ packageVersion, localSha, checkout, ref, remote, in
       [t("updateStatusCurrentVersion", lang), formatVersionAndSha(packageVersion, localSha)],
       [t("updateStatusRepositoryRoot", lang), REPO_ROOT],
       [t("updateStatusCheckout", lang), `${checkout.kind} (${checkout.branch ?? "detached"})`],
-      [t("updateStatusRequestedRef", lang), `${ref} -> ${remote?.ref ?? "unknown"} @ ${shortSha(remote?.sha)}`],
+      [t("updateStatusRequestedRef", lang), `${ref} -> ${displayRemoteRef(remote?.ref)} @ ${shortSha(remote?.sha)}`],
       [t("updateStatusInstance", lang), instanceStatusLabel(instance, isRunning, residency)],
     ])
   );
@@ -109,7 +111,7 @@ function printDryRunPlan({ currentVersion, localSha, remote, instances }) {
     [
       formatKeyValue(t("updatePlanCurrentVersion", lang), formatVersionAndSha(currentVersion, localSha)),
       formatKeyValue(t("updatePlanTargetInstances", lang), instances.join(", ")),
-      message("updateDryRunFetch", remote.ref.replace(/\^\{\}$/, "")),
+      message("updateDryRunFetch", displayRemoteRef(remote.ref)),
       t("updateDryRunApply", lang),
       t("updateDryRunLimitations", lang),
       t("updateDryRun", lang),
@@ -249,27 +251,33 @@ function readableCurrentVersion() {
   return version === "unknown" ? null : version;
 }
 
-function fetchedText(file, options = {}) {
-  const content = tryRun("git", ["show", `FETCH_HEAD:${file}`]);
+function fetchedText(targetSha, file, options = {}) {
+  const content = tryRun("git", ["show", `${targetSha}:${file}`]);
   if (content === null) {
     if (options.optional) return null;
-    throw new UpdateError(`the fetched revision does not contain readable ${file}`);
+    throw new UpdateError(`fetched revision ${targetSha} does not contain readable ${file}`);
   }
   return content;
 }
 
-function fetchedPackageVersion() {
-  return parsePackageVersion(fetchedText("package.json"));
+function fetchedPackageVersion(targetSha) {
+  return parsePackageVersion(fetchedText(targetSha, "package.json"));
 }
 
-function fetchedTargetNotes(version) {
+function fetchedTargetNotes(targetSha, version) {
   if (version === "unknown") return null;
-  const changelog = fetchedText("CHANGELOG.md", { optional: true });
+  const changelog = fetchedText(targetSha, "CHANGELOG.md", { optional: true });
   return changelog === null ? null : extractChangelogSection(changelog, version);
 }
 
-function applyCommand(ref) {
-  return ref === "main" ? "node scripts/update.mjs" : `node scripts/update.mjs --ref ${ref}`;
+function applyCommand(ref, instance, allInstances) {
+  return buildApplyCommand({
+    platform: process.platform,
+    updateScript: path.join(REPO_ROOT, process.platform === "win32" ? "update.ps1" : "update.sh"),
+    ref,
+    instance,
+    allInstances,
+  });
 }
 
 function restoreCommand() {
@@ -318,33 +326,41 @@ function remoteFor(ref) {
 }
 
 function fetchResolved(remote, checkoutKind, options = {}) {
-  const ref = remote.ref.replace(/\^\{\}$/, "");
+  const ref = displayRemoteRef(remote.ref);
   const args = ["fetch"];
   if (checkoutKind === "managed") args.push("--depth", "1");
   args.push("origin", ref);
   try {
     if (options.quiet) {
       run("git", args);
-      return;
+    } else {
+      runInherited("git", args);
     }
-    runInherited("git", args);
   } catch {
     throw new UpdateError(`could not fetch origin ${ref}`);
   }
+  const fetchedSha = tryRun("git", ["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?.trim();
+  if (!fetchedSha || !/^[0-9a-f]{40,64}$/i.test(fetchedSha)) {
+    throw new UpdateError(`could not resolve fetched revision for ${ref}`);
+  }
+  if (fetchedSha !== remote.sha) {
+    throw new UpdateError(`fetched revision ${fetchedSha} does not match resolved remote revision ${remote.sha}`);
+  }
+  return fetchedSha;
 }
 
-function preflightBranchFastForward() {
-  if (tryRun("git", ["merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"]) === null) {
+function preflightBranchFastForward(targetSha) {
+  if (tryRun("git", ["merge-base", "--is-ancestor", "HEAD", targetSha]) === null) {
     throw new UpdateError("the current branch cannot fast-forward to the requested ref");
   }
 }
 
-function countDanglingManagedCommits() {
-  const value = tryRun("git", ["rev-list", "HEAD", "--not", "FETCH_HEAD", "--count"])?.trim();
+function countDanglingManagedCommits(targetSha) {
+  const value = tryRun("git", ["rev-list", "HEAD", "--not", targetSha, "--count"])?.trim();
   return value && /^\d+$/.test(value) ? Number(value) : 0;
 }
 
-async function precheckIncomingConfig() {
+async function precheckIncomingConfig(targetSha) {
   const envPath = path.join(REPO_ROOT, ".env");
   if (!fs.existsSync(envPath)) throw new UpdateError("no .env exists; run the installer interactively first");
   const values = parseEnv(fs.readFileSync(envPath, "utf8"));
@@ -353,7 +369,7 @@ async function precheckIncomingConfig() {
   // authoritative setup engine instead of rejecting a configuration it repairs.
   if ("CONTROLLED_REPO_PATH" in values) return;
 
-  const source = tryRun("git", ["show", "FETCH_HEAD:scripts/lib/validate.mjs"]);
+  const source = tryRun("git", ["show", `${targetSha}:scripts/lib/validate.mjs`]);
   if (source === null) throw new UpdateError("the requested revision does not contain scripts/lib/validate.mjs");
   const temp = path.join(os.tmpdir(), `dcs-update-validate-${process.pid}-${Date.now()}.mjs`);
   try {
@@ -644,13 +660,13 @@ async function restoreState(state) {
   }
 }
 
-function applySource(kind) {
+function applySource(kind, targetSha) {
   if (kind === "managed") {
-    runInherited("git", ["checkout", "-q", "--detach", "FETCH_HEAD"]);
+    runInherited("git", ["checkout", "-q", "--detach", targetSha]);
     return;
   }
   if (kind === "branch-clean") {
-    runInherited("git", ["merge", "--ff-only", "FETCH_HEAD"]);
+    runInherited("git", ["merge", "--ff-only", targetSha]);
     return;
   }
   throw new UpdateError(`unsafe checkout kind: ${kind}`);
@@ -729,7 +745,7 @@ async function main() {
   console.log(message("updateRoot", REPO_ROOT));
   console.log(message("updateCheckout", checkout.kind, checkout.branch ?? "detached"));
   const remote = remoteFor(ref);
-  if (remote) console.log(message("updateRequested", ref, remote.ref, remote.sha.slice(0, 12)));
+  if (remote) console.log(message("updateRequested", ref, displayRemoteRef(remote.ref), remote.sha.slice(0, 12)));
   const instance = currentInstance();
   const savedState = restoreStateStatus(instance);
   const pendingRestore = savedState.kind === "current" || savedState.kind === "unreadable";
@@ -773,12 +789,16 @@ async function main() {
   }
 
   if (decision.action === "check") {
-    fetchResolved(remote, checkout.kind, { quiet: true });
-    const targetVersion = fetchedPackageVersion();
-    const targetNotes = fetchedTargetNotes(targetVersion);
-    console.log(message("updateAvailable", currentVersion, local.slice(0, 12), targetVersion, remote.sha.slice(0, 12)));
-    printTargetNotes({ targetVersion, changelogSection: targetNotes, localSha: local, remoteSha: remote.sha });
-    console.log(message("updateApplyHint", applyCommand(ref)));
+    const targetSha = fetchResolved(remote, checkout.kind, { quiet: true });
+    const targetVersion = fetchedPackageVersion(targetSha);
+    const targetNotes = fetchedTargetNotes(targetSha, targetVersion);
+    console.log(message("updateAvailable", currentVersion, local.slice(0, 12), targetVersion, targetSha.slice(0, 12)));
+    printTargetNotes({ targetVersion, changelogSection: targetNotes, localSha: local, remoteSha: targetSha });
+    if (pendingRestore) {
+      console.log(message("updatePendingRestore"));
+    } else {
+      console.log(message("updateApplyHint", applyCommand(ref, instance, flags.allInstances)));
+    }
     process.exitCode = 2; // useful to a monitor: an update exists, no action taken
     return;
   }
@@ -789,20 +809,21 @@ async function main() {
       remote,
       instances: targetIds,
     });
+    if (pendingRestore) console.log(message("updatePendingRestore"));
     return;
   }
 
   // Fetch and prove branch ancestry BEFORE downtime. Fetch adds objects but
   // never moves HEAD, so failures here leave the running installation intact.
-  fetchResolved(remote, checkout.kind);
-  if (checkout.kind === "branch-clean") preflightBranchFastForward();
+  const targetSha = fetchResolved(remote, checkout.kind);
+  if (checkout.kind === "branch-clean") preflightBranchFastForward(targetSha);
   if (checkout.kind === "managed") {
-    const dangling = countDanglingManagedCommits();
+    const dangling = countDanglingManagedCommits(targetSha);
     if (dangling) console.log(message("updateManagedDangling", dangling));
   }
-  await precheckIncomingConfig();
+  await precheckIncomingConfig(targetSha);
 
-  const targetVersion = fetchedPackageVersion();
+  const targetVersion = fetchedPackageVersion(targetSha);
   const state = {
     version: 1,
     repoRoot: REPO_ROOT,
@@ -815,15 +836,15 @@ async function main() {
       residency: residencyState(id),
     })),
   };
-  const targetNotes = fetchedTargetNotes(targetVersion);
+  const targetNotes = fetchedTargetNotes(targetSha, targetVersion);
   printUpdatePlan({
     currentVersion,
     localSha: local,
     targetVersion,
-    remoteSha: remote.sha,
+    remoteSha: targetSha,
     instances: state.instances,
   });
-  printTargetNotes({ targetVersion, changelogSection: targetNotes, localSha: local, remoteSha: remote.sha });
+  printTargetNotes({ targetVersion, changelogSection: targetNotes, localSha: local, remoteSha: targetSha });
   await confirmActiveThreads(activeThreadSummary());
 
   const releaseLock = acquireUpdateLock(instance);
@@ -843,7 +864,7 @@ async function main() {
       }
     }
     printUpdateStage(2, "updateStageSource");
-    applySource(checkout.kind);
+    applySource(checkout.kind, targetSha);
     printUpdateStage(3, "updateStageSetup");
     runSetup();
     const now = localSha();
@@ -866,7 +887,7 @@ async function main() {
         currentVersion,
         localSha: local,
         targetVersion,
-        remoteSha: remote.sha,
+        remoteSha: targetSha,
         instances: state.instances.map(({ instance: id }) => id),
       });
       console.log(message("updateFailed"));

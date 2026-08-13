@@ -6,7 +6,7 @@
   with -Lang; setup.mjs shows the interactive chooser.
 
   Usage:
-    ./install.ps1 [-Lang zh|en] [-Yes] [-DryRun] [-Residency] [-Residency24x7] [-NoResidency] [-SkipAuth]
+    ./install.ps1 [-Lang zh|en] [-Yes] [-DryRun] [-Residency] [-Residency24x7] [-NoResidency] [-SkipAuth] [-Verbose]
 #>
 [CmdletBinding()]
 param(
@@ -129,6 +129,7 @@ if ($Residency)   { $fwd += '--residency' }
 if ($Residency24x7) { $fwd += '--residency-24x7' }
 if ($NoResidency) { $fwd += '--no-residency' }
 if ($SkipAuth)    { $fwd += '--skip-auth' }
+if ($VerbosePreference -ne 'SilentlyContinue') { $fwd += '--verbose' }
 
 & node $setup @fwd
 exit $LASTEXITCODE

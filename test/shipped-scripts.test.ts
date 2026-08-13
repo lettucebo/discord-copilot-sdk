@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -26,6 +26,21 @@ function relativeMarkdownLinks(text: string): string[] {
 
 /** Every .ps1 an end user is told to run. */
 const USER_FACING_PS1 = ["install.ps1", "get.ps1", "update.ps1", "run-bot.ps1", "stop-bot.ps1", "uninstall.ps1"];
+
+function writeExecutable(file: string, text: string) {
+  fs.writeFileSync(file, text);
+  fs.chmodSync(file, 0o755);
+}
+
+function bashPath(file: string): string {
+  if (process.platform !== "win32") return file;
+  const root = bashUsesMntC() ? "/mnt" : "/";
+  return file.replace(/^([A-Za-z]):/, (_, drive: string) => `${root}/${drive.toLowerCase()}`).replace(/\\/g, "/");
+}
+
+function bashUsesMntC(): boolean {
+  return process.platform === "win32" && spawnSync("bash", ["-lc", "test -d /mnt/c"]).status === 0;
+}
 
 describe("shipped scripts", () => {
   it("keeps bootstrap and installer headers honest and structured", () => {
@@ -60,6 +75,71 @@ describe("shipped scripts", () => {
     expect(installerSh).toContain("macOS / Linux installer");
     expect(installerSh).toContain("[2/2]");
     expect(installerSh).toContain("Handing off to local setup");
+  });
+
+  it("forwards --verbose through the local shell installer and network shell bootstrap without network access", { timeout: 20_000 }, () => {
+    const fixture = fs.mkdtempSync(path.join(ROOT, ".wrapper-verbose-"));
+    const bin = path.join(fixture, "bin");
+    const installRecord = path.join(fixture, "install-args.txt");
+    const getRecord = path.join(fixture, "get-args.txt");
+    const target = path.join(fixture, "target");
+    const isWsl = bashUsesMntC();
+    const wslEnv = isWsl ? [...(process.env.WSLENV?.split(":") ?? []), "DCS_RECORD/p", "DCS_GET_RECORD/p"].join(":") : process.env.WSLENV;
+    const env = {
+      ...process.env,
+      PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+      DCS_RECORD: isWsl ? installRecord : bashPath(installRecord),
+      WSLENV: wslEnv,
+      LANG: "en_US",
+    };
+    try {
+      fs.mkdirSync(bin, { recursive: true });
+      fs.mkdirSync(path.join(target, "scripts"), { recursive: true });
+      execFileSync("git", ["init", "-q", "-b", "main", target]);
+      execFileSync("git", ["-C", target, "remote", "add", "origin", "https://github.com/lettucebo/discord-copilot-sdk.git"]);
+      fs.copyFileSync(path.join(ROOT, "install.sh"), path.join(target, "install.sh"));
+      writeExecutable(path.join(bin, "id"), "#!/usr/bin/env bash\necho 1000\n");
+      writeExecutable(path.join(bin, "copilot"), "#!/usr/bin/env bash\nexit 0\n");
+      writeExecutable(
+        path.join(bin, "node"),
+        "#!/usr/bin/env bash\nif [ \"$1\" = \"-e\" ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > \"$DCS_RECORD\"\n"
+      );
+
+      const install = spawnSync("bash", [bashPath(path.join(target, "install.sh")), "--yes", "--dry-run", "--skip-auth", "--verbose"], {
+        env,
+        encoding: "utf8",
+      });
+      expect(install.status, `${install.stdout}${install.stderr}`).toBe(0);
+      expect(fs.readFileSync(installRecord, "utf8")).toContain("--verbose");
+
+      writeExecutable(path.join(target, "install.sh"), "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$DCS_GET_RECORD\"\n");
+      const bootstrap = spawnSync("bash", [bashPath(path.join(ROOT, "get.sh")), "--yes", "--dir", bashPath(target), "--verbose"], {
+        env: { ...env, DCS_GET_RECORD: isWsl ? getRecord : bashPath(getRecord) },
+        encoding: "utf8",
+      });
+      expect(bootstrap.status, `${bootstrap.stdout}${bootstrap.stderr}`).toBe(0);
+      expect(fs.readFileSync(getRecord, "utf8")).toContain("--verbose");
+    } finally {
+      fs.rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards PowerShell -Verbose through both supported entrypoints", () => {
+    const install = fs.readFileSync(path.join(ROOT, "install.ps1"), "utf8");
+    const bootstrap = fs.readFileSync(path.join(ROOT, "get.ps1"), "utf8");
+
+    expect(install).toMatch(/\$VerbosePreference\s+-ne\s+['"]SilentlyContinue['"]/);
+    expect(install).toContain("'--verbose'");
+    expect(bootstrap).toMatch(/\[switch\]\$Verbose/);
+    expect(bootstrap).toContain("'-Verbose'");
+  });
+
+  it("documents --verbose for shell users and -Verbose for PowerShell users in both install guides", () => {
+    for (const guide of INSTALL_GUIDES) {
+      const text = fs.readFileSync(path.join(ROOT, guide), "utf8");
+      expect(text).toContain("--verbose");
+      expect(text).toContain("-Verbose");
+    }
   });
 
   it("serializes the full Vitest suite because git-heavy fixtures share host resources", () => {

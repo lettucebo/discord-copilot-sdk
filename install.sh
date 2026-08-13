@@ -21,6 +21,7 @@ for a in "$@"; do
     --residency-24x7) FWD+=("--residency-24x7") ;;
     --no-residency) FWD+=("--no-residency") ;;
     --skip-auth) FWD+=("--skip-auth") ;;
+    --verbose) FWD+=("--verbose") ;;
   esac
 done
 # support "--lang zh" (separate token)

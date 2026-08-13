@@ -133,3 +133,11 @@ export function formatSummary(rows, width = 60) {
 export function supportsDynamicProgress({ isTTY, noColor }) {
   return isTTY === true && noColor !== true;
 }
+
+export function noColorRequested(env) {
+  return Object.hasOwn(env, "NO_COLOR");
+}
+
+export function supportsColor({ isTTY, env }) {
+  return isTTY === true && !noColorRequested(env);
+}

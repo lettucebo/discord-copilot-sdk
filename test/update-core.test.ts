@@ -15,6 +15,8 @@ import {
   resolveRemoteSha,
   remoteRefSpecs,
   shouldRetainRestoreState,
+  buildApplyCommand,
+  displayRemoteRef,
   updateLockRelativePath,
 } from "../scripts/lib/update-core.mjs";
 import { displayWidth } from "../scripts/lib/ui.mjs";
@@ -184,6 +186,53 @@ describe("resolveRemoteSha", () => {
   it("fails closed for malformed records and an unknown ref", () => {
     expect(parseLsRemote("malformed\n")).toEqual([]);
     expect(resolveRemoteSha(parseLsRemote("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main"), "nope")).toBe(null);
+  });
+});
+
+describe("displayRemoteRef", () => {
+  it("never presents annotated tags with Git's peeled-ref suffix", () => {
+    expect(displayRemoteRef("refs/tags/v1.2.3^{}")).toBe("refs/tags/v1.2.3");
+    expect(displayRemoteRef("refs/heads/main")).toBe("refs/heads/main");
+  });
+});
+
+describe("buildApplyCommand", () => {
+  it("builds a default-instance command through the platform update entrypoint", () => {
+    expect(
+      buildApplyCommand({
+        platform: "win32",
+        updateScript: "C:\\Program Files\\discord-copilot-sdk\\update.ps1",
+        ref: "main",
+        instance: "default",
+        allInstances: false,
+      })
+    ).toBe("$env:DISCORD_COPILOT_SDK_INSTANCE_ID = 'default'; & 'C:\\Program Files\\discord-copilot-sdk\\update.ps1'");
+  });
+
+  it("preserves a non-default instance and safely quotes a requested ref", () => {
+    expect(
+      buildApplyCommand({
+        platform: "linux",
+        updateScript: '/srv/discord copilot/update.sh',
+        ref: "refs/tags/v1.2.3",
+        instance: "ops",
+        allInstances: false,
+      })
+    ).toBe("DISCORD_COPILOT_SDK_INSTANCE_ID=ops bash \"/srv/discord copilot/update.sh\" --ref 'refs/tags/v1.2.3'");
+  });
+
+  it("preserves the explicit all-instance scope and neutralizes shell metacharacters in refs", () => {
+    expect(
+      buildApplyCommand({
+        platform: "darwin",
+        updateScript: "/srv/discord-copilot-sdk/update.sh",
+        ref: "release'; echo unsafe",
+        instance: "work",
+        allInstances: true,
+      })
+    ).toBe(
+      "DISCORD_COPILOT_SDK_INSTANCE_ID=work bash \"/srv/discord-copilot-sdk/update.sh\" --ref 'release'\\''; echo unsafe' --all-instances"
+    );
   });
 });
 

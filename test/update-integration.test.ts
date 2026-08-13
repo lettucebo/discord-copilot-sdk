@@ -104,7 +104,8 @@ async function waitForLock(home: string, instance: string): Promise<number> {
 async function runUpdate(
   target: string,
   args: string[] = [],
-  beforeRun?: (home: string) => Promise<void>
+  beforeRun?: (home: string) => Promise<void>,
+  envOverrides: NodeJS.ProcessEnv = {}
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const home = path.join(root, `home-${serial}`);
   await fs.promises.mkdir(home, { recursive: true });
@@ -120,6 +121,7 @@ async function runUpdate(
         HOME: home,
         USERPROFILE: home,
         PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+        ...envOverrides,
       },
       encoding: "utf8",
     });
@@ -134,6 +136,47 @@ async function runUpdate(
   }
 }
 
+async function runUpdateAfterRemoteResolved(
+  target: string,
+  args: string[],
+  onRemoteResolved: () => Promise<void>
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const home = path.join(root, `home-${serial}`);
+  await fs.promises.mkdir(home, { recursive: true });
+  const child = spawn(process.execPath, [ENGINE, ...args], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      DISCORD_COPILOT_SDK_UPDATE_ROOT: target,
+      DISCORD_COPILOT_SDK_INSTANCE_ID: `${instancePrefix}-${serial}`,
+      DISCORD_COPILOT_SDK_REF: "main",
+      HOME: home,
+      USERPROFILE: home,
+      PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  let mutation: Promise<void> | undefined;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+    if (mutation === undefined && stdout.includes("requested main ->")) mutation = onRemoteResolved();
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  const code = await new Promise<number>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (exitCode) => resolve(exitCode ?? 1));
+  });
+  if (mutation === undefined) throw new Error("updater did not resolve the requested remote ref");
+  await mutation;
+  return { code, stdout, stderr };
+}
+
 function expectInOrder(output: string, ...parts: string[]) {
   let previous = -1;
   for (const part of parts) {
@@ -142,6 +185,13 @@ function expectInOrder(output: string, ...parts: string[]) {
     expect(index, `out-of-order output fragment: ${part}\n${output}`).toBeGreaterThan(previous);
     previous = index;
   }
+}
+
+function expectedApplyCommand(target: string, instance: string): string {
+  if (process.platform === "win32") {
+    return `$env:DISCORD_COPILOT_SDK_INSTANCE_ID = '${instance}'; & '${path.join(target, "update.ps1").replace(/'/g, "''")}'`;
+  }
+  return `DISCORD_COPILOT_SDK_INSTANCE_ID=${instance} bash "${path.join(target, "update.sh")}"`;
 }
 
 beforeAll(async () => {
@@ -223,6 +273,19 @@ describe("git update data paths", { timeout: 60_000 }, () => {
 
     expect(resolved?.ref).toBe(`refs/tags/${tag}^{}`);
     expect(resolved?.sha).toBe((await git(source, "rev-parse", "HEAD")).stdout.trim());
+  });
+
+  it("never displays an annotated tag's peeled-ref syntax in update status", async () => {
+    const tag = "v9.9.10-display";
+    await git(source, "tag", "-a", tag, "-m", "annotated display release");
+    await git(source, "push", "-q", "origin", tag);
+    const local = await cloneTarget("annotated-tag-display");
+
+    const result = await runUpdate(local, ["--check", "--ref", `refs/tags/${tag}`, "--lang", "en"]);
+
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain(`refs/tags/${tag} -> refs/tags/${tag} @`);
+    expect(result.stdout).not.toContain(`refs/tags/${tag}^{}`);
   });
 
   it("refuses to restore a state recorded for a different checkout", async () => {
@@ -357,15 +420,49 @@ describe("git update data paths", { timeout: 60_000 }, () => {
 
     const result = await runUpdate(local, ["--check", "--lang", "en"]);
 
-    expect(result.code, result.stderr).toBe(2);
+    expect(result.code, `${result.stdout}${result.stderr}`).toBe(2);
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain("\nUpdate status\n");
     expect(result.stdout).toContain("Current version");
     expect(result.stdout).toContain("Instance");
     expect(result.stdout).toContain(`Update available: 0.2.0 (${localSha.slice(0, 12)}) -> 0.3.0 (${remoteSha.slice(0, 12)}).`);
-    expect(result.stdout).toContain("Apply it with: node scripts/update.mjs");
+    expect(result.stdout).toContain(`Apply it with: ${expectedApplyCommand(local, `${instancePrefix}-${serial}`)}`);
     expectInOrder(result.stdout, "Update status", `Update available: 0.2.0 (${localSha.slice(0, 12)}) -> 0.3.0 (${remoteSha.slice(0, 12)}).`);
     expect(fs.existsSync(path.join(local, ".git", "FETCH_HEAD"))).toBe(true);
+  });
+
+  it("refuses a fetch that resolves to a different commit before state or downtime", async () => {
+    await advanceToVersion("3.0.0");
+    const local = await cloneTarget("fetch-mismatch");
+    const before = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+    const resolvedSha = await advanceToVersion("3.1.0");
+    await fs.promises.writeFile(path.join(source, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version: "3.2.0" }));
+    await git(source, "add", "package.json");
+    await git(source, "commit", "-q", "-m", "move main during fetch");
+    const movedSha = (await git(source, "rev-parse", "HEAD")).stdout.trim();
+
+    const result = await runUpdateAfterRemoteResolved(local, ["--yes", "--no-restart", "--lang", "en"], () =>
+      git(source, "push", "-q", "origin", "main").then(() => undefined)
+    );
+    const home = path.join(root, `home-${serial}`);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(`fetched revision ${movedSha} does not match resolved remote revision ${resolvedSha}`);
+    expect((await git(local, "rev-parse", "HEAD")).stdout.trim()).toBe(before);
+    expect(result.stdout).not.toContain("[1/4] Stop");
+    expect(fs.existsSync(path.join(home, ".discord-copilot-sdk"))).toBe(false);
+  });
+
+  it("displays target metadata from the fetched SHA instead of another fetched object", async () => {
+    await advanceToVersion("3.3.0");
+    const local = await cloneTarget("pinned-fetched-metadata");
+    const pinnedSha = await advanceToVersion("3.4.0");
+
+    const result = await runUpdate(local, ["--check", "--lang", "en"]);
+
+    expect(result.code, result.stderr).toBe(2);
+    expect(result.stdout).toContain(`Update available: 3.3.0 (`);
+    expect(result.stdout).toContain(`-> 3.4.0 (${pinnedSha.slice(0, 12)}).`);
   });
 
   it("shows fetched target notes from FETCH_HEAD instead of the stale local changelog during --check", async () => {
@@ -399,7 +496,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
       `Update available: 0.8.0 (${localSha.slice(0, 12)}) -> 0.9.0 (${remoteSha.slice(0, 12)}).`,
       "Target release notes for 0.9.0:",
       compareUrl,
-      "Apply it with: node scripts/update.mjs"
+      `Apply it with: ${expectedApplyCommand(local, `${instancePrefix}-${serial}`)}`
     );
   });
 
@@ -525,6 +622,48 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain("Already up to date:");
     expect(result.stdout).toContain("Warning: a previous update left a recovery record; run node scripts/update.mjs --restore.");
+  });
+
+  it("makes a pending restore record actionable when --check finds an update", async () => {
+    await advanceToVersion("4.0.0");
+    const local = await cloneTarget("pending-restore-check-available");
+    await advanceToVersion("4.1.0");
+
+    const result = await runUpdate(local, ["--check", "--lang", "en"], async (home) => {
+      const stateDir = path.join(home, ".discord-copilot-sdk");
+      await fs.promises.mkdir(stateDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(stateDir, `update-state.${instancePrefix}-${serial}.json`),
+        JSON.stringify({ version: 1, repoRoot: local, oldSha: "1".repeat(40), instances: [] })
+      );
+    });
+
+    expect(result.code, result.stderr).toBe(2);
+    expect(result.stdout).toContain("Update available: 4.0.0 (");
+    expect(result.stdout).toContain("Warning: a previous update left a recovery record; run node scripts/update.mjs --restore.");
+    expect(result.stdout).not.toContain("Apply it with:");
+  });
+
+  it("makes a pending restore record actionable during a read-only dry run", async () => {
+    const local = await cloneTarget("pending-restore-dry-run");
+    await advanceToVersion("4.2.0");
+    const fetchHead = path.join(local, ".git", "FETCH_HEAD");
+    if (fs.existsSync(fetchHead)) await fs.promises.rm(fetchHead, { force: true });
+
+    const result = await runUpdate(local, ["--dry-run", "--lang", "en"], async (home) => {
+      const stateDir = path.join(home, ".discord-copilot-sdk");
+      await fs.promises.mkdir(stateDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(stateDir, `update-state.${instancePrefix}-${serial}.json`),
+        JSON.stringify({ version: 1, repoRoot: local, oldSha: "2".repeat(40), instances: [] })
+      );
+    });
+
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain("\nDry-run plan\n");
+    expect(result.stdout).toContain("Warning: a previous update left a recovery record; run node scripts/update.mjs --restore.");
+    expect(result.stdout).not.toContain("Apply it with:");
+    expect(fs.existsSync(fetchHead)).toBe(false);
   });
 
   it("does not warn a checkout about another checkout's pending restore state", async () => {
