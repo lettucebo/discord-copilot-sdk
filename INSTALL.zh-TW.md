@@ -208,7 +208,7 @@ apply 順序是：唯讀 preflight → fetch → branch／設定證明 → 顯�
 狀態：原本已停止的 instance 會維持停止並明講原因。`--no-restart` 也會讓
 每個 instance 保持停止，並印出可直接使用的手動啟動指令。
 
-> ⚠️ state record 建立後，若 setup、還原或最後的 state 清理失敗，更新器會保留 `~/.discord-copilot-sdk/update-state.<instance>.json`、回報**更新未完成**，並印出平台 wrapper 的復原指令：Windows 是 `update.ps1 -Restore`，macOS/Linux 是 `update.sh --restore`，且會保留所選 instance 的環境。它絕不自動做第二次還原。不要從這個失敗訊息推論所有 bot 一定已停止或仍在執行：請檢查顯示的 instance 狀態，再明確執行復原。Windows 停止是硬終止，進行中的 turn 可能遺失。先查看 active thread/worktree，只有確定可中斷時才確認 guard（或使用 `--yes`）。
+> ⚠️ state record 建立後，若 setup、還原或最後的 state 清理失敗，更新器會保留 `~/.discord-copilot-sdk/update-state.<instance>.json`、回報**更新未完成**，並印出精確、帶 instance 資格的平台 wrapper 復原指令。**請原樣複製輸出的指令**：它會先繫結選定的 `DISCORD_COPILOT_SDK_INSTANCE_ID`，再呼叫已安裝的 wrapper（PowerShell 形式為 `$env:DISCORD_COPILOT_SDK_INSTANCE_ID = '<instance>'; & '<installed-path>\update.ps1' -Restore`；bash 形式為 `DISCORD_COPILOT_SDK_INSTANCE_ID=<instance> bash "<installed-path>/update.sh" --restore`）。這些只是在說明繫結形式；實際 instance 與已安裝路徑必須以輸出的指令為準。它絕不自動做第二次還原。不要從這個失敗訊息推論所有 bot 一定已停止或仍在執行：請檢查顯示的 instance 狀態，再明確執行復原。Windows 停止是硬終止，進行中的 turn 可能遺失。先查看 active thread/worktree，只有確定可中斷時才確認 guard（或使用 `--yes`）。
 > 有待處理的復原記錄時，新的 apply 不能覆蓋它；在 `--restore` 解決前，`--check` 與 `--dry-run` 仍可用於診斷。
 
 ### 發版

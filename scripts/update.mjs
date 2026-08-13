@@ -392,7 +392,13 @@ async function withFetchedTarget(remote, checkoutKind, options, action) {
     try {
       deletePrivateRef(fetched.privateRef);
     } catch (error) {
-      if (!actionFailed) throw error;
+      if (actionFailed) {
+        // Preserve the action's failure and exit code, but never conceal a
+        // unique ref that could otherwise retain fetched objects indefinitely.
+        console.error(message("updatePrivateRefCleanupFailed", fetched.privateRef));
+      } else {
+        throw error;
+      }
     }
   }
 }

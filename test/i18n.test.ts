@@ -180,6 +180,15 @@ describe("update messages", () => {
     expect(MESSAGES.zh.updatePendingRestore).not.toContain("自動復原");
     expect(MESSAGES.zh.updateFailed).not.toContain("自動復原");
   });
+
+  it("warns bilingually when a private fetch ref cannot be cleaned", () => {
+    expect(MESSAGES.en.updatePrivateRefCleanupFailed).toBe(
+      "Warning: private update ref {0} could not be removed; remove it manually."
+    );
+    expect(MESSAGES.zh.updatePrivateRefCleanupFailed).toBe(
+      "警告：無法刪除私有更新 ref {0}；請手動移除。"
+    );
+  });
 });
 
 describe("skill source messages", () => {

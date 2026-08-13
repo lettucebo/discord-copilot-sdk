@@ -146,6 +146,13 @@ function realGitPath(): string {
   return executable.trim();
 }
 
+function nodeRequireOption(modulePath: string): string {
+  // NODE_OPTIONS treats backslashes as escapes while parsing quoted options.
+  // Node accepts slash-separated paths on Windows, so normalize only for its
+  // command-line parser and preserve the enclosing quote for whitespace.
+  return `--require="${modulePath.split(path.sep).join("/").replace(/"/g, '\\"')}"`;
+}
+
 async function createFetchBarrier(binDir: string, record: string): Promise<string> {
   const shim = path.join(binDir, "git-fetch-barrier.cjs");
   await fs.promises.mkdir(binDir, { recursive: true });
@@ -164,6 +171,10 @@ async function createFetchBarrier(binDir: string, record: string): Promise<strin
       '    fs.writeFileSync(process.env.DCS_FETCH_BARRIER_RECORD, JSON.stringify(args));',
       '    const pushed = spawnSync(process.env.DCS_FETCH_BARRIER_GIT, ["-C", process.env.DCS_FETCH_BARRIER_SOURCE, "push", "-q", "origin", "main"], { stdio: "inherit" });',
       '    if (pushed.status !== 0) process.exit(pushed.status ?? 1);',
+      "  }",
+      '  if (process.env.DCS_PRIVATE_REF_DELETE_RECORD && args[0] === "update-ref" && args[1] === "-d" && /^refs\\/dcs-update\\/[0-9a-f-]+$/i.test(args[2] || "")) {',
+      '    fs.writeFileSync(process.env.DCS_PRIVATE_REF_DELETE_RECORD, JSON.stringify(args));',
+      "    process.exit(1);",
       "  }",
       '  const result = spawnSync(process.env.DCS_FETCH_BARRIER_GIT, args, { stdio: "inherit" });',
       "  process.exit(result.status ?? 1);",
@@ -474,7 +485,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     await git(source, "add", "package.json");
     await git(source, "commit", "-q", "-m", "move main during fetch");
     const movedSha = (await git(source, "rev-parse", "HEAD")).stdout.trim();
-    const barrierBin = path.join(root, `fetch-barrier-${serial}`);
+    const barrierBin = path.join(root, `fetch barrier ${serial}`);
     const fetchRecord = path.join(barrierBin, "fetch-args.json");
     const shim = await createFetchBarrier(barrierBin, fetchRecord);
 
@@ -483,7 +494,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
       DCS_FETCH_BARRIER_GIT: realGitPath(),
       DCS_FETCH_BARRIER_RECORD: fetchRecord,
       DCS_FETCH_BARRIER_SOURCE: source,
-      NODE_OPTIONS: `--require=${shim}${process.env.NODE_OPTIONS ? ` ${process.env.NODE_OPTIONS}` : ""}`,
+      NODE_OPTIONS: `${nodeRequireOption(shim)}${process.env.NODE_OPTIONS ? ` ${process.env.NODE_OPTIONS}` : ""}`,
     });
     expect(fs.existsSync(fetchRecord), `${result.stdout}${result.stderr}`).toBe(true);
     const fetchArgs = JSON.parse(await fs.promises.readFile(fetchRecord, "utf8")) as string[];
@@ -498,6 +509,39 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(result.stdout).not.toContain("[1/4] Stop");
     expect(fs.existsSync(path.join(home, ".discord-copilot-sdk"))).toBe(false);
     expect((await git(local, "for-each-ref", "--format=%(refname)", "refs/dcs-update")).stdout.trim()).toBe("");
+  });
+
+  it("keeps the primary action failure visible when private-ref cleanup also fails", async () => {
+    const local = await cloneTarget("private-ref-cleanup-failure");
+    await fs.promises.writeFile(path.join(local, "local-only-commit.txt"), "diverge without making the worktree dirty\n");
+    await git(local, "add", "local-only-commit.txt");
+    await git(local, "commit", "-q", "-m", "local divergence");
+    await advanceRemote("remote divergence");
+    const barrierBin = path.join(root, `private-ref cleanup ${serial}`);
+    const fetchRecord = path.join(barrierBin, "fetch-args.json");
+    const deleteRecord = path.join(barrierBin, "delete-args.json");
+    const shim = await createFetchBarrier(barrierBin, fetchRecord);
+
+    const result = await runUpdate(local, ["--yes", "--no-restart", "--lang", "en"], undefined, {
+      PATH: `${barrierBin}${path.delimiter}${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+      DCS_FETCH_BARRIER_GIT: realGitPath(),
+      DCS_FETCH_BARRIER_RECORD: fetchRecord,
+      DCS_FETCH_BARRIER_SOURCE: source,
+      DCS_PRIVATE_REF_DELETE_RECORD: deleteRecord,
+      NODE_OPTIONS: `${nodeRequireOption(shim)}${process.env.NODE_OPTIONS ? ` ${process.env.NODE_OPTIONS}` : ""}`,
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("the current branch cannot fast-forward to the requested ref");
+    expect(result.stderr).toContain("Warning: private update ref refs/dcs-update/");
+    expect(result.stderr).toContain("could not be removed; remove it manually.");
+    const deleteArgs = JSON.parse(await fs.promises.readFile(deleteRecord, "utf8")) as string[];
+    expect(deleteArgs).toEqual(["update-ref", "-d", expect.stringMatching(/^refs\/dcs-update\/[0-9a-f-]+$/i)]);
+    const privateRefs = (await git(local, "for-each-ref", "--format=%(refname)", "refs/dcs-update")).stdout
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean);
+    expect(privateRefs).toEqual([deleteArgs[2]]);
   });
 
   it("forwards Unix-style shim argv to the real git binary", async () => {

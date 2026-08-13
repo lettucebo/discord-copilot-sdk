@@ -250,9 +250,14 @@ each instance stopped and prints its exact manual start command.
 > ⚠️ If setup, restore, or final state cleanup fails after a state record is
 > created, the updater preserves
 > `~/.discord-copilot-sdk/update-state.<instance>.json`, reports **Update
-> incomplete**, and prints the platform wrapper recovery command:
-> `update.ps1 -Restore` on Windows or `update.sh --restore` on macOS/Linux,
-> with the selected instance environment preserved. It never starts
+> incomplete**, and prints the exact instance-qualified platform-wrapper
+> recovery command. **Copy that printed command verbatim**: it binds the
+> selected `DISCORD_COPILOT_SDK_INSTANCE_ID` before invoking the installed
+> wrapper (PowerShell: `$env:DISCORD_COPILOT_SDK_INSTANCE_ID = '<instance>'; &
+> '<installed-path>\update.ps1' -Restore`; bash:
+> `DISCORD_COPILOT_SDK_INSTANCE_ID=<instance> bash
+> "<installed-path>/update.sh" --restore`). These are binding shapes only; the
+> printed command supplies the actual instance and installed path. It never starts
 > an automatic second restore. Do not infer that every bot is stopped or running
 > from that failure alone: inspect the shown instance state and recover
 > explicitly. On Windows stopping is a hard termination, so an in-flight turn
