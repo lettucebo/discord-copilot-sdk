@@ -177,3 +177,86 @@ export function reportLogInfo({ platform, stateDir, instance, residencyInstalled
     afterFirstStart: true,
   };
 }
+
+/**
+ * Create a bounded rolling line buffer for streamed installer child output.
+ *
+ * The quiet installer keeps the FULL output on disk but only the final N lines
+ * in memory for actionable failure reporting. The buffer must handle arbitrary
+ * chunk boundaries, because child stdout/stderr can split a line anywhere.
+ *
+ * @param {number} maxLines
+ */
+export function createOutputTail(maxLines = 40, maxLineChars = 4000) {
+  if (!Number.isInteger(maxLines) || maxLines < 1) throw new TypeError("maxLines must be an integer at least 1");
+  if (!Number.isInteger(maxLineChars) || maxLineChars < 1) throw new TypeError("maxLineChars must be an integer at least 1");
+  return { maxLines, maxLineChars, lines: [], partial: "", pendingLfFromCr: false };
+}
+
+function clampTailLine(text, maxLineChars) {
+  const value = String(text);
+  if (value.length <= maxLineChars) return value;
+  return maxLineChars === 1 ? "…" : `…${value.slice(-(maxLineChars - 1))}`;
+}
+
+/**
+ * Feed one streamed text chunk into a bounded output tail created by
+ * createOutputTail().
+ *
+ * @param {{maxLines:number, lines:string[], partial:string}} tail
+ * @param {string|Buffer} chunk
+ */
+export function pushOutputTail(tail, chunk) {
+  let text = String(chunk);
+  if (tail.pendingLfFromCr && text.startsWith("\n")) text = text.slice(1);
+  tail.pendingLfFromCr = false;
+  const combined = `${tail.partial}${text}`;
+  const parts = combined.split(/\r\n|\n|\r/u);
+  tail.pendingLfFromCr = combined.endsWith("\r");
+  tail.partial = clampTailLine(parts.pop() ?? "", tail.maxLineChars);
+  tail.lines.push(...parts.map((line) => clampTailLine(line, tail.maxLineChars)));
+  if (tail.lines.length > tail.maxLines) tail.lines.splice(0, tail.lines.length - tail.maxLines);
+}
+
+/**
+ * Materialize the current bounded tail as lines, including a final unterminated
+ * line if one is in progress.
+ *
+ * @param {{maxLines:number, lines:string[], partial:string}} tail
+ */
+export function outputTailLines(tail) {
+  const lines = tail.partial ? [...tail.lines, tail.partial] : [...tail.lines];
+  return lines.slice(-tail.maxLines);
+}
+
+/**
+ * Write one decoded child-output chunk to multiple sinks while respecting
+ * backpressure across all of them. The source stream pauses once when the first
+ * sink backpressures and resumes only after every blocked sink drains.
+ *
+ * @param {{pause:Function, resume:Function}} source
+ * @param {string} text
+ * @param {Array<{write:Function, once:Function, off?:Function}>} sinks
+ */
+export function writeChunkToSinks(source, text, sinks) {
+  let pending = 0;
+  const drains = [];
+  const onDrain = () => {
+    pending -= 1;
+    if (pending === 0) source.resume();
+  };
+  for (const sink of sinks) {
+    try {
+      if (!sink.write(text)) {
+        if (pending === 0) source.pause();
+        pending += 1;
+        const listener = () => onDrain();
+        drains.push([sink, listener]);
+        sink.once("drain", listener);
+      }
+    } catch (e) {
+      for (const [drainSink, listener] of drains) drainSink.off?.("drain", listener);
+      throw e;
+    }
+  }
+}

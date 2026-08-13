@@ -2,7 +2,17 @@ import { describe, it, expect, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { nodeVersionOk, reposRootProblem, livePidFromLock, reportLogInfo } from "../scripts/lib/setup-core.mjs";
+import { EventEmitter } from "node:events";
+import {
+  nodeVersionOk,
+  reposRootProblem,
+  livePidFromLock,
+  reportLogInfo,
+  createOutputTail,
+  pushOutputTail,
+  outputTailLines,
+  writeChunkToSinks,
+} from "../scripts/lib/setup-core.mjs";
 import { resolveReposRoot } from "../src/core/repo.js";
 
 describe("nodeVersionOk (engines: ^20.19 || >=22.12)", () => {
@@ -253,6 +263,57 @@ describe("reportLogInfo (installer completion report log target)", () => {
       kind: "path",
       value: path.join("C:\\State", "logs", "run-bot.default.log"),
       afterFirstStart: true,
+    });
+  });
+
+  describe("bounded installer output tails", () => {
+    it("keeps only the final lines across chunk boundaries", () => {
+      const tail = createOutputTail(3);
+
+      pushOutputTail(tail, "line-01\nline-02\nline");
+      pushOutputTail(tail, "-03\nline-04");
+
+      expect(outputTailLines(tail)).toEqual(["line-02", "line-03", "line-04"]);
+    });
+
+    it("treats carriage returns as boundaries and bounds unterminated partial output", () => {
+      const tail = createOutputTail(2, 8);
+
+      pushOutputTail(tail, "alpha\rbeta\r123456789");
+
+      expect(outputTailLines(tail)).toEqual(["beta", "…3456789"]);
+    });
+
+    it("treats CRLF split across chunks as one boundary", () => {
+      const tail = createOutputTail(5);
+
+      pushOutputTail(tail, "line-1\r");
+      pushOutputTail(tail, "\nline-2");
+
+      expect(outputTailLines(tail)).toEqual(["line-1", "line-2"]);
+    });
+  });
+
+  describe("writeChunkToSinks", () => {
+    it("pauses the source until every backpressured sink drains", () => {
+      const events = [];
+      const source = {
+        pause: () => events.push("pause"),
+        resume: () => events.push("resume"),
+      };
+      const logSink = new EventEmitter();
+      logSink.write = () => false;
+      const verboseSink = new EventEmitter();
+      verboseSink.write = () => false;
+
+      writeChunkToSinks(source, "chunk", [logSink, verboseSink]);
+      expect(events).toEqual(["pause"]);
+
+      logSink.emit("drain");
+      expect(events).toEqual(["pause"]);
+
+      verboseSink.emit("drain");
+      expect(events).toEqual(["pause", "resume"]);
     });
   });
 

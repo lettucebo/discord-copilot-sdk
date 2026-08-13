@@ -15,6 +15,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REAL_SCRIPTS = path.join(HERE, "..", "scripts");
 const isWin = process.platform === "win32";
 const FIXTURE_VERSION = "9.8.7";
+const SETUP_LOG_PREFIX = "setup-";
 
 // REPOS_ROOT is filled in per-fixture (see makeFixture) — it must be a REAL
 // directory that is NOT itself a git repo, because setup.mjs enforces that
@@ -68,7 +69,8 @@ function stubBuiltDist(repo) {
   fs.writeFileSync(path.join(repo, "dist", "core", "repo.js"), "export function resolveReposRoot(value) { return value; }\n");
 }
 
-function runSetup(repo, args) {
+function runSetup(repo, args, options = {}) {
+  const { env: envOverrides = {}, keepHome = false } = options;
   // Isolate HOME/USERPROFILE so any accidental STATE_DIR write (~/.discord-copilot-sdk)
   // lands in the fixture, never the real home, and would be observable.
   const home = fs.mkdtempSync(path.join(tmpdir(), "dp-int-home-"));
@@ -78,6 +80,7 @@ function runSetup(repo, args) {
     HOME: home,
     USERPROFILE: home,
     PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+    ...envOverrides,
   };
   try {
     const result = spawnSync(process.execPath, [path.join(repo, "scripts", "setup.mjs"), ...args], {
@@ -87,7 +90,7 @@ function runSetup(repo, args) {
     });
     return Object.assign(result, { home });
   } finally {
-    fs.rmSync(home, { recursive: true, force: true });
+    if (!keepHome) fs.rmSync(home, { recursive: true, force: true });
   }
 }
 
@@ -96,20 +99,91 @@ function listStray(repo) {
   return fs.readdirSync(repo).filter((f) => /^\.env\..*\.(tmp|bak)$/.test(f) || f === ".env.tmp" || f === ".env.bak");
 }
 
+function setupLogDir(home) {
+  return path.join(home, ".discord-copilot-sdk", "logs");
+}
+
+function listSetupLogs(home) {
+  const dir = setupLogDir(home);
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .filter((name) => name.startsWith(SETUP_LOG_PREFIX))
+    .map((name) => path.join(dir, name));
+}
+
+function numberLines(prefix, count) {
+  return Array.from({ length: count }, (_, index) => `${prefix}-${String(index + 1).padStart(2, "0")}`).join("\n") + "\n";
+}
+
+function writeNodeCommandStub(name, source, targetDir = binDir) {
+  const scriptPath = path.join(targetDir, `${name}-stub.mjs`);
+  fs.writeFileSync(scriptPath, source);
+  if (isWin) {
+    fs.writeFileSync(path.join(targetDir, `${name}.cmd`), `@echo off\r\n"${process.execPath}" "%~dp0${name}-stub.mjs" %*\r\n`);
+  } else {
+    const wrapperPath = path.join(targetDir, name);
+    fs.writeFileSync(wrapperPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} "$(dirname "$0")/${name}-stub.mjs" "$@"\n`);
+    fs.chmodSync(wrapperPath, 0o755);
+  }
+}
+
 beforeAll(() => {
   root = fs.mkdtempSync(path.join(tmpdir(), "dp-int-bin-"));
   binDir = path.join(root, "bin");
   fs.mkdirSync(binDir, { recursive: true });
   // Stub git + copilot so the read-only prereq gate resolves them on any host.
-  for (const name of ["git", "copilot", "npm"]) {
-    if (isWin) {
-      fs.writeFileSync(path.join(binDir, `${name}.cmd`), "@echo off\r\nexit /b 0\r\n");
-    } else {
-      const p = path.join(binDir, name);
-      fs.writeFileSync(p, "#!/bin/sh\nexit 0\n");
-      fs.chmodSync(p, 0o755);
-    }
-  }
+  writeNodeCommandStub(
+    "git",
+    [
+      'const args = process.argv.slice(2);',
+      'if (args[0] === "--version") { console.log("git version 2.47.0"); process.exit(0); }',
+      'if (args[0] === "ls-files") process.exit(1);',
+      "process.exit(0);",
+      "",
+    ].join("\n")
+  );
+  writeNodeCommandStub(
+    "copilot",
+    [
+      'const args = process.argv.slice(2);',
+      'if (args[0] === "--version") { console.log("copilot 1.0.0"); process.exit(0); }',
+      "process.exit(0);",
+      "",
+    ].join("\n")
+  );
+  writeNodeCommandStub(
+    "npm",
+    [
+      'import { spawn } from "node:child_process";',
+      'const args = process.argv.slice(2);',
+      'const joined = args.join(" ");',
+      'if (joined === "--version") { console.log("10.9.0"); process.exit(0); }',
+      'const phase = joined === "run build" ? "BUILD" : args[0] === "ci" || args[0] === "install" ? "INSTALL" : "GENERIC";',
+      'const writeHexParts = async (target, envKey) => {',
+      '  const raw = process.env[envKey];',
+      '  if (!raw) return;',
+      '  for (const hex of JSON.parse(raw)) {',
+      '    target.write(Buffer.from(hex, "hex"));',
+      '    await new Promise((resolve) => setTimeout(resolve, 0));',
+      "  }",
+      "};",
+      'const stdout = process.env[`DP_${phase}_STDOUT`] || "";',
+      'const stderr = process.env[`DP_${phase}_STDERR`] || "";',
+      'if (stdout) process.stdout.write(stdout);',
+      'if (stderr) process.stderr.write(stderr);',
+      'await writeHexParts(process.stdout, `DP_${phase}_STDOUT_HEX_PARTS`);',
+      'await writeHexParts(process.stderr, `DP_${phase}_STDERR_HEX_PARTS`);',
+      'if (process.env[`DP_${phase}_KILL_SELF`] === "1") {',
+      '  spawn(process.execPath, ["-e", `setTimeout(() => process.kill(${process.pid}, "SIGTERM"), 25)`], { stdio: "ignore" });',
+      '  setInterval(() => {}, 1000);',
+      '  await new Promise(() => {});',
+      "}",
+      'const exitCode = Number(process.env[`DP_${phase}_EXIT`] || "0");',
+      "process.exit(Number.isFinite(exitCode) ? exitCode : 0);",
+      "",
+    ].join("\n")
+  );
 });
 
 afterAll(() => {
@@ -348,6 +422,227 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       expect(fs.readFileSync(path.join(repo, ".env"), "utf8")).toBe(before);
     } finally {
       fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("dry-run remains mutation-free and does not create a setup log", () => {
+    const repo = makeFixture(true);
+    let home;
+    try {
+      const r = runSetup(repo, ["--dry-run", "--yes", "--skip-auth", "--lang", "en"], { keepHome: true });
+      home = r.home;
+      expect(r.status).toBe(0);
+      expect(listSetupLogs(home)).toEqual([]);
+    } finally {
+      if (home) fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("default build runner keeps non-TTY output stable, hides successful child output, and logs it under the isolated state dir", () => {
+    const repo = makeFixture(true);
+    let home;
+    try {
+      stubBuiltDist(repo);
+      const r = runSetup(repo, ["--yes", "--skip-auth", "--lang", "en"], {
+        keepHome: true,
+        env: {
+          DP_INSTALL_STDOUT: "install-stdout-marker\n",
+          DP_INSTALL_STDERR: "install-stderr-marker\n",
+          DP_BUILD_STDOUT: "build-stdout-marker\n",
+          DP_BUILD_STDERR: "build-stderr-marker\n",
+        },
+      });
+      home = r.home;
+      const out = (r.stdout || "") + (r.stderr || "");
+      const logs = listSetupLogs(home);
+
+      expect(r.status).toBe(0);
+      expect(out).toContain("npm install --no-audit --no-fund");
+      expect(out).toContain("npm run build");
+      expect(out).not.toContain("install-stdout-marker");
+      expect(out).not.toContain("install-stderr-marker");
+      expect(out).not.toContain("build-stdout-marker");
+      expect(out).not.toContain("build-stderr-marker");
+      expect(out).not.toContain("\r");
+      expect(out).not.toContain("DEP0190");
+      expect(logs).toHaveLength(1);
+      expect(logs[0].startsWith(setupLogDir(home))).toBe(true);
+      const logText = fs.readFileSync(logs[0], "utf8");
+      expect(logText).toContain("install-stdout-marker");
+      expect(logText).toContain("install-stderr-marker");
+      expect(logText).toContain("build-stdout-marker");
+      expect(logText).toContain("build-stderr-marker");
+    } finally {
+      if (home) fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("verbose build runner mirrors child output while still succeeding", () => {
+    const repo = makeFixture(true);
+    let home;
+    try {
+      stubBuiltDist(repo);
+      const r = runSetup(repo, ["--yes", "--skip-auth", "--lang", "en", "--verbose"], {
+        keepHome: true,
+        env: {
+          DP_INSTALL_STDOUT: "verbose-install-marker\n",
+          DP_BUILD_STDERR: "verbose-build-marker\n",
+        },
+      });
+      home = r.home;
+      const out = (r.stdout || "") + (r.stderr || "");
+
+      expect(r.status).toBe(0);
+      expect(out).toContain("verbose-install-marker");
+      expect(out).toContain("verbose-build-marker");
+      expect(out).toContain("npm install --no-audit --no-fund");
+      expect(out).toContain("npm run build");
+      expect(out).not.toContain("DEP0190");
+      expect(listSetupLogs(home)).toHaveLength(1);
+    } finally {
+      if (home) fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("command failure prints only the final 40 log lines, names the protected log, and stops before later stages", () => {
+    const repo = makeFixture(true);
+    let home;
+    try {
+      const r = runSetup(repo, ["--yes", "--skip-auth", "--lang", "en"], {
+        keepHome: true,
+        env: {
+          DP_BUILD_STDOUT: numberLines("tail", 60),
+          DP_BUILD_EXIT: "23",
+        },
+      });
+      home = r.home;
+      const out = (r.stdout || "") + (r.stderr || "");
+      const logs = listSetupLogs(home);
+
+      expect(r.status).toBe(1);
+      expect(out).toContain("npm run build");
+      expect(out).toMatch(/failed/i);
+      expect(out).toContain(setupLogDir(home));
+      expect(out).not.toContain("tail-01");
+      expect(out).not.toContain("tail-20");
+      expect(out).toContain("tail-21");
+      expect(out).toContain("tail-60");
+      expect(out.match(/tail-\d{2}/g)).toHaveLength(40);
+      expect(out).not.toContain("[4/5] Config validation and .env write");
+      expect(out).not.toContain("Action summary");
+      expect(logs).toHaveLength(1);
+      const logText = fs.readFileSync(logs[0], "utf8");
+      expect(logText).toContain("tail-01");
+      expect(logText).toContain("tail-60");
+    } finally {
+      if (home) fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("signal-terminated commands still report the protected log path and stop before later stages", () => {
+    const repo = makeFixture(true);
+    let home;
+    try {
+      const r = runSetup(repo, ["--yes", "--skip-auth", "--lang", "en"], {
+        keepHome: true,
+        env: {
+          DP_BUILD_STDOUT: "before-signal\n",
+          DP_BUILD_KILL_SELF: "1",
+        },
+      });
+      home = r.home;
+      const out = (r.stdout || "") + (r.stderr || "");
+
+      expect(r.status).toBe(1);
+      expect(out).toContain("npm run build");
+      expect(out).toContain(setupLogDir(home));
+      expect(out).toMatch(/terminated unexpectedly|failed/i);
+      expect(out).not.toContain("[4/5] Config validation and .env write");
+      expect(out).not.toContain("Action summary");
+    } finally {
+      if (home) fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves utf-8 output split across child chunks in verbose output and logs", () => {
+    const repo = makeFixture(true);
+    let home;
+    try {
+      stubBuiltDist(repo);
+      const r = runSetup(repo, ["--yes", "--skip-auth", "--lang", "en", "--verbose"], {
+        keepHome: true,
+        env: {
+          DP_BUILD_STDOUT_HEX_PARTS: JSON.stringify(["e4", "bda0", "e5", "a5bd0a"]),
+        },
+      });
+      home = r.home;
+      const out = (r.stdout || "") + (r.stderr || "");
+      const logs = listSetupLogs(home);
+
+      expect(r.status).toBe(0);
+      expect(out).toContain("你好");
+      expect(out).not.toContain("�");
+      expect(out).not.toContain("DEP0190");
+      expect(logs).toHaveLength(1);
+      const logText = fs.readFileSync(logs[0], "utf8");
+      expect(logText).toContain("你好");
+      expect(logText).not.toContain("�");
+    } finally {
+      if (home) fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(!isWin)("reports the protected log path when npm cannot be started at all", () => {
+    const repo = makeFixture(true);
+    let home;
+    const missingNpmDir = fs.mkdtempSync(path.join(root, "bin-no-npm-"));
+    try {
+      writeNodeCommandStub(
+        "git",
+        [
+          'const args = process.argv.slice(2);',
+          'if (args[0] === "--version") { console.log("git version 2.47.0"); process.exit(0); }',
+          'if (args[0] === "ls-files") process.exit(1);',
+          "process.exit(0);",
+          "",
+        ].join("\n"),
+        missingNpmDir
+      );
+      writeNodeCommandStub(
+        "copilot",
+        [
+          'const args = process.argv.slice(2);',
+          'if (args[0] === "--version") { console.log("copilot 1.0.0"); process.exit(0); }',
+          "process.exit(0);",
+          "",
+        ].join("\n"),
+        missingNpmDir
+      );
+
+      const r = runSetup(repo, ["--yes", "--skip-auth", "--lang", "en"], {
+        keepHome: true,
+        env: {
+          PATH: missingNpmDir,
+        },
+      });
+      home = r.home;
+      const out = (r.stdout || "") + (r.stderr || "");
+
+      expect(r.status).toBe(1);
+      expect(out).toContain("npm install --no-audit --no-fund");
+      expect(out).toContain(setupLogDir(home));
+      expect(out).toMatch(/Could not start/i);
+      expect(out).not.toContain("[4/5] Config validation and .env write");
+    } finally {
+      if (home) fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(missingNpmDir, { recursive: true, force: true });
     }
   });
 });

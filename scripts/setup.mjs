@@ -2,19 +2,28 @@
 // discord-copilot-sdk installer core — the ONE config engine (bilingual zh-TW / English).
 // Node built-ins ONLY (runs before `npm install`). Invoked by install.ps1 /
 // install.sh, or directly: `node scripts/setup.mjs [--lang zh|en] [--yes]
-// [--no-residency|--residency] [--dry-run] [--skip-auth]`.
+// [--no-residency|--residency] [--dry-run] [--skip-auth] [--verbose]`.
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { parseEnv } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mergeEnv, dropEnvKeys } from "./lib/env-file.mjs";
 import { secureWrite, secureBackup, hardenExisting } from "./lib/secure-file.mjs";
-import { nodeVersionOk, reposRootProblem, livePidFromLock, reportLogInfo } from "./lib/setup-core.mjs";
+import {
+  nodeVersionOk,
+  reposRootProblem,
+  livePidFromLock,
+  reportLogInfo,
+  createOutputTail,
+  pushOutputTail,
+  outputTailLines,
+  writeChunkToSinks,
+} from "./lib/setup-core.mjs";
 import { UNKNOWN, formatMessage, t, detectLang, normalizeLang } from "./lib/i18n.mjs";
-import { formatSection, formatStage, formatKeyValue, formatSummary } from "./lib/ui.mjs";
+import { formatSection, formatStage, formatKeyValue, formatSummary, supportsDynamicProgress } from "./lib/ui.mjs";
 import { parsePackageVersion } from "./lib/update-core.mjs";
 import { MANAGED_KEYS, validateConfig, REMOVED_KEYS } from "./lib/validate.mjs";
 import { setupResidency, residencyName, chooseResidencyMode, hasResidencyRegistration, instanceId } from "./lib/residency.mjs";
@@ -36,6 +45,7 @@ const FLAGS = {
   yes: has("--yes") || has("-y"),
   dryRun: has("--dry-run"),
   skipAuth: has("--skip-auth"),
+  verbose: has("--verbose"),
   residency: has("--residency") ? true : has("--no-residency") ? false : undefined,
   // Separate from --residency on purpose: asking for 24/7 implies wanting
   // residency, but wanting residency must never imply consenting to a stored
@@ -440,8 +450,13 @@ async function main() {
   // `npm ci` cannot verify). Use `ci` when the user has generated their own —
   // it is faster and reproducible — and fall back to `install` otherwise.
   const hasLock = fs.existsSync(path.join(REPO_ROOT, "package-lock.json"));
-  run("npm", hasLock ? ["ci"] : ["install", "--no-audit", "--no-fund"], sanitizedChildEnv());
-  run("npm", ["run", "build"], sanitizedChildEnv());
+  const buildLog = openSetupLog(lang);
+  try {
+    await run("npm", hasLock ? ["ci"] : ["install", "--no-audit", "--no-fund"], sanitizedChildEnv(), lang, buildLog);
+    await run("npm", ["run", "build"], sanitizedChildEnv(), lang, buildLog);
+  } finally {
+    await closeLogStream(buildLog.stream, lang);
+  }
 
   // 8) Validate the MERGED config through the REAL runtime schema (in memory —
   //    no .env file, no ambient env, no token in this process's env). This is the
@@ -631,15 +646,195 @@ function previewMasked(values, lang) {
   return `${formatSection(t("configPreviewHeader", lang))}\n${lines.join("\n")}`;
 }
 
-function run(cmd, args, env) {
-  // On Windows npm is npm.cmd and Node refuses to spawn .cmd without a shell
-  // (EINVAL, post CVE-2024-27980). Use execSync with a shell there (args are
-  // hardcoded, no user input) to avoid the shell+args DEP0190 warning.
-  if (process.platform === "win32" && cmd === "npm") {
-    execSync(`npm ${args.join(" ")}`, { cwd: REPO_ROOT, stdio: "inherit", env });
-  } else {
-    execFileSync(cmd, args, { cwd: REPO_ROOT, stdio: "inherit", env });
+function hardenLogPath(target, lang, { directory = false } = {}) {
+  try {
+    if (process.platform === "win32") applyWindowsAcl(target);
+    else fs.chmodSync(target, directory ? 0o700 : 0o600);
+  } catch (e) {
+    const key = directory ? "buildLogDirError" : "buildLogFileError";
+    throw new SetupError(formatMessage(t(key, lang), [errorMessage(e)]));
   }
+}
+
+function openSetupLog(lang) {
+  const logDir = path.join(STATE_DIR, "logs");
+  try {
+    fs.mkdirSync(logDir, { recursive: true, mode: 0o700 });
+  } catch (e) {
+    throw new SetupError(formatMessage(t("buildLogDirError", lang), [errorMessage(e)]));
+  }
+  hardenLogPath(logDir, lang, { directory: true });
+  const logPath = path.join(logDir, `setup-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}.log`);
+  try {
+    fs.writeFileSync(logPath, "", { encoding: "utf8", mode: 0o600, flag: "wx" });
+  } catch (e) {
+    throw new SetupError(formatMessage(t("buildLogFileError", lang), [errorMessage(e)]));
+  }
+  try {
+    hardenLogPath(logPath, lang);
+  } catch (e) {
+    try {
+      fs.rmSync(logPath, { force: true });
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
+  return {
+    path: logPath,
+    stream: fs.createWriteStream(logPath, { flags: "a", encoding: "utf8" }),
+  };
+}
+
+async function closeLogStream(stream, lang) {
+  if (stream.destroyed) return;
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      stream.off("error", onError);
+      fn(value);
+    };
+    const onError = (e) => done(reject, new SetupError(formatMessage(t("buildLogFileError", lang), [errorMessage(e)])));
+    stream.once("error", onError);
+    stream.end(() => done(resolve));
+  });
+}
+
+function commandLabel(cmd, args) {
+  return [cmd, ...args].join(" ");
+}
+
+function formatElapsed(ms) {
+  const seconds = ms / 1000;
+  return `${seconds < 10 ? seconds.toFixed(1) : seconds.toFixed(0)}s`;
+}
+
+function errorMessage(e) {
+  return e instanceof Error ? e.message : String(e);
+}
+
+function finishDynamicStatus(text, interval) {
+  if (interval === undefined) return;
+  clearInterval(interval);
+  process.stdout.write(`\r\x1b[2K${text}\n`);
+}
+
+function buildFailureDetails(lang, logPath, tailLines, maxLines = 40, reason) {
+  const lines = [formatMessage(t("buildLogPath", lang), [logPath])];
+  if (reason) lines.unshift(reason);
+  if (tailLines.length) lines.push(formatMessage(t("buildRecentLogTail", lang), [String(maxLines)]), ...tailLines);
+  return lines.join("\n");
+}
+
+function spawnChild(cmd, args, env) {
+  if (process.platform === "win32" && cmd === "npm") {
+    return spawn(`npm ${args.join(" ")}`, {
+      cwd: REPO_ROOT,
+      env,
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+  }
+  return spawn(cmd, args, {
+    cwd: REPO_ROOT,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+}
+
+async function run(cmd, args, env, lang, log) {
+  const label = commandLabel(cmd, args);
+  const startedAt = Date.now();
+  const useDynamic = !FLAGS.verbose && supportsDynamicProgress({ isTTY: process.stdout.isTTY, noColor: !!process.env.NO_COLOR });
+  const startMessage = formatMessage(t("buildStepStarting", lang), [label]);
+  let ticker;
+  if (useDynamic) {
+    const render = () => {
+      process.stdout.write(`\r\x1b[2K${startMessage} (${formatElapsed(Date.now() - startedAt)})`);
+    };
+    render();
+    ticker = setInterval(render, 1000);
+    ticker.unref?.();
+  } else {
+    info(startMessage);
+  }
+
+  const tail = createOutputTail(40);
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    let logError;
+    const child = spawnChild(cmd, args, env);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
+    const fail = (reason) => {
+      if (settled) return;
+      settled = true;
+      reject(reason);
+    };
+
+    const writeChunk = (chunk, sink) => {
+      if (settled) return;
+      const text = String(chunk);
+      pushOutputTail(tail, text);
+      try {
+        writeChunkToSinks(
+          sink,
+          text,
+          FLAGS.verbose ? [log.stream, sink === child.stderr ? process.stderr : process.stdout] : [log.stream]
+        );
+      } catch (e) {
+        logError = e;
+        child.kill();
+        return;
+      }
+    };
+
+    log.stream.once("error", (e) => {
+      logError = e;
+      child.kill();
+    });
+    child.stdout.on("data", (chunk) => writeChunk(chunk, child.stdout));
+    child.stderr.on("data", (chunk) => writeChunk(chunk, child.stderr));
+    child.once("error", (e) => {
+      const reason = formatMessage(t("buildStartFailed", lang), [label, errorMessage(e)]);
+      fail(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail), 40, reason)));
+    });
+    child.once("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      if (logError) {
+        reject(new SetupError(formatMessage(t("buildLogFileError", lang), [errorMessage(logError)])));
+        return;
+      }
+      if (signal) {
+        const reason = formatMessage(t("buildSignalFailed", lang), [label, signal]);
+        reject(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail), 40, reason)));
+        return;
+      }
+      if (code !== 0) {
+        reject(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail))));
+        return;
+      }
+      resolve();
+    });
+  }).then(
+    () => {
+      const successMessage = formatMessage(t("buildStepDone", lang), [label, formatElapsed(Date.now() - startedAt)]);
+      if (useDynamic) finishDynamicStatus(c(32, "✓ ") + successMessage, ticker);
+      else ok(successMessage);
+    },
+    (failure) => {
+      const failedMessage = formatMessage(t("buildStepFailed", lang), [label, formatElapsed(Date.now() - startedAt)]);
+      if (useDynamic) finishDynamicStatus(c(31, "✗ ") + failedMessage, ticker);
+      else err(failedMessage);
+      throw failure;
+    }
+  );
 }
 
 function bannerTitle(lang, version) {
