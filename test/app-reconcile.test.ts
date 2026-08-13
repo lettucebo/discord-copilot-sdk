@@ -272,12 +272,13 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const internals = app as unknown as {
         actorCreateDependencies?: {
           secureOpen?: { backend?: SecureOpenBackend; pathMode?: "win32" | "posix" };
+          fileDeliveryPlatform?: NodeJS.Platform;
         };
         bindingCheck: (binding: { workDir: string }) => Promise<{ ok: true }>;
         approvalKeyFor(path: string): Promise<string>;
         resumeRecord(record: unknown): Promise<void>;
       };
-      internals.actorCreateDependencies = { secureOpen: { backend, pathMode } };
+      internals.actorCreateDependencies = { secureOpen: { backend, pathMode }, fileDeliveryPlatform: "win32" };
       internals.bindingCheck = vi.fn(async (binding) => {
         expect(binding.workDir).toBe(validationPath);
         return { ok: true } as const;

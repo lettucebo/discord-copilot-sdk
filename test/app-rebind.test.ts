@@ -848,9 +848,13 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       app as unknown as {
         actorCreateDependencies?: {
           secureOpen?: { backend?: SecureOpenBackend; pathMode?: "win32" | "posix" };
+          fileDeliveryPlatform?: NodeJS.Platform;
         };
       }
-    ).actorCreateDependencies = { secureOpen: { backend, pathMode: "posix" } };
+    ).actorCreateDependencies = {
+      secureOpen: { backend, pathMode: "posix" },
+      fileDeliveryPlatform: "win32",
+    };
     const bindingCheck = vi.fn(async (binding: { workDir: string }) =>
       binding.workDir === validationPath
         ? {
@@ -912,9 +916,10 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       app as unknown as {
         actorCreateDependencies?: {
           secureOpen?: { backend?: SecureOpenBackend; pathMode?: "win32" | "posix" };
+          fileDeliveryPlatform?: NodeJS.Platform;
         };
       }
-    ).actorCreateDependencies = { secureOpen: { backend, pathMode } };
+    ).actorCreateDependencies = { secureOpen: { backend, pathMode }, fileDeliveryPlatform: "win32" };
     const bindingCheck = vi.fn(async (binding: { workDir: string }) => {
       expect(binding.workDir).toBe(validationPath);
       return { ok: true } as const;

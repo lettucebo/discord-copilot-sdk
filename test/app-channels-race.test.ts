@@ -452,9 +452,10 @@ describe("/new channel-registry epoch fence", { timeout: 60_000 }, () => {
       app as unknown as {
         actorCreateDependencies?: {
           secureOpen?: { backend?: SecureOpenBackend; pathMode?: "win32" | "posix" };
+          fileDeliveryPlatform?: NodeJS.Platform;
         };
       }
-    ).actorCreateDependencies = { secureOpen: { backend, pathMode } };
+    ).actorCreateDependencies = { secureOpen: { backend, pathMode }, fileDeliveryPlatform: "win32" };
     const bindingCheck = vi.fn(async (binding: Binding) => {
       expect(binding.workDir).toBe(validationPath);
       return { ok: true } as const;
