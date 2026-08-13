@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs";
 import os from "node:os";
@@ -108,6 +108,7 @@ async function runUpdate(
   envOverrides: NodeJS.ProcessEnv = {}
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const home = path.join(root, `home-${serial}`);
+  const childPath = envOverrides.PATH ?? `${bin}${path.delimiter}${process.env.PATH ?? ""}`;
   await fs.promises.mkdir(home, { recursive: true });
   await beforeRun?.(home);
   try {
@@ -120,7 +121,8 @@ async function runUpdate(
         DISCORD_COPILOT_SDK_REF: "main",
         HOME: home,
         USERPROFILE: home,
-        PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+        PATH: childPath,
+        Path: childPath,
         ...envOverrides,
       },
       encoding: "utf8",
@@ -136,45 +138,51 @@ async function runUpdate(
   }
 }
 
-async function runUpdateAfterRemoteResolved(
-  target: string,
-  args: string[],
-  onRemoteResolved: () => Promise<void>
-): Promise<{ code: number; stdout: string; stderr: string }> {
-  const home = path.join(root, `home-${serial}`);
-  await fs.promises.mkdir(home, { recursive: true });
-  const child = spawn(process.execPath, [ENGINE, ...args], {
-    cwd: ROOT,
-    env: {
-      ...process.env,
-      DISCORD_COPILOT_SDK_UPDATE_ROOT: target,
-      DISCORD_COPILOT_SDK_INSTANCE_ID: `${instancePrefix}-${serial}`,
-      DISCORD_COPILOT_SDK_REF: "main",
-      HOME: home,
-      USERPROFILE: home,
-      PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdout = "";
-  let stderr = "";
-  let mutation: Promise<void> | undefined;
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => {
-    stdout += chunk;
-    if (mutation === undefined && stdout.includes("requested main ->")) mutation = onRemoteResolved();
-  });
-  child.stderr.on("data", (chunk: string) => {
-    stderr += chunk;
-  });
-  const code = await new Promise<number>((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", (exitCode) => resolve(exitCode ?? 1));
-  });
-  if (mutation === undefined) throw new Error("updater did not resolve the requested remote ref");
-  await mutation;
-  return { code, stdout, stderr };
+function realGitPath(): string {
+  const locator = process.platform === "win32" ? "where" : "which";
+  const output = execFileSync(locator, ["git"], { encoding: "utf8" });
+  const executable = output.split(/\r?\n/).find((entry) => entry.trim() !== "");
+  if (!executable) throw new Error("could not locate real git");
+  return executable.trim();
+}
+
+async function createFetchBarrier(binDir: string, record: string): Promise<string> {
+  const shim = path.join(binDir, "git-fetch-barrier.cjs");
+  await fs.promises.mkdir(binDir, { recursive: true });
+  await fs.promises.writeFile(
+    shim,
+    [
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'const { spawnSync } = require("node:child_process");',
+      'if (path.basename(process.execPath).toLowerCase() === "git.exe") {',
+      "  const args = process.argv.slice(1);",
+      "  args[0] = path.basename(args[0]);",
+      '  if (args[0] === "fetch") {',
+      '    fs.writeFileSync(process.env.DCS_FETCH_BARRIER_RECORD, JSON.stringify(args));',
+      '    const pushed = spawnSync(process.env.DCS_FETCH_BARRIER_GIT, ["-C", process.env.DCS_FETCH_BARRIER_SOURCE, "push", "-q", "origin", "main"], { stdio: "inherit" });',
+      '    if (pushed.status !== 0) process.exit(pushed.status ?? 1);',
+      "  }",
+      '  const result = spawnSync(process.env.DCS_FETCH_BARRIER_GIT, args, { stdio: "inherit" });',
+      "  process.exit(result.status ?? 1);",
+      "}",
+      "",
+    ].join("\n"),
+    "utf8"
+  );
+  if (process.platform === "win32") {
+    const wrapper = path.join(binDir, "git.exe");
+    try {
+      await fs.promises.link(process.execPath, wrapper);
+    } catch {
+      await fs.promises.copyFile(process.execPath, wrapper);
+    }
+  } else {
+    const wrapper = path.join(binDir, "git");
+    await fs.promises.writeFile(wrapper, `#!/usr/bin/env sh\nexec "${process.execPath}" "${shim}" "$@"\n`, "utf8");
+    await fs.promises.chmod(wrapper, 0o755);
+  }
+  return shim;
 }
 
 function expectInOrder(output: string, ...parts: string[]) {
@@ -187,11 +195,23 @@ function expectInOrder(output: string, ...parts: string[]) {
   }
 }
 
-function expectedApplyCommand(target: string, instance: string): string {
+function expectedUpdateCommand(target: string, instance: string, args: string[]): string {
   if (process.platform === "win32") {
-    return `$env:DISCORD_COPILOT_SDK_INSTANCE_ID = '${instance}'; & '${path.join(target, "update.ps1").replace(/'/g, "''")}'`;
+    return `$env:DISCORD_COPILOT_SDK_INSTANCE_ID = '${instance}'; & '${path.join(target, "update.ps1").replace(/'/g, "''")}'${args
+      .map((arg) => (arg.startsWith("refs/") ? ` -Ref '${arg}'` : arg === "all" ? " -AllInstances" : " -Restore"))
+      .join("")}`;
   }
-  return `DISCORD_COPILOT_SDK_INSTANCE_ID=${instance} bash "${path.join(target, "update.sh")}"`;
+  return `DISCORD_COPILOT_SDK_INSTANCE_ID=${instance} bash "${path.join(target, "update.sh")}"${args
+    .map((arg) => (arg.startsWith("refs/") ? ` --ref '${arg}'` : arg === "all" ? " --all-instances" : " --restore"))
+    .join("")}`;
+}
+
+function expectedApplyCommand(target: string, instance: string, ref = "main", allInstances = false): string {
+  return expectedUpdateCommand(target, instance, [...(ref === "main" ? [] : [ref]), ...(allInstances ? ["all"] : [])]);
+}
+
+function expectedRestoreCommand(target: string, instance: string): string {
+  return expectedUpdateCommand(target, instance, ["restore"]);
 }
 
 beforeAll(async () => {
@@ -431,7 +451,19 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(fs.existsSync(path.join(local, ".git", "FETCH_HEAD"))).toBe(true);
   });
 
-  it("refuses a fetch that resolves to a different commit before state or downtime", async () => {
+  it("preserves a non-main ref and all-instance scope in the wrapper apply hint", async () => {
+    await advanceToVersion("3.5.0");
+    const local = await cloneTarget("wrapper-apply-flags");
+    await advanceToVersion("3.6.0");
+    const instance = `${instancePrefix}-${serial}`;
+
+    const result = await runUpdate(local, ["--check", "--ref", "refs/heads/main", "--all-instances", "--lang", "en"]);
+
+    expect(result.code, result.stderr).toBe(2);
+    expect(result.stdout).toContain(`Apply it with: ${expectedApplyCommand(local, instance, "refs/heads/main", true)}`);
+  });
+
+  it("pins a remote move at the controlled fetch barrier before state or downtime", async () => {
     await advanceToVersion("3.0.0");
     const local = await cloneTarget("fetch-mismatch");
     const before = (await git(local, "rev-parse", "HEAD")).stdout.trim();
@@ -440,17 +472,30 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     await git(source, "add", "package.json");
     await git(source, "commit", "-q", "-m", "move main during fetch");
     const movedSha = (await git(source, "rev-parse", "HEAD")).stdout.trim();
+    const barrierBin = path.join(root, `fetch-barrier-${serial}`);
+    const fetchRecord = path.join(barrierBin, "fetch-args.json");
+    const shim = await createFetchBarrier(barrierBin, fetchRecord);
 
-    const result = await runUpdateAfterRemoteResolved(local, ["--yes", "--no-restart", "--lang", "en"], () =>
-      git(source, "push", "-q", "origin", "main").then(() => undefined)
-    );
+    const result = await runUpdate(local, ["--yes", "--no-restart", "--lang", "en"], undefined, {
+      PATH: `${barrierBin}${path.delimiter}${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+      DCS_FETCH_BARRIER_GIT: realGitPath(),
+      DCS_FETCH_BARRIER_RECORD: fetchRecord,
+      DCS_FETCH_BARRIER_SOURCE: source,
+      NODE_OPTIONS: `--require=${shim}${process.env.NODE_OPTIONS ? ` ${process.env.NODE_OPTIONS}` : ""}`,
+    });
+    expect(fs.existsSync(fetchRecord), `${result.stdout}${result.stderr}`).toBe(true);
+    const fetchArgs = JSON.parse(await fs.promises.readFile(fetchRecord, "utf8")) as string[];
     const home = path.join(root, `home-${serial}`);
 
+    expect(fetchArgs).toContain("fetch");
+    expect(fetchArgs.some((arg) => /^\+?refs\/heads\/main:refs\/dcs-update\/[0-9a-f-]+$/i.test(arg))).toBe(true);
+    expect(fs.readFileSync(ENGINE, "utf8")).not.toContain("FETCH_HEAD");
     expect(result.code).toBe(1);
     expect(result.stderr).toContain(`fetched revision ${movedSha} does not match resolved remote revision ${resolvedSha}`);
     expect((await git(local, "rev-parse", "HEAD")).stdout.trim()).toBe(before);
     expect(result.stdout).not.toContain("[1/4] Stop");
     expect(fs.existsSync(path.join(home, ".discord-copilot-sdk"))).toBe(false);
+    expect((await git(local, "for-each-ref", "--format=%(refname)", "refs/dcs-update")).stdout.trim()).toBe("");
   });
 
   it("displays target metadata from the fetched SHA instead of another fetched object", async () => {
@@ -621,7 +666,9 @@ describe("git update data paths", { timeout: 60_000 }, () => {
 
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain("Already up to date:");
-    expect(result.stdout).toContain("Warning: a previous update left a recovery record; run node scripts/update.mjs --restore.");
+    expect(result.stdout).toContain(
+      `Warning: a previous update left a recovery record; run ${expectedRestoreCommand(local, `${instancePrefix}-${serial}`)}.`
+    );
   });
 
   it("makes a pending restore record actionable when --check finds an update", async () => {
@@ -640,7 +687,9 @@ describe("git update data paths", { timeout: 60_000 }, () => {
 
     expect(result.code, result.stderr).toBe(2);
     expect(result.stdout).toContain("Update available: 4.0.0 (");
-    expect(result.stdout).toContain("Warning: a previous update left a recovery record; run node scripts/update.mjs --restore.");
+    expect(result.stdout).toContain(
+      `Warning: a previous update left a recovery record; run ${expectedRestoreCommand(local, `${instancePrefix}-${serial}`)}.`
+    );
     expect(result.stdout).not.toContain("Apply it with:");
   });
 
@@ -661,7 +710,9 @@ describe("git update data paths", { timeout: 60_000 }, () => {
 
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain("\nDry-run plan\n");
-    expect(result.stdout).toContain("Warning: a previous update left a recovery record; run node scripts/update.mjs --restore.");
+    expect(result.stdout).toContain(
+      `Warning: a previous update left a recovery record; run ${expectedRestoreCommand(local, `${instancePrefix}-${serial}`)}.`
+    );
     expect(result.stdout).not.toContain("Apply it with:");
     expect(fs.existsSync(fetchHead)).toBe(false);
   });
@@ -823,7 +874,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
       expect(result.stdout).toContain(instance);
       expect(result.stdout).toContain("Update finalization");
       expect(result.stdout).toContain("did not complete");
-      expect(result.stdout).toContain("node scripts/update.mjs --restore");
+      expect(result.stdout).toContain(expectedRestoreCommand(local, instance));
       expect(result.stdout).not.toContain("Restored the pre-update running state.");
       expect(result.stdout).not.toContain("Update complete");
       expect(result.stderr).toContain("simulated setup failure");
@@ -915,7 +966,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
       expect(result.stdout).toContain("Update finalization");
       expect(result.stdout).toContain("did not complete");
       expect(result.stdout).toContain("Recovery command");
-      expect(result.stdout).toContain("node scripts/update.mjs --restore");
+      expect(result.stdout).toContain(expectedRestoreCommand(local, instance));
       expect(result.stdout).not.toContain("Restored the pre-update running state.");
       expect(result.stdout).not.toContain("Update complete");
       expect(result.stdout).not.toContain("Update succeeded; --no-restart leaves it stopped.");

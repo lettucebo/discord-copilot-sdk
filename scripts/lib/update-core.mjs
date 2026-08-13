@@ -125,13 +125,31 @@ function quoteShellPath(value) {
  */
 export function buildApplyCommand({ platform, updateScript, ref, instance, allInstances }) {
   const args = [];
-  if (ref !== "main") args.push("--ref", platform === "win32" ? `'${quotePowerShell(ref)}'` : quoteShell(ref));
-  if (allInstances) args.push("--all-instances");
+  if (ref !== "main") args.push(platform === "win32" ? "-Ref" : "--ref", platform === "win32" ? `'${quotePowerShell(ref)}'` : quoteShell(ref));
+  if (allInstances) args.push(platform === "win32" ? "-AllInstances" : "--all-instances");
   const suffix = args.length ? ` ${args.join(" ")}` : "";
   if (platform === "win32") {
     return `$env:DISCORD_COPILOT_SDK_INSTANCE_ID = '${quotePowerShell(instance)}'; & '${quotePowerShell(updateScript)}'${suffix}`;
   }
   return `DISCORD_COPILOT_SDK_INSTANCE_ID=${instance} bash "${quoteShellPath(updateScript)}"${suffix}`;
+}
+
+/**
+ * Render the explicit recovery command through the same platform wrapper as
+ * a normal update, retaining the selected instance without bypassing wrapper
+ * argument binding.
+ *
+ * @param {{
+ *   platform: string,
+ *   updateScript: string,
+ *   instance: string
+ * }} input
+ */
+export function buildRestoreCommand({ platform, updateScript, instance }) {
+  if (platform === "win32") {
+    return `$env:DISCORD_COPILOT_SDK_INSTANCE_ID = '${quotePowerShell(instance)}'; & '${quotePowerShell(updateScript)}' -Restore`;
+  }
+  return `DISCORD_COPILOT_SDK_INSTANCE_ID=${instance} bash "${quoteShellPath(updateScript)}" --restore`;
 }
 
 /**

@@ -15,10 +15,12 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseEnv } from "node:util";
 import {
   buildApplyCommand,
+  buildRestoreCommand,
   classifyCheckout,
   displayRemoteRef,
   parseLsRemote,
@@ -141,7 +143,7 @@ function printRestoreStatus({ instance, repoRoot, oldSha, createdAt, currentVers
   console.log(formatSummary(rows));
 }
 
-function printUpdateIncomplete({ currentVersion, localSha, targetVersion, remoteSha, instances }) {
+function printUpdateIncomplete({ currentVersion, localSha, targetVersion, remoteSha, instances, instance }) {
   console.log(formatSection(t("updateIncompleteHeader", lang)));
   console.log(
     formatSummary([
@@ -149,7 +151,7 @@ function printUpdateIncomplete({ currentVersion, localSha, targetVersion, remote
       [t("updatePlanTargetVersion", lang), formatVersionAndSha(targetVersion, remoteSha)],
       [t("updatePlanTargetInstances", lang), instances.join(", ")],
       [t("updateIncompleteRestartLabel", lang), t("updateIncompleteRestart", lang)],
-      [t("updateIncompleteRecoveryLabel", lang), restoreCommand()],
+      [t("updateIncompleteRecoveryLabel", lang), restoreCommand(instance)],
     ])
   );
 }
@@ -280,8 +282,12 @@ function applyCommand(ref, instance, allInstances) {
   });
 }
 
-function restoreCommand() {
-  return "node scripts/update.mjs --restore";
+function restoreCommand(instance) {
+  return buildRestoreCommand({
+    platform: process.platform,
+    updateScript: path.join(REPO_ROOT, process.platform === "win32" ? "update.ps1" : "update.sh"),
+    instance,
+  });
 }
 
 function onPath(command) {
@@ -327,26 +333,68 @@ function remoteFor(ref) {
 
 function fetchResolved(remote, checkoutKind, options = {}) {
   const ref = displayRemoteRef(remote.ref);
-  const args = ["fetch"];
-  if (checkoutKind === "managed") args.push("--depth", "1");
-  args.push("origin", ref);
+  const privateRef = `refs/dcs-update/${randomUUID()}`;
   try {
+    const args = ["fetch"];
+    if (checkoutKind === "managed") args.push("--depth", "1");
+    args.push("origin", `${ref}:${privateRef}`);
     if (options.quiet) {
       run("git", args);
     } else {
       runInherited("git", args);
     }
   } catch {
+    try {
+      run("git", ["update-ref", "-d", privateRef]);
+    } catch {
+      // The failed fetch is the primary error; a unique private ref may not
+      // exist yet, so cleanup must not hide that refusal.
+    }
     throw new UpdateError(`could not fetch origin ${ref}`);
   }
-  const fetchedSha = tryRun("git", ["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?.trim();
+  const fetchedSha = tryRun("git", ["rev-parse", "--verify", `${privateRef}^{commit}`])?.trim();
   if (!fetchedSha || !/^[0-9a-f]{40,64}$/i.test(fetchedSha)) {
+    try {
+      run("git", ["update-ref", "-d", privateRef]);
+    } catch {
+      // Preserve the malformed private-ref proof failure.
+    }
     throw new UpdateError(`could not resolve fetched revision for ${ref}`);
   }
   if (fetchedSha !== remote.sha) {
+    try {
+      run("git", ["update-ref", "-d", privateRef]);
+    } catch {
+      // The remote movement mismatch is the primary safe failure.
+    }
     throw new UpdateError(`fetched revision ${fetchedSha} does not match resolved remote revision ${remote.sha}`);
   }
-  return fetchedSha;
+  return { targetSha: fetchedSha, privateRef };
+}
+
+function deletePrivateRef(privateRef) {
+  try {
+    run("git", ["update-ref", "-d", privateRef]);
+  } catch {
+    throw new UpdateError(`could not clean private update ref ${privateRef}`);
+  }
+}
+
+async function withFetchedTarget(remote, checkoutKind, options, action) {
+  const fetched = fetchResolved(remote, checkoutKind, options);
+  let actionFailed = false;
+  try {
+    return await action(fetched.targetSha);
+  } catch (error) {
+    actionFailed = true;
+    throw error;
+  } finally {
+    try {
+      deletePrivateRef(fetched.privateRef);
+    } catch (error) {
+      if (!actionFailed) throw error;
+    }
+  }
 }
 
 function preflightBranchFastForward(targetSha) {
@@ -784,22 +832,23 @@ async function main() {
   }
   if (decision.action === "up-to-date") {
     console.log(message("updateAlreadyCurrent", currentVersion, local.slice(0, 12)));
-    if (pendingRestore) console.log(message("updatePendingRestore"));
+    if (pendingRestore) console.log(message("updatePendingRestore", restoreCommand(instance)));
     return;
   }
 
   if (decision.action === "check") {
-    const targetSha = fetchResolved(remote, checkout.kind, { quiet: true });
-    const targetVersion = fetchedPackageVersion(targetSha);
-    const targetNotes = fetchedTargetNotes(targetSha, targetVersion);
-    console.log(message("updateAvailable", currentVersion, local.slice(0, 12), targetVersion, targetSha.slice(0, 12)));
-    printTargetNotes({ targetVersion, changelogSection: targetNotes, localSha: local, remoteSha: targetSha });
-    if (pendingRestore) {
-      console.log(message("updatePendingRestore"));
-    } else {
-      console.log(message("updateApplyHint", applyCommand(ref, instance, flags.allInstances)));
-    }
-    process.exitCode = 2; // useful to a monitor: an update exists, no action taken
+    await withFetchedTarget(remote, checkout.kind, { quiet: true }, async (targetSha) => {
+      const targetVersion = fetchedPackageVersion(targetSha);
+      const targetNotes = fetchedTargetNotes(targetSha, targetVersion);
+      console.log(message("updateAvailable", currentVersion, local.slice(0, 12), targetVersion, targetSha.slice(0, 12)));
+      printTargetNotes({ targetVersion, changelogSection: targetNotes, localSha: local, remoteSha: targetSha });
+      if (pendingRestore) {
+        console.log(message("updatePendingRestore", restoreCommand(instance)));
+      } else {
+        console.log(message("updateApplyHint", applyCommand(ref, instance, flags.allInstances)));
+      }
+      process.exitCode = 2; // useful to a monitor: an update exists, no action taken
+    });
     return;
   }
   if (decision.action === "dry-run") {
@@ -809,13 +858,13 @@ async function main() {
       remote,
       instances: targetIds,
     });
-    if (pendingRestore) console.log(message("updatePendingRestore"));
+    if (pendingRestore) console.log(message("updatePendingRestore", restoreCommand(instance)));
     return;
   }
 
   // Fetch and prove branch ancestry BEFORE downtime. Fetch adds objects but
   // never moves HEAD, so failures here leave the running installation intact.
-  const targetSha = fetchResolved(remote, checkout.kind);
+  await withFetchedTarget(remote, checkout.kind, {}, async (targetSha) => {
   if (checkout.kind === "branch-clean") preflightBranchFastForward(targetSha);
   if (checkout.kind === "managed") {
     const dangling = countDanglingManagedCommits(targetSha);
@@ -889,13 +938,15 @@ async function main() {
         targetVersion,
         remoteSha: targetSha,
         instances: state.instances.map(({ instance: id }) => id),
+        instance,
       });
-      console.log(message("updateFailed"));
+      console.log(message("updateFailed", restoreCommand(instance)));
     }
     throw error;
   } finally {
     releaseLock();
   }
+  });
 }
 
 main().catch((error) => {

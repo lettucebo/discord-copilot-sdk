@@ -192,10 +192,11 @@ fork is not supported in v1, even if its bootstrap script is fetched through
 `--check` exits `0` if the requested ref already equals HEAD, `2` if an update
 exists, or `1` on a fail-closed preflight refusal (for example, a dirty
 checkout or another live instance). An already-current check does not fetch.
-When an update exists, `--check` fetches the requested ref into the local Git
-object database and `FETCH_HEAD` **without moving HEAD or touching the bot,
-residency, `.env`, or setup**. This lets it truthfully show the target version,
-bounded target notes, and a full commit comparison link. `--dry-run` remains
+When an update exists, `--check` fetches the requested ref into a unique,
+short-lived private local ref under `refs/dcs-update/` **without moving HEAD or
+touching the bot, residency, `.env`, or setup**. This lets it truthfully show
+the target version, bounded target notes, and a full commit comparison link.
+`--dry-run` remains
 read-only: it does not fetch, stop, build, write, or checkout, and explicitly
 labels target-version/note discovery as work for a real update. Short refs
 prefer a branch over a same-named tag; use `--ref refs/tags/v0.1.0` to remove
@@ -226,8 +227,8 @@ checkout also require separate operator attention.
 
 The updater refuses a dirty or unknown checkout. A named development branch
 updates only through `git merge --ff-only`, after proving ancestry; a
-bootstrap-managed detached checkout fetches depth-one then detaches at
-`FETCH_HEAD`. It scans all live instance locks and requires `--all-instances`
+bootstrap-managed detached checkout fetches depth-one then detaches at the
+verified immutable commit SHA. It scans all live instance locks and requires `--all-instances`
 before touching source used by another instance.
 
 The apply sequence is: read-only preflight → fetch → branch/config proof →
@@ -249,7 +250,9 @@ each instance stopped and prints its exact manual start command.
 > ⚠️ If setup, restore, or final state cleanup fails after a state record is
 > created, the updater preserves
 > `~/.discord-copilot-sdk/update-state.<instance>.json`, reports **Update
-> incomplete**, and prints `node scripts/update.mjs --restore`. It never starts
+> incomplete**, and prints the platform wrapper recovery command:
+> `update.ps1 -Restore` on Windows or `update.sh --restore` on macOS/Linux,
+> with the selected instance environment preserved. It never starts
 > an automatic second restore. Do not infer that every bot is stopped or running
 > from that failure alone: inspect the shown instance state and recover
 > explicitly. On Windows stopping is a hard termination, so an in-flight turn

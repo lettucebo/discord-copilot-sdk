@@ -16,6 +16,7 @@ import {
   remoteRefSpecs,
   shouldRetainRestoreState,
   buildApplyCommand,
+  buildRestoreCommand,
   displayRemoteRef,
   updateLockRelativePath,
 } from "../scripts/lib/update-core.mjs";
@@ -233,6 +234,42 @@ describe("buildApplyCommand", () => {
     ).toBe(
       "DISCORD_COPILOT_SDK_INSTANCE_ID=work bash \"/srv/discord-copilot-sdk/update.sh\" --ref 'release'\\''; echo unsafe' --all-instances"
     );
+  });
+
+  it("uses PowerShell-native flags for a non-main all-instance update", () => {
+    expect(
+      buildApplyCommand({
+        platform: "win32",
+        updateScript: "C:\\Program Files\\discord-copilot-sdk\\update.ps1",
+        ref: "refs/tags/v1.2.3",
+        instance: "ops",
+        allInstances: true,
+      })
+    ).toBe(
+      "$env:DISCORD_COPILOT_SDK_INSTANCE_ID = 'ops'; & 'C:\\Program Files\\discord-copilot-sdk\\update.ps1' -Ref 'refs/tags/v1.2.3' -AllInstances"
+    );
+  });
+});
+
+describe("buildRestoreCommand", () => {
+  it("uses the selected instance and PowerShell-native restore flag", () => {
+    expect(
+      buildRestoreCommand({
+        platform: "win32",
+        updateScript: "C:\\Program Files\\discord-copilot-sdk\\update.ps1",
+        instance: "ops",
+      })
+    ).toBe("$env:DISCORD_COPILOT_SDK_INSTANCE_ID = 'ops'; & 'C:\\Program Files\\discord-copilot-sdk\\update.ps1' -Restore");
+  });
+
+  it("uses the shell wrapper for the selected instance", () => {
+    expect(
+      buildRestoreCommand({
+        platform: "linux",
+        updateScript: "/srv/discord copilot/update.sh",
+        instance: "ops",
+      })
+    ).toBe("DISCORD_COPILOT_SDK_INSTANCE_ID=ops bash \"/srv/discord copilot/update.sh\" --restore");
   });
 });
 

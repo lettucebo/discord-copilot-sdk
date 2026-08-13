@@ -175,7 +175,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 ./update.sh --restore
 ```
 
-`--check` 在要求的 ref 已等於 HEAD 時 exit `0`、有更新時 `2`、fail-closed preflight 拒絕時 `1`（例如 dirty checkout 或另一個 live instance）。已是最新時不會 fetch。有更新時，`--check` 會把要求的 ref fetch 到本機 Git object database 和 `FETCH_HEAD`，**不會移動 HEAD，也不會碰 bot、常駐、`.env` 或 setup**；因此它能誠實顯示目標版本、有限的目標變更摘要和完整 commit 比較連結。`--dry-run` 保持唯讀：不 fetch、停機、建置、寫入或 checkout，並會明確說目標版本／摘要要等真正更新 fetch 後才知道。短 ref 同時是 branch/tag 時優先選 branch；用 `--ref refs/tags/v0.1.0` 可消除歧義。annotated tag 比較的是 peeled commit，不是 tag object。
+`--check` 在要求的 ref 已等於 HEAD 時 exit `0`、有更新時 `2`、fail-closed preflight 拒絕時 `1`（例如 dirty checkout 或另一個 live instance）。已是最新時不會 fetch。有更新時，`--check` 會把要求的 ref fetch 到 `refs/dcs-update/` 底下唯一、短暫的私有本機 ref，**不會移動 HEAD，也不會碰 bot、常駐、`.env` 或 setup**；因此它能誠實顯示目標版本、有限的目標變更摘要和完整 commit 比較連結。`--dry-run` 保持唯讀：不 fetch、停機、建置、寫入或 checkout，並會明確說目標版本／摘要要等真正更新 fetch 後才知道。短 ref 同時是 branch/tag 時優先選 branch；用 `--ref refs/tags/v0.1.0` 可消除歧義。annotated tag 比較的是 peeled commit，不是 tag object。
 
 更新器永遠會標示它檢查的 checkout。例如 source 已同步時會印出：
 
@@ -198,7 +198,7 @@ Checkout         branch-clean (main)
 更新器也會提示留下了復原記錄；過期的 build output、dependencies 或手動改過的
 checkout 仍須由操作者另外處理。
 
-更新器會拒絕 dirty 或無法辨識的 checkout。具名開發分支只有在先證明 ancestor 關係後，才用 `git merge --ff-only` 更新；bootstrap 管理的 detached checkout 則 depth-one fetch 後 detach 到 `FETCH_HEAD`。它會掃描所有 live instance lock，若有其他 instance 正在跑，必須顯式傳入 `--all-instances` 才能改動共用 source。
+更新器會拒絕 dirty 或無法辨識的 checkout。具名開發分支只有在先證明 ancestor 關係後，才用 `git merge --ff-only` 更新；bootstrap 管理的 detached checkout 則 depth-one fetch 後 detach 到已驗證、不可變的 commit SHA。它會掃描所有 live instance lock，若有其他 instance 正在跑，必須顯式傳入 `--all-instances` 才能改動共用 source。
 
 apply 順序是：唯讀 preflight → fetch → branch／設定證明 → 顯示目標版本的**更新計畫**和目標變更摘要 → active-thread guard → 停常駐 → 停 bot → 移動 source → `setup.mjs --yes --skip-auth --no-residency` → 還原。既有常駐只會重新 enable/start，絕不重新 register，所以 Windows 24/7 task 不會悄悄降成登入後保活。完整差異連結由精確的本機／fetch SHA 組成，不會假設目標一定已發佈成 GitHub Release。
 
@@ -208,7 +208,7 @@ apply 順序是：唯讀 preflight → fetch → branch／設定證明 → 顯�
 狀態：原本已停止的 instance 會維持停止並明講原因。`--no-restart` 也會讓
 每個 instance 保持停止，並印出可直接使用的手動啟動指令。
 
-> ⚠️ state record 建立後，若 setup、還原或最後的 state 清理失敗，更新器會保留 `~/.discord-copilot-sdk/update-state.<instance>.json`、回報**更新未完成**，並印出 `node scripts/update.mjs --restore`。它絕不自動做第二次還原。不要從這個失敗訊息推論所有 bot 一定已停止或仍在執行：請檢查顯示的 instance 狀態，再明確執行復原。Windows 停止是硬終止，進行中的 turn 可能遺失。先查看 active thread/worktree，只有確定可中斷時才確認 guard（或使用 `--yes`）。
+> ⚠️ state record 建立後，若 setup、還原或最後的 state 清理失敗，更新器會保留 `~/.discord-copilot-sdk/update-state.<instance>.json`、回報**更新未完成**，並印出平台 wrapper 的復原指令：Windows 是 `update.ps1 -Restore`，macOS/Linux 是 `update.sh --restore`，且會保留所選 instance 的環境。它絕不自動做第二次還原。不要從這個失敗訊息推論所有 bot 一定已停止或仍在執行：請檢查顯示的 instance 狀態，再明確執行復原。Windows 停止是硬終止，進行中的 turn 可能遺失。先查看 active thread/worktree，只有確定可中斷時才確認 guard（或使用 `--yes`）。
 > 有待處理的復原記錄時，新的 apply 不能覆蓋它；在 `--restore` 解決前，`--check` 與 `--dry-run` 仍可用於診斷。
 
 ### 發版
