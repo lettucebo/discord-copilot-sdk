@@ -247,9 +247,9 @@ export function readyMarkerMatches(text, instance, pid) {
   }
 }
 
-/** A restore snapshot exists only to recover from a failed setup/apply path. */
-export function shouldRetainRestoreState(setupSucceeded) {
-  return !setupSucceeded;
+/** A restore snapshot exists until the whole update flow finishes cleanly. */
+export function shouldRetainRestoreState(updateCompleted) {
+  return !updateCompleted;
 }
 
 /** The apply sequence. Residency must stop before the process it restarts. */

@@ -448,7 +448,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
 
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain("Already up to date:");
-    expect(result.stdout).toContain("Warning: a failed update still awaits --restore; the bot remains stopped.");
+    expect(result.stdout).toContain("Warning: a failed update still awaits --restore; automatic recovery did not complete.");
   });
 
   it("does not warn a checkout about another checkout's pending restore state", async () => {
@@ -585,8 +585,8 @@ describe("git update data paths", { timeout: 60_000 }, () => {
       expect(result.stdout).toContain(`0.9.0 (${localSha.slice(0, 12)})`);
       expect(result.stdout).toContain(`1.0.0 (${remoteSha.slice(0, 12)})`);
       expect(result.stdout).toContain(instance);
-      expect(result.stdout).toContain("Automatic restart");
-      expect(result.stdout).toContain("did not occur");
+      expect(result.stdout).toContain("Automatic recovery");
+      expect(result.stdout).toContain("did not complete");
       expect(result.stdout).toContain("node scripts/update.mjs --restore");
       expect(result.stdout).not.toContain("Restored the pre-update running state.");
       expect(result.stdout).not.toContain("Update complete");
@@ -599,6 +599,93 @@ describe("git update data paths", { timeout: 60_000 }, () => {
       if (fs.existsSync(ready)) {
         expect(await fs.promises.readFile(ready, "utf8")).toContain(`"pid":${originalPid}`);
       }
+    } finally {
+      if (originalPid) {
+        try {
+          process.kill(originalPid);
+        } catch {
+          // The updater should already have stopped the original process.
+        }
+      }
+    }
+  });
+
+  it("reports structured restore guidance when setup succeeds but restore fails", async () => {
+    await advanceToVersion("1.0.1");
+    const local = await cloneTarget("restore-phase-failure");
+    const localSha = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+    await advanceToVersion("1.1.0");
+    await fs.promises.writeFile(path.join(source, "scripts", "setup.mjs"), "process.exit(0);\n");
+    await fs.promises.writeFile(
+      path.join(source, "run-bot.ps1"),
+      ["Write-Error 'simulated restore failure'", "exit 1", ""].join("\r\n")
+    );
+    await fs.promises.writeFile(
+      path.join(source, "run-bot.sh"),
+      ["#!/usr/bin/env bash", "echo 'simulated restore failure' >&2", "exit 1", ""].join("\n")
+    );
+    await git(source, "add", "scripts/setup.mjs", "run-bot.ps1", "run-bot.sh");
+    await git(source, "commit", "-q", "-m", "break restore startup");
+    await git(source, "push", "-q", "origin", "main");
+    const remoteSha = (await git(source, "rev-parse", "HEAD")).stdout.trim();
+    let originalPid: number | undefined;
+
+    try {
+      const result = await runUpdate(local, ["--yes", "--lang", "en"], async (home) => {
+        const instance = `${instancePrefix}-${serial}`;
+        const dist = path.join(local, "dist");
+        await fs.promises.mkdir(dist, { recursive: true });
+        await fs.promises.writeFile(
+          path.join(dist, "index.js"),
+          [
+            'const fs = require("node:fs");',
+            'const path = require("node:path");',
+            'const home = process.env.USERPROFILE || process.env.HOME;',
+            'const instance = process.env.DISCORD_COPILOT_SDK_INSTANCE_ID;',
+            'const state = path.join(home, ".discord-copilot-sdk");',
+            "fs.mkdirSync(state, { recursive: true });",
+            'const lock = path.join(state, `${instance}.lock`);',
+            "fs.writeFileSync(lock, String(process.pid));",
+            'const ready = path.join(state, "startup-ready");',
+            "fs.mkdirSync(ready, { recursive: true });",
+            'fs.writeFileSync(path.join(ready, `${instance}.ready.json`), JSON.stringify({ version: 1, pid: process.pid, instance }));',
+            "setInterval(() => {}, 1_000);",
+            "",
+          ].join("\n")
+        );
+        const child = spawn(process.execPath, [path.join(dist, "index.js")], {
+          env: {
+            ...process.env,
+            DISCORD_COPILOT_SDK_INSTANCE_ID: instance,
+            HOME: home,
+            USERPROFILE: home,
+          },
+          stdio: "ignore",
+        });
+        originalPid = child.pid;
+        await waitForLock(home, instance);
+      });
+
+      const instance = `${instancePrefix}-${serial}`;
+      const home = path.join(root, `home-${serial}`);
+      const stateFile = path.join(home, ".discord-copilot-sdk", `update-state.${instance}.json`);
+
+      expect(result.code).toBe(1);
+      expect(result.stdout).toContain("[4/4] Restore running state");
+      expect(result.stdout).toContain("\nUpdate incomplete\n");
+      expect(result.stdout).toContain(`1.0.1 (${localSha.slice(0, 12)})`);
+      expect(result.stdout).toContain(`1.1.0 (${remoteSha.slice(0, 12)})`);
+      expect(result.stdout).toContain(instance);
+      expect(result.stdout).toContain("Automatic recovery");
+      expect(result.stdout).toContain("did not complete");
+      expect(result.stdout).toContain("Recovery command");
+      expect(result.stdout).toContain("node scripts/update.mjs --restore");
+      expect(result.stdout).not.toContain("Restored the pre-update running state.");
+      expect(result.stdout).not.toContain("Update complete");
+      expect(result.stdout).not.toContain("Update succeeded; --no-restart leaves it stopped.");
+      expect(result.stderr).toContain("simulated restore failure");
+      expect(fs.existsSync(stateFile)).toBe(true);
+      expect(() => process.kill(originalPid as number, 0)).toThrow();
     } finally {
       if (originalPid) {
         try {

@@ -210,7 +210,7 @@ describe("planUpdate", () => {
       });
 
       describe("shouldRetainRestoreState", () => {
-        it("retains state only while setup has not succeeded", () => {
+        it("retains state until the update fully completes", () => {
           expect(shouldRetainRestoreState(false)).toBe(true);
           expect(shouldRetainRestoreState(true)).toBe(false);
         });

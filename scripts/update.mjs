@@ -818,7 +818,7 @@ async function main() {
 
   const releaseLock = acquireUpdateLock(instance);
   writeState(instance, state);
-  let setupSucceeded = false;
+  let updateCompleted = false;
   try {
     // `stop-bot` is the identity-aware lifecycle path. Do not duplicate its PID
     // trust checks here; verify afterward because its user-facing scripts return
@@ -836,11 +836,11 @@ async function main() {
     applySource(checkout.kind);
     printUpdateStage(3, "updateStageSetup");
     runSetup();
-    setupSucceeded = true;
     const now = localSha();
     console.log(message("updateApplied", currentVersion, local.slice(0, 12), currentPackageVersion(), now.slice(0, 12)));
     if (flags.noRestart) {
-      if (!shouldRetainRestoreState(setupSucceeded)) fs.rmSync(statePath(instance), { force: true });
+      fs.rmSync(statePath(instance), { force: true });
+      updateCompleted = true;
       for (const entry of state.instances) console.log(message("updateNoRestartInstance", entry.instance, startCommand(entry.instance)));
       console.log(message("updateNoRestart"));
       return;
@@ -848,9 +848,10 @@ async function main() {
     printUpdateStage(4, "updateStageRestore");
     await restoreState(state);
     fs.rmSync(statePath(instance), { force: true });
+    updateCompleted = true;
     console.log(message("updateComplete"));
   } catch (error) {
-    if (!setupSucceeded) {
+    if (shouldRetainRestoreState(updateCompleted)) {
       printUpdateIncomplete({
         currentVersion,
         localSha: local,
