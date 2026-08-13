@@ -137,6 +137,14 @@ bash install.sh --skip-auth
 
 The installer will: detect prerequisites → collect + **validate** config → `npm ci` + build → validate the config in memory against the real schema → **finally** write `.env` securely (owner-only, token never echoed, atomic write + backup) → (optional) residency → done report. (Build first, `.env` written last; on a **fresh install** npm never sees the token on disk.)
 
+Its output starts with an **Install plan**, then shows five numbered stages:
+prerequisites/sign-in state, configuration, dependency build, validation/write,
+and residency. The completion summary names the installed version plus exact
+start, stop, log, update, and uninstall commands. Successful build output is
+kept in an owner-only log under `~/.discord-copilot-sdk/logs`; it is shown on
+failure only as a bounded tail, together with the full log path. Pass
+`--verbose` to stream the underlying npm/build output directly.
+
 ---
 
 ## 3b. Update an existing installation
@@ -180,29 +188,40 @@ fork is not supported in v1, even if its bootstrap script is fetched through
 ./update.sh --restore
 ```
 
-`--check` performs no writes and exits `0` if the requested ref already equals
-HEAD, `2` if it differs, or `1` on a fail-closed preflight refusal (for example,
-a dirty checkout or another live instance). `--dry-run` presents the lifecycle
-plan without fetch, stop, build, write, or checkout. Short refs prefer a branch
-over a same-named tag; use `--ref refs/tags/v0.1.0` to remove ambiguity.
-Annotated tags compare their peeled commit, not the tag object.
+`--check` exits `0` if the requested ref already equals HEAD, `2` if an update
+exists, or `1` on a fail-closed preflight refusal (for example, a dirty
+checkout or another live instance). An already-current check does not fetch.
+When an update exists, `--check` fetches the requested ref into the local Git
+object database and `FETCH_HEAD` **without moving HEAD or touching the bot,
+residency, `.env`, or setup**. This lets it truthfully show the target version,
+bounded target notes, and a full commit comparison link. `--dry-run` remains
+read-only: it does not fetch, stop, build, write, or checkout, and explicitly
+labels target-version/note discovery as work for a real update. Short refs
+prefer a branch over a same-named tag; use `--ref refs/tags/v0.1.0` to remove
+ambiguity. Annotated tags compare their peeled commit, not the tag object.
 
 The updater always identifies the checkout it inspected. For example, a
 current-source check prints:
 
 ```text
 discord-copilot-sdk 0.1.0 (00de349c47e2)
-  root C:\Users\you\discord-copilot-sdk
-  checkout branch-clean (main)
-  requested main -> refs/heads/main @ 00de349c47e2
-Source HEAD already matches refs/heads/main; no update is needed.
+
+Update status
+------------------------------------------------------------
+Current version  0.1.0 (00de349c47e2)
+Repository root  C:\Users\you\discord-copilot-sdk
+Checkout         branch-clean (main)
+Requested ref    main -> refs/heads/main @ 00de349c47e2
+Instance         default: stopped, residency unknown
+------------------------------------------------------------
+Already up to date: 0.1.0 (00de349c47e2).
 ```
 
 This reports **source identity**, not a runtime health check: exit `0` proves
 only that HEAD matches the resolved ref. If a failed update is awaiting
-`--restore`, the updater says so even when the source is current; stale build
-output, dependencies, or a manually changed checkout also require separate
-operator attention.
+`--restore`, the updater says that a recovery record remains even when the
+source is current; stale build output, dependencies, or a manually changed
+checkout also require separate operator attention.
 
 The updater refuses a dirty or unknown checkout. A named development branch
 updates only through `git merge --ff-only`, after proving ancestry; a
@@ -210,10 +229,14 @@ bootstrap-managed detached checkout fetches depth-one then detaches at
 `FETCH_HEAD`. It scans all live instance locks and requires `--all-instances`
 before touching source used by another instance.
 
-The apply sequence is: read-only preflight → stop residency → stop bot → move
-source → `setup.mjs --yes --skip-auth --no-residency` → restore. Existing
-residency is only re-enabled/restarted; it is never re-registered, so a Windows
-24/7 task is not silently downgraded to login-keepalive.
+The apply sequence is: read-only preflight → fetch → branch/config proof →
+show the target-version **Update plan** and target notes → active-thread guard
+→ stop residency → stop bot → move source →
+`setup.mjs --yes --skip-auth --no-residency` → restore. Existing residency is
+only re-enabled/restarted; it is never re-registered, so a Windows 24/7 task is
+not silently downgraded to login-keepalive. The full diff link is constructed
+from the exact local and fetched SHA; it does not assume the target is a
+published GitHub Release.
 
 Successful applies report all four stages (stop, source, setup, restore) per
 instance. A restart is reported only after the updater observes the new PID
@@ -222,13 +245,17 @@ The updater restores the state that existed before the update: an instance that
 was already stopped remains stopped and says so. `--no-restart` likewise keeps
 each instance stopped and prints its exact manual start command.
 
-> ⚠️ If setup fails after source changes, the updater intentionally leaves the
-> bot stopped, preserves `~/.discord-copilot-sdk/update-state.<instance>.json`,
-> and prints the `--restore` command. On Windows stopping is a hard termination,
-> so an in-flight turn may be lost. Review active threads/worktrees first and
-> confirm the guard (or pass `--yes`) only when that interruption is acceptable.
-> A new apply refuses to overwrite pending restore state; `--check` and
-> `--dry-run` remain safe diagnostics until `--restore` resolves it.
+> ⚠️ If setup, restore, or final state cleanup fails after a state record is
+> created, the updater preserves
+> `~/.discord-copilot-sdk/update-state.<instance>.json`, reports **Update
+> incomplete**, and prints `node scripts/update.mjs --restore`. It never starts
+> an automatic second restore. Do not infer that every bot is stopped or running
+> from that failure alone: inspect the shown instance state and recover
+> explicitly. On Windows stopping is a hard termination, so an in-flight turn
+> may be lost. Review active threads/worktrees first and confirm the guard (or
+> pass `--yes`) only when that interruption is acceptable. A new apply refuses
+> to overwrite a pending recovery record; `--check` and `--dry-run` remain
+> diagnostic until `--restore` resolves it.
 
 ### Releases
 

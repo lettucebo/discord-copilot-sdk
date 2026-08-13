@@ -137,6 +137,8 @@ bash install.sh --skip-auth
 
 安裝器會：偵測前置需求 → 收集設定並**驗證** → `npm ci` + build → 用真實 schema 在記憶體驗證設定 → **最後**才安全寫入 `.env`（權限僅限本人、token 不顯示、原子寫入 + 備份）→（可選）設定常駐 → 完成報告。（先建置再寫入，`.env` 是最後一步；**全新安裝**時 npm 過程中磁碟上不會有 token。）
 
+輸出會先顯示**安裝計畫**，再顯示五個編號階段：前置需求／登入狀態、設定、相依套件建置、驗證／寫入、常駐。完成摘要會列出已安裝版本，以及精確的啟動、停止、查看記錄、更新和解除安裝指令。成功的 build 輸出會寫入 `~/.discord-copilot-sdk/logs` 底下僅限本人的記錄檔；失敗時終端機只會顯示有限的尾段和完整記錄位置。加上 `--verbose` 可直接串流底層 npm/build 輸出。
+
 ---
 
 ## 3b. 更新既有安裝
@@ -173,26 +175,32 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 ./update.sh --restore
 ```
 
-`--check` 不寫入任何東西；要求的 ref 已等於 HEAD 時 exit `0`、不同時 `2`、fail-closed preflight 拒絕時 `1`（例如 dirty checkout 或另一個 live instance）。`--dry-run` 會顯示完整生命週期，但不 fetch、停機、建置、寫入或 checkout。短 ref 同時是 branch/tag 時優先選 branch；用 `--ref refs/tags/v0.1.0` 可消除歧義。annotated tag 比較的是 peeled commit，不是 tag object。
+`--check` 在要求的 ref 已等於 HEAD 時 exit `0`、有更新時 `2`、fail-closed preflight 拒絕時 `1`（例如 dirty checkout 或另一個 live instance）。已是最新時不會 fetch。有更新時，`--check` 會把要求的 ref fetch 到本機 Git object database 和 `FETCH_HEAD`，**不會移動 HEAD，也不會碰 bot、常駐、`.env` 或 setup**；因此它能誠實顯示目標版本、有限的目標變更摘要和完整 commit 比較連結。`--dry-run` 保持唯讀：不 fetch、停機、建置、寫入或 checkout，並會明確說目標版本／摘要要等真正更新 fetch 後才知道。短 ref 同時是 branch/tag 時優先選 branch；用 `--ref refs/tags/v0.1.0` 可消除歧義。annotated tag 比較的是 peeled commit，不是 tag object。
 
 更新器永遠會標示它檢查的 checkout。例如 source 已同步時會印出：
 
 ```text
 discord-copilot-sdk 0.1.0 (00de349c47e2)
-  root C:\Users\you\discord-copilot-sdk
-  checkout branch-clean (main)
-  requested main -> refs/heads/main @ 00de349c47e2
-原始碼 HEAD 已等於 refs/heads/main，無需更新。
+
+更新狀態
+------------------------------------------------------------
+目前版本        0.1.0 (00de349c47e2)
+Repository 根目錄 C:\Users\you\discord-copilot-sdk
+Checkout         branch-clean (main)
+要求的 ref      main -> refs/heads/main @ 00de349c47e2
+執行個體        default: 已停止、常駐狀態未知
+------------------------------------------------------------
+已是最新版本：0.1.0 (00de349c47e2)。
 ```
 
 這是在報告**原始碼身分**，不是 runtime 健康檢查：exit `0` 只證明 HEAD
 符合解析後的 ref。即使 source 已同步，若有失敗更新正等待 `--restore`，
-更新器也會提出警告；過期的 build output、dependencies 或手動改過的
+更新器也會提示留下了復原記錄；過期的 build output、dependencies 或手動改過的
 checkout 仍須由操作者另外處理。
 
 更新器會拒絕 dirty 或無法辨識的 checkout。具名開發分支只有在先證明 ancestor 關係後，才用 `git merge --ff-only` 更新；bootstrap 管理的 detached checkout 則 depth-one fetch 後 detach 到 `FETCH_HEAD`。它會掃描所有 live instance lock，若有其他 instance 正在跑，必須顯式傳入 `--all-instances` 才能改動共用 source。
 
-apply 順序是：唯讀 preflight → 停常駐 → 停 bot → 移動 source → `setup.mjs --yes --skip-auth --no-residency` → 還原。既有常駐只會重新 enable/start，絕不重新 register，所以 Windows 24/7 task 不會悄悄降成登入後保活。
+apply 順序是：唯讀 preflight → fetch → branch／設定證明 → 顯示目標版本的**更新計畫**和目標變更摘要 → active-thread guard → 停常駐 → 停 bot → 移動 source → `setup.mjs --yes --skip-auth --no-residency` → 還原。既有常駐只會重新 enable/start，絕不重新 register，所以 Windows 24/7 task 不會悄悄降成登入後保活。完整差異連結由精確的本機／fetch SHA 組成，不會假設目標一定已發佈成 GitHub Release。
 
 成功的 apply 會逐 instance 報告四個階段（停止、套用原始碼、setup、還原）。
 只有更新器觀察到新的 PID，且它在 Discord 啟動完成後寫入 current-ready proof，
@@ -200,8 +208,8 @@ apply 順序是：唯讀 preflight → 停常駐 → 停 bot → 移動 source �
 狀態：原本已停止的 instance 會維持停止並明講原因。`--no-restart` 也會讓
 每個 instance 保持停止，並印出可直接使用的手動啟動指令。
 
-> ⚠️ source 已變更後若 setup 失敗，更新器會刻意讓 bot 保持停止、保留 `~/.discord-copilot-sdk/update-state.<instance>.json`，並印出 `--restore` 指令。Windows 停止是硬終止，進行中的 turn 可能遺失。先查看 active thread/worktree，只有確定可中斷時才確認 guard（或使用 `--yes`）。
-> 未處理的 restore state 不能被新的 apply 覆蓋；在 `--restore` 解決前，`--check` 與 `--dry-run` 仍是安全的診斷方式。
+> ⚠️ state record 建立後，若 setup、還原或最後的 state 清理失敗，更新器會保留 `~/.discord-copilot-sdk/update-state.<instance>.json`、回報**更新未完成**，並印出 `node scripts/update.mjs --restore`。它絕不自動做第二次還原。不要從這個失敗訊息推論所有 bot 一定已停止或仍在執行：請檢查顯示的 instance 狀態，再明確執行復原。Windows 停止是硬終止，進行中的 turn 可能遺失。先查看 active thread/worktree，只有確定可中斷時才確認 guard（或使用 `--yes`）。
+> 有待處理的復原記錄時，新的 apply 不能覆蓋它；在 `--restore` 解決前，`--check` 與 `--dry-run` 仍可用於診斷。
 
 ### 發版
 
