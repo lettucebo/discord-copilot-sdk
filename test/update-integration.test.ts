@@ -294,6 +294,39 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(result.stdout).toContain("Restored the pre-update running state.");
   });
 
+  it("prints restore status before a matching restore fails and never emits a success-shaped line", async () => {
+    const local = await cloneTarget("restore-failure-status");
+    const instance = `${instancePrefix}-${serial}`;
+    const oldSha = "1111111111111111111111111111111111111111";
+    const createdAt = "2026-01-02T03:04:05.000Z";
+    await fs.promises.writeFile(path.join(local, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version: "0.8.0" }));
+
+    const result = await runUpdate(local, ["--restore", "--lang", "en"], async (home) => {
+      const stateDir = path.join(home, ".discord-copilot-sdk");
+      await fs.promises.mkdir(stateDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(stateDir, `update-state.${instance}.json`),
+        JSON.stringify({
+          version: 1,
+          repoRoot: local,
+          oldSha,
+          createdAt,
+          instances: [{ instance, wasRunning: true, residency: { registered: false, enabled: false, known: false } }],
+        })
+      );
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain("\nRestore status\n");
+    expect(result.stdout).toContain("Saved instance");
+    expect(result.stdout).toContain(instance);
+    expect(result.stdout).toContain(oldSha.slice(0, 12));
+    expect(result.stdout).toContain(createdAt);
+    expect(result.stdout).toContain("Current version");
+    expect(result.stdout).not.toContain("Restored the pre-update running state.");
+    expect(result.stderr.toLowerCase()).toContain("run-bot");
+  });
+
   it("reports already-up-to-date status with the installed version and skips fetch", async () => {
     await advanceToVersion("0.1.0");
     const local = await cloneTarget("up-to-date");
@@ -333,6 +366,30 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(result.stdout).toContain("Apply it with: node scripts/update.mjs");
     expectInOrder(result.stdout, "Update status", `Update available: 0.2.0 (${localSha.slice(0, 12)}) -> 0.3.0 (${remoteSha.slice(0, 12)}).`);
     expect(fs.existsSync(path.join(local, ".git", "FETCH_HEAD"))).toBe(true);
+  });
+
+  it("keeps --dry-run read-only while showing the dry-run plan and its limits", async () => {
+    const local = await cloneTarget("dry-run");
+    await advanceToVersion("0.7.0");
+    const before = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+    const envBefore = await fs.promises.readFile(path.join(local, ".env"), "utf8");
+    const fetchHead = path.join(local, ".git", "FETCH_HEAD");
+    const home = path.join(root, `home-${serial}`);
+    if (fs.existsSync(fetchHead)) await fs.promises.rm(fetchHead, { force: true });
+
+    const result = await runUpdate(local, ["--dry-run", "--lang", "en"]);
+
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("\nUpdate status\n");
+    expect(result.stdout).toContain("\nDry-run plan\n");
+    expect(result.stdout).toContain("Would fetch");
+    expect(result.stdout).toContain("Would stop the selected residency/bot processes, move HEAD, run setup, then restore the prior running state.");
+    expect(result.stdout).toContain("Target version and release notes will be discovered only during a real update fetch.");
+    expect((await git(local, "rev-parse", "HEAD")).stdout.trim()).toBe(before);
+    expect(await fs.promises.readFile(path.join(local, ".env"), "utf8")).toBe(envBefore);
+    expect(fs.existsSync(fetchHead)).toBe(false);
+    expect(fs.existsSync(path.join(home, ".discord-copilot-sdk"))).toBe(false);
   });
 
   it("does not fail a check when the target changelog has no matching release section", async () => {
@@ -466,6 +523,91 @@ describe("git update data paths", { timeout: 60_000 }, () => {
       expect(result.stdout).toContain(`DISCORD_COPILOT_SDK_INSTANCE_ID=${instancePrefix}-${serial} bash "`);
     }
     expect(result.stdout).toContain("Update succeeded; --no-restart leaves it stopped.");
+  });
+
+  it("reports a structured incomplete update while leaving a failed apply stopped", async () => {
+    await advanceToVersion("0.9.0");
+    const local = await cloneTarget("failed-apply");
+    const localSha = (await git(local, "rev-parse", "HEAD")).stdout.trim();
+    await advanceToVersion("1.0.0");
+    await fs.promises.writeFile(path.join(source, "scripts", "setup.mjs"), 'console.error("simulated setup failure"); process.exit(1);\n');
+    await git(source, "add", "scripts/setup.mjs");
+    await git(source, "commit", "-q", "-m", "break update setup");
+    await git(source, "push", "-q", "origin", "main");
+    const remoteSha = (await git(source, "rev-parse", "HEAD")).stdout.trim();
+    let originalPid: number | undefined;
+
+    try {
+      const result = await runUpdate(local, ["--yes", "--lang", "en"], async (home) => {
+        const instance = `${instancePrefix}-${serial}`;
+        const dist = path.join(local, "dist");
+        await fs.promises.mkdir(dist, { recursive: true });
+        await fs.promises.writeFile(
+          path.join(dist, "index.js"),
+          [
+            'const fs = require("node:fs");',
+            'const path = require("node:path");',
+            'const home = process.env.USERPROFILE || process.env.HOME;',
+            'const instance = process.env.DISCORD_COPILOT_SDK_INSTANCE_ID;',
+            'const state = path.join(home, ".discord-copilot-sdk");',
+            "fs.mkdirSync(state, { recursive: true });",
+            'const lock = path.join(state, `${instance}.lock`);',
+            "fs.writeFileSync(lock, String(process.pid));",
+            'const ready = path.join(state, "startup-ready");',
+            "fs.mkdirSync(ready, { recursive: true });",
+            'fs.writeFileSync(path.join(ready, `${instance}.ready.json`), JSON.stringify({ version: 1, pid: process.pid, instance }));',
+            "setInterval(() => {}, 1_000);",
+            "",
+          ].join("\n")
+        );
+        const child = spawn(process.execPath, [path.join(dist, "index.js")], {
+          env: {
+            ...process.env,
+            DISCORD_COPILOT_SDK_INSTANCE_ID: instance,
+            HOME: home,
+            USERPROFILE: home,
+          },
+          stdio: "ignore",
+        });
+        originalPid = child.pid;
+        await waitForLock(home, instance);
+      });
+
+      const instance = `${instancePrefix}-${serial}`;
+      const home = path.join(root, `home-${serial}`);
+      const stateFile = path.join(home, ".discord-copilot-sdk", `update-state.${instance}.json`);
+      const lock = path.join(home, ".discord-copilot-sdk", `${instance}.lock`);
+      const ready = path.join(home, ".discord-copilot-sdk", "startup-ready", `${instance}.ready.json`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      expect(result.code).toBe(1);
+      expect(result.stdout).toContain("\nUpdate incomplete\n");
+      expect(result.stdout).toContain(`0.9.0 (${localSha.slice(0, 12)})`);
+      expect(result.stdout).toContain(`1.0.0 (${remoteSha.slice(0, 12)})`);
+      expect(result.stdout).toContain(instance);
+      expect(result.stdout).toContain("Automatic restart");
+      expect(result.stdout).toContain("did not occur");
+      expect(result.stdout).toContain("node scripts/update.mjs --restore");
+      expect(result.stdout).not.toContain("Restored the pre-update running state.");
+      expect(result.stdout).not.toContain("Update complete");
+      expect(result.stderr).toContain("simulated setup failure");
+      expect(fs.existsSync(stateFile)).toBe(true);
+      expect(() => process.kill(originalPid as number, 0)).toThrow();
+      if (fs.existsSync(lock)) {
+        expect((await fs.promises.readFile(lock, "utf8")).trim()).toBe(String(originalPid));
+      }
+      if (fs.existsSync(ready)) {
+        expect(await fs.promises.readFile(ready, "utf8")).toContain(`"pid":${originalPid}`);
+      }
+    } finally {
+      if (originalPid) {
+        try {
+          process.kill(originalPid);
+        } catch {
+          // The updater should already have stopped the original process.
+        }
+      }
+    }
   });
 
   it("shows an unknown target version in the apply plan when fetched metadata cannot be parsed", async () => {

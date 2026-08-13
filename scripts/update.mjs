@@ -102,6 +102,45 @@ function printUpdatePlan({ currentVersion, localSha, targetVersion, remoteSha, i
   console.log(lines.join("\n"));
 }
 
+function printDryRunPlan({ currentVersion, localSha, remote, instances }) {
+  console.log(formatSection(t("updateDryRunHeader", lang)));
+  console.log(
+    [
+      formatKeyValue(t("updatePlanCurrentVersion", lang), formatVersionAndSha(currentVersion, localSha)),
+      formatKeyValue(t("updatePlanTargetInstances", lang), instances.join(", ")),
+      message("updateDryRunFetch", remote.ref.replace(/\^\{\}$/, "")),
+      t("updateDryRunApply", lang),
+      t("updateDryRunLimitations", lang),
+      t("updateDryRun", lang),
+    ].join("\n")
+  );
+}
+
+function printRestoreStatus({ instance, repoRoot, oldSha, createdAt, currentVersion }) {
+  const rows = [
+    [t("updateRestoreStatusSavedInstance", lang), instance],
+    [t("updateRestoreStatusRepositoryRoot", lang), repoRoot],
+    [t("updateRestoreStatusSavedSource", lang), shortSha(oldSha)],
+    [t("updateRestoreStatusCreatedAt", lang), createdAt],
+  ];
+  if (currentVersion !== null) rows.splice(1, 0, [t("updateRestoreStatusCurrentVersion", lang), currentVersion]);
+  console.log(formatSection(t("updateRestoreStatusHeader", lang)));
+  console.log(formatSummary(rows));
+}
+
+function printUpdateIncomplete({ currentVersion, localSha, targetVersion, remoteSha, instances }) {
+  console.log(formatSection(t("updateIncompleteHeader", lang)));
+  console.log(
+    formatSummary([
+      [t("updatePlanCurrentVersion", lang), formatVersionAndSha(currentVersion, localSha)],
+      [t("updatePlanTargetVersion", lang), formatVersionAndSha(targetVersion, remoteSha)],
+      [t("updatePlanTargetInstances", lang), instances.join(", ")],
+      [t("updateIncompleteRestartLabel", lang), t("updateIncompleteRestart", lang)],
+      [t("updateIncompleteRecoveryLabel", lang), restoreCommand()],
+    ])
+  );
+}
+
 function printUpdateStage(current, titleKey) {
   console.log(formatStage(current, UPDATE_STAGE_TOTAL, t(titleKey, lang)));
 }
@@ -194,6 +233,11 @@ function currentPackageVersion() {
   }
 }
 
+function readableCurrentVersion() {
+  const version = currentPackageVersion();
+  return version === "unknown" ? null : version;
+}
+
 function fetchedText(file, options = {}) {
   const content = tryRun("git", ["show", `FETCH_HEAD:${file}`]);
   if (content === null) {
@@ -215,6 +259,10 @@ function fetchedTargetNotes(version) {
 
 function applyCommand(ref) {
   return ref === "main" ? "node scripts/update.mjs" : `node scripts/update.mjs --ref ${ref}`;
+}
+
+function restoreCommand() {
+  return "node scripts/update.mjs --restore";
 }
 
 function onPath(command) {
@@ -637,9 +685,16 @@ async function restoreSaved() {
     console.log(message("updateForeignRestoreState", instance, root ?? "(missing repo root)"));
   }
   for (const { file, instance, state, root } of matching) {
-    const oldSha = typeof state.oldSha === "string" && /^[0-9a-f]{4,64}$/i.test(state.oldSha) ? state.oldSha.slice(0, 12) : "unknown";
+    const oldSha = typeof state.oldSha === "string" ? state.oldSha : null;
     const createdAt = typeof state.createdAt === "string" ? state.createdAt : "unknown";
-    console.log(message("updateRestoreSummary", instance, root, oldSha, createdAt));
+    printRestoreStatus({
+      instance,
+      repoRoot: root,
+      oldSha,
+      createdAt,
+      currentVersion: readableCurrentVersion(),
+    });
+    console.log(message("updateRestoreSummary", instance, root, shortSha(oldSha), createdAt));
     await restoreState(state);
     fs.rmSync(file, { force: true });
   }
@@ -683,6 +738,7 @@ async function main() {
   if (otherLive.length && !flags.allInstances) {
     throw new UpdateError(`other instance(s) are running: ${otherLive.map((entry) => entry.instance).join(", ")}; re-run with --all-instances`);
   }
+  const targetIds = [...new Set([instance, ...(flags.allInstances ? live.map((entry) => entry.instance) : [])])];
 
   const decision = planUpdate({
     checkout: checkout.kind,
@@ -719,7 +775,12 @@ async function main() {
     return;
   }
   if (decision.action === "dry-run") {
-    console.log(message("updateDryRun"));
+    printDryRunPlan({
+      currentVersion,
+      localSha: local,
+      remote,
+      instances: targetIds,
+    });
     return;
   }
 
@@ -733,7 +794,7 @@ async function main() {
   }
   await precheckIncomingConfig();
 
-  const targetIds = [...new Set([instance, ...(flags.allInstances ? live.map((entry) => entry.instance) : [])])];
+  const targetVersion = fetchedPackageVersion();
   const state = {
     version: 1,
     repoRoot: REPO_ROOT,
@@ -749,7 +810,7 @@ async function main() {
   printUpdatePlan({
     currentVersion,
     localSha: local,
-    targetVersion: fetchedPackageVersion(),
+    targetVersion,
     remoteSha: remote.sha,
     instances: state.instances,
   });
@@ -788,11 +849,20 @@ async function main() {
     await restoreState(state);
     fs.rmSync(statePath(instance), { force: true });
     console.log(message("updateComplete"));
-  } finally {
-    releaseLock();
+  } catch (error) {
     if (!setupSucceeded) {
+      printUpdateIncomplete({
+        currentVersion,
+        localSha: local,
+        targetVersion,
+        remoteSha: remote.sha,
+        instances: state.instances.map(({ instance: id }) => id),
+      });
       console.log(message("updateFailed"));
     }
+    throw error;
+  } finally {
+    releaseLock();
   }
 }
 
