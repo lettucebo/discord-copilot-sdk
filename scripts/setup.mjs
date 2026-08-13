@@ -455,7 +455,7 @@ async function main() {
     await run("npm", hasLock ? ["ci"] : ["install", "--no-audit", "--no-fund"], sanitizedChildEnv(), lang, buildLog);
     await run("npm", ["run", "build"], sanitizedChildEnv(), lang, buildLog);
   } finally {
-    await closeLogStream(buildLog.stream, lang);
+    await closeLogStream(buildLog, lang);
   }
 
   // 8) Validate the MERGED config through the REAL runtime schema (in memory —
@@ -680,26 +680,78 @@ function openSetupLog(lang) {
     }
     throw e;
   }
-  return {
+  const log = {
     path: logPath,
     stream: fs.createWriteStream(logPath, { flags: "a", encoding: "utf8" }),
+    failure: undefined,
+    onFailure: undefined,
+    closePromise: undefined,
+  };
+  log.stream.on("error", (e) => {
+    const failure = rememberLogFailure(log, lang, e);
+    log.onFailure?.(failure);
+  });
+  return log;
+}
+
+function buildLogFileSetupError(lang, cause) {
+  return new SetupError(formatMessage(t("buildLogFileError", lang), [errorMessage(cause)]));
+}
+
+function rememberLogFailure(log, lang, cause) {
+  if (!log.failure) log.failure = cause instanceof SetupError ? cause : buildLogFileSetupError(lang, cause);
+  return log.failure;
+}
+
+function throwIfLogFailed(log) {
+  if (log.failure) throw log.failure;
+}
+
+function bindLogFailure(log, onFailure) {
+  throwIfLogFailed(log);
+  log.onFailure = onFailure;
+  return () => {
+    if (log.onFailure === onFailure) log.onFailure = undefined;
   };
 }
 
-async function closeLogStream(stream, lang) {
-  if (stream.destroyed) return;
-  await new Promise((resolve, reject) => {
+async function closeLogStream(log, lang) {
+  throwIfLogFailed(log);
+  if (log.closePromise) return log.closePromise;
+  if (log.stream.destroyed || log.stream.closed) {
+    throwIfLogFailed(log);
+    return;
+  }
+  log.closePromise = new Promise((resolve, reject) => {
     let settled = false;
     const done = (fn, value) => {
       if (settled) return;
       settled = true;
-      stream.off("error", onError);
+      log.stream.off("close", onClose);
+      log.stream.off("finish", onFinish);
       fn(value);
     };
-    const onError = (e) => done(reject, new SetupError(formatMessage(t("buildLogFileError", lang), [errorMessage(e)])));
-    stream.once("error", onError);
-    stream.end(() => done(resolve));
+    const onClose = () => {
+      try {
+        throwIfLogFailed(log);
+        done(resolve);
+      } catch (e) {
+        done(reject, e);
+      }
+    };
+    const onFinish = () => {
+      if (log.stream.closed || log.stream.destroyed) onClose();
+    };
+    log.stream.once("close", onClose);
+    log.stream.once("finish", onFinish);
+    try {
+      log.stream.end();
+      if (log.stream.closed) onClose();
+    } catch (e) {
+      done(reject, rememberLogFailure(log, lang, e));
+    }
   });
+  await log.closePromise;
 }
 
 function commandLabel(cmd, args) {
@@ -764,65 +816,85 @@ async function run(cmd, args, env, lang, log) {
   }
 
   const tail = createOutputTail(40);
-  await new Promise((resolve, reject) => {
-    let settled = false;
-    let logError;
-    const child = spawnChild(cmd, args, env);
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
+  await Promise.resolve()
+    .then(() => {
+      throwIfLogFailed(log);
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        let child;
 
-    const fail = (reason) => {
-      if (settled) return;
-      settled = true;
-      reject(reason);
-    };
+        let clearLogFailure = () => {};
+        const settle = (fn, value) => {
+          if (settled) return;
+          settled = true;
+          clearLogFailure();
+          fn(value);
+        };
+        const fail = (reason) => settle(reject, reason);
 
-    const writeChunk = (chunk, sink) => {
-      if (settled) return;
-      const text = String(chunk);
-      pushOutputTail(tail, text);
-      try {
-        writeChunkToSinks(
-          sink,
-          text,
-          FLAGS.verbose ? [log.stream, sink === child.stderr ? process.stderr : process.stdout] : [log.stream]
-        );
-      } catch (e) {
-        logError = e;
-        child.kill();
-        return;
-      }
-    };
+        clearLogFailure = bindLogFailure(log, (failure) => {
+          try {
+            child.kill();
+          } catch {
+            /* ignore */
+          }
+          fail(failure);
+        });
 
-    log.stream.once("error", (e) => {
-      logError = e;
-      child.kill();
-    });
-    child.stdout.on("data", (chunk) => writeChunk(chunk, child.stdout));
-    child.stderr.on("data", (chunk) => writeChunk(chunk, child.stderr));
-    child.once("error", (e) => {
-      const reason = formatMessage(t("buildStartFailed", lang), [label, errorMessage(e)]);
-      fail(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail), 40, reason)));
-    });
-    child.once("close", (code, signal) => {
-      if (settled) return;
-      settled = true;
-      if (logError) {
-        reject(new SetupError(formatMessage(t("buildLogFileError", lang), [errorMessage(logError)])));
-        return;
-      }
-      if (signal) {
-        const reason = formatMessage(t("buildSignalFailed", lang), [label, signal]);
-        reject(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail), 40, reason)));
-        return;
-      }
-      if (code !== 0) {
-        reject(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail))));
-        return;
-      }
-      resolve();
-    });
-  }).then(
+        child = spawnChild(cmd, args, env);
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+
+        const writeChunk = (chunk, sink) => {
+          if (settled) return;
+          const text = String(chunk);
+          pushOutputTail(tail, text);
+          try {
+            writeChunkToSinks(
+              sink,
+              text,
+              FLAGS.verbose ? [log.stream, sink === child.stderr ? process.stderr : process.stdout] : [log.stream]
+            );
+            throwIfLogFailed(log);
+          } catch (e) {
+            const failure = rememberLogFailure(log, lang, e);
+            try {
+              child.kill();
+            } catch {
+              /* ignore */
+            }
+            fail(failure);
+          }
+        };
+
+        child.stdout.on("data", (chunk) => writeChunk(chunk, child.stdout));
+        child.stderr.on("data", (chunk) => writeChunk(chunk, child.stderr));
+        child.once("error", (e) => {
+          const reason = formatMessage(t("buildStartFailed", lang), [label, errorMessage(e)]);
+          fail(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail), 40, reason)));
+        });
+        child.once("close", (code, signal) => {
+          if (settled) return;
+          try {
+            throwIfLogFailed(log);
+          } catch (e) {
+            fail(e);
+            return;
+          }
+          if (signal) {
+            const reason = formatMessage(t("buildSignalFailed", lang), [label, signal]);
+            fail(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail), 40, reason)));
+            return;
+          }
+          if (code !== 0) {
+            fail(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail))));
+            return;
+          }
+          settle(resolve);
+        });
+      });
+    })
+    .then(
     () => {
       const successMessage = formatMessage(t("buildStepDone", lang), [label, formatElapsed(Date.now() - startedAt)]);
       if (useDynamic) finishDynamicStatus(c(32, "✓ ") + successMessage, ticker);

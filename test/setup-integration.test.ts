@@ -116,6 +116,14 @@ function numberLines(prefix, count) {
   return Array.from({ length: count }, (_, index) => `${prefix}-${String(index + 1).padStart(2, "0")}`).join("\n") + "\n";
 }
 
+function rewriteSetupFixture(repo, replacer) {
+  const setupPath = path.join(repo, "scripts", "setup.mjs");
+  const original = fs.readFileSync(setupPath, "utf8");
+  const updated = replacer(original);
+  expect(updated).not.toBe(original);
+  fs.writeFileSync(setupPath, updated);
+}
+
 function writeNodeCommandStub(name, source, targetDir = binDir) {
   const scriptPath = path.join(targetDir, `${name}-stub.mjs`);
   fs.writeFileSync(scriptPath, source);
@@ -156,6 +164,7 @@ beforeAll(() => {
     "npm",
     [
       'import { spawn } from "node:child_process";',
+      'import fs from "node:fs";',
       'const args = process.argv.slice(2);',
       'const joined = args.join(" ");',
       'if (joined === "--version") { console.log("10.9.0"); process.exit(0); }',
@@ -170,6 +179,8 @@ beforeAll(() => {
       "};",
       'const stdout = process.env[`DP_${phase}_STDOUT`] || "";',
       'const stderr = process.env[`DP_${phase}_STDERR`] || "";',
+      'const delayMs = Number(process.env[`DP_${phase}_DELAY_MS`] || "0");',
+      'const touchPath = process.env[`DP_${phase}_TOUCH_PATH`];',
       'if (stdout) process.stdout.write(stdout);',
       'if (stderr) process.stderr.write(stderr);',
       'await writeHexParts(process.stdout, `DP_${phase}_STDOUT_HEX_PARTS`);',
@@ -179,6 +190,8 @@ beforeAll(() => {
       '  setInterval(() => {}, 1000);',
       '  await new Promise(() => {});',
       "}",
+      'if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));',
+      'if (touchPath) fs.writeFileSync(touchPath, `${phase.toLowerCase()}-completed\\n`);',
       'const exitCode = Number(process.env[`DP_${phase}_EXIT`] || "0");',
       "process.exit(Number.isFinite(exitCode) ? exitCode : 0);",
       "",
@@ -501,6 +514,97 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       expect(out).toContain("npm run build");
       expect(out).not.toContain("DEP0190");
       expect(listSetupLogs(home)).toHaveLength(1);
+    } finally {
+      if (home) fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("setup-log write-stream failures exit non-zero and stop before later stages or the summary", () => {
+    const repo = makeFixture(true);
+    let home;
+    try {
+      stubBuiltDist(repo);
+      rewriteSetupFixture(repo, (source) =>
+        source
+          .replace(
+            'import { setupResidency, residencyName, chooseResidencyMode, hasResidencyRegistration, instanceId } from "./lib/residency.mjs";',
+            [
+              'import { setupResidency, residencyName, chooseResidencyMode, hasResidencyRegistration, instanceId } from "./lib/residency.mjs";',
+              "const realCreateWriteStream = fs.createWriteStream.bind(fs);",
+              "let injectedLogFailure = false;",
+              "fs.createWriteStream = (...args) => {",
+              "  const stream = realCreateWriteStream(...args);",
+              "  const realWrite = stream.write.bind(stream);",
+              "  stream.write = (...writeArgs) => {",
+              "    const result = realWrite(...writeArgs);",
+              "    if (!injectedLogFailure) {",
+              "      injectedLogFailure = true;",
+              '      setTimeout(() => stream.destroy(new Error("simulated log stream failure")), 150);',
+              "    }",
+              "    return result;",
+              "  };",
+              "  return stream;",
+              "};",
+            ].join("\n")
+          )
+          .replace(
+            '    await run("npm", hasLock ? ["ci"] : ["install", "--no-audit", "--no-fund"], sanitizedChildEnv(), lang, buildLog);\n    await run("npm", ["run", "build"], sanitizedChildEnv(), lang, buildLog);',
+            '    await run("npm", hasLock ? ["ci"] : ["install", "--no-audit", "--no-fund"], sanitizedChildEnv(), lang, buildLog);\n    await new Promise((resolve) => setTimeout(resolve, 300));\n    await run("npm", ["run", "build"], sanitizedChildEnv(), lang, buildLog);'
+          )
+      );
+
+      const r = runSetup(repo, ["--yes", "--skip-auth", "--lang", "en"], {
+        keepHome: true,
+        env: {
+          DP_INSTALL_STDOUT: "install-before-log-failure\n",
+        },
+      });
+      home = r.home;
+      const out = (r.stdout || "") + (r.stderr || "");
+
+      expect(r.status).toBe(1);
+      expect(out).toContain("Could not create or secure the setup log file: simulated log stream failure");
+      expect(out).not.toContain("[4/5] Config validation and .env write");
+      expect(out).not.toContain("Action summary");
+    } finally {
+      if (home) fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("setup-log failures at build spawn do not leave the spawned npm process running", async () => {
+    const repo = makeFixture(true);
+    let home;
+    const markerPath = path.join(repo, "build-child-marker.txt");
+    try {
+      stubBuiltDist(repo);
+      rewriteSetupFixture(repo, (source) =>
+        source.replace(
+          "        child = spawnChild(cmd, args, env);",
+          [
+            "        child = spawnChild(cmd, args, env);",
+            '        if (cmd === "npm" && args.join(" ") === "run build") {',
+            '          log.stream.destroy(new Error("simulated log stream failure"));',
+            "        }",
+          ].join("\n")
+        )
+      );
+
+      const r = runSetup(repo, ["--yes", "--skip-auth", "--lang", "en"], {
+        keepHome: true,
+        env: {
+          DP_BUILD_DELAY_MS: "250",
+          DP_BUILD_TOUCH_PATH: markerPath,
+        },
+      });
+      home = r.home;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const out = (r.stdout || "") + (r.stderr || "");
+
+      expect(r.status).toBe(1);
+      expect(out).toContain("Could not create or secure the setup log file: simulated log stream failure");
+      expect(fs.existsSync(markerPath)).toBe(false);
     } finally {
       if (home) fs.rmSync(home, { recursive: true, force: true });
       fs.rmSync(repo, { recursive: true, force: true });
