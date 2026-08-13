@@ -71,11 +71,12 @@ function runSetup(repo, args) {
     PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
   };
   try {
-    return spawnSync(process.execPath, [path.join(repo, "scripts", "setup.mjs"), ...args], {
+    const result = spawnSync(process.execPath, [path.join(repo, "scripts", "setup.mjs"), ...args], {
       cwd: repo,
       env,
       encoding: "utf8",
     });
+    return Object.assign(result, { home });
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
@@ -118,26 +119,49 @@ afterAll(() => {
 // instead of being raised globally, which would blunt the signal for genuinely
 // hanging unit tests.
 describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 }, () => {
-  it("valid config, English: exits 0, masks the token, and mutates NOTHING", () => {
+  it("valid config, English dry-run: prints the install plan before stage 1, masks secrets, and mutates NOTHING", () => {
     const repo = makeFixture(true);
     try {
       const before = fs.readFileSync(path.join(repo, ".env"), "utf8");
       const r = runSetup(repo, ["--dry-run", "--yes", "--skip-auth", "--lang", "en"]);
       const out = (r.stdout || "") + (r.stderr || "");
       const shell = isWin ? "ps1" : "sh";
+      const stateDir = path.join(r.home, ".discord-copilot-sdk");
 
       expect(r.status).toBe(0);
       expect(out).toContain(`== discord-copilot-sdk installer ${FIXTURE_VERSION} ==`);
+      expect(out).toContain("Install plan");
+      expect(out.indexOf("Install plan")).toBeLessThan(out.indexOf("[1/5] Prerequisites and Copilot sign-in state"));
+      expect(out).toContain("[1/5] Prerequisites and Copilot sign-in state");
+      expect(out).toContain("[2/5] Configuration collection");
+      expect(out).not.toContain("[3/5] Dependency install and build");
+      expect(out).not.toContain("[4/5] Config validation and .env write");
+      expect(out).not.toContain("[5/5] Residency setup");
+      expect(out).toContain("Package version");
+      expect(out).toContain(FIXTURE_VERSION);
+      expect(out).toContain("Repository root");
+      expect(out).toContain(repo);
+      expect(out).toContain(".env path");
+      expect(out).toContain(path.join(repo, ".env"));
+      expect(out).toContain("State directory");
+      expect(out).toContain(stateDir);
+      expect(out).toContain("Instance id");
+      expect(out).toContain("default");
+      expect(out).toContain("Dry run");
+      expect(out).toContain("Yes");
       expect(out).toContain("Config to write (token masked)");
-      expect(out).toContain("DISCORD_BOT_TOKEN=********");
-      expect(out).toContain(`Start: ./run-bot.${shell}`);
-      expect(out).toContain(`Stop: ./stop-bot.${shell}`);
-      expect(out).toContain("View logs: after the first start, ");
+      expect(out).toMatch(/DISCORD_BOT_TOKEN\s+\*{8}/);
+      expect(out).toContain("Action summary");
+      expect(out).toContain(`./run-bot.${shell}`);
+      expect(out).toContain(`./stop-bot.${shell}`);
+      expect(out).toMatch(/View logs\s+after the first start,/);
       expect(out).toContain("run-bot.default.log");
-      expect(out).toContain(`Update: ./update.${shell}`);
-      expect(out).toContain(`Uninstall: ./uninstall.${shell}`);
+      expect(out).toContain(`./update.${shell}`);
+      expect(out).toContain(`./uninstall.${shell}`);
       expect(out).toContain("Final step (manual): send a test message in your Discord channel, or use /new to begin.");
       expect(out).toContain("Safety: use a private server, enable 2FA, and never commit .env / your token.");
+      expect(out).not.toContain("Config-load health check passed.");
+      expect(out).not.toContain("Writing .env");
       // The real secret must NEVER appear in output.
       expect(out).not.toContain("tok_UNIQUE_SENTINEL_do_not_leak_9f3c");
       // Dry-run is read-only: .env unchanged, no temp/backup left behind.
@@ -168,13 +192,13 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       const out = (r.stdout || "") + (r.stderr || "");
 
       expect(r.status).toBe(0);
-      expect(out).toContain("View logs: after the first start, ");
+      expect(out).toMatch(/View logs\s+after the first start,/);
       expect(out).toContain("run-bot.default.log");
       if (isWin) {
-        expect(out).toContain("View logs: if residency is enabled, ");
+        expect(out).toMatch(/Residency log\s+if residency is enabled,/);
         expect(out).toContain("discord-copilot-sdk-default.log");
       } else {
-        expect(out).toContain("View logs: if residency is enabled, ");
+        expect(out).toMatch(/Residency log\s+if residency is enabled,/);
         expect(out).toContain(
           process.platform === "linux"
             ? "journalctl --user -u discord-copilot-sdk-default.service -f"
@@ -272,6 +296,7 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       const out = (r.stdout || "") + (r.stderr || "");
       // Names the missing required key(s); never mutates on a fail-closed abort.
       expect(out).toMatch(/DISCORD_BOT_TOKEN/);
+      expect(out).not.toContain("Action summary");
       expect(fs.existsSync(path.join(repo, ".env"))).toBe(false);
     } finally {
       fs.rmSync(repo, { recursive: true, force: true });

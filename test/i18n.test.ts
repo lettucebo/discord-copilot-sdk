@@ -134,3 +134,37 @@ describe("skill source messages", () => {
     }
   );
 });
+
+describe("setup information architecture messages", () => {
+  it.each([
+    "planHeader",
+    "planPackageVersion",
+    "planRepositoryRoot",
+    "planEnvPath",
+    "planStateDir",
+    "planInstanceId",
+    "planDryRun",
+    "stagePrereqs",
+    "stageConfig",
+    "stageBuild",
+    "stageValidateWrite",
+    "stageResidency",
+    "prereqNodeLabel",
+    "prereqGitLabel",
+    "prereqCopilotLabel",
+    "prereqAuthLabel",
+    "prereqPresentPath",
+    "summaryHeader",
+  ])("defines the bilingual %s setup message", (key) => {
+    for (const lang of LANGS) expect(t(key, lang)).not.toBe(key);
+  });
+
+  it("keeps zh/en placeholder arity aligned for every message key", () => {
+    const placeholders = (text: string) =>
+      [...text.matchAll(/\{(\d+)\}/g)].map((match) => Number(match[1])).sort((a, b) => a - b);
+
+    for (const key of messageKeys()) {
+      expect(placeholders(MESSAGES.zh[key]), key).toEqual(placeholders(MESSAGES.en[key]));
+    }
+  });
+});

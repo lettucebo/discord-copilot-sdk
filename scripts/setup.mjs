@@ -14,6 +14,7 @@ import { mergeEnv, dropEnvKeys } from "./lib/env-file.mjs";
 import { secureWrite, secureBackup, hardenExisting } from "./lib/secure-file.mjs";
 import { nodeVersionOk, reposRootProblem, livePidFromLock, reportLogInfo } from "./lib/setup-core.mjs";
 import { UNKNOWN, formatMessage, t, detectLang, normalizeLang } from "./lib/i18n.mjs";
+import { formatSection, formatStage, formatKeyValue, formatSummary } from "./lib/ui.mjs";
 import { parsePackageVersion } from "./lib/update-core.mjs";
 import { MANAGED_KEYS, validateConfig, REMOVED_KEYS } from "./lib/validate.mjs";
 import { setupResidency, residencyName, chooseResidencyMode, hasResidencyRegistration, instanceId } from "./lib/residency.mjs";
@@ -43,6 +44,7 @@ const FLAGS = {
   lang: normalizeLang(flagVal("--lang")),
 };
 const interactive = process.stdin.isTTY && process.stdout.isTTY && !FLAGS.yes;
+const TOTAL_STAGES = 5;
 
 // ---- tiny UI -------------------------------------------------------------
 const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
@@ -144,6 +146,23 @@ function onPath(exe) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function probeVersion(exe) {
+  try {
+    const output = execFileSync(exe, ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 3000,
+      windowsHide: true,
+    });
+    return String(output)
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .find(Boolean);
+  } catch {
+    return undefined;
   }
 }
 
@@ -283,16 +302,31 @@ async function main() {
   info(c(36, "== " + bannerTitle(lang, installedVersion) + " =="));
   warn(t("labWarning", lang));
   if (FLAGS.dryRun) info(c(90, t("dryNote", lang)));
+  printInstallPlan(lang, installedVersion);
 
   // Repo-root guard (verified via import.meta location AND package.json name).
   const pkg = readJson(path.join(REPO_ROOT, "package.json"));
   if (!pkg || pkg.name !== "discord-copilot-sdk") throw new SetupError(t("notInRepo", lang));
 
   // 1) Read-only prerequisite detection.
-  info("\n" + c(1, t("prereqHeader", lang)));
+  printStage(lang, 1, "stagePrereqs");
   const missing = [];
-  if (!nodeVersionOk()) throw new SetupError(t("prereqNodeOld", lang) + process.versions.node);
-  for (const exe of ["git", "copilot"]) if (!onPath(exe)) missing.push(exe);
+  const nodeOk = nodeVersionOk();
+  const gitOnPath = onPath("git");
+  const copilotOnPath = onPath("copilot");
+  if (!gitOnPath) missing.push("git");
+  if (!copilotOnPath) missing.push("copilot");
+  const authState = FLAGS.skipAuth ? "skipped" : copilotAuthState();
+  info(formatKeyValue(t("prereqNodeLabel", lang), process.versions.node));
+  info(formatKeyValue(t("prereqGitLabel", lang), gitOnPath ? probeVersion("git") || t("prereqPresentPath", lang) : t("prereqMissingValue", lang)));
+  info(
+    formatKeyValue(
+      t("prereqCopilotLabel", lang),
+      copilotOnPath ? probeVersion("copilot") || t("prereqPresentPath", lang) : t("prereqMissingValue", lang)
+    )
+  );
+  info(formatKeyValue(t("prereqAuthLabel", lang), authStateLabel(authState, lang)));
+  if (!nodeOk) throw new SetupError(t("prereqNodeOld", lang) + process.versions.node);
   if (missing.length) {
     warn(t("prereqMissing", lang) + missing.join(", "));
     info(t("prereqInstallHint", lang));
@@ -304,17 +338,16 @@ async function main() {
   // 2) Auth: never a false "ok". Only a definite "unauthenticated" (copilot on
   //    PATH but ~/.copilot absent) fails a non-interactive run; "indeterminate"
   //    just warns (we can't confirm a login from here).
-  info("\n" + c(1, t("authHeader", lang)));
   if (FLAGS.skipAuth) {
     warn(t("authSkip", lang));
   } else {
-    const state = copilotAuthState();
-    warn(t("authUnknown", lang) + ` (${state})`);
-    if (!interactive && state === "unauthenticated") throw new SetupError(t("authUnknown", lang));
+    warn(t("authUnknown", lang) + ` (${authState})`);
+    if (!interactive && authState === "unauthenticated") throw new SetupError(t("authUnknown", lang));
   }
 
   // 3) Load existing .env as defaults (read-only) and collect config in memory.
-  info("\n" + c(1, t("configHeader", lang)));
+  printStage(lang, 2, "stageConfig");
+  info(t("configHeader", lang));
   const existing = readEnvValues();
   // 3a) Migrate a pre-multi-repo .env BEFORE prompting, so the operator is shown
   //     the derived values and can correct them, rather than being asked to
@@ -372,7 +405,7 @@ async function main() {
 
   // 6) Dry-run stops here — nothing mutated. Never print the token.
   if (FLAGS.dryRun) {
-    info("\n" + c(90, previewMasked(values, lang)));
+    info(c(90, previewMasked(values, lang)));
     info(c(90, t("residencyDry", lang) + residencyName()));
     report(lang, installedVersion, { dryRun: true, residencyInstalled: dryRunResidencyInstalled });
     return;
@@ -399,7 +432,8 @@ async function main() {
   //    .env is still present during npm; the token is the user's own on their own
   //    machine, so this is acceptable for a single-owner lab.)
   ensureEnvNotTracked();
-  info("\n" + c(1, t("buildHeader", lang)));
+  printStage(lang, 3, "stageBuild");
+  info(t("buildHeader", lang));
   // `npm ci` REQUIRES a lockfile and fails hard without one, and this project
   // deliberately ships no lockfile (see .gitignore: one generated behind a
   // corporate proxy pins internal hosts and carries integrity hashes public
@@ -413,6 +447,7 @@ async function main() {
   //    no .env file, no ambient env, no token in this process's env). This is the
   //    same parser+schema the bot uses (parseEnv → parseConfig), so a config the
   //    runtime would reject fails the install BEFORE we write anything.
+  printStage(lang, 4, "stageValidateWrite");
   const { parseConfig } = await import(pathToFileURL(path.join(REPO_ROOT, "dist", "config.js")).href);
   let parsed;
   try {
@@ -452,6 +487,7 @@ async function main() {
 
   // 10) Residency (opt-in). Two distinct things, labelled honestly:
   //     login-keepalive (default) vs true 24/7 (needs a stored password).
+  printStage(lang, 5, "stageResidency");
   const wantResidency =
     FLAGS.residency ?? FLAGS.residency247 ?? (interactive ? /^y/i.test(await ask(t("residencyPrompt", lang) + " ", "")) : false);
   let residencyInstalled = hasResidencyRegistration();
@@ -590,9 +626,9 @@ function runningInstancePid() {
 function previewMasked(values, lang) {
   const lines = MANAGED_KEYS.map((s) => {
     const v = values[s.key] ?? "";
-    return `  ${s.key}=${s.secret ? (v ? "********" : "") : v}`;
+    return formatKeyValue(s.key, `${s.secret ? (v ? "********" : "") : v}`, 24);
   });
-  return (lang === "zh" ? "將寫入的設定（token 已遮蔽）：\n" : "Config to write (token masked):\n") + lines.join("\n");
+  return `${formatSection(t("configPreviewHeader", lang))}\n${lines.join("\n")}`;
 }
 
 function run(cmd, args, env) {
@@ -610,6 +646,42 @@ function bannerTitle(lang, version) {
   return version === UNKNOWN ? `${t("banner", lang)} (${UNKNOWN})` : `${t("banner", lang)} ${version}`;
 }
 
+function boolLabel(value, lang) {
+  if (lang === "en") return value ? "Yes" : "No";
+  return value ? t("yes", lang) : t("no", lang);
+}
+
+function trimLabel(label) {
+  return String(label).replace(/[：:]\s*$/u, "");
+}
+
+function printSection(title) {
+  info(formatSection(c(1, title)));
+}
+
+function printStage(lang, current, titleKey) {
+  printSection(formatStage(current, TOTAL_STAGES, t(titleKey, lang)));
+}
+
+function printInstallPlan(lang, version) {
+  const rows = [
+    formatKeyValue(t("planPackageVersion", lang), version),
+    formatKeyValue(t("planRepositoryRoot", lang), REPO_ROOT),
+    formatKeyValue(t("planEnvPath", lang), ENV_PATH),
+    formatKeyValue(t("planStateDir", lang), STATE_DIR),
+    formatKeyValue(t("planInstanceId", lang), instanceId()),
+  ];
+  if (FLAGS.dryRun) rows.push(formatKeyValue(t("planDryRun", lang), boolLabel(true, lang)));
+  printSection(t("planHeader", lang));
+  info(rows.join("\n"));
+}
+
+function authStateLabel(state, lang) {
+  if (FLAGS.skipAuth) return t("authStateSkipped", lang);
+  if (state === "unauthenticated") return t("authStateUnauthenticated", lang);
+  return t("authStateIndeterminate", lang);
+}
+
 function report(lang, version, options = {}) {
   const shell = process.platform === "win32" ? "ps1" : "sh";
   const manualLogInfo = reportLogInfo(
@@ -625,11 +697,12 @@ function report(lang, version, options = {}) {
     manualLogInfo.kind === "path" && manualLogInfo.afterFirstStart && !fs.existsSync(manualLogInfo.value)
       ? formatMessage(t("doneLogAfterStart", lang), [manualLogInfo.value])
       : manualLogInfo.value;
-  info("\n" + c(32, t("doneHeader", lang)) + (options.dryRun ? " (dry-run)" : ""));
-  info(t("doneVersion", lang) + version);
-  info(t("doneStart", lang) + `./run-bot.${shell}`);
-  info(t("doneStop", lang) + `./stop-bot.${shell}`);
-  info(t("doneLog", lang) + manualLogDetail);
+  const rows = [
+    [trimLabel(t("doneVersion", lang)), version],
+    [trimLabel(t("doneStart", lang)), `./run-bot.${shell}`],
+    [trimLabel(t("doneStop", lang)), `./stop-bot.${shell}`],
+    [trimLabel(t("doneLog", lang)), manualLogDetail],
+  ];
   if (options.residencyInstalled) {
     const residencyLogInfo = reportLogInfo(
       {
@@ -640,12 +713,14 @@ function report(lang, version, options = {}) {
       },
       path
     );
-    info(t("doneLog", lang) + formatMessage(t("doneLogResidency", lang), [residencyLogInfo.value]));
+    rows.push([t("summaryResidencyLogLabel", lang), formatMessage(t("doneLogResidency", lang), [residencyLogInfo.value])]);
   }
-  info(t("doneUpdate", lang) + `./update.${shell}`);
-  info(t("doneUninstall", lang) + `./uninstall.${shell}`);
-  info(t("doneManual", lang));
-  info(c(33, t("doneSafety", lang)));
+  rows.push([trimLabel(t("doneUpdate", lang)), `./update.${shell}`]);
+  rows.push([trimLabel(t("doneUninstall", lang)), `./uninstall.${shell}`]);
+  rows.push([t("summaryManualLabel", lang), t("doneManual", lang)]);
+  rows.push([t("summarySafetyLabel", lang), t("doneSafety", lang)]);
+  printSection(t("summaryHeader", lang) + (options.dryRun ? " (dry-run)" : ""));
+  info(formatSummary(rows));
 }
 
 main().catch((e) => {
