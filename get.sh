@@ -48,7 +48,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-say "discord-copilot-sdk 一鍵安裝（網路啟動器）" "discord-copilot-sdk one-line bootstrap"
+say "== discord-copilot-sdk ==" "== discord-copilot-sdk =="
+say "[1/2] 網路啟動器（macOS / Linux）" "[1/2] Network bootstrap (macOS / Linux)"
 
 # --- git --- (must run before folder detection below, which shells out to git)
 if ! command -v git >/dev/null 2>&1; then
@@ -167,7 +168,7 @@ fi
 
 # --- hand off to the repo's installer ---
 [ -f "$TARGET/install.sh" ] || { echo "install.sh not found at $TARGET" >&2; exit 1; }
-say "交給安裝器…" "Handing off to the installer…"
+say "[2/2] 交給本機安裝器…" "[2/2] Handing off to the local installer…"
 # `< /dev/tty` matters: this script's stdin is the curl pipe, so without it the
 # installer's prompts (including the hidden password prompt) would read the
 # script body instead of the user.

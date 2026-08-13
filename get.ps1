@@ -96,7 +96,9 @@ param(
   $ref = if ($Ref) { $Ref } elseif ($env:DISCORD_COPILOT_SDK_REF) { $env:DISCORD_COPILOT_SDK_REF } else { 'main' }
   $norm = { param($u) ($u -replace '\.git$', '' -replace '/$', '').ToLowerInvariant() }
 
-  Say 'discord-copilot-sdk 一鍵安裝（網路啟動器）' 'discord-copilot-sdk one-line bootstrap'
+  Say '== discord-copilot-sdk ==' '== discord-copilot-sdk =='
+
+  Say '[1/2] 網路啟動器（Windows）' '[1/2] Network bootstrap (Windows)'
 
   # --- git --- (must run before folder detection below, which shells out to git)
   if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -238,7 +240,7 @@ param(
   # --- hand off to the repo's installer, in a CHILD process ---
   $installer = Join-Path $target 'install.ps1'
   if (-not (Test-Path $installer)) { throw "install.ps1 not found at $installer" }
-  Say '交給安裝器…' 'Handing off to the installer…'
+  Say '[2/2] 交給本機安裝器…' '[2/2] Handing off to the local installer…'
   $psExe = (Get-Process -Id $PID).Path
   if (-not $psExe) { $psExe = 'powershell.exe' }
   & $psExe -NoProfile -ExecutionPolicy Bypass -File $installer @forward

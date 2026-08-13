@@ -28,6 +28,40 @@ function relativeMarkdownLinks(text: string): string[] {
 const USER_FACING_PS1 = ["install.ps1", "get.ps1", "update.ps1", "run-bot.ps1", "stop-bot.ps1", "uninstall.ps1"];
 
 describe("shipped scripts", () => {
+  it("keeps bootstrap and installer headers honest and structured", () => {
+    const bootstrapPs1 = fs.readFileSync(path.join(ROOT, "get.ps1"), "utf8");
+    expect(bootstrapPs1).toContain("discord-copilot-sdk");
+    expect(bootstrapPs1).toContain("[1/2]");
+    expect(bootstrapPs1).toContain("Network bootstrap");
+    expect(bootstrapPs1).toContain("  Target: $target");
+    expect(bootstrapPs1).toContain("  Ref: $ref");
+    expect(bootstrapPs1).toContain("[2/2]");
+    expect(bootstrapPs1).toContain("Handing off to the local installer");
+
+    const bootstrapSh = fs.readFileSync(path.join(ROOT, "get.sh"), "utf8");
+    expect(bootstrapSh).toContain("discord-copilot-sdk");
+    expect(bootstrapSh).toContain("[1/2]");
+    expect(bootstrapSh).toContain("Network bootstrap");
+    expect(bootstrapSh).toContain("  Target: $TARGET");
+    expect(bootstrapSh).toContain("  Ref: $REF");
+    expect(bootstrapSh).toContain("[2/2]");
+    expect(bootstrapSh).toContain("Handing off to the local installer");
+
+    const installerPs1 = fs.readFileSync(path.join(ROOT, "install.ps1"), "utf8");
+    expect(installerPs1).toContain("discord-copilot-sdk");
+    expect(installerPs1).toContain("[1/2]");
+    expect(installerPs1).toContain("Windows installer");
+    expect(installerPs1).toContain("[2/2]");
+    expect(installerPs1).toContain("Handing off to local setup");
+
+    const installerSh = fs.readFileSync(path.join(ROOT, "install.sh"), "utf8");
+    expect(installerSh).toContain("discord-copilot-sdk");
+    expect(installerSh).toContain("[1/2]");
+    expect(installerSh).toContain("macOS / Linux installer");
+    expect(installerSh).toContain("[2/2]");
+    expect(installerSh).toContain("Handing off to local setup");
+  });
+
   it("serializes the full Vitest suite because git-heavy fixtures share host resources", () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
       scripts?: Record<string, string>;
