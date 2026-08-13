@@ -43,7 +43,7 @@ let binDir; // stub-bin prepended to PATH
 function makeFixture(withEnv) {
   const repo = fs.mkdtempSync(path.join(tmpdir(), "dp-int-"));
   fs.cpSync(REAL_SCRIPTS, path.join(repo, "scripts"), { recursive: true });
-  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version: FIXTURE_VERSION }));
+  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version: FIXTURE_VERSION, type: "module" }));
   fs.writeFileSync(path.join(repo, ".env.example"), "DISCORD_BOT_TOKEN=\nDEV_GUILD_ID=\n");
   if (withEnv) {
     // A separate directory from the fixture root itself, so it can't be
@@ -57,6 +57,15 @@ function makeFixture(withEnv) {
     fs.writeFileSync(path.join(repo, ".env"), validEnv(reposRoot));
   }
   return repo;
+}
+
+function stubBuiltDist(repo) {
+  fs.mkdirSync(path.join(repo, "dist", "core"), { recursive: true });
+  fs.writeFileSync(
+    path.join(repo, "dist", "config.js"),
+    'export function parseConfig(env) { return { REPOS_ROOT: env.REPOS_ROOT }; }\n'
+  );
+  fs.writeFileSync(path.join(repo, "dist", "core", "repo.js"), "export function resolveReposRoot(value) { return value; }\n");
 }
 
 function runSetup(repo, args) {
@@ -92,7 +101,7 @@ beforeAll(() => {
   binDir = path.join(root, "bin");
   fs.mkdirSync(binDir, { recursive: true });
   // Stub git + copilot so the read-only prereq gate resolves them on any host.
-  for (const name of ["git", "copilot"]) {
+  for (const name of ["git", "copilot", "npm"]) {
     if (isWin) {
       fs.writeFileSync(path.join(binDir, `${name}.cmd`), "@echo off\r\nexit /b 0\r\n");
     } else {
@@ -205,6 +214,28 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
             : "discord-copilot-sdk-default.log"
         );
       }
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("successful non-dry-run explicitly reports completion, while dry-run stays marked as dry-run", () => {
+    const repo = makeFixture(true);
+    try {
+      stubBuiltDist(repo);
+
+      const success = runSetup(repo, ["--yes", "--skip-auth", "--lang", "en"]);
+      const successOut = (success.stdout || "") + (success.stderr || "");
+      expect(success.status).toBe(0);
+      expect(successOut).toContain("✅ Installation complete");
+      expect(successOut).toContain("Action summary");
+      expect(successOut).not.toContain("Action summary (dry-run)");
+
+      const dryRun = runSetup(repo, ["--dry-run", "--yes", "--skip-auth", "--lang", "en"]);
+      const dryRunOut = (dryRun.stdout || "") + (dryRun.stderr || "");
+      expect(dryRun.status).toBe(0);
+      expect(dryRunOut).toContain("Action summary (dry-run)");
+      expect(dryRunOut).not.toContain("✅ Installation complete");
     } finally {
       fs.rmSync(repo, { recursive: true, force: true });
     }

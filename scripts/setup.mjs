@@ -719,6 +719,7 @@ function report(lang, version, options = {}) {
   rows.push([trimLabel(t("doneUninstall", lang)), `./uninstall.${shell}`]);
   rows.push([t("summaryManualLabel", lang), t("doneManual", lang)]);
   rows.push([t("summarySafetyLabel", lang), t("doneSafety", lang)]);
+  if (!options.dryRun) info(t("doneHeader", lang));
   printSection(t("summaryHeader", lang) + (options.dryRun ? " (dry-run)" : ""));
   info(formatSummary(rows));
 }
