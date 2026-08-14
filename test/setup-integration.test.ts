@@ -135,6 +135,10 @@ function rewriteSetupFixture(repo, replacer) {
   fs.writeFileSync(setupPath, updated);
 }
 
+function posixNodeCommandWrapperSource(scriptPath) {
+  return `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(scriptPath)} "$@"\n`;
+}
+
 function writeNodeCommandStub(name, source, targetDir = binDir) {
   const scriptPath = path.join(targetDir, `${name}-stub.mjs`);
   fs.writeFileSync(scriptPath, source);
@@ -142,7 +146,7 @@ function writeNodeCommandStub(name, source, targetDir = binDir) {
     fs.writeFileSync(path.join(targetDir, `${name}.cmd`), `@echo off\r\n"${process.execPath}" "%~dp0${name}-stub.mjs" %*\r\n`);
   } else {
     const wrapperPath = path.join(targetDir, name);
-    fs.writeFileSync(wrapperPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} "$(dirname "$0")/${name}-stub.mjs" "$@"\n`);
+    fs.writeFileSync(wrapperPath, posixNodeCommandWrapperSource(scriptPath));
     fs.chmodSync(wrapperPath, 0o755);
   }
 }
@@ -226,6 +230,14 @@ afterAll(() => {
 // instead of being raised globally, which would blunt the signal for genuinely
 // hanging unit tests.
 describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 }, () => {
+  it("builds POSIX command wrappers without external shell utilities", () => {
+    const wrapper = posixNodeCommandWrapperSource("/fixture/bin/git-stub.mjs");
+
+    expect(wrapper).toContain("#!/bin/sh");
+    expect(wrapper).toContain('"/fixture/bin/git-stub.mjs"');
+    expect(wrapper).not.toContain("dirname");
+  });
+
   it("valid config, English dry-run: prints the install plan before stage 1, masks secrets, and mutates NOTHING", () => {
     const repo = makeFixture(true);
     try {
@@ -761,6 +773,9 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       const out = (r.stdout || "") + (r.stderr || "");
 
       expect(r.status).toBe(1);
+      expect(out).not.toContain("Missing: git, copilot");
+      expect(out).not.toContain("Git               missing");
+      expect(out).not.toContain("Copilot           missing");
       expect(out).toContain("npm install --no-audit --no-fund");
       expect(out).toContain(setupLogDir(home));
       expect(out).toMatch(/Could not start/i);

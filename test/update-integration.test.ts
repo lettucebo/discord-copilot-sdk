@@ -21,6 +21,18 @@ let remote: string;
 let bin: string;
 let serial = 0;
 const instancePrefix = `test-${randomUUID()}`;
+const UPDATE_FIXTURE_PREFIX = "dcs-update-git-";
+
+async function removeFixtureRoot(rootPath: string): Promise<void> {
+  const resolvedRoot = path.resolve(rootPath);
+  const expectedParent = path.resolve(os.tmpdir());
+  if (path.dirname(resolvedRoot) !== expectedParent || !path.basename(resolvedRoot).startsWith(UPDATE_FIXTURE_PREFIX)) {
+    throw new Error(`refusing to remove non-fixture path: ${resolvedRoot}`);
+  }
+  // Node 20 on Windows can keep a copied git.exe locked briefly after child
+  // exit; bounded rm retries keep cleanup strict without masking real leaks.
+  await fs.promises.rm(resolvedRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+}
 
 async function cloneTarget(name: string): Promise<string> {
   const target = path.join(root, name);
@@ -230,7 +242,7 @@ function expectedRestoreCommand(target: string, instance: string): string {
 }
 
 beforeAll(async () => {
-  root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dcs-update-git-"));
+  root = await fs.promises.mkdtemp(path.join(os.tmpdir(), UPDATE_FIXTURE_PREFIX));
   source = path.join(root, "source");
   remote = path.join(root, "remote.git");
   bin = path.join(root, "bin");
@@ -261,10 +273,26 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await fs.promises.rm(root, { recursive: true, force: true });
+  await removeFixtureRoot(root);
 });
 
 describe("git update data paths", { timeout: 60_000 }, () => {
+  it("cleanup removes only the dedicated update temp root", async () => {
+    const fixtureRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), UPDATE_FIXTURE_PREFIX));
+    await fs.promises.mkdir(path.join(fixtureRoot, "child"), { recursive: true });
+    await fs.promises.writeFile(path.join(fixtureRoot, "child", "marker.txt"), "ok\n");
+
+    await removeFixtureRoot(fixtureRoot);
+
+    expect(fs.existsSync(fixtureRoot)).toBe(false);
+  });
+
+  it("cleanup refuses paths outside the dedicated update temp root", async () => {
+    const outside = path.join(os.tmpdir(), `outside-${Date.now()}`);
+
+    await expect(removeFixtureRoot(outside)).rejects.toThrow(/refus/i);
+  });
+
   it("refuses a dirty named branch before moving it to a newer remote commit", async () => {
     const local = await cloneTarget("dirty");
     const before = (await git(local, "rev-parse", "HEAD")).stdout.trim();
