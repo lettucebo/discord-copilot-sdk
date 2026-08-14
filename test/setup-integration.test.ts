@@ -740,6 +740,16 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
         ].join("\n"),
         missingNpmDir
       );
+      writeNodeCommandStub(
+        "which",
+        [
+          'const command = process.argv[2];',
+          'if (command === "git" || command === "copilot") { console.log(command); process.exit(0); }',
+          "process.exit(1);",
+          "",
+        ].join("\n"),
+        missingNpmDir
+      );
 
       const r = runSetup(repo, ["--yes", "--skip-auth", "--lang", "en"], {
         keepHome: true,

@@ -31,6 +31,8 @@ async function cloneTarget(name: string): Promise<string> {
   // without globally mutating the developer's Git configuration.
   await git(target, "remote", "set-url", "origin", PUBLIC_ORIGIN);
   await git(target, "config", `url.${pathToFileURL(remote).href}.insteadOf`, PUBLIC_ORIGIN);
+  await git(target, "config", "user.email", "update-target@test.invalid");
+  await git(target, "config", "user.name", "update target");
   const reposRoot = path.join(root, "repos-root");
   await fs.promises.mkdir(reposRoot, { recursive: true });
   await fs.promises.writeFile(
@@ -1038,7 +1040,7 @@ describe("git update data paths", { timeout: 60_000 }, () => {
       expect(result.stdout).not.toContain("Restored the pre-update running state.");
       expect(result.stdout).not.toContain("Update complete");
       expect(result.stdout).not.toContain("Update succeeded; --no-restart leaves it stopped.");
-      expect(result.stderr).toContain("simulated restore failure");
+      expect(result.stderr).toMatch(/simulated restore\s+failure/);
       expect(fs.existsSync(stateFile)).toBe(true);
       expect(() => process.kill(originalPid as number, 0)).toThrow();
     } finally {

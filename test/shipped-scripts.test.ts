@@ -32,14 +32,33 @@ function writeExecutable(file: string, text: string) {
   fs.chmodSync(file, 0o755);
 }
 
-function bashPath(file: string): string {
-  if (process.platform !== "win32") return file;
-  const root = bashUsesMntC() ? "/mnt" : "/";
-  return file.replace(/^([A-Za-z]):/, (_, drive: string) => `${root}/${drive.toLowerCase()}`).replace(/\\/g, "/");
+function bashConversionTool(): "cygpath" | "wslpath" | undefined {
+  if (process.platform !== "win32") return undefined;
+  const probe = spawnSync(
+    "bash",
+    [
+      "-lc",
+      "if command -v cygpath >/dev/null 2>&1; then printf cygpath; elif command -v wslpath >/dev/null 2>&1; then printf wslpath; else exit 1; fi",
+    ],
+    { encoding: "utf8" }
+  );
+  const tool = probe.stdout.trim();
+  return tool === "cygpath" || tool === "wslpath" ? tool : undefined;
 }
 
-function bashUsesMntC(): boolean {
-  return process.platform === "win32" && spawnSync("bash", ["-lc", "test -d /mnt/c"]).status === 0;
+function bashPath(file: string): string {
+  const tool = bashConversionTool();
+  if (tool === undefined) return file;
+  const wslEnv =
+    tool === "wslpath"
+      ? [...(process.env.WSLENV?.split(":") ?? []), "DCS_BASH_PATH"].join(":")
+      : process.env.WSLENV;
+  const result = spawnSync("bash", ["-lc", `${tool} -u "$DCS_BASH_PATH"`], {
+    encoding: "utf8",
+    env: { ...process.env, DCS_BASH_PATH: file, WSLENV: wslEnv },
+  });
+  if (result.status !== 0) throw new Error(`could not convert path for bash: ${result.stderr}`);
+  return result.stdout.trim();
 }
 
 describe("shipped scripts", () => {
@@ -83,7 +102,7 @@ describe("shipped scripts", () => {
     const installRecord = path.join(fixture, "install-args.txt");
     const getRecord = path.join(fixture, "get-args.txt");
     const target = path.join(fixture, "target");
-    const isWsl = bashUsesMntC();
+    const isWsl = bashConversionTool() === "wslpath";
     const wslEnv = isWsl ? [...(process.env.WSLENV?.split(":") ?? []), "DCS_RECORD/p", "DCS_GET_RECORD/p"].join(":") : process.env.WSLENV;
     const env = {
       ...process.env,
