@@ -22,6 +22,10 @@ let bin: string;
 let serial = 0;
 const instancePrefix = `test-${randomUUID()}`;
 const UPDATE_FIXTURE_PREFIX = "dcs-update-git-";
+const CLEANUP_RM_MAX_RETRIES = 20;
+const CLEANUP_RM_RETRY_DELAY_MS = 100;
+const CLEANUP_RM_RETRY_BUDGET_MS = CLEANUP_RM_RETRY_DELAY_MS * (CLEANUP_RM_MAX_RETRIES * (CLEANUP_RM_MAX_RETRIES + 1)) / 2;
+const CLEANUP_HOOK_TIMEOUT_MS = 30_000;
 
 async function removeFixtureRoot(rootPath: string): Promise<void> {
   const resolvedRoot = path.resolve(rootPath);
@@ -31,7 +35,12 @@ async function removeFixtureRoot(rootPath: string): Promise<void> {
   }
   // Node 20 on Windows can keep a copied git.exe locked briefly after child
   // exit; bounded rm retries keep cleanup strict without masking real leaks.
-  await fs.promises.rm(resolvedRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  await fs.promises.rm(resolvedRoot, {
+    recursive: true,
+    force: true,
+    maxRetries: CLEANUP_RM_MAX_RETRIES,
+    retryDelay: CLEANUP_RM_RETRY_DELAY_MS,
+  });
 }
 
 async function cloneTarget(name: string): Promise<string> {
@@ -274,7 +283,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await removeFixtureRoot(root);
-});
+}, CLEANUP_HOOK_TIMEOUT_MS);
 
 describe("git update data paths", { timeout: 60_000 }, () => {
   it("cleanup removes only the dedicated update temp root", async () => {
@@ -291,6 +300,10 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     const outside = path.join(os.tmpdir(), `outside-${Date.now()}`);
 
     await expect(removeFixtureRoot(outside)).rejects.toThrow(/refus/i);
+  });
+
+  it("cleanup hook timeout leaves room for the bounded Windows retry budget", () => {
+    expect(CLEANUP_HOOK_TIMEOUT_MS).toBeGreaterThan(CLEANUP_RM_RETRY_BUDGET_MS);
   });
 
   it("refuses a dirty named branch before moving it to a newer remote commit", async () => {
