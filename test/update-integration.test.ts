@@ -25,7 +25,9 @@ const UPDATE_FIXTURE_PREFIX = "dcs-update-git-";
 const CLEANUP_RM_MAX_RETRIES = 20;
 const CLEANUP_RM_RETRY_DELAY_MS = 100;
 const CLEANUP_RM_RETRY_BUDGET_MS = CLEANUP_RM_RETRY_DELAY_MS * (CLEANUP_RM_MAX_RETRIES * (CLEANUP_RM_MAX_RETRIES + 1)) / 2;
-const CLEANUP_HOOK_TIMEOUT_MS = 30_000;
+const WINDOWS_GIT_WRAPPER_COUNT = 3;
+const CLEANUP_HOOK_TIMEOUT_MS =
+  process.platform === "win32" ? CLEANUP_RM_RETRY_BUDGET_MS * WINDOWS_GIT_WRAPPER_COUNT + 10_000 : 10_000;
 
 async function removeFixtureRoot(rootPath: string): Promise<void> {
   const resolvedRoot = path.resolve(rootPath);
@@ -302,8 +304,9 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     await expect(removeFixtureRoot(outside)).rejects.toThrow(/refus/i);
   });
 
-  it("cleanup hook timeout leaves room for the bounded Windows retry budget", () => {
-    expect(CLEANUP_HOOK_TIMEOUT_MS).toBeGreaterThan(CLEANUP_RM_RETRY_BUDGET_MS);
+  it("cleanup hook timeout covers every copied Windows git wrapper retry budget", () => {
+    const requiredBudget = process.platform === "win32" ? CLEANUP_RM_RETRY_BUDGET_MS * WINDOWS_GIT_WRAPPER_COUNT : 0;
+    expect(CLEANUP_HOOK_TIMEOUT_MS).toBeGreaterThan(requiredBudget);
   });
 
   it("refuses a dirty named branch before moving it to a newer remote commit", async () => {
