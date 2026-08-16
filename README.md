@@ -22,6 +22,7 @@ device. Token usage and the live model/effort/context tier are available on dema
 
 **Working end-to-end and installable** (`install.ps1` / `install.sh`, see
 [`INSTALL.md`](INSTALL.md)). Architecture and phase history in [`docs/PLAN.md`](docs/PLAN.md).
+Contributor CI diagnostics are in [`docs/CI-TROUBLESHOOTING.md`](docs/CI-TROUBLESHOOTING.md).
 Still lab-only — read the security model below before running it.
 
 ### Formerly `discopilot`
