@@ -83,4 +83,3 @@ Windows 解析 `.cmd` launcher 的方式與 POSIX executable 不同。Fixture �
    ```
 
 5. 最後執行 `npm run typecheck && npm test`。
-

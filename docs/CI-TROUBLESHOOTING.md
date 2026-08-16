@@ -83,4 +83,3 @@ Reduce that loop by:
    ```
 
 5. Finish with `npm run typecheck && npm test`.
-
