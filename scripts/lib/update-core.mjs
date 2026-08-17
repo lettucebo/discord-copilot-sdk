@@ -1,6 +1,8 @@
 // Pure update planning helpers. The updater must decide whether it is safe to
 // stop the bot before it changes HEAD, so this module has no filesystem or
 // subprocess side effects and is covered independently.
+import { truncateDisplayWidth } from "./ui.mjs";
+
 
 /** @typedef {"managed" | "branch-clean" | "branch-dirty" | "unknown"} CheckoutKind */
 
@@ -89,6 +91,65 @@ export function resolveRemoteSha(records, requestedRef) {
   }
 
   return find(`refs/heads/${requestedRef}`) ?? find(`refs/tags/${requestedRef}^{}`) ?? find(`refs/tags/${requestedRef}`);
+}
+
+export function displayRemoteRef(ref) {
+  return typeof ref === "string" ? ref.replace(/\^\{\}$/, "") : "unknown";
+}
+
+function quotePowerShell(value) {
+  return String(value).replace(/'/g, "''");
+}
+
+function quoteShell(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function quoteShellPath(value) {
+  return String(value).replace(/["\\$`]/g, "\\$&");
+}
+
+/**
+ * Render a command that preserves the instance and scope selected during a
+ * read-only update check. The updater passes only validated instances and
+ * parsed refs, while quoting ref text again prevents an output hint from
+ * becoming a shell injection sink.
+ *
+ * @param {{
+ *   platform: string,
+ *   updateScript: string,
+ *   ref: string,
+ *   instance: string,
+ *   allInstances: boolean
+ * }} input
+ */
+export function buildApplyCommand({ platform, updateScript, ref, instance, allInstances }) {
+  const args = [];
+  if (ref !== "main") args.push(platform === "win32" ? "-Ref" : "--ref", platform === "win32" ? `'${quotePowerShell(ref)}'` : quoteShell(ref));
+  if (allInstances) args.push(platform === "win32" ? "-AllInstances" : "--all-instances");
+  const suffix = args.length ? ` ${args.join(" ")}` : "";
+  if (platform === "win32") {
+    return `$env:DISCORD_COPILOT_SDK_INSTANCE_ID = '${quotePowerShell(instance)}'; & '${quotePowerShell(updateScript)}'${suffix}`;
+  }
+  return `DISCORD_COPILOT_SDK_INSTANCE_ID=${instance} bash "${quoteShellPath(updateScript)}"${suffix}`;
+}
+
+/**
+ * Render the explicit recovery command through the same platform wrapper as
+ * a normal update, retaining the selected instance without bypassing wrapper
+ * argument binding.
+ *
+ * @param {{
+ *   platform: string,
+ *   updateScript: string,
+ *   instance: string
+ * }} input
+ */
+export function buildRestoreCommand({ platform, updateScript, instance }) {
+  if (platform === "win32") {
+    return `$env:DISCORD_COPILOT_SDK_INSTANCE_ID = '${quotePowerShell(instance)}'; & '${quotePowerShell(updateScript)}' -Restore`;
+  }
+  return `DISCORD_COPILOT_SDK_INSTANCE_ID=${instance} bash "${quoteShellPath(updateScript)}" --restore`;
 }
 
 /**
@@ -206,6 +267,50 @@ export function parseUpdateArgs(args) {
   return result;
 }
 
+const FULL_SHA = /^[0-9a-f]{40,64}$/i;
+const COMPARE_URL = "https://github.com/lettucebo/discord-copilot-sdk/compare/";
+const ANSI_SEQUENCE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-Z\\-_])|\u009b[0-?]*[ -/]*[@-~]/g;
+const UNSAFE_CONTROLS = /[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+const TARGET_NOTES_LINE_LIMIT = 16;
+const TARGET_NOTES_WIDTH = 160;
+
+function stripUnsafeTerminalSequences(text) {
+  return String(text).replace(ANSI_SEQUENCE, "").replace(UNSAFE_CONTROLS, "");
+}
+
+/**
+ * Bound and neutralize target changelog notes before they reach the terminal.
+ * The updater reads changelog content from an untrusted fetched revision, so
+ * every emitted line must be width-limited and free of terminal controls.
+ *
+ * @param {{
+ *   version: string,
+ *   changelogSection: string | null,
+ *   localSha: string,
+ *   remoteSha: string
+ * }} input
+ * @returns {{notes: string[], omittedCount: number, compareUrl: string | null}}
+ */
+export function summarizeTargetNotes({ version, changelogSection, localSha, remoteSha }) {
+  const compareUrl = FULL_SHA.test(localSha) && FULL_SHA.test(remoteSha) ? `${COMPARE_URL}${localSha}...${remoteSha}` : null;
+  if (version === "unknown" || typeof changelogSection !== "string") {
+    return { notes: [], omittedCount: 0, compareUrl };
+  }
+
+  const notes = changelogSection
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => stripUnsafeTerminalSequences(line))
+    .filter((line) => line.trim() !== "")
+    .map((line) => truncateDisplayWidth(line, TARGET_NOTES_WIDTH));
+
+  return {
+    notes: notes.slice(0, TARGET_NOTES_LINE_LIMIT),
+    omittedCount: Math.max(0, notes.length - TARGET_NOTES_LINE_LIMIT),
+    compareUrl,
+  };
+}
+
 /** A namespace distinct from `<instance>.lock`, which only the bot may own. */
 export function updateLockRelativePath(instance) {
   return `updates/${instance}.lock`;
@@ -247,9 +352,9 @@ export function readyMarkerMatches(text, instance, pid) {
   }
 }
 
-/** A restore snapshot exists only to recover from a failed setup/apply path. */
-export function shouldRetainRestoreState(setupSucceeded) {
-  return !setupSucceeded;
+/** A restore snapshot exists until the whole update flow finishes cleanly. */
+export function shouldRetainRestoreState(updateCompleted) {
+  return !updateCompleted;
 }
 
 /** The apply sequence. Residency must stop before the process it restarts. */

@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { buildWindowsRegisterScript, chooseResidencyMode } from "../scripts/lib/residency.mjs";
+import type {
+  ExecFileSyncOptions,
+  ExecFileSyncOptionsWithBufferEncoding,
+  ExecFileSyncOptionsWithStringEncoding,
+} from "node:child_process";
+import type { NonSharedBuffer } from "node:buffer";
+import { buildWindowsRegisterScript, chooseResidencyMode, hasResidencyRegistration } from "../scripts/lib/residency.mjs";
 
 const base = {
   name: "discord-copilot-sdk-default",
@@ -8,6 +14,41 @@ const base = {
   wrapperLeaf: "run-bot.default.ps1",
   pwEnvVar: "DCS_RESIDENCY_PW",
 };
+
+function mockExecFileSync(
+  impl: (command: string, args: readonly string[], options?: ExecFileSyncOptions) => NonSharedBuffer
+): NonNullable<NonNullable<Parameters<typeof hasResidencyRegistration>[0]>["execFileSyncFn"]> {
+  const isExecFileSyncOptions = (
+    value: readonly string[] | ExecFileSyncOptions | undefined
+  ): value is ExecFileSyncOptions | undefined => value === undefined || !Array.isArray(value);
+
+  function execFileSyncFn(file: string): NonSharedBuffer;
+  function execFileSyncFn(file: string, options: ExecFileSyncOptionsWithStringEncoding): string;
+  function execFileSyncFn(file: string, options: ExecFileSyncOptionsWithBufferEncoding): NonSharedBuffer;
+  function execFileSyncFn(file: string, options?: ExecFileSyncOptions): string | NonSharedBuffer;
+  function execFileSyncFn(file: string, args: readonly string[]): NonSharedBuffer;
+  function execFileSyncFn(file: string, args: readonly string[], options: ExecFileSyncOptionsWithStringEncoding): string;
+  function execFileSyncFn(file: string, args: readonly string[], options: ExecFileSyncOptionsWithBufferEncoding): NonSharedBuffer;
+  function execFileSyncFn(file: string, args?: readonly string[], options?: ExecFileSyncOptions): string | NonSharedBuffer;
+  function execFileSyncFn(
+    file: string,
+    argsOrOptions?: readonly string[] | ExecFileSyncOptions,
+    maybeOptions?: ExecFileSyncOptions
+  ): string | NonSharedBuffer {
+    const args: readonly string[] = Array.isArray(argsOrOptions) ? argsOrOptions : [];
+    let resolvedOptions: ExecFileSyncOptions | undefined;
+    if (Array.isArray(argsOrOptions)) {
+      resolvedOptions = maybeOptions;
+    } else if (isExecFileSyncOptions(argsOrOptions)) {
+      resolvedOptions = argsOrOptions;
+    }
+    const output = impl(file, args, resolvedOptions);
+    const encoding = resolvedOptions?.encoding;
+    return typeof encoding === "string" && encoding !== "buffer" ? output.toString(encoding) : output;
+  }
+
+  return execFileSyncFn;
+}
 
 describe("chooseResidencyMode", () => {
   const win = { platform: "win32", interactive: true, hasTty: true };
@@ -102,5 +143,64 @@ describe("buildWindowsRegisterScript", () => {
       mode: "logon",
     });
     expect(s).toContain("C:\\Users\\O''Brien\\run-bot.ps1");
+  });
+});
+
+describe("hasResidencyRegistration", () => {
+  it("checks the actual platform-specific residency registration target", () => {
+    expect(
+      hasResidencyRegistration({
+        platform: "win32",
+        instance: "default",
+        execFileSyncFn: mockExecFileSync(() => Buffer.from("ok")),
+      })
+    ).toBe(true);
+
+    expect(
+      hasResidencyRegistration({
+        platform: "darwin",
+        instance: "default",
+        uid: 501,
+        execFileSyncFn: mockExecFileSync((command, args) => {
+          expect(command).toBe("launchctl");
+          expect(args).toEqual(["print", "gui/501/com.discord-copilot-sdk.default"]);
+          return Buffer.from("loaded");
+        }),
+      })
+    ).toBe(true);
+
+    expect(
+      hasResidencyRegistration({
+        platform: "linux",
+        instance: "ops",
+        execFileSyncFn: mockExecFileSync((command, args) => {
+          expect(command).toBe("systemctl");
+          expect(args).toEqual(["--user", "is-enabled", "discord-copilot-sdk-ops.service"]);
+          return Buffer.from("enabled");
+        }),
+      })
+    ).toBe(true);
+  });
+
+  it("fails closed when the residency registration is absent or unreadable", () => {
+    expect(
+      hasResidencyRegistration({
+        platform: "win32",
+        instance: "default",
+        execFileSyncFn: () => {
+          throw new Error("missing");
+        },
+      })
+    ).toBe(false);
+    expect(
+      hasResidencyRegistration({
+        platform: "darwin",
+        instance: "default",
+        uid: 501,
+        execFileSyncFn: () => {
+          throw new Error("missing");
+        },
+      })
+    ).toBe(false);
   });
 });

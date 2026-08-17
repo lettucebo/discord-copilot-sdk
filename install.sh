@@ -21,6 +21,7 @@ for a in "$@"; do
     --residency-24x7) FWD+=("--residency-24x7") ;;
     --no-residency) FWD+=("--no-residency") ;;
     --skip-auth) FWD+=("--skip-auth") ;;
+    --verbose) FWD+=("--verbose") ;;
   esac
 done
 # support "--lang zh" (separate token)
@@ -47,23 +48,25 @@ if [ "$lang" = "zh" ]; then export DISCORD_COPILOT_SDK_LOCALE="zh-TW"; else expo
 msg() { # msg <key>
   if [ "$lang" = "zh" ]; then
     case "$1" in
-      banner) echo "discord-copilot-sdk 安裝（前置準備）" ;;
+      banner) echo "discord-copilot-sdk" ;;
+      stage1) echo "[1/2] macOS / Linux 安裝器" ;;
       checking) echo "檢查前置需求（Node / git / Copilot CLI）…" ;;
       installing) echo "正在安裝" ;;
       manual) echo "無法自動安裝，請手動安裝後重新執行：" ;;
       reopen) echo "已安裝相依套件，但目前的 shell 可能還找不到它。請重新開啟終端機後再次執行本腳本。" ;;
-      handoff) echo "前置準備完成，交給設定精靈…" ;;
+      handoff) echo "[2/2] 交給本機設定…" ;;
       noPm) echo "找不到支援的套件管理器（brew/apt/dnf）。請手動安裝 Node>=20.19、git、GitHub Copilot CLI。" ;;
       dry) echo "（--dry-run：不會安裝或變更任何東西。）" ;;
     esac
   else
     case "$1" in
-      banner) echo "discord-copilot-sdk install (bootstrap)" ;;
+      banner) echo "discord-copilot-sdk" ;;
+      stage1) echo "[1/2] macOS / Linux installer" ;;
       checking) echo "Checking prerequisites (Node / git / Copilot CLI)…" ;;
       installing) echo "Installing" ;;
       manual) echo "Could not auto-install; please install manually and re-run: " ;;
       reopen) echo "Installed dependencies, but this shell may not see them yet. Reopen your terminal and run this script again." ;;
-      handoff) echo "Bootstrap done, handing off to the setup wizard…" ;;
+      handoff) echo "[2/2] Handing off to local setup…" ;;
       noPm) echo "No supported package manager (brew/apt/dnf) found. Install Node>=20.19, git, and the GitHub Copilot CLI manually." ;;
       dry) echo "(--dry-run: nothing will be installed or changed.)" ;;
     esac
@@ -71,6 +74,7 @@ msg() { # msg <key>
 }
 
 echo "== $(msg banner) =="
+echo "$(msg stage1)"
 [ "$DRY" = "1" ] && echo "$(msg dry)"
 
 have() { command -v "$1" >/dev/null 2>&1; }

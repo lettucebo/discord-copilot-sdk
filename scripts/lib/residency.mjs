@@ -22,6 +22,47 @@ export function residencyName() {
   return `discord-copilot-sdk-${instanceId()}`;
 }
 
+export function hasResidencyRegistration({
+  platform = process.platform,
+  instance = instanceId(),
+  home = os.homedir(),
+  uid = typeof process.getuid === "function" ? process.getuid() : undefined,
+  execFileSyncFn = execFileSync,
+} = {}) {
+  if (platform === "win32") {
+    try {
+      execFileSyncFn("schtasks", ["/Query", "/TN", `discord-copilot-sdk-${instance}`], {
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  if (platform === "darwin") {
+    if (uid === undefined) return false;
+    try {
+      execFileSyncFn("launchctl", ["print", `gui/${uid}/com.discord-copilot-sdk.${instance}`], {
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  if (platform === "linux") {
+    try {
+      execFileSyncFn("systemctl", ["--user", "is-enabled", `discord-copilot-sdk-${instance}.service`], {
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 /** Directory that holds copilot(.exe) so the resident process can find it (the
  *  Scheduled Task / launchd / systemd env has almost no PATH). */
 function copilotDir() {
@@ -83,7 +124,7 @@ export async function setupResidency(lang, opts = {}) {
   if (process.platform === "win32") return setupWindows(lang, opts);
   if (process.platform === "darwin") return setupMac(lang, opts);
   if (process.platform === "linux") return setupLinux(lang, opts);
-  return;
+  return false;
 }
 
 // ---- Windows: Scheduled Task (at-logon keepalive, no admin) ----------------
@@ -237,6 +278,7 @@ function setupWindows(lang, opts = {}) {
         ? `  停止：schtasks /End /TN ${name}  ；移除：schtasks /Delete /TN ${name} /F  ；記錄：${logFile}`
         : `  Stop: schtasks /End /TN ${name}  ; Remove: schtasks /Delete /TN ${name} /F  ; Log: ${logFile}`
     );
+    return true;
   } catch (e) {
     console.log(
       (lang === "zh"
@@ -246,6 +288,7 @@ function setupWindows(lang, opts = {}) {
         " — " +
         (e && e.message)
     );
+    return false;
   }
 }
 
@@ -293,6 +336,7 @@ function setupMac(lang) {
     }
     execFileSync("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "inherit" });
     console.log(t("residencyMac", lang) + plistPath); // only on success
+    return true;
   } catch (e) {
     console.log(
       (lang === "zh"
@@ -302,6 +346,7 @@ function setupMac(lang) {
         " — " +
         (e && e.message)
     );
+    return false;
   }
 }
 
@@ -365,11 +410,12 @@ WantedBy=default.target
           ? "  ⚠️ 目前仍只是「登入後保活」。"
           : "  ⚠️ Still login-keepalive only for now."
     );
-    return;
+    return enabled;
   }
   console.log(
     lang === "zh"
       ? "  提示：登入前也要常駐請執行 `loginctl enable-linger $USER`（可能需權限）。"
       : "  Note: for pre-login residency run `loginctl enable-linger $USER` (may need privileges)."
   );
+  return enabled;
 }

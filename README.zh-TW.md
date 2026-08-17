@@ -10,7 +10,7 @@
 
 ## 狀態
 
-**已可 end-to-end 運作並可安裝**（`install.ps1` / `install.sh`，見 [`INSTALL.zh-TW.md`](INSTALL.zh-TW.md)）。架構與 phase 歷史在 [`docs/PLAN.md`](docs/PLAN.md)。仍僅限實驗環境——執行前請先閱讀下方安全模型。
+**已可 end-to-end 運作並可安裝**（`install.ps1` / `install.sh`，見 [`INSTALL.zh-TW.md`](INSTALL.zh-TW.md)）。架構與 phase 歷史在 [`docs/PLAN.md`](docs/PLAN.md)。貢獻者 CI 診斷請見 [`docs/CI-TROUBLESHOOTING.zh-TW.md`](docs/CI-TROUBLESHOOTING.zh-TW.md)。仍僅限實驗環境——執行前請先閱讀下方安全模型。
 
 ### 前身 `discopilot`
 

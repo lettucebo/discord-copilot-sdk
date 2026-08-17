@@ -83,7 +83,47 @@ describe("update messages", () => {
     "updateRoot",
     "updateCheckout",
     "updateRequested",
+    "updateStatusHeader",
+    "updateStatusCurrentVersion",
+    "updateStatusRepositoryRoot",
+    "updateStatusCheckout",
+    "updateStatusRequestedRef",
+    "updateStatusInstance",
+    "updatePlanHeader",
+    "updatePlanCurrentVersion",
+    "updatePlanTargetVersion",
+    "updatePlanTargetInstances",
+    "updatePlanInstanceState",
+    "updateDryRunHeader",
+    "updateDryRunFetch",
+    "updateDryRunApply",
+    "updateDryRunLimitations",
+    "updateRestoreStatusHeader",
+    "updateRestoreStatusSavedInstance",
+    "updateRestoreStatusRepositoryRoot",
+    "updateRestoreStatusSavedSource",
+    "updateRestoreStatusCreatedAt",
+    "updateRestoreStatusCurrentVersion",
+    "updateIncompleteHeader",
+    "updateIncompleteRestartLabel",
+    "updateIncompleteRestart",
+    "updateIncompleteRecoveryLabel",
+    "updateInstanceStatus",
+    "updateRunning",
+    "updateStoppedState",
+    "updateStopped",
+    "updateResidencyEnabled",
+    "updateResidencyDisabledState",
+    "updateResidencyNotRegisteredState",
+    "updateResidencyUnknownState",
+    "updateResidencyDisabled",
+    "updateResidencyNotRegistered",
     "updatePendingRestore",
+    "updateAvailable",
+    "updateApplyHint",
+    "updateTargetNotes",
+    "updateTargetNotesOmitted",
+    "updateCompareLink",
     "updatePhaseStop",
     "updatePhaseSource",
     "updatePhaseSetup",
@@ -109,6 +149,46 @@ describe("update messages", () => {
   ])("defines the bilingual %s update message", (key) => {
     for (const lang of LANGS) expect(t(key, lang)).not.toBe(key);
   });
+
+  it.each([
+    "updateAlreadyCurrent",
+    "updateInstanceStatus",
+    "updateAvailable",
+    "updateApplyHint",
+    "updateTargetNotes",
+    "updateTargetNotesOmitted",
+    "updateCompareLink",
+  ])("keeps zh/en placeholder arity aligned for %s", (key) => {
+    const placeholders = (text: string) =>
+      [...text.matchAll(/\{(\d+)\}/g)].map((match) => Number(match[1])).sort((a, b) => a - b);
+
+    expect(placeholders(MESSAGES.zh[key])).toEqual(placeholders(MESSAGES.en[key]));
+  });
+
+  it("uses phase-neutral recovery wording in both languages while preserving restore guidance", () => {
+    expect(MESSAGES.en.updateIncompleteRestartLabel).toBe("Update finalization");
+    expect(MESSAGES.en.updateIncompleteRestart).toBe("did not complete");
+    expect(MESSAGES.en.updatePendingRestore).toBe("Warning: a previous update left a recovery record; run {0}.");
+    expect(MESSAGES.en.updateFailed).toBe("Update did not complete; update finalization did not complete. Fix the cause, then run {0}.");
+    expect(MESSAGES.en.updatePendingRestore).not.toContain("automatic recovery");
+    expect(MESSAGES.en.updateFailed).not.toContain("automatic recovery");
+
+    expect(MESSAGES.zh.updateIncompleteRestartLabel).toBe("更新收尾");
+    expect(MESSAGES.zh.updateIncompleteRestart).toBe("未完成");
+    expect(MESSAGES.zh.updatePendingRestore).toBe("警告：先前的更新留下了復原記錄；請執行 {0}。");
+    expect(MESSAGES.zh.updateFailed).toBe("更新未完成；更新收尾未完成。修正原因後執行 {0}。");
+    expect(MESSAGES.zh.updatePendingRestore).not.toContain("自動復原");
+    expect(MESSAGES.zh.updateFailed).not.toContain("自動復原");
+  });
+
+  it("warns bilingually when a private fetch ref cannot be cleaned", () => {
+    expect(MESSAGES.en.updatePrivateRefCleanupFailed).toBe(
+      "Warning: private update ref {0} could not be removed; remove it manually."
+    );
+    expect(MESSAGES.zh.updatePrivateRefCleanupFailed).toBe(
+      "警告：無法刪除私有更新 ref {0}；請手動移除。"
+    );
+  });
 });
 
 describe("skill source messages", () => {
@@ -118,4 +198,43 @@ describe("skill source messages", () => {
       for (const lang of LANGS) expect(t(key, lang)).not.toBe(key);
     }
   );
+});
+
+describe("setup information architecture messages", () => {
+  it.each([
+    "planHeader",
+    "planPackageVersion",
+    "planRepositoryRoot",
+    "planEnvPath",
+    "planStateDir",
+    "planInstanceId",
+    "planDryRun",
+    "stagePrereqs",
+    "stageConfig",
+    "stageBuild",
+    "stageValidateWrite",
+    "stageResidency",
+    "buildStepStarting",
+    "buildStepDone",
+    "buildStepFailed",
+    "buildLogPath",
+    "buildRecentLogTail",
+    "prereqNodeLabel",
+    "prereqGitLabel",
+    "prereqCopilotLabel",
+    "prereqAuthLabel",
+    "prereqPresentPath",
+    "summaryHeader",
+  ])("defines the bilingual %s setup message", (key) => {
+    for (const lang of LANGS) expect(t(key, lang)).not.toBe(key);
+  });
+
+  it("keeps zh/en placeholder arity aligned for every message key", () => {
+    const placeholders = (text: string) =>
+      [...text.matchAll(/\{(\d+)\}/g)].map((match) => Number(match[1])).sort((a, b) => a - b);
+
+    for (const key of messageKeys()) {
+      expect(placeholders(MESSAGES.zh[key]), key).toEqual(placeholders(MESSAGES.en[key]));
+    }
+  });
 });

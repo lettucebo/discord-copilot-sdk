@@ -2,20 +2,31 @@
 // discord-copilot-sdk installer core — the ONE config engine (bilingual zh-TW / English).
 // Node built-ins ONLY (runs before `npm install`). Invoked by install.ps1 /
 // install.sh, or directly: `node scripts/setup.mjs [--lang zh|en] [--yes]
-// [--no-residency|--residency] [--dry-run] [--skip-auth]`.
+// [--no-residency|--residency] [--dry-run] [--skip-auth] [--verbose]`.
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { parseEnv } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mergeEnv, dropEnvKeys } from "./lib/env-file.mjs";
 import { secureWrite, secureBackup, hardenExisting } from "./lib/secure-file.mjs";
-import { nodeVersionOk, reposRootProblem, livePidFromLock } from "./lib/setup-core.mjs";
-import { t, detectLang, normalizeLang } from "./lib/i18n.mjs";
+import {
+  nodeVersionOk,
+  reposRootProblem,
+  livePidFromLock,
+  reportLogInfo,
+  createOutputTail,
+  pushOutputTail,
+  outputTailLines,
+  writeChunkToSinks,
+} from "./lib/setup-core.mjs";
+import { UNKNOWN, formatMessage, t, detectLang, normalizeLang } from "./lib/i18n.mjs";
+import { formatSection, formatStage, formatKeyValue, formatSummary, noColorRequested, supportsColor, supportsDynamicProgress } from "./lib/ui.mjs";
+import { parsePackageVersion } from "./lib/update-core.mjs";
 import { MANAGED_KEYS, validateConfig, REMOVED_KEYS } from "./lib/validate.mjs";
-import { setupResidency, residencyName, chooseResidencyMode, instanceId } from "./lib/residency.mjs";
+import { setupResidency, residencyName, chooseResidencyMode, hasResidencyRegistration, instanceId } from "./lib/residency.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
@@ -34,6 +45,7 @@ const FLAGS = {
   yes: has("--yes") || has("-y"),
   dryRun: has("--dry-run"),
   skipAuth: has("--skip-auth"),
+  verbose: has("--verbose"),
   residency: has("--residency") ? true : has("--no-residency") ? false : undefined,
   // Separate from --residency on purpose: asking for 24/7 implies wanting
   // residency, but wanting residency must never imply consenting to a stored
@@ -42,14 +54,18 @@ const FLAGS = {
   lang: normalizeLang(flagVal("--lang")),
 };
 const interactive = process.stdin.isTTY && process.stdout.isTTY && !FLAGS.yes;
+const TOTAL_STAGES = 5;
 
 // ---- tiny UI -------------------------------------------------------------
-const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
+const noColor = noColorRequested(process.env);
+const useColor = supportsColor({ isTTY: process.stdout.isTTY, env: process.env });
+const useErrorColor = supportsColor({ isTTY: process.stderr.isTTY, env: process.env });
 const c = (code, s) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
+const cError = (code, s) => (useErrorColor ? `\x1b[${code}m${s}\x1b[0m` : s);
 const info = (s) => process.stdout.write(s + "\n");
 const ok = (s) => info(c(32, "✓ ") + s);
 const warn = (s) => info(c(33, "! ") + s);
-const err = (s) => process.stderr.write(c(31, "✗ ") + s + "\n");
+const err = (s) => process.stderr.write(cError(31, "✗ ") + s + "\n");
 
 class SetupError extends Error {}
 
@@ -143,6 +159,23 @@ function onPath(exe) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function probeVersion(exe) {
+  try {
+    const output = execFileSync(exe, ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 3000,
+      windowsHide: true,
+    });
+    return String(output)
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .find(Boolean);
+  } catch {
+    return undefined;
   }
 }
 
@@ -278,19 +311,35 @@ async function residencyMode(lang, interactive) {
 async function main() {
   const lang = await resolveLanguage();
   if (interactive) ok(t("langChosen", lang));
-  info(c(36, "== " + t("banner", lang) + " =="));
+  const installedVersion = packageVersion();
+  info(c(36, "== " + bannerTitle(lang, installedVersion) + " =="));
   warn(t("labWarning", lang));
   if (FLAGS.dryRun) info(c(90, t("dryNote", lang)));
+  printInstallPlan(lang, installedVersion);
 
   // Repo-root guard (verified via import.meta location AND package.json name).
   const pkg = readJson(path.join(REPO_ROOT, "package.json"));
   if (!pkg || pkg.name !== "discord-copilot-sdk") throw new SetupError(t("notInRepo", lang));
 
   // 1) Read-only prerequisite detection.
-  info("\n" + c(1, t("prereqHeader", lang)));
+  printStage(lang, 1, "stagePrereqs");
   const missing = [];
-  if (!nodeVersionOk()) throw new SetupError(t("prereqNodeOld", lang) + process.versions.node);
-  for (const exe of ["git", "copilot"]) if (!onPath(exe)) missing.push(exe);
+  const nodeOk = nodeVersionOk();
+  const gitOnPath = onPath("git");
+  const copilotOnPath = onPath("copilot");
+  if (!gitOnPath) missing.push("git");
+  if (!copilotOnPath) missing.push("copilot");
+  const authState = FLAGS.skipAuth ? "skipped" : copilotAuthState();
+  info(formatKeyValue(t("prereqNodeLabel", lang), process.versions.node));
+  info(formatKeyValue(t("prereqGitLabel", lang), gitOnPath ? probeVersion("git") || t("prereqPresentPath", lang) : t("prereqMissingValue", lang)));
+  info(
+    formatKeyValue(
+      t("prereqCopilotLabel", lang),
+      copilotOnPath ? probeVersion("copilot") || t("prereqPresentPath", lang) : t("prereqMissingValue", lang)
+    )
+  );
+  info(formatKeyValue(t("prereqAuthLabel", lang), authStateLabel(authState, lang)));
+  if (!nodeOk) throw new SetupError(t("prereqNodeOld", lang) + process.versions.node);
   if (missing.length) {
     warn(t("prereqMissing", lang) + missing.join(", "));
     info(t("prereqInstallHint", lang));
@@ -302,17 +351,16 @@ async function main() {
   // 2) Auth: never a false "ok". Only a definite "unauthenticated" (copilot on
   //    PATH but ~/.copilot absent) fails a non-interactive run; "indeterminate"
   //    just warns (we can't confirm a login from here).
-  info("\n" + c(1, t("authHeader", lang)));
   if (FLAGS.skipAuth) {
     warn(t("authSkip", lang));
   } else {
-    const state = copilotAuthState();
-    warn(t("authUnknown", lang) + ` (${state})`);
-    if (!interactive && state === "unauthenticated") throw new SetupError(t("authUnknown", lang));
+    warn(t("authUnknown", lang) + ` (${authState})`);
+    if (!interactive && authState === "unauthenticated") throw new SetupError(t("authUnknown", lang));
   }
 
   // 3) Load existing .env as defaults (read-only) and collect config in memory.
-  info("\n" + c(1, t("configHeader", lang)));
+  printStage(lang, 2, "stageConfig");
+  info(t("configHeader", lang));
   const existing = readEnvValues();
   // 3a) Migrate a pre-multi-repo .env BEFORE prompting, so the operator is shown
   //     the derived values and can correct them, rather than being asked to
@@ -366,11 +414,13 @@ async function main() {
   const baseText = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : exampleText;
   const merged = mergeEnv(dropEnvKeys(baseText, REMOVED_KEYS), values);
 
+  const dryRunResidencyInstalled = hasResidencyRegistration() || FLAGS.residency === true || FLAGS.residency247 === true;
+
   // 6) Dry-run stops here — nothing mutated. Never print the token.
   if (FLAGS.dryRun) {
-    info("\n" + c(90, previewMasked(values, lang)));
+    info(c(90, previewMasked(values, lang)));
     info(c(90, t("residencyDry", lang) + residencyName()));
-    info("\n" + c(32, t("doneHeader", lang)) + " (dry-run)");
+    report(lang, installedVersion, { dryRun: true, residencyInstalled: dryRunResidencyInstalled });
     return;
   }
 
@@ -395,20 +445,27 @@ async function main() {
   //    .env is still present during npm; the token is the user's own on their own
   //    machine, so this is acceptable for a single-owner lab.)
   ensureEnvNotTracked();
-  info("\n" + c(1, t("buildHeader", lang)));
+  printStage(lang, 3, "stageBuild");
+  info(t("buildHeader", lang));
   // `npm ci` REQUIRES a lockfile and fails hard without one, and this project
   // deliberately ships no lockfile (see .gitignore: one generated behind a
   // corporate proxy pins internal hosts and carries integrity hashes public
   // `npm ci` cannot verify). Use `ci` when the user has generated their own —
   // it is faster and reproducible — and fall back to `install` otherwise.
   const hasLock = fs.existsSync(path.join(REPO_ROOT, "package-lock.json"));
-  run("npm", hasLock ? ["ci"] : ["install", "--no-audit", "--no-fund"], sanitizedChildEnv());
-  run("npm", ["run", "build"], sanitizedChildEnv());
+  const buildLog = openSetupLog(lang);
+  try {
+    await run("npm", hasLock ? ["ci"] : ["install", "--no-audit", "--no-fund"], sanitizedChildEnv(), lang, buildLog);
+    await run("npm", ["run", "build"], sanitizedChildEnv(), lang, buildLog);
+  } finally {
+    await closeLogStream(buildLog, lang);
+  }
 
   // 8) Validate the MERGED config through the REAL runtime schema (in memory —
   //    no .env file, no ambient env, no token in this process's env). This is the
   //    same parser+schema the bot uses (parseEnv → parseConfig), so a config the
   //    runtime would reject fails the install BEFORE we write anything.
+  printStage(lang, 4, "stageValidateWrite");
   const { parseConfig } = await import(pathToFileURL(path.join(REPO_ROOT, "dist", "config.js")).href);
   let parsed;
   try {
@@ -448,16 +505,19 @@ async function main() {
 
   // 10) Residency (opt-in). Two distinct things, labelled honestly:
   //     login-keepalive (default) vs true 24/7 (needs a stored password).
+  printStage(lang, 5, "stageResidency");
   const wantResidency =
     FLAGS.residency ?? FLAGS.residency247 ?? (interactive ? /^y/i.test(await ask(t("residencyPrompt", lang) + " ", "")) : false);
+  let residencyInstalled = hasResidencyRegistration();
   if (wantResidency) {
-    await setupResidency(lang, await residencyMode(lang, interactive));
+    residencyInstalled = await setupResidency(lang, await residencyMode(lang, interactive));
+    residencyInstalled = hasResidencyRegistration() || residencyInstalled;
   } else {
     info(t("residencySkip", lang));
   }
 
   // 10) Report.
-  report(lang);
+  report(lang, installedVersion, { residencyInstalled });
 }
 
 // ---- helpers -------------------------------------------------------------
@@ -466,6 +526,14 @@ function readJson(p) {
     return JSON.parse(fs.readFileSync(p, "utf8"));
   } catch {
     return undefined;
+  }
+}
+
+function packageVersion() {
+  try {
+    return parsePackageVersion(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
+  } catch {
+    return UNKNOWN;
   }
 }
 
@@ -576,28 +644,355 @@ function runningInstancePid() {
 function previewMasked(values, lang) {
   const lines = MANAGED_KEYS.map((s) => {
     const v = values[s.key] ?? "";
-    return `  ${s.key}=${s.secret ? (v ? "********" : "") : v}`;
+    return formatKeyValue(s.key, `${s.secret ? (v ? "********" : "") : v}`, 24);
   });
-  return (lang === "zh" ? "將寫入的設定（token 已遮蔽）：\n" : "Config to write (token masked):\n") + lines.join("\n");
+  return `${formatSection(t("configPreviewHeader", lang))}\n${lines.join("\n")}`;
 }
 
-function run(cmd, args, env) {
-  // On Windows npm is npm.cmd and Node refuses to spawn .cmd without a shell
-  // (EINVAL, post CVE-2024-27980). Use execSync with a shell there (args are
-  // hardcoded, no user input) to avoid the shell+args DEP0190 warning.
-  if (process.platform === "win32" && cmd === "npm") {
-    execSync(`npm ${args.join(" ")}`, { cwd: REPO_ROOT, stdio: "inherit", env });
-  } else {
-    execFileSync(cmd, args, { cwd: REPO_ROOT, stdio: "inherit", env });
+function hardenLogPath(target, lang, { directory = false } = {}) {
+  try {
+    if (process.platform === "win32") applyWindowsAcl(target);
+    else fs.chmodSync(target, directory ? 0o700 : 0o600);
+  } catch (e) {
+    const key = directory ? "buildLogDirError" : "buildLogFileError";
+    throw new SetupError(formatMessage(t(key, lang), [errorMessage(e)]));
   }
 }
 
-function report(lang) {
-  const start = process.platform === "win32" ? "npm run start" : "npm run start";
-  info("\n" + c(32, t("doneHeader", lang)));
-  info(t("doneStart", lang) + start);
-  info(t("doneManual", lang));
-  info(c(33, t("doneSafety", lang)));
+function openSetupLog(lang) {
+  const logDir = path.join(STATE_DIR, "logs");
+  try {
+    fs.mkdirSync(logDir, { recursive: true, mode: 0o700 });
+  } catch (e) {
+    throw new SetupError(formatMessage(t("buildLogDirError", lang), [errorMessage(e)]));
+  }
+  hardenLogPath(logDir, lang, { directory: true });
+  const logPath = path.join(logDir, `setup-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}.log`);
+  try {
+    fs.writeFileSync(logPath, "", { encoding: "utf8", mode: 0o600, flag: "wx" });
+  } catch (e) {
+    throw new SetupError(formatMessage(t("buildLogFileError", lang), [errorMessage(e)]));
+  }
+  try {
+    hardenLogPath(logPath, lang);
+  } catch (e) {
+    try {
+      fs.rmSync(logPath, { force: true });
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
+  const log = {
+    path: logPath,
+    stream: fs.createWriteStream(logPath, { flags: "a", encoding: "utf8" }),
+    failure: undefined,
+    onFailure: undefined,
+    closePromise: undefined,
+  };
+  log.stream.on("error", (e) => {
+    const failure = rememberLogFailure(log, lang, e);
+    log.onFailure?.(failure);
+  });
+  return log;
+}
+
+function buildLogFileSetupError(lang, cause) {
+  return new SetupError(formatMessage(t("buildLogFileError", lang), [errorMessage(cause)]));
+}
+
+function rememberLogFailure(log, lang, cause) {
+  if (!log.failure) log.failure = cause instanceof SetupError ? cause : buildLogFileSetupError(lang, cause);
+  return log.failure;
+}
+
+function throwIfLogFailed(log) {
+  if (log.failure) throw log.failure;
+}
+
+function bindLogFailure(log, onFailure) {
+  throwIfLogFailed(log);
+  log.onFailure = onFailure;
+  return () => {
+    if (log.onFailure === onFailure) log.onFailure = undefined;
+  };
+}
+
+async function closeLogStream(log, lang) {
+  throwIfLogFailed(log);
+  if (log.closePromise) return log.closePromise;
+  if (log.stream.destroyed || log.stream.closed) {
+    throwIfLogFailed(log);
+    return;
+  }
+  log.closePromise = new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      log.stream.off("close", onClose);
+      log.stream.off("finish", onFinish);
+      fn(value);
+    };
+    const onClose = () => {
+      try {
+        throwIfLogFailed(log);
+        done(resolve);
+      } catch (e) {
+        done(reject, e);
+      }
+    };
+    const onFinish = () => {
+      if (log.stream.closed || log.stream.destroyed) onClose();
+    };
+    log.stream.once("close", onClose);
+    log.stream.once("finish", onFinish);
+    try {
+      log.stream.end();
+      if (log.stream.closed) onClose();
+    } catch (e) {
+      done(reject, rememberLogFailure(log, lang, e));
+    }
+  });
+  await log.closePromise;
+}
+
+function commandLabel(cmd, args) {
+  return [cmd, ...args].join(" ");
+}
+
+function formatElapsed(ms) {
+  const seconds = ms / 1000;
+  return `${seconds < 10 ? seconds.toFixed(1) : seconds.toFixed(0)}s`;
+}
+
+function errorMessage(e) {
+  return e instanceof Error ? e.message : String(e);
+}
+
+function finishDynamicStatus(text, interval) {
+  if (interval === undefined) return;
+  clearInterval(interval);
+  process.stdout.write(`\r\x1b[2K${text}\n`);
+}
+
+function buildFailureDetails(lang, logPath, tailLines, maxLines = 40, reason) {
+  const lines = [formatMessage(t("buildLogPath", lang), [logPath])];
+  if (reason) lines.unshift(reason);
+  if (tailLines.length) lines.push(formatMessage(t("buildRecentLogTail", lang), [String(maxLines)]), ...tailLines);
+  return lines.join("\n");
+}
+
+function spawnChild(cmd, args, env) {
+  if (process.platform === "win32" && cmd === "npm") {
+    return spawn(`npm ${args.join(" ")}`, {
+      cwd: REPO_ROOT,
+      env,
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+  }
+  return spawn(cmd, args, {
+    cwd: REPO_ROOT,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+}
+
+async function run(cmd, args, env, lang, log) {
+  const label = commandLabel(cmd, args);
+  const startedAt = Date.now();
+  const useDynamic =
+    !FLAGS.verbose && supportsDynamicProgress({ isTTY: process.stdout.isTTY, noColor });
+  const startMessage = formatMessage(t("buildStepStarting", lang), [label]);
+  let ticker;
+  if (useDynamic) {
+    const render = () => {
+      process.stdout.write(`\r\x1b[2K${startMessage} (${formatElapsed(Date.now() - startedAt)})`);
+    };
+    render();
+    ticker = setInterval(render, 1000);
+    ticker.unref?.();
+  } else {
+    info(startMessage);
+  }
+
+  const tail = createOutputTail(40);
+  await Promise.resolve()
+    .then(() => {
+      throwIfLogFailed(log);
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        let child;
+
+        let clearLogFailure = () => {};
+        const settle = (fn, value) => {
+          if (settled) return;
+          settled = true;
+          clearLogFailure();
+          fn(value);
+        };
+        const fail = (reason) => settle(reject, reason);
+
+        clearLogFailure = bindLogFailure(log, (failure) => {
+          try {
+            child.kill();
+          } catch {
+            /* ignore */
+          }
+          fail(failure);
+        });
+
+        child = spawnChild(cmd, args, env);
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+
+        const writeChunk = (chunk, sink) => {
+          if (settled) return;
+          const text = String(chunk);
+          pushOutputTail(tail, text);
+          try {
+            writeChunkToSinks(
+              sink,
+              text,
+              FLAGS.verbose ? [log.stream, sink === child.stderr ? process.stderr : process.stdout] : [log.stream]
+            );
+            throwIfLogFailed(log);
+          } catch (e) {
+            const failure = rememberLogFailure(log, lang, e);
+            try {
+              child.kill();
+            } catch {
+              /* ignore */
+            }
+            fail(failure);
+          }
+        };
+
+        child.stdout.on("data", (chunk) => writeChunk(chunk, child.stdout));
+        child.stderr.on("data", (chunk) => writeChunk(chunk, child.stderr));
+        child.once("error", (e) => {
+          const reason = formatMessage(t("buildStartFailed", lang), [label, errorMessage(e)]);
+          fail(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail), 40, reason)));
+        });
+        child.once("close", (code, signal) => {
+          if (settled) return;
+          try {
+            throwIfLogFailed(log);
+          } catch (e) {
+            fail(e);
+            return;
+          }
+          if (signal) {
+            const reason = formatMessage(t("buildSignalFailed", lang), [label, signal]);
+            fail(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail), 40, reason)));
+            return;
+          }
+          if (code !== 0) {
+            fail(new SetupError(buildFailureDetails(lang, log.path, outputTailLines(tail))));
+            return;
+          }
+          settle(resolve);
+        });
+      });
+    })
+    .then(
+    () => {
+      const successMessage = formatMessage(t("buildStepDone", lang), [label, formatElapsed(Date.now() - startedAt)]);
+      if (useDynamic) finishDynamicStatus(c(32, "✓ ") + successMessage, ticker);
+      else ok(successMessage);
+    },
+    (failure) => {
+      const failedMessage = formatMessage(t("buildStepFailed", lang), [label, formatElapsed(Date.now() - startedAt)]);
+      if (useDynamic) finishDynamicStatus(c(31, "✗ ") + failedMessage, ticker);
+      else err(failedMessage);
+      throw failure;
+    }
+  );
+}
+
+function bannerTitle(lang, version) {
+  return version === UNKNOWN ? `${t("banner", lang)} (${UNKNOWN})` : `${t("banner", lang)} ${version}`;
+}
+
+function boolLabel(value, lang) {
+  if (lang === "en") return value ? "Yes" : "No";
+  return value ? t("yes", lang) : t("no", lang);
+}
+
+function trimLabel(label) {
+  return String(label).replace(/[：:]\s*$/u, "");
+}
+
+function printSection(title) {
+  info(formatSection(c(1, title)));
+}
+
+function printStage(lang, current, titleKey) {
+  printSection(formatStage(current, TOTAL_STAGES, t(titleKey, lang)));
+}
+
+function printInstallPlan(lang, version) {
+  const rows = [
+    formatKeyValue(t("planPackageVersion", lang), version),
+    formatKeyValue(t("planRepositoryRoot", lang), REPO_ROOT),
+    formatKeyValue(t("planEnvPath", lang), ENV_PATH),
+    formatKeyValue(t("planStateDir", lang), STATE_DIR),
+    formatKeyValue(t("planInstanceId", lang), instanceId()),
+  ];
+  if (FLAGS.dryRun) rows.push(formatKeyValue(t("planDryRun", lang), boolLabel(true, lang)));
+  printSection(t("planHeader", lang));
+  info(rows.join("\n"));
+}
+
+function authStateLabel(state, lang) {
+  if (FLAGS.skipAuth) return t("authStateSkipped", lang);
+  if (state === "unauthenticated") return t("authStateUnauthenticated", lang);
+  return t("authStateIndeterminate", lang);
+}
+
+function report(lang, version, options = {}) {
+  const shell = process.platform === "win32" ? "ps1" : "sh";
+  const manualLogInfo = reportLogInfo(
+    {
+      platform: process.platform,
+      stateDir: STATE_DIR,
+      instance: instanceId(),
+      residencyInstalled: false,
+    },
+    path
+  );
+  const manualLogDetail =
+    manualLogInfo.kind === "path" && manualLogInfo.afterFirstStart && !fs.existsSync(manualLogInfo.value)
+      ? formatMessage(t("doneLogAfterStart", lang), [manualLogInfo.value])
+      : manualLogInfo.value;
+  const rows = [
+    [trimLabel(t("doneVersion", lang)), version],
+    [trimLabel(t("doneStart", lang)), `./run-bot.${shell}`],
+    [trimLabel(t("doneStop", lang)), `./stop-bot.${shell}`],
+    [trimLabel(t("doneLog", lang)), manualLogDetail],
+  ];
+  if (options.residencyInstalled) {
+    const residencyLogInfo = reportLogInfo(
+      {
+        platform: process.platform,
+        stateDir: STATE_DIR,
+        instance: instanceId(),
+        residencyInstalled: true,
+      },
+      path
+    );
+    rows.push([t("summaryResidencyLogLabel", lang), formatMessage(t("doneLogResidency", lang), [residencyLogInfo.value])]);
+  }
+  rows.push([trimLabel(t("doneUpdate", lang)), `./update.${shell}`]);
+  rows.push([trimLabel(t("doneUninstall", lang)), `./uninstall.${shell}`]);
+  rows.push([t("summaryManualLabel", lang), t("doneManual", lang)]);
+  rows.push([t("summarySafetyLabel", lang), t("doneSafety", lang)]);
+  if (!options.dryRun) info(t("doneHeader", lang));
+  printSection(t("summaryHeader", lang) + (options.dryRun ? " (dry-run)" : ""));
+  info(formatSummary(rows));
 }
 
 main().catch((e) => {

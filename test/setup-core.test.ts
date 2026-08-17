@@ -2,7 +2,17 @@ import { describe, it, expect, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { nodeVersionOk, reposRootProblem, livePidFromLock } from "../scripts/lib/setup-core.mjs";
+import { EventEmitter } from "node:events";
+import {
+  nodeVersionOk,
+  reposRootProblem,
+  livePidFromLock,
+  reportLogInfo,
+  createOutputTail,
+  pushOutputTail,
+  outputTailLines,
+  writeChunkToSinks,
+} from "../scripts/lib/setup-core.mjs";
 import { resolveReposRoot } from "../src/core/repo.js";
 
 describe("nodeVersionOk (engines: ^20.19 || >=22.12)", () => {
@@ -244,5 +254,86 @@ describe("livePidFromLock (installer's running-bot guard)", () => {
         /* ignore */
       }
     }
+  });
+});
+
+describe("reportLogInfo (installer completion report log target)", () => {
+  it("uses the manual launcher log until the bot has actually been started", () => {
+    expect(reportLogInfo({ platform: "win32", stateDir: "C:\\State", instance: "default", residencyInstalled: false }, path)).toEqual({
+      kind: "path",
+      value: path.join("C:\\State", "logs", "run-bot.default.log"),
+      afterFirstStart: true,
+    });
+  });
+
+  describe("bounded installer output tails", () => {
+    it("keeps only the final lines across chunk boundaries", () => {
+      const tail = createOutputTail(3);
+
+      pushOutputTail(tail, "line-01\nline-02\nline");
+      pushOutputTail(tail, "-03\nline-04");
+
+      expect(outputTailLines(tail)).toEqual(["line-02", "line-03", "line-04"]);
+    });
+
+    it("treats carriage returns as boundaries and bounds unterminated partial output", () => {
+      const tail = createOutputTail(2, 8);
+
+      pushOutputTail(tail, "alpha\rbeta\r123456789");
+
+      expect(outputTailLines(tail)).toEqual(["beta", "…3456789"]);
+    });
+
+    it("treats CRLF split across chunks as one boundary", () => {
+      const tail = createOutputTail(5);
+
+      pushOutputTail(tail, "line-1\r");
+      pushOutputTail(tail, "\nline-2");
+
+      expect(outputTailLines(tail)).toEqual(["line-1", "line-2"]);
+    });
+  });
+
+  describe("writeChunkToSinks", () => {
+    it("pauses the source until every backpressured sink drains", () => {
+      const events: Array<"pause" | "resume"> = [];
+      const source = {
+        pause: () => events.push("pause"),
+        resume: () => events.push("resume"),
+      };
+      type DrainSink = EventEmitter & { write: (text: string) => boolean };
+      const logSink: DrainSink = Object.assign(new EventEmitter(), { write: () => false });
+      const verboseSink: DrainSink = Object.assign(new EventEmitter(), { write: () => false });
+
+      writeChunkToSinks(source, "chunk", [logSink, verboseSink]);
+      expect(events).toEqual(["pause"]);
+
+      logSink.emit("drain");
+      expect(events).toEqual(["pause"]);
+
+      verboseSink.emit("drain");
+      expect(events).toEqual(["pause", "resume"]);
+    });
+  });
+
+  it("uses the residency log file when Windows or macOS residency was installed", () => {
+    expect(reportLogInfo({ platform: "win32", stateDir: "C:\\State", instance: "default", residencyInstalled: true }, path)).toEqual({
+      kind: "path",
+      value: path.join("C:\\State", "logs", "discord-copilot-sdk-default.log"),
+      afterFirstStart: false,
+    });
+    expect(reportLogInfo({ platform: "darwin", stateDir: "/state", instance: "qa", residencyInstalled: true }, path)).toEqual({
+      kind: "path",
+      value: path.join("/state", "logs", "discord-copilot-sdk-qa.log"),
+      afterFirstStart: false,
+    });
+  });
+
+  it("uses the systemd journal command when Linux residency was installed", () => {
+    expect(reportLogInfo({ platform: "linux", stateDir: "/state", instance: "ops", residencyInstalled: true }, path)).toEqual({
+      kind: "command",
+      value: "journalctl --user -u discord-copilot-sdk-ops.service -f",
+      afterFirstStart: false,
+    });
   });
 });

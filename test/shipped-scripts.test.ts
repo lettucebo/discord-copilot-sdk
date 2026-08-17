@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -27,7 +27,140 @@ function relativeMarkdownLinks(text: string): string[] {
 /** Every .ps1 an end user is told to run. */
 const USER_FACING_PS1 = ["install.ps1", "get.ps1", "update.ps1", "run-bot.ps1", "stop-bot.ps1", "uninstall.ps1"];
 
+function writeExecutable(file: string, text: string) {
+  fs.writeFileSync(file, text);
+  fs.chmodSync(file, 0o755);
+}
+
+function bashConversionTool(): "cygpath" | "wslpath" | undefined {
+  if (process.platform !== "win32") return undefined;
+  const probe = spawnSync(
+    "bash",
+    [
+      "-lc",
+      "if command -v cygpath >/dev/null 2>&1; then printf cygpath; elif command -v wslpath >/dev/null 2>&1; then printf wslpath; else exit 1; fi",
+    ],
+    { encoding: "utf8" }
+  );
+  const tool = probe.stdout.trim();
+  return tool === "cygpath" || tool === "wslpath" ? tool : undefined;
+}
+
+function bashPath(file: string): string {
+  const tool = bashConversionTool();
+  if (tool === undefined) return file;
+  const wslEnv =
+    tool === "wslpath"
+      ? [...(process.env.WSLENV?.split(":") ?? []), "DCS_BASH_PATH"].join(":")
+      : process.env.WSLENV;
+  const result = spawnSync("bash", ["-lc", `${tool} -u "$DCS_BASH_PATH"`], {
+    encoding: "utf8",
+    env: { ...process.env, DCS_BASH_PATH: file, WSLENV: wslEnv },
+  });
+  if (result.status !== 0) throw new Error(`could not convert path for bash: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
 describe("shipped scripts", () => {
+  it("keeps bootstrap and installer headers honest and structured", () => {
+    const bootstrapPs1 = fs.readFileSync(path.join(ROOT, "get.ps1"), "utf8");
+    expect(bootstrapPs1).toContain("discord-copilot-sdk");
+    expect(bootstrapPs1).toContain("[1/2]");
+    expect(bootstrapPs1).toContain("Network bootstrap");
+    expect(bootstrapPs1).toContain("  Target: $target");
+    expect(bootstrapPs1).toContain("  Ref: $ref");
+    expect(bootstrapPs1).toContain("[2/2]");
+    expect(bootstrapPs1).toContain("Handing off to the local installer");
+
+    const bootstrapSh = fs.readFileSync(path.join(ROOT, "get.sh"), "utf8");
+    expect(bootstrapSh).toContain("discord-copilot-sdk");
+    expect(bootstrapSh).toContain("[1/2]");
+    expect(bootstrapSh).toContain("Network bootstrap");
+    expect(bootstrapSh).toContain("  Target: $TARGET");
+    expect(bootstrapSh).toContain("  Ref: $REF");
+    expect(bootstrapSh).toContain("[2/2]");
+    expect(bootstrapSh).toContain("Handing off to the local installer");
+
+    const installerPs1 = fs.readFileSync(path.join(ROOT, "install.ps1"), "utf8");
+    expect(installerPs1).toContain("discord-copilot-sdk");
+    expect(installerPs1).toContain("[1/2]");
+    expect(installerPs1).toContain("Windows installer");
+    expect(installerPs1).toContain("[2/2]");
+    expect(installerPs1).toContain("Handing off to local setup");
+
+    const installerSh = fs.readFileSync(path.join(ROOT, "install.sh"), "utf8");
+    expect(installerSh).toContain("discord-copilot-sdk");
+    expect(installerSh).toContain("[1/2]");
+    expect(installerSh).toContain("macOS / Linux installer");
+    expect(installerSh).toContain("[2/2]");
+    expect(installerSh).toContain("Handing off to local setup");
+  });
+
+  it("forwards --verbose through the local shell installer and network shell bootstrap without network access", { timeout: 20_000 }, () => {
+    const fixture = fs.mkdtempSync(path.join(ROOT, ".wrapper-verbose-"));
+    const bin = path.join(fixture, "bin");
+    const installRecord = path.join(fixture, "install-args.txt");
+    const getRecord = path.join(fixture, "get-args.txt");
+    const target = path.join(fixture, "target");
+    const isWsl = bashConversionTool() === "wslpath";
+    const wslEnv = isWsl ? [...(process.env.WSLENV?.split(":") ?? []), "DCS_RECORD/p", "DCS_GET_RECORD/p"].join(":") : process.env.WSLENV;
+    const env = {
+      ...process.env,
+      PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+      DCS_RECORD: isWsl ? installRecord : bashPath(installRecord),
+      WSLENV: wslEnv,
+      LANG: "en_US",
+    };
+    try {
+      fs.mkdirSync(bin, { recursive: true });
+      fs.mkdirSync(path.join(target, "scripts"), { recursive: true });
+      execFileSync("git", ["init", "-q", "-b", "main", target]);
+      execFileSync("git", ["-C", target, "remote", "add", "origin", "https://github.com/lettucebo/discord-copilot-sdk.git"]);
+      fs.copyFileSync(path.join(ROOT, "install.sh"), path.join(target, "install.sh"));
+      writeExecutable(path.join(bin, "id"), "#!/usr/bin/env bash\necho 1000\n");
+      writeExecutable(path.join(bin, "copilot"), "#!/usr/bin/env bash\nexit 0\n");
+      writeExecutable(
+        path.join(bin, "node"),
+        "#!/usr/bin/env bash\nif [ \"$1\" = \"-e\" ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > \"$DCS_RECORD\"\n"
+      );
+
+      const install = spawnSync("bash", [bashPath(path.join(target, "install.sh")), "--yes", "--dry-run", "--skip-auth", "--verbose"], {
+        env,
+        encoding: "utf8",
+      });
+      expect(install.status, `${install.stdout}${install.stderr}`).toBe(0);
+      expect(fs.readFileSync(installRecord, "utf8")).toContain("--verbose");
+
+      writeExecutable(path.join(target, "install.sh"), "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$DCS_GET_RECORD\"\n");
+      const bootstrap = spawnSync("bash", [bashPath(path.join(ROOT, "get.sh")), "--yes", "--dir", bashPath(target), "--verbose"], {
+        env: { ...env, DCS_GET_RECORD: isWsl ? getRecord : bashPath(getRecord) },
+        encoding: "utf8",
+      });
+      expect(bootstrap.status, `${bootstrap.stdout}${bootstrap.stderr}`).toBe(0);
+      expect(fs.readFileSync(getRecord, "utf8")).toContain("--verbose");
+    } finally {
+      fs.rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards PowerShell -Verbose through both supported entrypoints", () => {
+    const install = fs.readFileSync(path.join(ROOT, "install.ps1"), "utf8");
+    const bootstrap = fs.readFileSync(path.join(ROOT, "get.ps1"), "utf8");
+
+    expect(install).toMatch(/\$VerbosePreference\s+-ne\s+['"]SilentlyContinue['"]/);
+    expect(install).toContain("'--verbose'");
+    expect(bootstrap).toMatch(/\[switch\]\$Verbose/);
+    expect(bootstrap).toContain("'-Verbose'");
+  });
+
+  it("documents --verbose for shell users and -Verbose for PowerShell users in both install guides", () => {
+    for (const guide of INSTALL_GUIDES) {
+      const text = fs.readFileSync(path.join(ROOT, guide), "utf8");
+      expect(text).toContain("--verbose");
+      expect(text).toContain("-Verbose");
+    }
+  });
+
   it("serializes the full Vitest suite because git-heavy fixtures share host resources", () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
       scripts?: Record<string, string>;

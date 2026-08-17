@@ -128,6 +128,7 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 | **message 404 新 anchor** | `render-chunks.ts` + `render-chunks.test.ts`（`RE-ANCHORS ...`、survivor-safety；補貼於尾端，見下方殘留）|
 | **rebind 舊 incarnation teardown / `/end` 交錯** | `app-rebind.test.ts`（post-swap 舊 actor retain/retry、`/end` 同時擁有 replacement + 舊 worktree、unconfirmed durable pointer、pre-swap rollback end race）+ `session-store.test.ts`（v5 stale-rebind terminal record restart persistence）|
 | 最小 CI（Win/Ubuntu、Node 20.19+22.12）| `.github/workflows/ci.yml` |
+| **update fetch proof / private-ref cleanup failure** | `update-integration.test.ts`（`pins a remote move...`、`keeps the primary action failure...`；`NODE_OPTIONS` preload 保留 Windows 覆蓋，見 §14.4） |
 
 **設計決策（與 §9 措辭的差異，刻意記錄）：**
 - **「modal 路徑」= thread 訊息自由輸入**，非 Discord modal 彈窗。行動裝置友善、無彈窗限制；freeform 能力已實作並測試（`session-actor.test.ts` `freeform message answers (wasFreeform=true)`）。不另做 Discord modal（YAGNI，非使用者需求）。
@@ -300,8 +301,9 @@ resume 的錯誤。
 - 採用本機 `update.ps1`／`update.sh` 加 `scripts/update.mjs` 的三階段流程：**唯讀 preflight → apply → 僅成功後 restore**。更新器在停止前檢查 origin、remote ref、checkout 形狀、多 instance、FF-only 可行性、新版設定與 active thread/worktree。
 - 網路一行形式不直接 fetch/checkout 目標；它下載最新 engine 到私有暫存目錄，讓 engine 先停常駐與 bot 再變更 source。這保留自救能力，也避免 Windows npm 覆寫 live runtime 的 EPERM。
 - 更新輸出採分階段身分／生命週期報告：在遠端比較前印出 source SemVer、SHA、絕對 root 與 checkout，解析成功後印出 requested/ref resolved SHA；成功 apply 依序報告 stop、source、setup、restore。只有 `liveInstances()` 觀察到新 PID 才宣稱重啟成功；更新前已停止的 instance 維持停止並明講。`--check` 的 `0` 僅代表 HEAD 等於要求 ref，絕不是 runtime 健康結論；若有待 `--restore` 狀態，即使 source 相同也必須警告。
+- 安裝器先顯示安裝計畫，接著以編號五階段（前置需求／登入、設定、相依套件建置、驗證／寫入、常駐）輸出可行動狀態。成功的 build 輸出只寫入 owner-only log；失敗只顯示有限 tail 與完整 log 位置；operator 可用平台原生的 verbose 開關取得串流輸出。這避免把 token 或大量 build output 混入一般終端摘要，且安裝與更新均以可複製的下一步命令結尾。
 - entrypoint 與 engine 都以字面的 `git config --get remote.origin.url` 驗證 upstream，不能使用會展開 `insteadOf` 的 `git remote get-url`，以免企業 mirror 使一行命令靜默 fallback 到另一個 checkout。`--restore` 比對 state 記錄的絕對 `repoRoot`：foreign state 絕不會被執行（只警告並保留），同 root state 照常恢復；若完全沒有相符 state 則 fail-closed。若 foreign state 與 apply 使用相同 instance id，apply 也會在任何停機或寫入前拒絕，絕不能覆寫另一個 checkout 的唯一恢復紀錄。
-- dev branch 僅允許乾淨且 `merge-base --is-ancestor` 可證明的 `git merge --ff-only`；managed detached clone 用 depth-one fetch 加 `checkout --detach FETCH_HEAD`。
+- dev branch 僅允許乾淨且 `merge-base --is-ancestor` 可證明的 `git merge --ff-only`；每次 fetch 都寫入隨機的私有 `refs/dcs-update/<nonce>`，解析並比對預先取得的 remote SHA 後，只把該不可變 SHA 用於證明與套用，最後刪除私有 ref；managed detached clone 用 depth-one fetch 加 `checkout --detach <verified-sha>`。
 - 不做 Discord `/update`：行程不能安全覆寫自己的 runtime，失敗後 Discord 也無法回報；這是 fail-closed 取捨，不是 UX 缺漏。
 - 初始版本為 SemVer `0.1.0`，`--version` 顯示 app 版號、commit 與 SDK。發版分成「規劃」與「發布」兩步：先跑 `node scripts/release.mjs --plan` 取得 version 提案、`CHANGELOG DRAFT` 與 `REVIEW BY HAND`，但那只是證據；必須由人確認版本與整理過的英文 notes，先合併進 `## [Unreleased]` 並 commit，之後才可在乾淨 tree 執行 `npm run release -- <version>` 建立 release commit 與 annotated tag。真正發布只靠 `git push --follow-tags` 觸發 workflow；workflow 先用 `node scripts/release.mjs --notes <version>` 讀取最終 `CHANGELOG.md` 區段當 release body，再附 GitHub 自動產生的 notes，不手動 `gh release create`。
 - 發版版本規則固定為：在 `0.x` 期間，breaking 變更升 **minor**、`feat` 升 **patch**、`fix` / `perf` / security fix（含 `fix(security)` 與 subject 含 `CVE`）都升 **patch**；`>=1.0.0` 後才改成 breaking 升 **major**、`feat` 升 **minor**、`fix` / `perf` / security fix 升 **patch**。若沒有任何 release-worthy commit，就不發版、不硬湊版本號。`REVIEW BY HAND` 會自動攔下非 conventional 與非 ASCII 主旨；任何不明確是英文的文字都必須先由人重寫或翻譯，才能進 CHANGELOG。
@@ -319,6 +321,13 @@ resume 的錯誤。
 - `run-bot.ps1`／`run-bot.sh` 共同呼叫 `scripts/run.mjs`，不再把「child 活過兩秒」當成成功。launcher 產生一次性 256-bit token，只有 `DiscordCopilotApp.start()` 完成 Copilot、gateway、commands、reconcile 與 staging cleanup 後才原子寫入 token 對應 marker。
 - launcher 僅在 **child PID = live app lock owner = marker PID/instance** 時宣告 ready。token marker 是一次性的完成證明；成功、child failure、timeout 與 launcher 中斷都清除它。app 也寫入 per-instance current-ready marker，供 updater 驗證常駐服務恢復；它同樣必須吻合 live lock PID，graceful shutdown owner-aware 清除，故不是第二份 PID registry。
 - ready 最多等待 120 秒。逾時或 marker 不可信時只終止 launcher 自己建立的 child PID，絕不依名稱掃描或終止其他 Node process。Windows hard-stop 仍可能留下 stale app lock，下一次 app 以既有 owner-aware reclaim 回收。
+
+### 14.4 Windows Node 20 update-fixture cleanup（2026-08-17）
+
+- `update-integration.test.ts` 曾為 Git fault injection 在 fixture 內建立 `git.exe`（hard link，失敗時 copy）。Windows + Node 20.19 的 CI 與本機重現均顯示：一個 wrapper 即可使 `afterAll` 的 recursive `fs.rm` 逾時。把 hook timeout 從 30 秒提高到 73 秒仍然失敗，因此「每個 wrapper 的 retry budget 相加」方案已被否決。
+- 採用 test-only `NODE_OPTIONS` CommonJS preload：它只攔截測試 child process 中字面量的 `child_process.execFileSync("git", ...)`，以 `syncBuiltinESMExports()` 使 `scripts/update.mjs` 的 named import 看見攔截，並把其餘命令與 Git 執行交給真實 executable。production updater 沒有新環境變數或測試 seam。
+- 這保留兩個跨平台不變式測試：fetch 過程 remote 移動時不得套用錯誤 SHA 或在 proof 前停機；primary action failure 不得被 private-ref cleanup failure 掩蓋。fixture clone 也明確設定 `user.name`、`user.email` 與 `commit.gpgsign=false`，不依賴開發機／runner 的全域 Git 設定。
+- cleanup 仍維持有界、fail-closed 的 `fs.rm` 設定；不得把 recursive retry 的 per-path 行為換算成整個 fixture tree 的 hook timeout，也不得吞掉 cleanup error。已接受的殘留風險是第三方防毒或 OS lock 仍可能使有界 cleanup 失敗；這會讓測試失敗，而不是靜默留下 fixture。
 
 ## 15. 平台路徑 test 字面量稽核（2026-08-07）
 

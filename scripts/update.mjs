@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Safe local updater. The ordering is deliberate:
 //
-//   read-only preflight -> stop residency -> stop bot -> move HEAD -> setup -> restore
+//   read-only preflight -> fetch -> branch/config proof -> show plan -> active-thread guard
+//   -> stop residency -> stop bot -> move HEAD -> setup -> restore
 //
 // npm may replace files held by a live bot on Windows, while residency restarts
 // a killed process. Moving either stop step earlier is how an update becomes an
@@ -14,10 +15,14 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseEnv } from "node:util";
 import {
+  buildApplyCommand,
+  buildRestoreCommand,
   classifyCheckout,
+  displayRemoteRef,
   parseLsRemote,
   parsePackageVersion,
   parseUpdateArgs,
@@ -26,11 +31,14 @@ import {
   resolveRemoteSha,
   readyMarkerMatches,
   shouldRetainRestoreState,
+  summarizeTargetNotes,
   targetInstancesStopped,
   updateLockRelativePath,
 } from "./lib/update-core.mjs";
+import { extractChangelogSection } from "./lib/release-core.mjs";
 import { nodeVersionOk } from "./lib/setup-core.mjs";
 import { detectLang, formatMessage, t } from "./lib/i18n.mjs";
+import { formatKeyValue, formatSection, formatStage, formatSummary } from "./lib/ui.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const requestedRoot = process.env.DISCORD_COPILOT_SDK_UPDATE_ROOT;
@@ -44,6 +52,113 @@ class UpdateError extends Error {}
 const flags = parseUpdateArgs(process.argv.slice(2));
 const lang = flags.lang ?? detectLang(process.env);
 const message = (key, ...values) => formatMessage(t(key, lang), values);
+const UPDATE_STAGE_TOTAL = 4;
+
+function shortSha(sha) {
+  return typeof sha === "string" && /^[0-9a-f]{4,64}$/i.test(sha) ? sha.slice(0, 12) : "unknown";
+}
+
+function formatVersionAndSha(version, sha) {
+  return `${version} (${shortSha(sha)})`;
+}
+
+function residencyStateLabel(residency) {
+  if (!residency?.known) return t("updateResidencyUnknownState", lang);
+  if (!residency.registered) return t("updateResidencyNotRegisteredState", lang);
+  return residency.enabled ? t("updateResidencyEnabled", lang) : t("updateResidencyDisabledState", lang);
+}
+
+function instanceStatusLabel(instance, isRunning, residency) {
+  return formatMessage(t("updateInstanceStatus", lang), [
+    instance,
+    t(isRunning ? "updateRunning" : "updateStoppedState", lang),
+    residencyStateLabel(residency),
+  ]);
+}
+
+function printUpdateStatus({ packageVersion, localSha, checkout, ref, remote, instance, isRunning, residency }) {
+  console.log(formatSection(t("updateStatusHeader", lang)));
+  console.log(
+    formatSummary([
+      [t("updateStatusCurrentVersion", lang), formatVersionAndSha(packageVersion, localSha)],
+      [t("updateStatusRepositoryRoot", lang), REPO_ROOT],
+      [t("updateStatusCheckout", lang), `${checkout.kind} (${checkout.branch ?? "detached"})`],
+      [t("updateStatusRequestedRef", lang), `${ref} -> ${displayRemoteRef(remote?.ref)} @ ${shortSha(remote?.sha)}`],
+      [t("updateStatusInstance", lang), instanceStatusLabel(instance, isRunning, residency)],
+    ])
+  );
+}
+
+function printUpdatePlan({ currentVersion, localSha, targetVersion, remoteSha, instances }) {
+  const lines = [
+    formatKeyValue(t("updatePlanCurrentVersion", lang), formatVersionAndSha(currentVersion, localSha)),
+    formatKeyValue(t("updatePlanTargetVersion", lang), formatVersionAndSha(targetVersion, remoteSha)),
+    formatKeyValue(t("updatePlanTargetInstances", lang), instances.map(({ instance }) => instance).join(", ")),
+  ];
+  for (const [index, entry] of instances.entries()) {
+    lines.push(
+      formatKeyValue(
+        index === 0 ? t("updatePlanInstanceState", lang) : "",
+        instanceStatusLabel(entry.instance, entry.wasRunning, entry.residency)
+      )
+    );
+  }
+  console.log(formatSection(t("updatePlanHeader", lang)));
+  console.log(lines.join("\n"));
+}
+
+function printDryRunPlan({ currentVersion, localSha, remote, instances }) {
+  console.log(formatSection(t("updateDryRunHeader", lang)));
+  console.log(
+    [
+      formatKeyValue(t("updatePlanCurrentVersion", lang), formatVersionAndSha(currentVersion, localSha)),
+      formatKeyValue(t("updatePlanTargetInstances", lang), instances.join(", ")),
+      message("updateDryRunFetch", displayRemoteRef(remote.ref)),
+      t("updateDryRunApply", lang),
+      t("updateDryRunLimitations", lang),
+      t("updateDryRun", lang),
+    ].join("\n")
+  );
+}
+
+function printTargetNotes({ targetVersion, changelogSection, localSha, remoteSha }) {
+  const summary = summarizeTargetNotes({ version: targetVersion, changelogSection, localSha, remoteSha });
+  if (summary.notes.length) {
+    console.log(message("updateTargetNotes", targetVersion));
+    console.log(summary.notes.join("\n"));
+    if (summary.omittedCount > 0) console.log(message("updateTargetNotesOmitted", summary.omittedCount));
+  }
+  if (summary.compareUrl) console.log(message("updateCompareLink", summary.compareUrl));
+}
+
+function printRestoreStatus({ instance, repoRoot, oldSha, createdAt, currentVersion }) {
+  const rows = [
+    [t("updateRestoreStatusSavedInstance", lang), instance],
+    [t("updateRestoreStatusRepositoryRoot", lang), repoRoot],
+    [t("updateRestoreStatusSavedSource", lang), shortSha(oldSha)],
+    [t("updateRestoreStatusCreatedAt", lang), createdAt],
+  ];
+  if (currentVersion !== null) rows.splice(1, 0, [t("updateRestoreStatusCurrentVersion", lang), currentVersion]);
+  console.log(formatSection(t("updateRestoreStatusHeader", lang)));
+  console.log(formatSummary(rows));
+}
+
+function printUpdateIncomplete({ currentVersion, localSha, targetVersion, remoteSha, instances, instance }) {
+  console.log(formatSection(t("updateIncompleteHeader", lang)));
+  console.log(
+    formatSummary([
+      [t("updatePlanCurrentVersion", lang), formatVersionAndSha(currentVersion, localSha)],
+      [t("updatePlanTargetVersion", lang), formatVersionAndSha(targetVersion, remoteSha)],
+      [t("updatePlanTargetInstances", lang), instances.join(", ")],
+      [t("updateIncompleteRestartLabel", lang), t("updateIncompleteRestart", lang)],
+      [t("updateIncompleteRecoveryLabel", lang), restoreCommand(instance)],
+    ])
+  );
+}
+
+function printUpdateStage(current, titleKey) {
+  console.log(formatStage(current, UPDATE_STAGE_TOTAL, t(titleKey, lang)));
+}
 
 function run(command, args, opts = {}) {
   return execFileSync(command, args, {
@@ -133,6 +248,48 @@ function currentPackageVersion() {
   }
 }
 
+function readableCurrentVersion() {
+  const version = currentPackageVersion();
+  return version === "unknown" ? null : version;
+}
+
+function fetchedText(targetSha, file, options = {}) {
+  const content = tryRun("git", ["show", `${targetSha}:${file}`]);
+  if (content === null) {
+    if (options.optional) return null;
+    throw new UpdateError(`fetched revision ${targetSha} does not contain readable ${file}`);
+  }
+  return content;
+}
+
+function fetchedPackageVersion(targetSha) {
+  return parsePackageVersion(fetchedText(targetSha, "package.json"));
+}
+
+function fetchedTargetNotes(targetSha, version) {
+  if (version === "unknown") return null;
+  const changelog = fetchedText(targetSha, "CHANGELOG.md", { optional: true });
+  return changelog === null ? null : extractChangelogSection(changelog, version);
+}
+
+function applyCommand(ref, instance, allInstances) {
+  return buildApplyCommand({
+    platform: process.platform,
+    updateScript: path.join(REPO_ROOT, process.platform === "win32" ? "update.ps1" : "update.sh"),
+    ref,
+    instance,
+    allInstances,
+  });
+}
+
+function restoreCommand(instance) {
+  return buildRestoreCommand({
+    platform: process.platform,
+    updateScript: path.join(REPO_ROOT, process.platform === "win32" ? "update.ps1" : "update.sh"),
+    instance,
+  });
+}
+
 function onPath(command) {
   const probe = process.platform === "win32" ? "where" : "which";
   try {
@@ -174,26 +331,90 @@ function remoteFor(ref) {
   return resolveRemoteSha(parseLsRemote(output), ref);
 }
 
-function fetchResolved(remote, checkoutKind) {
-  const ref = remote.ref.replace(/\^\{\}$/, "");
-  const args = ["fetch"];
-  if (checkoutKind === "managed") args.push("--depth", "1");
-  args.push("origin", ref);
-  runInherited("git", args);
+function fetchResolved(remote, checkoutKind, options = {}) {
+  const ref = displayRemoteRef(remote.ref);
+  const privateRef = `refs/dcs-update/${randomUUID()}`;
+  try {
+    const args = ["fetch"];
+    if (checkoutKind === "managed") args.push("--depth", "1");
+    args.push("origin", `${ref}:${privateRef}`);
+    if (options.quiet) {
+      run("git", args);
+    } else {
+      runInherited("git", args);
+    }
+  } catch {
+    try {
+      run("git", ["update-ref", "-d", privateRef]);
+    } catch {
+      // The failed fetch is the primary error; a unique private ref may not
+      // exist yet, so cleanup must not hide that refusal.
+    }
+    throw new UpdateError(`could not fetch origin ${ref}`);
+  }
+  const fetchedSha = tryRun("git", ["rev-parse", "--verify", `${privateRef}^{commit}`])?.trim();
+  if (!fetchedSha || !/^[0-9a-f]{40,64}$/i.test(fetchedSha)) {
+    try {
+      run("git", ["update-ref", "-d", privateRef]);
+    } catch {
+      // Preserve the malformed private-ref proof failure.
+    }
+    throw new UpdateError(`could not resolve fetched revision for ${ref}`);
+  }
+  if (fetchedSha !== remote.sha) {
+    try {
+      run("git", ["update-ref", "-d", privateRef]);
+    } catch {
+      // The remote movement mismatch is the primary safe failure.
+    }
+    throw new UpdateError(`fetched revision ${fetchedSha} does not match resolved remote revision ${remote.sha}`);
+  }
+  return { targetSha: fetchedSha, privateRef };
 }
 
-function preflightBranchFastForward() {
-  if (tryRun("git", ["merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"]) === null) {
+function deletePrivateRef(privateRef) {
+  try {
+    run("git", ["update-ref", "-d", privateRef]);
+  } catch {
+    throw new UpdateError(`could not clean private update ref ${privateRef}`);
+  }
+}
+
+async function withFetchedTarget(remote, checkoutKind, options, action) {
+  const fetched = fetchResolved(remote, checkoutKind, options);
+  let actionFailed = false;
+  try {
+    return await action(fetched.targetSha);
+  } catch (error) {
+    actionFailed = true;
+    throw error;
+  } finally {
+    try {
+      deletePrivateRef(fetched.privateRef);
+    } catch (error) {
+      if (actionFailed) {
+        // Preserve the action's failure and exit code, but never conceal a
+        // unique ref that could otherwise retain fetched objects indefinitely.
+        console.error(message("updatePrivateRefCleanupFailed", fetched.privateRef));
+      } else {
+        throw error;
+      }
+    }
+  }
+}
+
+function preflightBranchFastForward(targetSha) {
+  if (tryRun("git", ["merge-base", "--is-ancestor", "HEAD", targetSha]) === null) {
     throw new UpdateError("the current branch cannot fast-forward to the requested ref");
   }
 }
 
-function countDanglingManagedCommits() {
-  const value = tryRun("git", ["rev-list", "HEAD", "--not", "FETCH_HEAD", "--count"])?.trim();
+function countDanglingManagedCommits(targetSha) {
+  const value = tryRun("git", ["rev-list", "HEAD", "--not", targetSha, "--count"])?.trim();
   return value && /^\d+$/.test(value) ? Number(value) : 0;
 }
 
-async function precheckIncomingConfig() {
+async function precheckIncomingConfig(targetSha) {
   const envPath = path.join(REPO_ROOT, ".env");
   if (!fs.existsSync(envPath)) throw new UpdateError("no .env exists; run the installer interactively first");
   const values = parseEnv(fs.readFileSync(envPath, "utf8"));
@@ -202,7 +423,7 @@ async function precheckIncomingConfig() {
   // authoritative setup engine instead of rejecting a configuration it repairs.
   if ("CONTROLLED_REPO_PATH" in values) return;
 
-  const source = tryRun("git", ["show", "FETCH_HEAD:scripts/lib/validate.mjs"]);
+  const source = tryRun("git", ["show", `${targetSha}:scripts/lib/validate.mjs`]);
   if (source === null) throw new UpdateError("the requested revision does not contain scripts/lib/validate.mjs");
   const temp = path.join(os.tmpdir(), `dcs-update-validate-${process.pid}-${Date.now()}.mjs`);
   try {
@@ -323,9 +544,13 @@ function readWindowsResidency(instance) {
   const output = tryRun(ps, [
     "-NoProfile",
     "-Command",
-    `$t=Get-ScheduledTask -TaskName '${name}' -ErrorAction SilentlyContinue;if($t){if($t.Settings.Enabled){'enabled'}else{'disabled'}}`,
+    `$t=Get-ScheduledTask -TaskName '${name}' -ErrorAction SilentlyContinue;if($t){if($t.Settings.Enabled){'enabled'}else{'disabled'}}else{'missing'}`,
   ]);
-  return { registered: output !== null && /^(enabled|disabled)\s*$/i.test(output), enabled: /^enabled\s*$/i.test(output ?? "") };
+  const trimmed = output?.trim().toLowerCase();
+  if (trimmed === "enabled") return { registered: true, enabled: true, known: true };
+  if (trimmed === "disabled") return { registered: true, enabled: false, known: true };
+  if (trimmed === "missing") return { registered: false, enabled: false, known: true };
+  return { registered: false, enabled: false, known: false };
 }
 
 function residencyState(instance) {
@@ -333,14 +558,19 @@ function residencyState(instance) {
   if (process.platform === "darwin") {
     const uid = String(process.getuid?.() ?? "");
     const label = `com.discord-copilot-sdk.${instance}`;
+    const registered = fs.existsSync(path.join(os.homedir(), "Library", "LaunchAgents", `${label}.plist`));
+    const enabledProbe = tryRun("launchctl", ["print", `gui/${uid}/${label}`]);
     return {
-      registered: fs.existsSync(path.join(os.homedir(), "Library", "LaunchAgents", `${label}.plist`)),
-      enabled: tryRun("launchctl", ["print", `gui/${uid}/${label}`]) !== null,
+      registered,
+      enabled: enabledProbe !== null,
+      known: registered || enabledProbe !== null,
     };
   }
   const unit = `discord-copilot-sdk-${instance}.service`;
-  const enabled = tryRun("systemctl", ["--user", "is-enabled", unit])?.trim() === "enabled";
-  return { registered: enabled || tryRun("systemctl", ["--user", "cat", unit]) !== null, enabled };
+  const enabledOutput = tryRun("systemctl", ["--user", "is-enabled", unit])?.trim();
+  const catOutput = tryRun("systemctl", ["--user", "cat", unit]);
+  const enabled = enabledOutput === "enabled";
+  return { registered: enabled || catOutput !== null, enabled, known: enabledOutput !== undefined || catOutput !== null };
 }
 
 function writeState(instance, state) {
@@ -484,13 +714,13 @@ async function restoreState(state) {
   }
 }
 
-function applySource(kind) {
+function applySource(kind, targetSha) {
   if (kind === "managed") {
-    runInherited("git", ["checkout", "-q", "--detach", "FETCH_HEAD"]);
+    runInherited("git", ["checkout", "-q", "--detach", targetSha]);
     return;
   }
   if (kind === "branch-clean") {
-    runInherited("git", ["merge", "--ff-only", "FETCH_HEAD"]);
+    runInherited("git", ["merge", "--ff-only", targetSha]);
     return;
   }
   throw new UpdateError(`unsafe checkout kind: ${kind}`);
@@ -536,9 +766,16 @@ async function restoreSaved() {
     console.log(message("updateForeignRestoreState", instance, root ?? "(missing repo root)"));
   }
   for (const { file, instance, state, root } of matching) {
-    const oldSha = typeof state.oldSha === "string" && /^[0-9a-f]{4,64}$/i.test(state.oldSha) ? state.oldSha.slice(0, 12) : "unknown";
+    const oldSha = typeof state.oldSha === "string" ? state.oldSha : null;
     const createdAt = typeof state.createdAt === "string" ? state.createdAt : "unknown";
-    console.log(message("updateRestoreSummary", instance, root, oldSha, createdAt));
+    printRestoreStatus({
+      instance,
+      repoRoot: root,
+      oldSha,
+      createdAt,
+      currentVersion: readableCurrentVersion(),
+    });
+    console.log(message("updateRestoreSummary", instance, root, shortSha(oldSha), createdAt));
     await restoreState(state);
     fs.rmSync(file, { force: true });
   }
@@ -553,23 +790,36 @@ async function main() {
   }
 
   const packageText = ensureRepo();
+  const currentVersion = parsePackageVersion(packageText);
   ensurePrerequisites();
   const ref = flags.ref ?? process.env.DISCORD_COPILOT_SDK_REF ?? "main";
   const local = localSha();
   const checkout = checkoutFacts();
-  console.log(message("updateSourceIdentity", parsePackageVersion(packageText), local.slice(0, 12)));
+  console.log(message("updateSourceIdentity", currentVersion, local.slice(0, 12)));
   console.log(message("updateRoot", REPO_ROOT));
   console.log(message("updateCheckout", checkout.kind, checkout.branch ?? "detached"));
   const remote = remoteFor(ref);
-  if (remote) console.log(message("updateRequested", ref, remote.ref, remote.sha.slice(0, 12)));
+  if (remote) console.log(message("updateRequested", ref, displayRemoteRef(remote.ref), remote.sha.slice(0, 12)));
   const instance = currentInstance();
   const savedState = restoreStateStatus(instance);
   const pendingRestore = savedState.kind === "current" || savedState.kind === "unreadable";
   const live = liveInstances();
+  const selectedResidency = residencyState(instance);
+  printUpdateStatus({
+    packageVersion: currentVersion,
+    localSha: local,
+    checkout,
+    ref,
+    remote,
+    instance,
+    isRunning: live.some((entry) => entry.instance === instance),
+    residency: selectedResidency,
+  });
   const otherLive = live.filter((entry) => entry.instance !== instance);
   if (otherLive.length && !flags.allInstances) {
     throw new UpdateError(`other instance(s) are running: ${otherLive.map((entry) => entry.instance).join(", ")}; re-run with --all-instances`);
   }
+  const targetIds = [...new Set([instance, ...(flags.allInstances ? live.map((entry) => entry.instance) : [])])];
 
   const decision = planUpdate({
     checkout: checkout.kind,
@@ -587,32 +837,48 @@ async function main() {
     );
   }
   if (decision.action === "up-to-date") {
-    console.log(message("updateAlreadyCurrent", remote.ref));
-    if (pendingRestore) console.log(message("updatePendingRestore"));
+    console.log(message("updateAlreadyCurrent", currentVersion, local.slice(0, 12)));
+    if (pendingRestore) console.log(message("updatePendingRestore", restoreCommand(instance)));
     return;
   }
 
   if (decision.action === "check") {
-    process.exitCode = 2; // useful to a monitor: an update exists, no action taken
+    await withFetchedTarget(remote, checkout.kind, { quiet: true }, async (targetSha) => {
+      const targetVersion = fetchedPackageVersion(targetSha);
+      const targetNotes = fetchedTargetNotes(targetSha, targetVersion);
+      console.log(message("updateAvailable", currentVersion, local.slice(0, 12), targetVersion, targetSha.slice(0, 12)));
+      printTargetNotes({ targetVersion, changelogSection: targetNotes, localSha: local, remoteSha: targetSha });
+      if (pendingRestore) {
+        console.log(message("updatePendingRestore", restoreCommand(instance)));
+      } else {
+        console.log(message("updateApplyHint", applyCommand(ref, instance, flags.allInstances)));
+      }
+      process.exitCode = 2; // useful to a monitor: an update exists, no action taken
+    });
     return;
   }
   if (decision.action === "dry-run") {
-    console.log(message("updateDryRun"));
+    printDryRunPlan({
+      currentVersion,
+      localSha: local,
+      remote,
+      instances: targetIds,
+    });
+    if (pendingRestore) console.log(message("updatePendingRestore", restoreCommand(instance)));
     return;
   }
 
   // Fetch and prove branch ancestry BEFORE downtime. Fetch adds objects but
   // never moves HEAD, so failures here leave the running installation intact.
-  fetchResolved(remote, checkout.kind);
-  if (checkout.kind === "branch-clean") preflightBranchFastForward();
+  await withFetchedTarget(remote, checkout.kind, {}, async (targetSha) => {
+  if (checkout.kind === "branch-clean") preflightBranchFastForward(targetSha);
   if (checkout.kind === "managed") {
-    const dangling = countDanglingManagedCommits();
+    const dangling = countDanglingManagedCommits(targetSha);
     if (dangling) console.log(message("updateManagedDangling", dangling));
   }
-  await precheckIncomingConfig();
-  await confirmActiveThreads(activeThreadSummary());
+  await precheckIncomingConfig(targetSha);
 
-  const targetIds = [...new Set([instance, ...(flags.allInstances ? live.map((entry) => entry.instance) : [])])];
+  const targetVersion = fetchedPackageVersion(targetSha);
   const state = {
     version: 1,
     repoRoot: REPO_ROOT,
@@ -625,15 +891,25 @@ async function main() {
       residency: residencyState(id),
     })),
   };
+  const targetNotes = fetchedTargetNotes(targetSha, targetVersion);
+  printUpdatePlan({
+    currentVersion,
+    localSha: local,
+    targetVersion,
+    remoteSha: targetSha,
+    instances: state.instances,
+  });
+  printTargetNotes({ targetVersion, changelogSection: targetNotes, localSha: local, remoteSha: targetSha });
+  await confirmActiveThreads(activeThreadSummary());
 
   const releaseLock = acquireUpdateLock(instance);
   writeState(instance, state);
-  let setupSucceeded = false;
+  let updateCompleted = false;
   try {
     // `stop-bot` is the identity-aware lifecycle path. Do not duplicate its PID
     // trust checks here; verify afterward because its user-facing scripts return
     // success when they decline to stop a stale/reused PID.
-    console.log(message("updatePhaseStop"));
+    printUpdateStage(1, "updateStageStop");
     for (const id of targetIds) stopInstance(id);
     await verifyStopped(live.filter((entry) => targetIds.includes(entry.instance)));
     for (const entry of state.instances) {
@@ -642,29 +918,41 @@ async function main() {
         console.log(message("updateResidencyDisabled", entry.instance));
       }
     }
-    console.log(message("updatePhaseSource"));
-    applySource(checkout.kind);
-    console.log(message("updatePhaseSetup"));
+    printUpdateStage(2, "updateStageSource");
+    applySource(checkout.kind, targetSha);
+    printUpdateStage(3, "updateStageSetup");
     runSetup();
-    setupSucceeded = true;
     const now = localSha();
-    console.log(message("updateApplied", parsePackageVersion(packageText), local.slice(0, 12), currentPackageVersion(), now.slice(0, 12)));
+    console.log(message("updateApplied", currentVersion, local.slice(0, 12), currentPackageVersion(), now.slice(0, 12)));
     if (flags.noRestart) {
-      if (!shouldRetainRestoreState(setupSucceeded)) fs.rmSync(statePath(instance), { force: true });
+      fs.rmSync(statePath(instance), { force: true });
+      updateCompleted = true;
       for (const entry of state.instances) console.log(message("updateNoRestartInstance", entry.instance, startCommand(entry.instance)));
       console.log(message("updateNoRestart"));
       return;
     }
-    console.log(message("updatePhaseRestore"));
+    printUpdateStage(4, "updateStageRestore");
     await restoreState(state);
     fs.rmSync(statePath(instance), { force: true });
+    updateCompleted = true;
     console.log(message("updateComplete"));
+  } catch (error) {
+    if (shouldRetainRestoreState(updateCompleted)) {
+      printUpdateIncomplete({
+        currentVersion,
+        localSha: local,
+        targetVersion,
+        remoteSha: targetSha,
+        instances: state.instances.map(({ instance: id }) => id),
+        instance,
+      });
+      console.log(message("updateFailed", restoreCommand(instance)));
+    }
+    throw error;
   } finally {
     releaseLock();
-    if (!setupSucceeded) {
-      console.log(message("updateFailed"));
-    }
   }
+  });
 }
 
 main().catch((error) => {

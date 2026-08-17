@@ -6,7 +6,7 @@
   with -Lang; setup.mjs shows the interactive chooser.
 
   Usage:
-    ./install.ps1 [-Lang zh|en] [-Yes] [-DryRun] [-Residency] [-Residency24x7] [-NoResidency] [-SkipAuth]
+    ./install.ps1 [-Lang zh|en] [-Yes] [-DryRun] [-Residency] [-Residency24x7] [-NoResidency] [-SkipAuth] [-Verbose]
 #>
 [CmdletBinding()]
 param(
@@ -36,24 +36,26 @@ $env:DISCORD_COPILOT_SDK_LOCALE = if ($L -eq 'zh') { 'zh-TW' } else { 'en-US' }
 # --- tiny bilingual bootstrap strings (Node not guaranteed yet) ---
 $T = @{
   zh = @{
-    banner   = 'discord-copilot-sdk 安裝（前置準備）'
+    banner   = 'discord-copilot-sdk'
+    stage1 = '[1/2] Windows 安裝器'
     checking = '檢查前置需求（Node / git / Copilot CLI）…'
     haveNode = 'Node 版本'
     installing = '正在安裝'
     installedManual = '無法自動安裝，請手動安裝後重新執行：'
     reopen   = '已安裝相依套件，但目前的終端機可能還找不到它。請「關閉並重新開啟」終端機後再次執行本腳本。'
-    nowNode  = '前置準備完成，交給設定精靈…'
+    nowNode  = '[2/2] 交給本機設定…'
     needWinget = '找不到 winget。請先安裝「應用程式安裝程式」(App Installer) 或手動安裝 Node/git/Copilot。'
     dry = '（-DryRun：不會安裝或變更任何東西。）'
   }
   en = @{
-    banner   = 'discord-copilot-sdk install (bootstrap)'
+    banner   = 'discord-copilot-sdk'
+    stage1 = '[1/2] Windows installer'
     checking = 'Checking prerequisites (Node / git / Copilot CLI)…'
     haveNode = 'Node version'
     installing = 'Installing'
     installedManual = 'Could not auto-install; please install manually and re-run: '
     reopen   = 'Installed dependencies, but this terminal may not see them yet. CLOSE and REOPEN the terminal, then run this script again.'
-    nowNode  = 'Bootstrap done, handing off to the setup wizard…'
+    nowNode  = '[2/2] Handing off to local setup…'
     needWinget = 'winget not found. Install "App Installer" first, or install Node/git/Copilot manually.'
     dry = '(-DryRun: nothing will be installed or changed.)'
   }
@@ -61,6 +63,7 @@ $T = @{
 function Msg([string]$k) { return $T[$L][$k] }
 
 Write-Host ("== " + (Msg 'banner') + " ==") -ForegroundColor Cyan
+Write-Host (Msg 'stage1') -ForegroundColor Cyan
 if ($DryRun) { Write-Host (Msg 'dry') -ForegroundColor DarkGray }
 
 function Test-Cmd([string]$name) {
@@ -126,6 +129,7 @@ if ($Residency)   { $fwd += '--residency' }
 if ($Residency24x7) { $fwd += '--residency-24x7' }
 if ($NoResidency) { $fwd += '--no-residency' }
 if ($SkipAuth)    { $fwd += '--skip-auth' }
+if ($VerbosePreference -ne 'SilentlyContinue') { $fwd += '--verbose' }
 
 & node $setup @fwd
 exit $LASTEXITCODE

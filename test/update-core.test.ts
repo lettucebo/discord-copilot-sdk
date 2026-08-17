@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import {
   classifyCheckout,
   readyMarkerMatches,
+  summarizeTargetNotes,
   targetInstancesStopped,
   orderUpdateSteps,
   parsePackageVersion,
@@ -14,8 +15,12 @@ import {
   resolveRemoteSha,
   remoteRefSpecs,
   shouldRetainRestoreState,
+  buildApplyCommand,
+  buildRestoreCommand,
+  displayRemoteRef,
   updateLockRelativePath,
 } from "../scripts/lib/update-core.mjs";
+import { displayWidth } from "../scripts/lib/ui.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const forbiddenModule = "(?:node:)?(?:fs(?:/promises)?|child_process|process)";
@@ -65,6 +70,54 @@ describe("parsePackageVersion", () => {
     expect(parsePackageVersion(metadata)).toBe("unknown");
   });
 });
+
+
+describe("summarizeTargetNotes", () => {
+  it("uses the full commit comparison URL even when target notes are omitted", () => {
+    const localSha = "a".repeat(40);
+    const remoteSha = "b".repeat(40);
+
+    expect(
+      summarizeTargetNotes({
+        version: "unknown",
+        changelogSection: "- should be omitted",
+        localSha,
+        remoteSha,
+      })
+    ).toEqual({
+      notes: [],
+      omittedCount: 0,
+      compareUrl: `https://github.com/lettucebo/discord-copilot-sdk/compare/${localSha}...${remoteSha}`,
+    });
+  });
+
+  it("bounds displayed changelog lines and strips terminal control sequences", () => {
+    const lines = [
+      "\u001b[31m- fetched target line\u001b[0m",
+      "\u0007- control-prefixed line",
+      `- ${"x".repeat(200)}`,
+      ...Array.from({ length: 15 }, (_, index) => `- later line ${index + 1}`),
+    ];
+    const summary = summarizeTargetNotes({
+      version: "1.2.3",
+      changelogSection: lines.flatMap((line) => [line, ""]).join("\n"),
+      localSha: "c".repeat(40),
+      remoteSha: "d".repeat(40),
+    });
+
+    expect(summary.notes).toHaveLength(16);
+    expect(summary.notes[0]).toBe("- fetched target line");
+    expect(summary.notes[1]).toBe("- control-prefixed line");
+    expect(summary.notes.some((line) => line.endsWith("…"))).toBe(true);
+    expect(summary.omittedCount).toBe(2);
+    for (const line of summary.notes) {
+      expect(displayWidth(line)).toBeLessThanOrEqual(160);
+      expect(line).not.toMatch(/[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f]/);
+      expect(line).not.toContain("\u001b");
+    }
+  });
+});
+
 
 describe("classifyCheckout", () => {
   it("recognizes a clean detached checkout as bootstrap-managed", () => {
@@ -134,6 +187,89 @@ describe("resolveRemoteSha", () => {
   it("fails closed for malformed records and an unknown ref", () => {
     expect(parseLsRemote("malformed\n")).toEqual([]);
     expect(resolveRemoteSha(parseLsRemote("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main"), "nope")).toBe(null);
+  });
+});
+
+describe("displayRemoteRef", () => {
+  it("never presents annotated tags with Git's peeled-ref suffix", () => {
+    expect(displayRemoteRef("refs/tags/v1.2.3^{}")).toBe("refs/tags/v1.2.3");
+    expect(displayRemoteRef("refs/heads/main")).toBe("refs/heads/main");
+  });
+});
+
+describe("buildApplyCommand", () => {
+  it("builds a default-instance command through the platform update entrypoint", () => {
+    expect(
+      buildApplyCommand({
+        platform: "win32",
+        updateScript: "C:\\Program Files\\discord-copilot-sdk\\update.ps1",
+        ref: "main",
+        instance: "default",
+        allInstances: false,
+      })
+    ).toBe("$env:DISCORD_COPILOT_SDK_INSTANCE_ID = 'default'; & 'C:\\Program Files\\discord-copilot-sdk\\update.ps1'");
+  });
+
+  it("preserves a non-default instance and safely quotes a requested ref", () => {
+    expect(
+      buildApplyCommand({
+        platform: "linux",
+        updateScript: '/srv/discord copilot/update.sh',
+        ref: "refs/tags/v1.2.3",
+        instance: "ops",
+        allInstances: false,
+      })
+    ).toBe("DISCORD_COPILOT_SDK_INSTANCE_ID=ops bash \"/srv/discord copilot/update.sh\" --ref 'refs/tags/v1.2.3'");
+  });
+
+  it("preserves the explicit all-instance scope and neutralizes shell metacharacters in refs", () => {
+    expect(
+      buildApplyCommand({
+        platform: "darwin",
+        updateScript: "/srv/discord-copilot-sdk/update.sh",
+        ref: "release'; echo unsafe",
+        instance: "work",
+        allInstances: true,
+      })
+    ).toBe(
+      "DISCORD_COPILOT_SDK_INSTANCE_ID=work bash \"/srv/discord-copilot-sdk/update.sh\" --ref 'release'\\''; echo unsafe' --all-instances"
+    );
+  });
+
+  it("uses PowerShell-native flags for a non-main all-instance update", () => {
+    expect(
+      buildApplyCommand({
+        platform: "win32",
+        updateScript: "C:\\Program Files\\discord-copilot-sdk\\update.ps1",
+        ref: "refs/tags/v1.2.3",
+        instance: "ops",
+        allInstances: true,
+      })
+    ).toBe(
+      "$env:DISCORD_COPILOT_SDK_INSTANCE_ID = 'ops'; & 'C:\\Program Files\\discord-copilot-sdk\\update.ps1' -Ref 'refs/tags/v1.2.3' -AllInstances"
+    );
+  });
+});
+
+describe("buildRestoreCommand", () => {
+  it("uses the selected instance and PowerShell-native restore flag", () => {
+    expect(
+      buildRestoreCommand({
+        platform: "win32",
+        updateScript: "C:\\Program Files\\discord-copilot-sdk\\update.ps1",
+        instance: "ops",
+      })
+    ).toBe("$env:DISCORD_COPILOT_SDK_INSTANCE_ID = 'ops'; & 'C:\\Program Files\\discord-copilot-sdk\\update.ps1' -Restore");
+  });
+
+  it("uses the shell wrapper for the selected instance", () => {
+    expect(
+      buildRestoreCommand({
+        platform: "linux",
+        updateScript: "/srv/discord copilot/update.sh",
+        instance: "ops",
+      })
+    ).toBe("DISCORD_COPILOT_SDK_INSTANCE_ID=ops bash \"/srv/discord copilot/update.sh\" --restore");
   });
 });
 
@@ -210,7 +346,7 @@ describe("planUpdate", () => {
       });
 
       describe("shouldRetainRestoreState", () => {
-        it("retains state only while setup has not succeeded", () => {
+        it("retains state until the update fully completes", () => {
           expect(shouldRetainRestoreState(false)).toBe(true);
           expect(shouldRetainRestoreState(true)).toBe(false);
         });
