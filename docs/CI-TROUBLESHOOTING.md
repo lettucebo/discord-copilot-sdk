@@ -29,7 +29,17 @@ PowerShell parsing is authoritative in CI when `pwsh` is unavailable locally.
 
 ### `Hook timed out` or `EPERM ... git.exe` in `update-integration`
 
-Windows may retain a copied `git.exe` briefly after its child exits. Cleanup must use bounded retries, and the Vitest cleanup-hook timeout must cover the retry budget for every copied wrapper. Do not hide a leaked process with unbounded retries or ignore cleanup errors.
+Do not copy or link a test-only executable into the fixture tree. On Windows
+with Node 20.19, a Git wrapper can keep recursive fixture cleanup from
+finishing. Recursive `fs.rm` retries can apply to more than one path, so a
+suite timeout cannot be safely derived by multiplying a retry budget by the
+number of wrappers.
+
+Use a `NODE_OPTIONS` preload to intercept the test process's literal
+`execFileSync("git", ...)` calls and delegate to the real Git executable. This
+preserves the fault-injection coverage on Windows without placing a lockable
+executable in the fixture. Keep cleanup bounded and fail closed; do not use
+unbounded retries or ignore cleanup errors.
 
 ### Windows path assertions fail but Ubuntu passes
 

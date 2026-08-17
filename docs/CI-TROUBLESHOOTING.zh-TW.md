@@ -29,7 +29,15 @@ for f in scripts/setup.mjs scripts/run.mjs scripts/update.mjs scripts/uninstall.
 
 ### `update-integration` 出現 `Hook timed out` 或 `EPERM ... git.exe`
 
-Windows 可能在 child exit 後短暫鎖住複製的 `git.exe`。Cleanup 必須使用有界重試，Vitest cleanup-hook timeout 也必須涵蓋每個複製 wrapper 的重試 budget。不要用無限重試或忽略 cleanup error 來掩蓋洩漏的 process。
+不要在 fixture 樹內複製或 hard link 僅供測試的可執行檔。Windows + Node
+20.19 曾觀察到 Git wrapper 使 recursive fixture cleanup 無法完成。recursive
+`fs.rm` 的 retry 可能套用到不只一個 path，因此不能把 retry budget 乘上 wrapper
+數量來推導 suite timeout。
+
+改用 `NODE_OPTIONS` preload 攔截測試 process 中字面量的
+`execFileSync("git", ...)` 呼叫，再轉交給真實 Git executable。這樣可保留 Windows
+的 fault-injection 覆蓋，且不會在 fixture 內留下可能被鎖住的 executable。Cleanup
+仍須有界並 fail-closed；不要使用無限重試或忽略 cleanup error。
 
 ### Path assertion 只在 Windows 失敗
 
