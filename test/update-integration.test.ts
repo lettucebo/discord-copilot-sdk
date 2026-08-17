@@ -54,6 +54,7 @@ async function cloneTarget(name: string): Promise<string> {
   await git(target, "config", `url.${pathToFileURL(remote).href}.insteadOf`, PUBLIC_ORIGIN);
   await git(target, "config", "user.email", "update-target@test.invalid");
   await git(target, "config", "user.name", "update target");
+  await git(target, "config", "commit.gpgsign", "false");
   const reposRoot = path.join(root, "repos-root");
   await fs.promises.mkdir(reposRoot, { recursive: true });
   await fs.promises.writeFile(
@@ -183,41 +184,28 @@ async function createFetchBarrier(binDir: string, record: string): Promise<strin
     shim,
     [
       'const fs = require("node:fs");',
-      'const path = require("node:path");',
-      'const { spawnSync } = require("node:child_process");',
-      'const invokedAsGitExe = path.basename(process.execPath).toLowerCase() === "git.exe";',
-      'const invokedAsScript = process.argv.length > 1 && path.resolve(process.argv[1]) === __filename;',
-      "if (invokedAsGitExe || invokedAsScript) {",
-      "  const args = invokedAsGitExe ? process.argv.slice(1) : process.argv.slice(2);",
-      "  if (invokedAsGitExe && args[0]) args[0] = path.basename(args[0]);",
+      'const childProcess = require("node:child_process");',
+      'const { syncBuiltinESMExports } = require("node:module");',
+      "const realExecFileSync = childProcess.execFileSync;",
+      "childProcess.execFileSync = (command, args, options) => {",
+      '  if (command !== "git") return realExecFileSync(command, args, options);',
       '  if (args[0] === "fetch") {',
       '    fs.writeFileSync(process.env.DCS_FETCH_BARRIER_RECORD, JSON.stringify(args));',
-      '    const pushed = spawnSync(process.env.DCS_FETCH_BARRIER_GIT, ["-C", process.env.DCS_FETCH_BARRIER_SOURCE, "push", "-q", "origin", "main"], { stdio: "inherit" });',
-      '    if (pushed.status !== 0) process.exit(pushed.status ?? 1);',
+      '    realExecFileSync(process.env.DCS_FETCH_BARRIER_GIT, ["-C", process.env.DCS_FETCH_BARRIER_SOURCE, "push", "-q", "origin", "main"], { stdio: "inherit" });',
       "  }",
       '  if (process.env.DCS_PRIVATE_REF_DELETE_RECORD && args[0] === "update-ref" && args[1] === "-d" && /^refs\\/dcs-update\\/[0-9a-f-]+$/i.test(args[2] || "")) {',
       '    fs.writeFileSync(process.env.DCS_PRIVATE_REF_DELETE_RECORD, JSON.stringify(args));',
-      "    process.exit(1);",
+      '    const error = new Error("injected private-ref cleanup failure");',
+      "    error.status = 1;",
+      "    throw error;",
       "  }",
-      '  const result = spawnSync(process.env.DCS_FETCH_BARRIER_GIT, args, { stdio: "inherit" });',
-      "  process.exit(result.status ?? 1);",
-      "}",
+      "  return realExecFileSync(process.env.DCS_FETCH_BARRIER_GIT, args, options);",
+      "};",
+      "syncBuiltinESMExports();",
       "",
     ].join("\n"),
     "utf8"
   );
-  if (process.platform === "win32") {
-    const wrapper = path.join(binDir, "git.exe");
-    try {
-      await fs.promises.link(process.execPath, wrapper);
-    } catch {
-      await fs.promises.copyFile(process.execPath, wrapper);
-    }
-  } else {
-    const wrapper = path.join(binDir, "git");
-    await fs.promises.writeFile(wrapper, `#!/usr/bin/env sh\nexec "${process.execPath}" "${shim}" "$@"\n`, "utf8");
-    await fs.promises.chmod(wrapper, 0o755);
-  }
   return shim;
 }
 
@@ -300,6 +288,12 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     const outside = path.join(os.tmpdir(), `outside-${Date.now()}`);
 
     await expect(removeFixtureRoot(outside)).rejects.toThrow(/refus/i);
+  });
+
+  it("disables commit signing in cloned update fixtures", async () => {
+    const local = await cloneTarget("commit-signing");
+
+    expect((await git(local, "config", "--get", "commit.gpgsign")).stdout.trim()).toBe("false");
   });
 
   it("cleanup hook timeout leaves room for the bounded Windows retry budget", () => {
@@ -587,26 +581,39 @@ describe("git update data paths", { timeout: 60_000 }, () => {
     expect(privateRefs).toEqual([deleteArgs[2]]);
   });
 
-  it("forwards Unix-style shim argv to the real git binary", async () => {
-    const local = await cloneTarget("unix-fetch-barrier-argv");
-    const barrierBin = path.join(root, `fetch-barrier-argv-${serial}`);
+  it("intercepts a preloaded git fetch without creating an executable wrapper", async () => {
+    const local = await cloneTarget("preloaded-fetch-barrier");
+    const barrierBin = path.join(root, `preloaded-fetch-barrier-${serial}`);
     const fetchRecord = path.join(barrierBin, "fetch-args.json");
     const shim = await createFetchBarrier(barrierBin, fetchRecord);
 
-    const result = await exec(process.execPath, [shim, "rev-parse", "--git-dir"], {
-      cwd: local,
-      env: {
-        ...process.env,
-        DCS_FETCH_BARRIER_GIT: realGitPath(),
-        DCS_FETCH_BARRIER_RECORD: fetchRecord,
-        DCS_FETCH_BARRIER_SOURCE: source,
-      },
-      encoding: "utf8",
-    });
+    await exec(
+      process.execPath,
+      ["-e", 'require("node:child_process").execFileSync("git", ["fetch", "origin", "main"], { stdio: "ignore" })'],
+      {
+        cwd: local,
+        env: {
+          ...process.env,
+          DCS_FETCH_BARRIER_GIT: realGitPath(),
+          DCS_FETCH_BARRIER_RECORD: fetchRecord,
+          DCS_FETCH_BARRIER_SOURCE: source,
+          NODE_OPTIONS: `${nodeRequireOption(shim)}${process.env.NODE_OPTIONS ? ` ${process.env.NODE_OPTIONS}` : ""}`,
+        },
+        encoding: "utf8",
+      }
+    );
 
-    expect(result.stderr).toBe("");
-    expect(result.stdout.trim()).toBe(".git");
-    expect(fs.existsSync(fetchRecord)).toBe(false);
+    expect(JSON.parse(await fs.promises.readFile(fetchRecord, "utf8"))).toEqual(["fetch", "origin", "main"]);
+  });
+
+  it("does not create an executable wrapper for the Git preloader", async () => {
+    const barrierBin = path.join(root, `fetch-barrier-node-only-${serial}`);
+    const fetchRecord = path.join(barrierBin, "fetch-args.json");
+
+    await createFetchBarrier(barrierBin, fetchRecord);
+
+    const executable = process.platform === "win32" ? "git.exe" : "git";
+    expect(fs.existsSync(path.join(barrierBin, executable))).toBe(false);
   });
 
   it("displays target metadata from the fetched SHA instead of another fetched object", async () => {
