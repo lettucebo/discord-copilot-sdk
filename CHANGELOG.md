@@ -9,6 +9,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-18
+
 ### Added
 
 - **Ordered timeline rendering in threads**: assistant text, reasoning and tool calls now render
