@@ -173,10 +173,11 @@ mis-parses the Chinese strings), every `.sh` has a shebang, and every `.sh` is c
 `.gitattributes` pins `*.sh`/`*.mjs` to LF and `install/get/run-bot/stop-bot.ps1` to CRLF.
 
 **Bilingual where users read it.** `README.md` / `README.zh-TW.md`, `INSTALL.md` /
-`INSTALL.zh-TW.md`, `docs/DISCORD-SETUP.md` / `docs/DISCORD-SETUP.zh-TW.md`, and
-`docs/CHANNEL-ACCESS.md` / `docs/CHANNEL-ACCESS.zh-TW.md` are separate English and zh-TW twin
-files; update both twins together. Installer strings live in `scripts/lib/i18n.mjs` and `zh` and
-`en` must be updated together. `docs/PLAN.md` is Chinese-only as the internal design record.
+`INSTALL.zh-TW.md`, `docs/DISCORD-SETUP.md` / `docs/DISCORD-SETUP.zh-TW.md`,
+`docs/CHANNEL-ACCESS.md` / `docs/CHANNEL-ACCESS.zh-TW.md`, and
+`docs/HARNESS-EVALUATION.md` / `docs/HARNESS-EVALUATION.zh-TW.md` are separate English and zh-TW
+twin files; update both twins together. Installer strings live in `scripts/lib/i18n.mjs` and `zh`
+and `en` must be updated together. `docs/PLAN.md` is Chinese-only as the internal design record.
 
 **`docs/PLAN.md` is the §-numbered design record** — decisions, rejected alternatives, accepted
 residual risks, and §9's map of required async-orchestration tests to the files covering them
