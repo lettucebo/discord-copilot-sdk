@@ -76,7 +76,6 @@ export const MANAGED_KEYS = [
   { key: "DISCORD_PARENT_CHANNEL_ID", required: true, promptKey: "promptParentChannelId", validate: isSnowflake, errKey: "errSnowflake" },
   { key: "REPOS_ROOT", required: true, promptKey: "promptReposRoot", validate: isNonEmpty, errKey: "errRequired" },
   { key: "DEFAULT_REPO", required: false, optional: true, promptKey: "promptDefaultRepo", validate: isRepoName, errKey: "errRepoName" },
-  { key: "DEV_GUILD_ID", required: false, optional: true, promptKey: "promptDevGuildId", validate: (v) => v === "" || isSnowflake(v), errKey: "errSnowflake" },
   { key: "DEFAULT_MODEL", required: false, defaultValue: "claude-sonnet-5", promptKey: "promptModel", validate: isNonEmpty, errKey: "errRequired" },
   { key: "DEFAULT_CONTEXT_TIER", required: false, defaultValue: "default", promptKey: "promptContextTier", validate: isContextTier, errKey: "errContextTier" },
   { key: "ENABLE_REPO_SKILLS", required: false, defaultValue: "true", promptKey: "promptRepoSkills", validate: isSkillSourceSwitch, errKey: "errSkillSourceSwitch" },

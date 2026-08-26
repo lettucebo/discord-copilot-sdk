@@ -36,7 +36,6 @@ function validEnv(reposRoot) {
     "DISCORD_GUILD_ID=234567890123456789",
     "DISCORD_PARENT_CHANNEL_ID=345678901234567890",
     `REPOS_ROOT=${reposRoot}`,
-    "DEV_GUILD_ID=",
     "DEFAULT_MODEL=claude-sonnet-5",
     "DEFAULT_CONTEXT_TIER=default",
     "",
@@ -50,7 +49,7 @@ function makeFixture(withEnv) {
   const repo = fs.mkdtempSync(path.join(tmpdir(), "dp-int-"));
   fs.cpSync(REAL_SCRIPTS, path.join(repo, "scripts"), { recursive: true });
   fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "discord-copilot-sdk", version: FIXTURE_VERSION, type: "module" }));
-  fs.writeFileSync(path.join(repo, ".env.example"), "DISCORD_BOT_TOKEN=\nDEV_GUILD_ID=\n");
+  fs.writeFileSync(path.join(repo, ".env.example"), "DISCORD_BOT_TOKEN=\n");
   if (withEnv) {
     // A separate directory from the fixture root itself, so it can't be
     // confused with the "is THIS a discord-copilot-sdk checkout" guard — just a
@@ -277,7 +276,9 @@ describe("setup.mjs --dry-run orchestration (integration)", { timeout: 60_000 },
       expect(out).toContain("run-bot.default.log");
       expect(out).toContain(`./update.${shell}`);
       expect(out).toContain(`./uninstall.${shell}`);
-      expect(out).toContain("Final step (manual): send a test message in your Discord channel, or use /new to begin.");
+      expect(out).toContain("add the bot to your private work channel");
+      expect(out).toContain("audit with /channel list");
+      expect(out).toContain("INSTALL positive/negative verification checklist");
       expect(out).toContain("Safety: use a private server, enable 2FA, and never commit .env / your token.");
       expect(out).not.toContain("Config-load health check passed.");
       expect(out).not.toContain("Writing .env");

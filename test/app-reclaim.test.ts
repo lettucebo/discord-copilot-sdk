@@ -9,6 +9,7 @@ import { SessionStore, type SessionBinding } from "../src/core/session-store.js"
 import { addWorktree } from "../src/core/worktree.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
+import type { ChatInputCommandInteraction } from "discord.js";
 
 const exec = promisify(execFile);
 const git = (cwd: string, ...args: string[]): Promise<{ stdout: string }> => exec("git", args, { cwd });
@@ -55,7 +56,6 @@ const cfgFor = (r: string): Parameters<typeof DiscordCopilotApp.createForTest>[0
     REPOS_ROOT: path.dirname(r),
     DEFAULT_MODEL: "claude-sonnet-5",
     DEFAULT_CONTEXT_TIER: "default",
-    PERMISSION_POLICY: "ask",
   }) as unknown as Parameters<typeof DiscordCopilotApp.createForTest>[0];
 
 const fakeCopilot = (): CopilotClient => ({}) as unknown as CopilotClient;
@@ -121,6 +121,17 @@ const reclaim = (
       reclaim(t: string, r: string, w: string, b?: string): Promise<{ ok: boolean; tail: string }>;
     }
   ).reclaim(id, repoPath, wd, br);
+
+const endStaleRecord = (
+  app: DiscordCopilotApp,
+  threadId: string,
+  interaction: ChatInputCommandInteraction
+): Promise<void> =>
+  (
+    app as unknown as {
+      endStaleRecord(i: ChatInputCommandInteraction, t: string): Promise<void>;
+    }
+  ).endStaleRecord(interaction, threadId);
 
 // Each test here creates a real git repo AND a real worktree, so it pays for
 // several git subprocesses. Locally that is ~1.4s; CI runs roughly 4-5x slower
@@ -194,5 +205,46 @@ describe("reclaim — the record and its worktree retire together", { timeout: 6
     expect(out.ok).toBe(true);
     expect(store.get("t2")).toBeUndefined();
     expect(fs.existsSync(path.join(repo, "a.txt"))).toBe(true); // repo untouched
+  });
+
+  it("lets an explicit /end clear an active record retained only for Discord no-access", async () => {
+    const store = new SessionStore(storeFile);
+    store.reserve({
+      threadId: "t3",
+      sessionId: "s3",
+      generation: 1,
+      repoPath: repo,
+      guildId: "g1",
+      parentChannelId: "c1",
+      workDir: repo,
+      devMode: "local",
+    });
+    store.commit("t3");
+    expect(store.setState("t3", "active", "thread-no-access")).toBe(true);
+    const app = DiscordCopilotApp.createForTest(
+      cfgFor(repo),
+      path.dirname(repo),
+      fakeCopilot(),
+      new NullTransport(),
+      store
+    );
+    const replies: unknown[] = [];
+    const edits: unknown[] = [];
+    const interaction = {
+      async reply(value: unknown) {
+        replies.push(value);
+      },
+      async deferReply(value: unknown) {
+        replies.push(value);
+      },
+      async editReply(value: unknown) {
+        edits.push(value);
+      },
+    } as unknown as ChatInputCommandInteraction;
+
+    await endStaleRecord(app, "t3", interaction);
+
+    expect(store.get("t3")).toBeUndefined();
+    expect(edits.join("\n")).toContain("已清除");
   });
 });

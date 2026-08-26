@@ -24,11 +24,12 @@ import { encodePermissionId, encodeChoiceId, encodePlanId } from "./custom-id.js
 import { renderChunks } from "./render-chunks.js";
 import { sanitizeForCodeBlock } from "../../core/text-safety.js";
 import type { OutboundFile } from "../../core/outbound-file.js";
+import { fetchChannelSafe } from "./channel-fetch.js";
 
 export { sanitizeForCodeBlock };
 
 /** Never let agent-produced text ping anyone. */
-const NO_MENTIONS = { allowedMentions: { parse: [] as never[] } };
+export const NO_MENTIONS = { allowedMentions: { parse: [] as never[] } };
 const RENDER_INTERVAL_MS = 1000;
 /** A stale attachment is already public. Do not let an unavailable delete API
  * stall a turn forever, but never report it as retracted without confirmation. */
@@ -206,15 +207,14 @@ export class DiscordTransport implements Transport {
         ? "Once = this request · Session = until the session ends · Always = remembered for this repo"
         : "Approve applies to this single request only.",
     });
-    const row = new ActionRowBuilder<ButtonBuilder>();
-    row.addComponents(
+    const buttons = [
       new ButtonBuilder()
         .setCustomId(encodePermissionId(view.nonce, "once"))
         .setLabel("Allow once")
         .setStyle(ButtonStyle.Success)
-    );
+    ];
     if (view.canOfferSession) {
-      row.addComponents(
+      buttons.push(
         new ButtonBuilder()
           .setCustomId(encodePermissionId(view.nonce, "session"))
           .setLabel("Allow for session")
@@ -225,13 +225,13 @@ export class DiscordTransport implements Transport {
           .setStyle(ButtonStyle.Secondary)
       );
     }
-    row.addComponents(
+    buttons.push(
       new ButtonBuilder()
         .setCustomId(encodePermissionId(view.nonce, "deny"))
         .setLabel("Deny")
         .setStyle(ButtonStyle.Danger)
     );
-    await channel.send({ embeds: [embed], components: [row], ...NO_MENTIONS });
+    await channel.send({ embeds: [embed], components: buttonRows(buttons), ...NO_MENTIONS });
   }
 
   async sendFile(
@@ -359,14 +359,10 @@ export class DiscordTransport implements Transport {
   }
 
   private async fetchThread(id: string): Promise<MinimalTextChannel | undefined> {
-    try {
-      const ch = await this.client.channels.fetch(id);
-      return ch && (ch as unknown as MinimalTextChannel).isTextBased()
-        ? (ch as unknown as MinimalTextChannel)
-        : undefined;
-    } catch {
-      return undefined;
-    }
+    const result = await fetchChannelSafe(this.client, id);
+    if (result.kind !== "ok") return undefined;
+    const channel = result.channel as unknown as MinimalTextChannel;
+    return channel.isTextBased() ? channel : undefined;
   }
 
   private getAttachPermission(channel: MinimalTextChannel): boolean | "unknown" {

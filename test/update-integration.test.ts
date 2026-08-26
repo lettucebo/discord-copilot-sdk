@@ -66,7 +66,6 @@ async function cloneTarget(name: string): Promise<string> {
       "DISCORD_PARENT_CHANNEL_ID=12345",
       `REPOS_ROOT=${reposRoot}`,
       "DEFAULT_REPO=",
-      "DEV_GUILD_ID=",
       "DEFAULT_MODEL=claude-sonnet-5",
       "DEFAULT_CONTEXT_TIER=default",
       "",

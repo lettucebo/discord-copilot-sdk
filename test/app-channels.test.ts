@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ChannelType, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
+import {
+  ChannelType,
+  MessageFlags,
+  PermissionFlagsBits,
+  type ChatInputCommandInteraction,
+} from "discord.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import { DiscordCopilotApp, type Session } from "../src/app.js";
 import type { Config } from "../src/config.js";
@@ -15,6 +20,7 @@ const OWNER = "10000";
 const GUILD = "20000";
 const SEED = "30000";
 const SECONDARY = "40000";
+const VISIBLE_DISABLED = "50000";
 const FIXTURES = join(process.cwd(), ".test-fixtures-app-channels");
 
 class FakeTransport implements Transport {
@@ -126,12 +132,10 @@ function config(reposRoot: string): Config {
     DISCORD_ALLOWED_USER_IDS: [OWNER],
     DISCORD_GUILD_ID: GUILD,
     DISCORD_PARENT_CHANNEL_ID: SEED,
-    DEV_GUILD_ID: undefined,
     REPOS_ROOT: reposRoot,
     DEFAULT_REPO: "repo",
     DEFAULT_MODEL: "claude-sonnet-5",
     DEFAULT_CONTEXT_TIER: "default",
-    PERMISSION_POLICY: "ask",
     ENABLE_REPO_SKILLS: "true",
     ENABLE_USER_SKILLS: "true",
     REPO_CLONE_HOST_POLICY: "github",
@@ -171,6 +175,14 @@ function cmdChannel(app: DiscordCopilotApp, interaction: ChatInputCommandInterac
   ).cmdChannel(interaction);
 }
 
+function cmdSessions(app: DiscordCopilotApp, interaction: ChatInputCommandInteraction): Promise<void> {
+  return (
+    app as unknown as {
+      cmdSessions(i: ChatInputCommandInteraction): Promise<void>;
+    }
+  ).cmdSessions(interaction);
+}
+
 function cmdYolo(app: DiscordCopilotApp, interaction: ChatInputCommandInteraction): Promise<void> {
   return (
     app as unknown as {
@@ -183,6 +195,7 @@ type DiscordForTest = {
   discord: {
     channels: {
       fetch(channelId: string): Promise<unknown>;
+      cache: Map<string, unknown>;
     };
   };
 };
@@ -251,7 +264,7 @@ describe("/channel", () => {
       type: ChannelType.GuildText,
       guildId: GUILD,
       guild: { members: { me: {} } },
-      permissionsFor: () => ({ has: () => false }),
+      permissionsFor: () => ({ has: (flag: bigint) => flag === PermissionFlagsBits.ViewChannel }),
     }));
 
     const enabling = cmdChannel(app, asInteraction(interaction));
@@ -294,7 +307,7 @@ describe("/channel", () => {
       type: ChannelType.GuildText,
       guildId: GUILD,
       guild: { members: { me: {} } },
-      permissionsFor: () => ({ has: () => false }),
+      permissionsFor: () => ({ has: (flag: bigint) => flag === PermissionFlagsBits.ViewChannel }),
     }));
 
     await cmdChannel(app, asInteraction(interaction));
@@ -330,6 +343,23 @@ describe("/channel", () => {
     expect(interaction.edits.join("\n")).toContain("不在設定的伺服器");
   });
 
+  it("refuses a private channel until the bot has View Channel", async () => {
+    const { app, registry } = harness();
+    const interaction = slash({ subcommand: "enable", strings: { channel: SECONDARY } });
+    patchChannelFetch(app, async () => ({
+      type: ChannelType.GuildText,
+      guildId: GUILD,
+      guild: { members: { me: {} } },
+      permissionsFor: () => ({ has: () => false }),
+    }));
+
+    await cmdChannel(app, asInteraction(interaction));
+
+    expect(registry.has(SECONDARY)).toBe(false);
+    expect(interaction.edits.join("\n")).toContain("編輯頻道 → 權限");
+    expect(interaction.edits.join("\n")).toContain("把這個 bot 加進去");
+  });
+
   it("rejects an invalid explicit target instead of enabling the current channel", async () => {
     const { app, registry } = harness();
     const fetch = vi.fn(async () => ({ type: ChannelType.GuildText, guildId: GUILD }));
@@ -347,7 +377,7 @@ describe("/channel", () => {
     expect(textOf(interaction.replies[0])).toContain("只接受頻道 ID");
   });
 
-  it("refuses to disable the seed or a channel held by live and durable sessions", async () => {
+  it("allows disabling the imported default but refuses a channel held by live and durable sessions", async () => {
     const { app, registry, store } = harness();
     expect(registry.enable(SECONDARY, OWNER)).toBe(true);
     sessionsOf(app).set("live-thread", session(SECONDARY));
@@ -357,8 +387,8 @@ describe("/channel", () => {
 
     const seed = slash({ subcommand: "disable" });
     await cmdChannel(app, asInteraction(seed));
-    expect(registry.has(SEED)).toBe(true);
-    expect(textOf(seed.replies[0])).toContain("不能從 Discord 停用");
+    expect(registry.has(SEED)).toBe(false);
+    expect(textOf(seed.replies[0])).toContain("已停用");
 
     const secondary = slash({ subcommand: "disable", strings: { channel: SECONDARY } });
     await cmdChannel(app, asInteraction(secondary));
@@ -382,10 +412,16 @@ describe("/channel", () => {
     const blockedParent = join(FIXTURES, "not-a-directory");
     const file = join(blockedParent, "channels.json");
     const { app, registry } = harness(file);
+    rmSync(blockedParent, { recursive: true, force: true });
     writeFileSync(blockedParent, "a file prevents the registry directory", "utf8");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const interaction = slash({ subcommand: "enable", strings: { channel: SECONDARY } });
-    patchChannelFetch(app, async () => ({ type: ChannelType.GuildText, guildId: GUILD }));
+    patchChannelFetch(app, async () => ({
+      type: ChannelType.GuildText,
+      guildId: GUILD,
+      guild: { members: { me: {} } },
+      permissionsFor: () => ({ has: () => true }),
+    }));
 
     try {
       await cmdChannel(app, asInteraction(interaction));
@@ -397,15 +433,68 @@ describe("/channel", () => {
     expect(interaction.edits.join("\n")).toContain("沒有**啟用");
   });
 
-  it("explains that authorization does not control Discord command visibility", async () => {
+  it("audits runtime authorization against Discord visibility", async () => {
     const { app } = harness();
     const interaction = slash({ subcommand: "list" });
+    patchChannelFetch(app, async (id) => ({
+      id,
+      type: ChannelType.GuildText,
+      guildId: GUILD,
+      guild: { members: { me: {} } },
+      permissionsFor: () => ({ has: () => true }),
+    }));
 
     await cmdChannel(app, asInteraction(interaction));
 
-    expect(textOf(interaction.replies[0])).toContain("bot 的授權");
-    expect(textOf(interaction.replies[0])).toContain("不等於");
-    expect(textOf(interaction.replies[0])).toContain("Server Settings → Integrations");
+    expect(textOf(interaction.replies[0])).toContain("頻道白名單與可見度");
+    expect(textOf(interaction.replies[0])).toContain("✅ 可見");
+    expect(textOf(interaction.replies[0])).toContain("首次啟動預設值");
+  });
+
+  it("reports a visible text channel that runtime authorization has not enabled", async () => {
+    const { app } = harness();
+    const interaction = slash({ subcommand: "list" });
+    const visibleChannel = {
+      id: VISIBLE_DISABLED,
+      type: ChannelType.GuildText,
+      guildId: GUILD,
+      guild: { members: { me: {} } },
+      permissionsFor: () => ({ has: () => true }),
+    };
+    (app as unknown as DiscordForTest).discord.channels.cache.set(VISIBLE_DISABLED, visibleChannel);
+    patchChannelFetch(app, async (id) => ({
+      id,
+      type: ChannelType.GuildText,
+      guildId: GUILD,
+      guild: { members: { me: {} } },
+      permissionsFor: () => ({ has: () => true }),
+    }));
+
+    await cmdChannel(app, asInteraction(interaction));
+
+    const text = textOf(interaction.replies[0]);
+    expect(text).toContain("bot 看得到、但尚未在程式內啟用");
+    expect(text).toContain(`<#${VISIBLE_DISABLED}>`);
+  });
+
+  it("separates clearable Discord no-access records from protected transient retries", async () => {
+    const { app, store } = harness();
+    expect(store.reserve(binding("no-access-thread", SEED))).toBe(true);
+    expect(store.commit("no-access-thread")).toBe(true);
+    expect(store.setState("no-access-thread", "active", "thread-no-access")).toBe(true);
+    expect(store.reserve(binding("transient-thread", SEED))).toBe(true);
+    expect(store.commit("transient-thread")).toBe(true);
+    expect(store.setState("transient-thread", "active", "transient-thread-fetch")).toBe(true);
+    const interaction = slash({ channelId: SEED });
+
+    await cmdSessions(app, asInteraction(interaction));
+
+    const text = textOf(interaction.replies[0]);
+    expect(text).toContain("Discord 暫時無法存取");
+    expect(text).toContain("/end thread:<id>");
+    expect(text).toContain("no-access-thread");
+    expect(text).toContain("暫時無法復原、**重啟後會再試**的記錄（不會被清除）");
+    expect(text).toContain("transient-thread");
   });
   it("keeps /yolo mode:on gated on the ack and then emits the live notice with file guidance", async () => {
     const notices: Array<{ key: string; text: string }> = [];

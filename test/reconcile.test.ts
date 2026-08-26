@@ -48,6 +48,13 @@ describe("planReconcile", () => {
     });
   });
 
+  it("active + missing Discord access → retry without changing the record", () => {
+    expect(planReconcile({ corrupt: false, state: "active", bindingOk: true, threadStatus: "no-access" })).toEqual({
+      kind: "skip",
+      reason: "thread-no-access",
+    });
+  });
+
   it("active + archived-unarchivable → block:thread-archived", () => {
     expect(
       planReconcile({ corrupt: false, state: "active", bindingOk: true, threadStatus: "archived-unarchivable" })

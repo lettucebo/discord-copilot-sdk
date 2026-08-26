@@ -12,7 +12,7 @@
 DISCORD_BOT_TOKEN=          # 步驟 3
 DISCORD_ALLOWED_USER_IDS=   # 步驟 5 — 你自己的 user ID
 DISCORD_GUILD_ID=           # 步驟 5 — 伺服器 ID
-DISCORD_PARENT_CHANNEL_ID=  # 步驟 5 — 種子／主要工作頻道 ID
+DISCORD_PARENT_CHANNEL_ID=  # 步驟 5 — 種子預設值（首次啟動用）工作頻道 ID
 ```
 
 ---
@@ -21,11 +21,17 @@ DISCORD_PARENT_CHANNEL_ID=  # 步驟 5 — 種子／主要工作頻道 ID
 
 Discord → 左側 **+** → **Create My Own** → **For me and my friends**。
 
-在裡面建立一個**文字頻道**（例如 `#copilot`）當作種子／主要工作頻道。每個 session 都會是在某個已啟用工作頻道底下的討論串；`.env` 設定的種子頻道是第一個。
+在裡面建立一個**文字頻道**（例如 `#copilot`）當作**種子預設值**工作頻道——也就是它的首次啟動預設值。每個 session 都會是在某個已啟用工作頻道底下的討論串；`.env` 設定的是第一次啟動用的種子預設值。
 
 > **為什麼要私人伺服器**：這個 bot 會以你的身分執行 shell 指令。任何看得到工作頻道的人都能看到 agent 的輸出（包含檔案內容）。輸入有 allow-list 保護，**輸出沒有**。
 
-> 反過來也一樣值得管：預設情況下 **bot 讀得到你伺服器的每一個頻道**。§4b 說明如何限制它能讀的範圍；[`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md) 說明另一層 slash 指令顯示與 `/channel` 授權模型。
+> 反過來也一樣值得管：邀請連結授予的 server-level 身分組可以讀取公開頻道，以及任何明確加入它的私密頻道。§4b 說明如何用私密頻道成員資格把 bot 限制在工作頻道；[`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md) 說明另一層 slash 指令顯示與 `/channel` 授權模型。
+
+### 建議：連工作頻道本身也設為私密
+
+私人**伺服器**能完全擋住陌生人，但一般公開頻道仍對伺服器所有成員可見，包含 bot。要讓 bot 的指令不要塞滿每個頻道的 `/` 選單，最主要且原生的做法是把每個**工作頻道**設為私密——這是 Discord 權限，不是這個 bot 自己的設定——並只把這個 bot 的 application（以及會用到它的人類）加為成員。完整模型與理由見 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md#3-主模型--私密工作頻道推薦的隱藏方式)。
+
+**在同一個伺服器跑不只一個實例**（例如正式版 app 與獨立的測試版 app）：為每個實例建立**各自獨立的 Discord application**，各有自己的 bot user，並把每個 application 的 bot **只**加進它應該擁有的頻道。兩個 application 永遠不會共用成員資格，所以它們的指令不會在同一個頻道的選單裡重複出現——這正是 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md#6-來自第二個-app-的重複指令) 描述的「`/new` 重複」問題的修法。
 
 ---
 
@@ -67,6 +73,10 @@ Discord 不允許「私有 App」帶著公開安裝連結，所以**順序是反
 > 兩個分頁**各自**要存一次。下拉選單已經顯示 `None` 不代表存過了 —— Discord 的存檔是手動的，畫面上會浮出 **Save Changes** 提示條。
 
 拿掉 Install Link **不會**影響已經在伺服器裡的 bot：slash 指令是 bot 啟動時自己用 API 註冊的，不是靠安裝流程註冊。日後若要重新邀請，用下面 §4 的網址即可。
+
+### 選用：提前測試 Channel Obfuscation
+
+Discord 正在推行一項破壞性的 Gateway 變更 —— 遮蔽 bot 看不到的頻道 —— **從 2026-11-16 起對所有 bot 強制**（完整機制見 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md#8-channel-obfuscation2026-08-12-變更2026-11-16-強制)）。你不需要做任何事來符合規定——bot 的程式碼本來就必須把任何名為 `"___hidden___"` 的頻道當成不透明——但你可以**現在**就讓這個 application 提前加入新的 Gateway 行為，先測試看看：**Bot** 分頁 → **Overview** → **Private Channel Obfuscation** 開關。這只影響 Gateway，是提前測試用的暫時開關；HTTP API 沒有對應的提前開關，一旦變更套用到你的 app，它就會直接開始省略被遮蔽的頻道。
 
 ---
 
@@ -143,13 +153,13 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20appli
 
 ## 4b. 🔒 限制 bot 能讀的範圍
 
-上面的邀請連結把權限給在**身分組**上，而身分組權限是**整個伺服器通用**的 —— 意思是 bot 看得到你**每一個**頻道，包括私人討論。對一個會把讀到的內容送進 Copilot 的工具來說，這值得收緊。
+上面的邀請連結把權限給在**身分組**上，而身分組權限是**整個伺服器通用**的 —— 意思是除非某個頻道自己的成員資格另有規定，否則 bot 看得到你**每一個**頻道，包括私人討論。對一個會把讀到的內容送進 Copilot 的工具來說，這值得收緊。
 
-> **重要更正**：拒絕 bot 的 `View Channel` 確實會限制 bot 能**讀**哪些頻道，但它**不會**把 bot 的 slash 指令從 `/` 選單藏起來，也**不會**阻止 Discord 從其他頻道送 `INTERACTION_CREATE` 給 bot。指令是否出現在選單，是由使用者在該頻道的 `USE_APPLICATION_COMMANDS` 權限加上 Application Command Permissions v2 決定（[Discord 文件](https://docs.discord.com/developers/interactions/application-commands#application-command-permissions-object-using-default-permissions)），而 interaction delivery 和頻道收發訊息權限是分開的（[Discord 文件](https://docs.discord.com/developers/interactions/receiving-and-responding#responding-to-an-interaction)）。那是管理員控制的另一個平面，請看 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md)。
+> **更正（依 2026-08-12 新事實更新）**：這份文件先前的版本主張，拒絕 bot 的 `View Channel` 只會限制 bot 能**讀**的內容，對指令是否出現在該頻道的 `/` 選單沒有影響。**這個說法是錯的，在此撤回。** 沒有 `View Channel` 存取權的頻道，bot 的指令也不會出現在那裡（[Discord Slash Commands FAQ](https://support-dev.discord.com/hc/en-us/articles/frequently-asked-questions)；[Command Permissions](https://support.discord.com/hc/en-us/articles/9349445088791-Command-Permissions-FAQ)）。也就是說，下面的私密頻道設定會同時給你**兩種**效果——讀取限制與指令可見度白名單——來自同一份頻道成員資格；證據等級，以及這如何對應到 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md#3-主模型--私密工作頻道推薦的隱藏方式) 描述的主要私密頻道模型，見 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md#4-更正一個過時的說法bot-的-view_channel-確實會影響指令可見度)。唯一仍然成立的是：Discord 仍可能把底層的 `INTERACTION_CREATE` payload 送到 bot 的後端（例如來自客戶端過時的快取指令清單），而且初始 interaction 回應不需要 `SEND_MESSAGES`（[Discord 文件](https://docs.discord.com/developers/interactions/receiving-and-responding#responding-to-an-interaction)）——所以真正的安全邊界仍然是 bot 自己的 `/channel` 授權檢查，不是這個權限畫面。
 
 ### 先理解為什麼「不給權限」沒有用
 
-大多數伺服器的 `@everyone` 身分組本身就帶著 **View Channels**，而 bot 也是成員，**一樣繼承它**。所以把 bot 身分組的權限清成 `0`，它照樣看得到所有沒有明確拒絕它的頻道。
+大多數伺服器的 `@everyone` 身分組本身就帶著 **View Channels**，而 bot 也是成員，**一樣繼承它**。所以把 bot 身分組的權限清成 `0`，它照樣看得到所有沒有明確拒絕它的頻道——這正是為什麼下面的做法是針對**頻道成員資格**下手，而不是改 bot 的身分組。
 
 自己確認一下：伺服器設定 → 身分組 → `@everyone` → 看 View Channels 是否開著。
 
@@ -159,25 +169,20 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot%20appli
 | 頻道層級 **允許** View Channels | 只加開**那一個**頻道。 |
 | 頻道層級 **拒絕** View Channels | **擋住**該頻道，優先於 `@everyone` 的伺服器層級允許。 |
 
-Discord 的權限解析順序是：`@everyone` 伺服器層級 → 身分組伺服器層級 → `@everyone` 頻道覆寫 → **身分組頻道覆寫**。所以身分組的頻道層級「拒絕」會蓋過 `@everyone` 的「允許」—— 這是唯一真正擋住讀取的方法。
+Discord 的權限解析順序是：`@everyone` 伺服器層級 → 身分組伺服器層級 → `@everyone` 頻道覆寫 → **身分組頻道覆寫**。私密頻道自己對 `@everyone` 的頻道層級拒絕，正是真正擋住讀取的機制——下面的步驟就是靠這個。
 
-### 正確的設定
+### 正確的設定：把每個工作頻道都設為私密
 
 | 放哪裡 | 給什麼 |
 | --- | --- |
 | Bot 的身分組 | **完全清空（`0`）** —— 包括不要 Administrator。 |
-| 工作頻道 | **允許**下面那組工作權限。 |
-| 其他**每一個**頻道與**分類** | **拒絕** View Channels。 |
+| 每個工作頻道 | 設為**私密**——拿掉 `@everyone` 的 View Channel（或一開始就建立為私密頻道）——然後**只**把 bot 的 application 和會用到它的人類加為明確成員，並給予下面那組工作權限。 |
 
-分類（Category）也要設，因為分類權限會往下繼承到底下的頻道。
-
-### ⚠️ 順序很重要
-
-**先做頻道設定，最後才拿掉 Administrator。** 反過來的話 bot 會先失去 `Manage Roles`，就沒有權限再去改頻道設定了。
+這刻意是**成員資格制**，不是逐一列出「拒絕」的清單：你完全不需要跑去伺服器裡其他每一個頻道或分類設定什麼。一個 bot 從未被加入的頻道，本來就把它擋在外面——這和 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md#3-主模型--私密工作頻道推薦的隱藏方式) §3 說明指令可見度時給出的理由是同一個。
 
 ### 步驟
 
-1. **每個工作頻道** → 編輯頻道 → 權限 → 加入你的 bot 身分組 → 依主機平台打開對應的一組：
+1. **每個工作頻道** → 設為私密（或直接建立為私密）→ 編輯頻道 → 權限 → 加入你的 bot application 與會用到它的人類 → 依主機平台打開對應的一組：
    - **Windows：** View Channels · Send Messages · Send Messages in Threads · Create Public Threads ·
      Create Private Threads · Manage Threads · Embed Links · Attach Files ·
      Read Message History · Add Reactions · Use External Emoji
@@ -186,9 +191,8 @@ Discord 的權限解析順序是：`@everyone` 伺服器層級 → 身分組伺�
      Send Messages in Threads · Create Public Threads · Create Private Threads · Manage Threads ·
      Embed Links · Read Message History · Add Reactions · Use External Emoji
      非 Windows 的整數是 `395137338432`。
-   這個範圍只限工作頻道，所以兩個平台各自的集合都可以比邀請權限稍微寬鬆。
-2. **其他每一個頻道與分類** → 權限 → 加入 bot 身分組 → **拒絕** View Channels。
-3. **最後**：伺服器設定 → 身分組 → 你的 bot 身分組 → **關掉 Administrator**，其餘留空。該頁右上角的 **Clear permissions** 可以一次清空。
+   這個範圍只限 bot 被明確加入的頻道，所以兩個平台各自的集合都可以比邀請權限稍微寬鬆。
+2. 伺服器設定 → 身分組 → 你的 bot 身分組 → **關掉 Administrator**，其餘留空。該頁右上角的 **Clear permissions** 可以一次清空。這一步和上面的私密頻道設定都是由人類設定，兩者之間沒有先後順序的要求。
 
 > **確認你改的是對的身分組。** 伺服器裡可能有多個整合身分組；編輯畫面的標題要顯示**你的 bot 名稱**。
 
@@ -200,17 +204,29 @@ Discord 的權限解析順序是：`@everyone` 伺服器層級 → 身分組伺�
 | --- | --- |
 | `Administrator` | 繞過**所有**頻道設定，上面做的隔離會全部失效。 |
 | `Manage Messages` | 程式只刪**自己發的**訊息，那不需要這個權限；給了等於能刪你的訊息。 |
-| `Manage Channels` / `Manage Roles` | 完全用不到。 |
+| `Manage Channels` / `Manage Roles` | 刻意**不給**——頻道／成員可見度一律由人類設定；bot 不需要、也絕不能修改自己的可見度權限。 |
 | `Mention Everyone` | 完全用不到。 |
 
 ### 驗收
 
 不要只看設定畫面 —— 實際測一次：
 
-1. 在已啟用的工作頻道 `/new`，在討論串送一則訊息 → 應該正常回覆。
-2. 在**別的**頻道 tag 或提到 bot → 它應該不會讀到那則訊息，也不會回應。這只能證明「訊息讀取」被限制；slash 指令顯示與 interaction 是否送達要依 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md) 另外驗證。
+1. **正向**：在已啟用的工作頻道 `/new`，在討論串送一則訊息 → 應該正常回覆。
+2. **反向**：在 bot 從未被加入的頻道 tag 或提到 bot → 它應該不會讀到那則訊息，也不會回應。這只能證明「訊息讀取」被限制；slash 指令顯示與 interaction 是否送達要依 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md) 另外驗證。
 
 Discord 左側頻道列表沒有真正的「以 bot 視角檢視」，但成員清單是有用訊號：bot 應該只出現在工作頻道的成員清單裡。
+
+---
+
+## 4c. 指令權限預設值：`default_member_permissions="0"`
+
+這個 bot 註冊的每個指令都帶著 `default_member_permissions="0"`。依 Discord 對這個欄位的語意，這代表**除非持有 guild 的 Administrator 權限，或在 Server Settings → Integrations → 該 app → Command permissions 裡有明確的 per-user／per-role 覆寫，否則 guild 裡預設沒有人能使用這個指令**（[Discord 文件](https://docs.discord.com/developers/interactions/application-commands#permissions)）。
+
+這是刻意的：搭配上面的私密頻道模型，即使某個 guild 成員恰好看得到某個工作頻道，光靠「看得到」也不足以讓他呼叫指令。
+
+**要注意的地方**：bot 自己的 `isAuthorized` allow-list（`DISCORD_ALLOWED_USER_IDS`）從來不要求其中的使用者是 guild Administrator——那是另一個獨立的授權平面（見 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md)）。如果你 allow-list 裡有人**不是** guild Administrator，`default_member_permissions="0"` 會讓他即使在看得到的工作頻道也完全無法呼叫任何指令，直到在 Integrations 為他加上覆寫為止。bot 在啟動時會印出警告，點名遇到這種情況的 allow-listed 使用者，並給出確切的逃生路徑：到 Integrations → Command permissions，為該使用者（或他所屬的身分組）加上明確允許。
+
+guild 的**擁有者**會被視為隱含滿足這項檢查（擁有者本來就有等同 Administrator 的權限），所以一般的單一擁有者設定不會觸發這個警告。
 
 ---
 
@@ -221,24 +237,24 @@ Discord 左側頻道列表沒有真正的「以 bot 視角檢視」，但成員�
 | 要填的欄位 | 怎麼拿 |
 | --- | --- |
 | `DISCORD_GUILD_ID` | 右鍵伺服器圖示 → **Copy Server ID**。 |
-| `DISCORD_PARENT_CHANNEL_ID` | 右鍵種子／主要文字頻道 → **Copy Channel ID**。這是永遠啟用的種子頻道，不是 bot 唯一能用的頻道。 |
+| `DISCORD_PARENT_CHANNEL_ID` | 右鍵**種子預設值**文字頻道 → **Copy Channel ID**。這是 bot 第一次啟動時自動被授權的頻道（它的首次啟動預設值）——不是 bot 唯一能用的頻道，也不會在不再需要時永遠不能被 `/channel disable`。 |
 | `DISCORD_ALLOWED_USER_IDS` | 右鍵**你自己的名字** → **Copy User ID**。 |
 | `DISCORD_BOT_TOKEN` | 來自 §3。 |
 
-- 種子頻道必須是**文字頻道**（不能是分類、論壇、公告頻道、語音頻道或討論串）；bot 啟動時會檢查。
+- 種子預設值頻道必須是**文字頻道**（不能是分類、論壇、公告頻道、語音頻道或討論串）；bot 啟動時會檢查。
 - `DISCORD_ALLOWED_USER_IDS` 是逗號分隔，但 v1 建議**只放你自己**。清單外的人即使在已啟用頻道也無法下指令。
 
 ### 之後想換父頻道
 
-bot 現在支援多個工作頻道。`DISCORD_PARENT_CHANNEL_ID` 是**種子**頻道：它永遠啟用，不能從 Discord 用 `/channel disable` 關掉；要改它仍然要編輯 `.env` 並重啟。其他工作頻道在執行中用 `/channel enable` 管理；見 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md)。
+bot 現在支援多個工作頻道。`DISCORD_PARENT_CHANNEL_ID` 只是一個**種子預設值**：這個 bot 實例第一次啟動時會自動被授權的頻道，讓開箱即用時至少有一個可用頻道。第一次啟動之後，它就會被寫進登錄檔，變成和用 `/channel enable` 加入的頻道完全一樣的普通已啟用紀錄——不是永久、不可停用的特例——之後再改 `.env` 對已持久化的授權**沒有任何效果**，因為登錄檔一旦寫入就是唯一權威來源。其他（或替換用的）工作頻道在執行中用 `/channel enable`／`/channel disable` 管理；見 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md)。
 
-如果要換種子本身：
+在既有安裝上把種子預設值換成別的工作頻道：
 
-1. 改 `.env` 的 `DISCORD_PARENT_CHANNEL_ID`。
-2. **趁 bot 還有權限時**，照 §4b 把新頻道的允許、舊頻道的拒絕設好。
-3. 重啟 bot（`./stop-bot.ps1` → `./run-bot.ps1`）。
+1. 把新頻道設為私密，加入 bot 與預定的人類成員，並依 §4b 給完整工作權限。
+2. **趁舊頻道仍是 enabled**，從舊頻道執行 `/channel enable channel:<新頻道-id>`（或在新頻道執行 `/channel enable`），再用 `/channel list` 驗證新項目。
+3. `/end` 結束所有仍指向舊頻道的 sessions，對舊頻道執行 `/channel disable`，最後才從舊頻道的成員／覆寫中移除 bot。
 
-舊種子頻道底下的討論串**會全部失效** —— 授權是綁已啟用工作頻道；如果你改了 `.env` 的種子，而且沒有先用 `/channel` 把舊種子另外啟用，它就不再屬於永遠啟用集合。這些記錄不會自己消失：bot 下次啟動會在新種子頻道列出它們，用 `/end thread:<id>` 清掉，順便回收 worktree。
+這時候改 `.env` 的 `DISCORD_PARENT_CHANNEL_ID` 只對**全新安裝**（從未寫過登錄檔）有意義——對已經啟動過一次的安裝，它不會回溯重新種子或重新授權任何東西。被停用波及的 session 不會自己消失：bot 下次啟動會列出這些孤兒紀錄，用 `/end thread:<id>` 清掉，順便回收 worktree。
 
 ---
 
@@ -247,16 +263,17 @@ bot 現在支援多個工作頻道。`DISCORD_PARENT_CHANNEL_ID` 是**種子**�
 回到專案資料夾照 [`INSTALL.zh-TW.md`](../INSTALL.zh-TW.md) 裝好、啟動後：
 
 1. bot 在成員清單顯示**在線**。
-2. 在種子頻道打 `/` → 看得到 `/new`、`/stop`、`/usage` 等指令。
-3. `/new` → 開出一個新討論串。
-4. 在討論串打「hello」→ **有回應**。沒回應代表 §2 的 intent 沒開。
+2. 在種子預設值頻道打 `/` → 看得到 `/new`、`/stop`、`/usage` 等指令。
+3. `/channel list` → 種子預設值應顯示為已啟用且可見，而且沒有非預期的可見度漂移。
+4. `/new` → 開出一個新討論串。
+5. 在討論串打「hello」→ **有回應**。沒回應代表 §2 的 intent 沒開。
 
-### 做過 §4b 收緊權限的話
+### 驗證 §4b 的私密頻道設定
 
 設定畫面看起來正確**不等於**真的生效 —— Discord 的權限是四層疊加運算出來的。實際驗證：
 
-1. **正向**：在已啟用工作頻道 `/new` → 開討論串 → 打字 → 有回應（證明允許那組有效）。
-2. **讀取限制反向測試**：到別的頻道提到 bot → 它應該不會讀到，也不會回應（證明訊息拒絕有效）。
+1. **正向**：在已啟用工作頻道 `/new` → 開討論串 → 打字 → 有回應（證明私密頻道成員資格有效）。
+2. **讀取限制反向測試**：到 bot 從未被加入的頻道提到 bot → 它應該不會讀到，也不會回應（證明限制有效）。
 3. **指令存取反向測試**：到沒有啟用的頻道打 `/`，應該看不到指令。如果仍然看得到，代表缺了 Discord 平面的整合設定；見 [`CHANNEL-ACCESS.zh-TW.md`](CHANNEL-ACCESS.zh-TW.md)。
 
 反向測試才是重點。只驗第一條的話，你證明的是「能用」，不是「被關住」。
@@ -273,8 +290,8 @@ bot 現在支援多個工作頻道。`DISCORD_PARENT_CHANNEL_ID` 是**種子**�
 | 討論串開了但 bot 不說話 | 少 `Send Messages in Threads`（`Send Messages` 對討論串無效）。 |
 | 指令回「Not authorized」 | `DISCORD_ALLOWED_USER_IDS` 不是你的 user ID。 |
 | 指令只在某些伺服器出現 | 指令是註冊到 `DISCORD_GUILD_ID` 那個伺服器的。 |
-| 收緊權限後 bot 整個消失了 | 工作頻道的 View Channels 沒給到，見 §4b。緊急還原：把 Administrator 打回去。 |
-| 換了 `DISCORD_PARENT_CHANNEL_ID` 後舊討論串沒反應 | 正常。改種子可能讓舊討論串落在已啟用頻道集合外。啟動時會列出這些殘留記錄，用 `/end thread:<id>` 清掉。 |
+| 收緊權限後 bot 整個消失了 | 依 §4b 把 bot 重新加入每個工作頻道並授予 View Channel。**不要**重新開啟 Administrator。 |
+| 改了 `DISCORD_PARENT_CHANNEL_ID`，但 bot 沒有移到新頻道 | 第一次啟動後這是正常行為：durable channel registry 才是權威來源。先把 bot 加進新的私密頻道並 `/channel enable`；結束舊頻道 sessions 後再 `/channel disable` 舊項目。 |
 
 ---
 
@@ -288,7 +305,7 @@ Bot 靠一個**本機** PID 鎖來避免重複啟動，它看不到別台機器�
 
 1. 舊機器先停掉：關掉程式，或執行 `schtasks /End /TN discord-copilot-sdk-default`。
 2. 新機器照 [`INSTALL.zh-TW.md`](../INSTALL.zh-TW.md) 安裝，填**同樣**的四個值。
-3. 兩台都想留著 → 分別建立**各自的 Discord application**：各自的 token、各自的種子／工作頻道，不要共用。
+3. 兩台都想留著 → 分別建立**各自的 Discord application**：各自的 token、各自的種子預設值工作頻道，不要共用。
 
 > `~/.discord-copilot-sdk/` 底下的狀態（可復原的 session、頻道登錄檔、已記住的核准規則）是**每台機器各自的**，不會跟著同步。新機器會從乾淨狀態開始，這是刻意的：核准規則與頻道授權不該悄悄跟著跑到另一台機器上。
 

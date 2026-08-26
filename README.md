@@ -73,12 +73,17 @@ Mitigations that **are** in place:
 - **Spoofing-resistant cards**: the command is shown escaped (no markdown/code-fence breakout),
   commands containing bidirectional/control characters are auto-denied, and an over-long command
   is auto-denied rather than shown partially.
-- **Access gate**: only allow-listed user id(s), in the configured guild + parent channel/threads,
+- **Access gate**: only allow-listed user id(s), in the configured guild + an enabled channel/threads,
   can drive a session. (This gates *input*; anyone who can read the channel can read *output* — use
   a private channel.) Secrets (`DISCORD_*`/`DISCORD_COPILOT_SDK_*`) are stripped from the agent's runtime env.
-  By default the bot can also *read* every channel in the server; §4b of
-  [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) covers limiting what it can read. Hiding the slash
-  commands themselves is a separate, admin-only Discord setting documented in
+  Which channels the bot can *read* is a Discord decision, not this bot's: the invite grants the bot
+  baseline permissions (so it can see ordinary public channels), but a **private channel** that only
+  this bot's application is added to is Discord's native whitelist — a bot that is not a member of a
+  channel receives none of its content, and its slash commands do not appear there either. The
+  recommended model is a private work channel; [`docs/CHANNEL-ACCESS.md`](docs/CHANNEL-ACCESS.md) is
+  the authoritative model and §4b of [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) covers the
+  least-privilege permission set. Hiding the slash commands where the bot *is* a member is a separate,
+  admin-only Discord Integrations override, also documented in
   [`docs/CHANNEL-ACCESS.md`](docs/CHANNEL-ACCESS.md).
 
 **Known limitation — inherited approvals:** the bot uses your logged-in Copilot (`~/.copilot`), so
@@ -133,7 +138,8 @@ Empirically confirmed on a real machine (Copilot Enterprise, copilot CLI 1.0.74-
 
 - Node.js `^20.19.0` or `>=22.12.0`
 - GitHub Copilot CLI installed and signed in on the host (the bot uses the logged-in user)
-- A Discord bot token; your Discord user id on the allow-list
+- A Discord bot token, your Discord user id (the allow-list), the guild (server) id, and a private
+  text channel id used as the first-run **seed default** (`DISCORD_PARENT_CHANNEL_ID`)
 
 ### Skills and source switches
 
@@ -311,8 +317,10 @@ while the controlled repo stayed untouched.
 
 - `/sessions` — what's live, with each one's state and branch (max 8). Leftover
   records are listed too, split by what can actually be done with them:
-  *clearable*, or *will retry on restart* (never deleted — the record is the only
-  pointer to that Copilot conversation).
+  *clearable*, *will retry on restart* (never deleted — the record is the only
+  pointer to that Copilot conversation), and records the bot lost channel access to
+  (`thread-no-access`), which retry once access is restored or on restart but can
+  also be explicitly cleared by the owner with `/end thread:<id>`.
 - `/end` — end **this** thread's session; the others keep running. In a thread
   whose session is gone but whose record survived, the same command reaps that
   record and its worktree.
@@ -330,9 +338,9 @@ session's work, ask it to commit, then `git merge copilot/t-<threadId>`.
 
 ### Channel access (`/channel`)
 
-Sessions can live in more than one Discord channel. `DISCORD_PARENT_CHANNEL_ID` is the always-enabled seed channel; an owner can add another channel with `/channel enable` inside that channel, or `/channel enable channel:<id>` from the seed channel. Use `/channel disable` to remove a channel and `/channel list` to inspect the bot-authorized list.
+Sessions can live in more than one private Discord channel. `DISCORD_PARENT_CHANNEL_ID` is the first-run **seed default**: it is imported into the channel registry on first run, then behaves like any other removable entry. Add the bot to a private channel first, then use `/channel enable` there or `/channel enable channel:<id>` from an already enabled channel. Use `/channel disable` to remove a channel and `/channel list` to audit authorization against Discord visibility. See [`docs/CHANNEL-ACCESS.md`](docs/CHANNEL-ACCESS.md) for the authoritative model and [`INSTALL.md`](INSTALL.md) for the full private-channel setup, enable, and positive/negative verification workflow.
 
-`/channel list` shows **bot authorization** only. Whether Discord shows the slash commands in a user's command picker is controlled separately by server admin settings; see [`docs/CHANNEL-ACCESS.md`](docs/CHANNEL-ACCESS.md).
+`/channel list` audits each **enabled** channel's authorization against what the bot can currently see and reports drift (authorized but no longer visible, or visible but never authorized). Whether Discord shows the slash commands in a user's command picker follows from channel membership, with an optional admin-only Integrations override; see [`docs/CHANNEL-ACCESS.md`](docs/CHANNEL-ACCESS.md).
 
 ## Repos and dev mode
 

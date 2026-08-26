@@ -9,7 +9,8 @@ import type { SessionState } from "./session-store.js";
 export type ThreadStatus =
   | "valid" // exists, in the right guild/parent, sendable (unarchived if needed)
   | "gone" // definitive 404 (Unknown Channel)
-  | "inaccessible" // 403 / missing access / wrong guild-parent / not a thread / locked
+  | "no-access" // 403 / missing access — ambiguous and therefore retryable
+  | "inaccessible" // wrong guild-parent / not a thread / locked — structurally invalid
   | "archived-unarchivable" // archived and we couldn't unarchive or it's still unsendable
   | "transient"; // network / 429 / 5xx / unknown — retryable, do NOT reclassify as gone
 
@@ -105,6 +106,8 @@ export function planReconcile(input: {
           return { kind: "resume" };
         case "gone":
           return { kind: "block", reason: "thread-gone" };
+        case "no-access":
+          return { kind: "skip", reason: "thread-no-access" };
         case "inaccessible":
           return { kind: "block", reason: "thread-inaccessible" };
         case "archived-unarchivable":

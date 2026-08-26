@@ -5,12 +5,6 @@ const csv = (v: string): string[] =>
   v.split(",").map((s) => s.trim()).filter(Boolean);
 
 const snowflake = z.string().regex(/^\d{5,25}$/, "must be a Discord snowflake id");
-/** An optional snowflake where an empty string (e.g. `DEV_GUILD_ID=` shipped in
- *  .env.example) is treated as "not set" rather than an invalid value. */
-const optionalSnowflake = z.preprocess(
-  (v) => (v === "" ? undefined : v),
-  snowflake.optional()
-);
 /** .default() only handles undefined, not an empty value from `.env`. These
  * switches must treat `KEY=` as unset or the installer/runtime contract splits:
  * the installer accepts an optional blank key while the runtime would reject it. */
@@ -21,8 +15,8 @@ const skillSourceSwitch = z.preprocess(
 
 /**
  * discord-copilot-sdk config schema (v1, lab-only). Parsed from environment variables.
- * Discord scope is intentionally narrow: a single guild + always-enabled seed
- * work channel (additional work channels are enabled at runtime) + an explicit
+ * Discord scope is intentionally narrow: a single guild + a persisted first-run
+ * work-channel default (additional work channels are enabled at runtime) + an explicit
  * user allow-list. `REPOS_ROOT` is the directory that CONTAINS every repo a
  * session may be bound to (⚠️ no isolation in v1 — run only in a disposable
  * environment).
@@ -85,10 +79,8 @@ export const ConfigSchema = z.object({
     .transform(csv)
     .pipe(z.array(snowflake).min(1, "at least one allowed user id is required")),
   DISCORD_GUILD_ID: snowflake,
-  /** Always-enabled seed work channel; additional work channels are enabled at
-   *  runtime. */
+  /** First-run work-channel default; afterwards it is an ordinary registry entry. */
   DISCORD_PARENT_CHANNEL_ID: snowflake,
-  DEV_GUILD_ID: optionalSnowflake,
   /** Absolute path to the directory that CONTAINS the repos a session may touch.
    *  Not a repo itself — see `resolveReposRoot`, which does the filesystem checks
    *  this (deliberately I/O-free) schema cannot. */
@@ -101,7 +93,6 @@ export const ConfigSchema = z.object({
   ),
   DEFAULT_MODEL: nonBlank("DEFAULT_MODEL must not be blank").default("claude-sonnet-5"),
   DEFAULT_CONTEXT_TIER: z.enum(["default", "long_context"]).default("default"),
-  PERMISSION_POLICY: z.enum(["ask"]).default("ask"),
   /** Explicit roots let a controlled repo supply skills without enabling broad
    * config/MCP discovery. Each source is independently switchable. */
   ENABLE_REPO_SKILLS: skillSourceSwitch,

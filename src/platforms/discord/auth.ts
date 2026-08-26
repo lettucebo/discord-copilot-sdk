@@ -10,9 +10,9 @@ export interface AuthContext {
 /** The configured single-owner lab policy.
  *
  *  `parentChannelIds` is a SET, not a single id: sessions may live under any
- *  channel the owner has enabled (`/channel enable`), plus the always-enabled
- *  seed channel from `DISCORD_PARENT_CHANNEL_ID`. Callers must rebuild this from
- *  the live `ChannelRegistry` on every check — a policy captured once at
+ *  channel the owner has enabled (`/channel enable`). On first run the registry
+ *  imports `DISCORD_PARENT_CHANNEL_ID` as an ordinary, removable entry. Callers
+ *  must rebuild this from the live `ChannelRegistry` on every check — a policy captured once at
  *  construction would make an enable take effect only after a restart. */
 export interface AuthPolicy {
   allowedUserIds: ReadonlySet<string>;

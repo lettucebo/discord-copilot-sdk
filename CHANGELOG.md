@@ -9,6 +9,37 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Private-channel visibility as the primary Discord whitelist**: making a work channel private
+  and adding only the intended bot application now yields Discord-native "invisible channel
+  means no commands, no content" behavior, with no Discord Integrations configuration or human
+  OAuth grant required. Integrations remains available as a secondary, admin-only override.
+- **Channel registry schema v2**: `DISCORD_PARENT_CHANNEL_ID` is imported once, only on a
+  missing or v1 registry file, as an ordinary enabled-channel record rather than a permanent
+  seed, and from then on can be removed like any channel added via `/channel enable`. An
+  existing v1 registry file is migrated in place, preserving every previously enabled channel.
+- `/channel list` now audits Discord visibility instead of reporting authorization only: it
+  flags enabled channels the bot can no longer see, and visible text channels that are not yet
+  enabled, so registry/Discord drift is surfaced rather than hidden.
+
+### Changed
+
+- **Losing Discord channel access (`50001 Missing Access`, including Channel Obfuscation) is
+  now retryable, not a terminal block**: an affected session resumes automatically once access
+  is restored or the bot restarts, `/sessions` lists it separately from both permanently
+  blocked and other transient-retry records, and an owner can still explicitly clear it with
+  `/end thread:<id>` after deciding to give up on recovery.
+- Slash commands now register with `default_member_permissions="0"`: only the guild owner or an
+  Administrator can invoke them by default, and every other allow-listed user needs an explicit
+  Discord Integrations user/role override.
+
+### Removed
+
+- The legacy `DEV_GUILD_ID` and `PERMISSION_POLICY` config keys are gone. A remaining `.env`
+  line for either is silently ignored by the runtime config parser rather than rejected — this
+  is not a breaking change, since neither key has affected behavior for some time.
+
 ## [1.1.0] - 2026-08-18
 
 ### Added

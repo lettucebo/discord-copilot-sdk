@@ -35,7 +35,7 @@ discord-copilot-sdk v1 **僅限實驗環境**。它會**以啟動 bot 的使用�
 - **Repo hooks、MCP 設定與 custom instructions 仍停用**：`enableFileHooks:false` 阻止受控 repo 的 `.github/hooks` 在背後以 `resolvedByHook` 自動核准指令。`enableConfigDiscovery:false` 阻止探索 `.mcp.json` / `.vscode/mcp.json`；`skipCustomInstructions:true` 仍不可少，因 SDK 不論 config discovery 都會載入 `AGENTS.md` / `.github/copilot-instructions.md`。
 - **Skills 是刻意、較窄的例外**：預設只明確載入 session repo 的 CLI 原生 skill roots：`.github/skills`、`.agents/skills`、`.claude/skills`，以及 `~/.copilot/skills`。這**不會**開啟 broad config/MCP discovery；實測 skill 的 `allowed-tools` frontmatter 也不會繞過 SDK 模式中的 Discord permission card。不過 skill 的名稱與描述即使尚未 invoke 也會進入 model context，因此 repo 作者仍可 steer agent。設 `ENABLE_REPO_SKILLS=false` 可只移除 repo skill roots、保留 user skills；`ENABLE_USER_SKILLS=false` 則相反。
 - **抗偽造 cards**：指令會被 escaped 顯示（避免 markdown/code-fence breakout），含 bidirectional/control characters 的指令會自動 deny，過長指令也會自動 deny，而不是只顯示一部分。
-- **Access gate**：只有 allow-list user id(s)、在設定的 guild + parent channel/threads 內，才能驅動 session。（這只 gate *input*；任何能讀 channel 的人都能讀 *output*——請使用私人 channel。）Secrets（`DISCORD_*`/`DISCORD_COPILOT_SDK_*`）會從 agent runtime env 移除。預設 bot 也能*讀取* server 中每個 channel；[`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) §4b 說明如何限制它能讀什麼。隱藏 slash commands 本身是另一個只能由 admin 設定的 Discord 項目，記錄在 [`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md)。
+- **Access gate**：只有 allow-list user id(s)、在設定的 guild + 已啟用 channel/threads 內，才能驅動 session。（這只 gate *input*；任何能讀 channel 的人都能讀 *output*——請使用私密 channel。）Secrets（`DISCORD_*`/`DISCORD_COPILOT_SDK_*`）會從 agent runtime env 移除。bot 能*讀取*哪些 channel 是 Discord 的決定，而非本 bot：invite 會給 bot 基本權限（因此看得到一般公開 channel），但只把這個 bot 的 application 加進去的**私密 channel** 才是 Discord 原生白名單——不是某 channel 成員的 bot 收不到它的任何內容，slash commands 也不會出現在那裡。推薦模型是私密工作 channel；[`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md) 是權威模型，[`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) §4b 說明最小權限組合。在 bot **是**成員的地方隱藏 slash commands，是另一個只能由 admin 設定的 Discord Integrations 覆寫，同樣記錄在 [`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md)。
 
 **已知限制——繼承的 approvals：** bot 使用你已登入的 Copilot（`~/.copilot`），所以你存在那裡的任何 blanket "always allow" approval rules 都會套用，並繞過每指令 Discord prompt。若要真正展示逐指令核准，請用沒有已儲存 auto-approvals 的 account/home 執行。完整隔離是延後的 controller/worker 分離。
 
@@ -64,7 +64,7 @@ discord-copilot-sdk v1 **僅限實驗環境**。它會**以啟動 bot 的使用�
 
 - Node.js `^20.19.0` 或 `>=22.12.0`
 - Host 上已安裝且登入 GitHub Copilot CLI（bot 使用已登入使用者）
-- Discord bot token；你的 Discord user id 在 allow-list 中
+- Discord bot token、你的 Discord user id（allow-list）、guild（server）id，以及一個作為首次啟動**種子預設值**（`DISCORD_PARENT_CHANNEL_ID`）的私密文字 channel id
 
 ### Skills 與來源開關
 
@@ -187,7 +187,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 
 > 這種隔離防的是*意外*互相覆蓋，不是 sandbox。Lab mode 仍以你的 OS user 無沙箱執行 tools，所以被刻意引導的 session（例如受 repo content prompt injection 影響）仍可用 path 存取另一個 session 的 worktree。上方安全模型仍全部適用。
 
-- `/sessions` — 顯示 live sessions、各自 state 與 branch（最多 8 個）。殘留 records 也會列出，並依實際可做的事分成 *clearable* 或 *will retry on restart*（絕不直接刪除——record 是該 Copilot conversation 唯一 pointer）。
+- `/sessions` — 顯示 live sessions、各自 state 與 branch（最多 8 個）。殘留 records 也會列出，並依實際可做的事分成 *clearable*、*will retry on restart*（絕不直接刪除——record 是該 Copilot conversation 唯一 pointer），以及 bot 失去 channel 存取權的紀錄（`thread-no-access`）——這類紀錄在存取權恢復或 restart 後會重試，但擁有者也可以用 `/end thread:<id>` 明確清除。
 - `/end` — 結束**此** thread 的 session；其他 session 繼續跑。在 session 已消失但 record 還在的 thread 中，同一指令會清掉該 record 與 worktree。
 - `/end thread:<id>` — 最常見殘留是**已刪除**的 thread，你無法在裡面輸入。請改從 parent channel 執行；bot 啟動時也會在那裡貼出 ids，以及任何沒有 record 的 worktree directory。只有 git 證明安全時才移除 worktree——任何 local content、detached HEAD，或 HEAD 在不同 branch，都會保留它，**且 record 會跟著保留**，讓 `/sessions` 仍能顯示磁碟狀態。處理該 tree（`git worktree remove`）後再執行同一指令完成清理。
 
@@ -195,9 +195,9 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 
 ### 頻道存取 (`/channel`)
 
-Sessions 現在可存在於多個 Discord channels。`DISCORD_PARENT_CHANNEL_ID` 是永遠啟用的 seed channel；owner 可在另一個 channel 內用 `/channel enable` 加入，或從 seed channel 用 `/channel enable channel:<id>` 加入。用 `/channel disable` 移除 channel，用 `/channel list` 檢視 bot 授權清單。
+Sessions 現在可存在於多個私密 Discord channels。`DISCORD_PARENT_CHANNEL_ID` 是首次啟動的**種子預設值**：它只會在首次啟動時寫入 channel registry，之後就是可移除的一般項目。先把 bot 加入私密 channel，再於該處執行 `/channel enable`，或從已啟用 channel 執行 `/channel enable channel:<id>`。用 `/channel disable` 移除 channel，用 `/channel list` 稽核授權與 Discord 可見度。權威模型見 [`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md)，完整的私密 channel 設定、啟用與正反向驗收流程見 [`INSTALL.zh-TW.md`](INSTALL.zh-TW.md)。
 
-`/channel list` 顯示的只是 **bot authorization**。Discord 是否在使用者 command picker 顯示 slash commands，是由 server admin settings 另行控制；請見 [`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md)。
+`/channel list` 會稽核每個**已啟用** channel 的授權與 bot 目前實際看得到的狀態，並回報漂移（已授權但看不見、或看得見但未授權）。Discord 是否在使用者 command picker 顯示 slash commands，是由 channel 成員資格決定，並可另加 admin 專用的 Integrations 覆寫；請見 [`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md)。
 
 ## Repos 與開發模式
 

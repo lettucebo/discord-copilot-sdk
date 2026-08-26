@@ -152,12 +152,10 @@ function config(reposRoot: string): Config {
     DISCORD_ALLOWED_USER_IDS: [OWNER],
     DISCORD_GUILD_ID: GUILD,
     DISCORD_PARENT_CHANNEL_ID: PARENT,
-    DEV_GUILD_ID: undefined,
     REPOS_ROOT: reposRoot,
     DEFAULT_REPO: "repo",
     DEFAULT_MODEL: "claude-sonnet-5",
     DEFAULT_CONTEXT_TIER: "default",
-    PERMISSION_POLICY: "ask",
     ENABLE_REPO_SKILLS: "false",
     ENABLE_USER_SKILLS: "false",
     REPO_CLONE_HOST_POLICY: "github",
@@ -240,6 +238,42 @@ describe("/file", () => {
     await invokeInteraction(app, slash());
 
     expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reveal startup state to an unauthorized user", async () => {
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as CopilotClient,
+      new FakeTransport(),
+      new SessionStore(storeFile),
+      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+    );
+    const interaction = slash({ userId: "99999" });
+
+    await (
+      app as unknown as { onInteraction(i: ChatInputCommandInteraction): Promise<void> }
+    ).onInteraction(interactionOf(interaction));
+
+    expect(interaction.replies).toEqual([]);
+  });
+
+  it("tells the owner startup is in progress even outside an enabled channel", async () => {
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as CopilotClient,
+      new FakeTransport(),
+      new SessionStore(storeFile),
+      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+    );
+    const interaction = slash({ channelId: "55555", parentId: "66666", commandName: "channel" });
+
+    await (
+      app as unknown as { onInteraction(i: ChatInputCommandInteraction): Promise<void> }
+    ).onInteraction(interactionOf(interaction));
+
+    expect(interaction.replies[0]?.content).toContain("啟動中");
   });
 
   it("refuses an unauthorized operator without touching transport", async () => {

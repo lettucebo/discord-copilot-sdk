@@ -104,7 +104,6 @@ const cfg = {
   REPOS_ROOT: "C:\\Repos",
   DEFAULT_MODEL: "claude-sonnet-5",
   DEFAULT_CONTEXT_TIER: "default",
-  PERMISSION_POLICY: "ask",
 } as unknown as Parameters<typeof DiscordCopilotApp.createForTest>[0];
 
 const fakeCopilot = {

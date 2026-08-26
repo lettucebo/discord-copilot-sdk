@@ -12,7 +12,7 @@ You will end up with these four values:
 DISCORD_BOT_TOKEN=          # step 3
 DISCORD_ALLOWED_USER_IDS=   # step 5 — your own user ID
 DISCORD_GUILD_ID=           # step 5 — server ID
-DISCORD_PARENT_CHANNEL_ID=  # step 5 — seed/primary work channel ID
+DISCORD_PARENT_CHANNEL_ID=  # step 5 — seed default (first-run) work channel ID
 ```
 
 ---
@@ -21,11 +21,17 @@ DISCORD_PARENT_CHANNEL_ID=  # step 5 — seed/primary work channel ID
 
 Discord → **+** on the left → **Create My Own** → **For me and my friends**.
 
-Create a **text channel** in it (for example `#copilot`) to act as the seed/primary work channel. Each session becomes a thread under one enabled work channel; the seed is the first one configured in `.env`.
+Create a **text channel** in it (for example `#copilot`) to act as the **seed default** work channel — its first-run default. Each session becomes a thread under one enabled work channel; the seed default is the one configured in `.env` for the very first start.
 
 > **Why private**: the bot runs shell commands as you. Anyone who can read a work channel can read the agent's output, including file contents. Input is allow-listed; **output is not**.
 
-> The reverse is worth controlling too: by default **the bot can read every channel in your server**. §4b explains how to confine what it can read; [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md) explains the separate command-visibility and `/channel` authorization model.
+> The reverse is worth controlling too: the invite's server-level role can read public channels and any private channel that explicitly includes it. §4b explains how private-channel membership confines the bot to its work channels; [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md) explains the separate command-visibility and `/channel` authorization model.
+
+### Recommended: make each work channel private too
+
+A private *server* keeps strangers out entirely, but its ordinary public channels remain visible to every server member, including the bot. The primary, native way to keep the bot's commands from cluttering every channel's `/` picker is to make each **work channel** private — Discord permissions, not this bot's own configuration — and add only this bot's application (plus the humans who use it) as members. See [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md#3-primary-model--private-work-channels-the-recommended-way-to-hide-the-bot) for the full model and rationale.
+
+**Running more than one instance in the same server** (for example a production app and a separate test app): create a **separate Discord application per instance**, each with its own bot user, and add each application's bot **only** to the channel(s) it should own. Two applications never share a member set, so their commands never double up in the same channel's picker — this is the fix for the "duplicate `/new`" problem described in [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md#6-duplicate-commands-from-a-second-app).
 
 ---
 
@@ -67,6 +73,10 @@ Discord refuses to make an app private while it still advertises an install link
 > Each tab has its **own** save. Seeing `None` in the dropdown does not mean it is saved — a **Save Changes** bar appears and must be clicked.
 
 Removing the install link does **not** affect a bot already in your server: slash commands are registered by the bot itself over the API at startup, not through the install flow. To re-invite later, use the URL in §4.
+
+### Optional: test Channel Obfuscation early
+
+Discord is rolling out a breaking Gateway change — obfuscating channels the bot cannot see — that becomes **mandatory for all bots on 2026-11-16** (see [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md#8-channel-obfuscation-2026-08-12-change-mandatory-2026-11-16) for the full mechanics). You do not need to do anything to comply — the bot's code must already treat any channel named `"___hidden___"` as opaque — but you can opt this application into the new Gateway behavior **now**, ahead of the deadline, to test it: **Bot** tab → **Overview** → **Private Channel Obfuscation** toggle. This is Gateway-only and temporary as an early-access switch; there is no equivalent early opt-in for the HTTP API, which will simply start omitting hidden channels once the change reaches your app.
 
 ---
 
@@ -143,13 +153,13 @@ Both scopes are required: `bot` for the bot user, `applications.commands` so it 
 
 ## 4b. 🔒 Confine what the bot can read
 
-The invite above grants permissions on the **role**, and role permissions apply **server-wide** — the bot can read **every** channel, including private ones. For a tool that feeds what it reads into Copilot, that is worth tightening.
+The invite above grants permissions on the **role**, and role permissions apply **server-wide** — the bot can read **every** channel, including private ones, unless a channel's own membership says otherwise. For a tool that feeds what it reads into Copilot, that is worth tightening.
 
-> **Important correction:** denying the bot `View Channel` confines what the bot can **read**, but it does **not** hide the bot's slash commands from the `/` picker and does **not** stop Discord from delivering `INTERACTION_CREATE` events from other channels. Command visibility is controlled by the user's `USE_APPLICATION_COMMANDS` permission plus Application Command Permissions v2 ([Discord docs](https://docs.discord.com/developers/interactions/application-commands#application-command-permissions-object-using-default-permissions)), and interaction delivery is separate from channel send/read permissions ([Discord docs](https://docs.discord.com/developers/interactions/receiving-and-responding#responding-to-an-interaction)). Use [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md) for that separate admin-controlled plane.
+> **Correction (updated with 2026-08-12 evidence):** an earlier version of this guide claimed that denying the bot `View Channel` confines only what the bot can **read**, with no effect on whether its slash commands appear in that channel's `/` picker. **That claim was wrong and is retracted.** A bot without `View Channel` access to a channel does not have its commands shown there either ([Discord Slash Commands FAQ](https://support-dev.discord.com/hc/en-us/articles/frequently-asked-questions); [Command Permissions](https://support.discord.com/hc/en-us/articles/9349445088791-Command-Permissions-FAQ)). That means the private-channel setup below gives you **both** effects — read-confinement and command-visibility whitelisting — from the same channel membership; see [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md#4-correcting-a-stale-claim-bot-view_channel-does-affect-command-visibility) for the evidence level and how this relates to the primary private-channel model described in [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md#3-primary-model--private-work-channels-the-recommended-way-to-hide-the-bot). The one thing that remains true regardless: Discord can still deliver the underlying `INTERACTION_CREATE` payload to the bot's backend (for example from a client's stale cached command list), and an initial interaction response does not require `SEND_MESSAGES` ([Discord docs](https://docs.discord.com/developers/interactions/receiving-and-responding#responding-to-an-interaction)) — so the bot's own `/channel` authorization check, not this permission screen, remains the actual security boundary.
 
 ### Why removing role permissions is not enough
 
-On most servers the `@everyone` role already grants **View Channels**, and a bot is a member like any other, so it **inherits that**. Clearing the bot role's permissions to `0` therefore changes nothing on its own.
+On most servers the `@everyone` role already grants **View Channels**, and a bot is a member like any other, so it **inherits that**. Clearing the bot role's permissions to `0` therefore changes nothing on its own — this is exactly why the procedure below acts on **channel membership**, not on the bot's role.
 
 Check yours in Server Settings → Roles → `@everyone` → whether View Channels is on:
 
@@ -159,25 +169,20 @@ Check yours in Server Settings → Roles → `@everyone` → whether View Channe
 | Channel-level **Allow** for View Channels | Adds **that one** channel. |
 | Channel-level **Deny** for View Channels | **Blocks** that channel, taking precedence over the `@everyone` server-level allow. |
 
-Resolution order is: `@everyone` server → role server → `@everyone` channel overwrite → **role channel overwrite**. A role-level channel DENY therefore overrides the `@everyone` server-level allow — that is the only thing that actually blocks reads.
+Resolution order is: `@everyone` server → role server → `@everyone` channel overwrite → **role channel overwrite**. A private channel's own `@everyone` channel-level deny is what actually blocks reads — that is the mechanism the steps below rely on.
 
-### The setup that works
+### The setup that works: make each work channel private
 
 | Where | What |
 | --- | --- |
 | Bot role | **Clear it completely (`0`)**, including Administrator. |
-| Work channels | **Allow** the work-permission set below. |
-| Every other channel and category | **Deny** View Channels. |
+| Each work channel | Make it **private** — remove `@everyone`'s View Channel (or create the channel as private from the start) — then add **only** the bot's application and the humans who should use it as explicit members, with the work-permission set below. |
 
-Categories matter too: their permissions cascade to the channels inside them.
-
-### ⚠️ Order matters
-
-**Do the channel overwrites first, remove Administrator last.** Reversed, the bot loses `Manage Roles` and can no longer edit channel permissions at all.
+This is deliberately **membership**, not a per-channel deny list: you never have to visit every *other* channel or category in the server. A channel the bot was never added to already keeps it out, for the same reason §3 of [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md#3-primary-model--private-work-channels-the-recommended-way-to-hide-the-bot) gives for command visibility.
 
 ### Steps
 
-1. **Each work channel** → Edit Channel → Permissions → add your bot role → allow the set for its host:
+1. **Each work channel** → make it private (or create it as private) → Edit Channel → Permissions → add your bot's application and the humans who should use it as members → allow the set for its host:
    - **Windows:** View Channels · Send Messages · Send Messages in Threads · Create Public Threads ·
      Create Private Threads · Manage Threads · Embed Links · Attach Files ·
      Read Message History · Add Reactions · Use External Emoji
@@ -186,9 +191,8 @@ Categories matter too: their permissions cascade to the channels inside them.
      Send Messages in Threads · Create Public Threads · Create Private Threads · Manage Threads ·
      Embed Links · Read Message History · Add Reactions · Use External Emoji
      The non-Windows integer is `395137338432`.
-   Because this scope is limited to work channels, either platform-specific set can be a little wider than its invite set.
-2. **Every other channel and category** → Permissions → add the bot role → **Deny** View Channels.
-3. **Last**: Server Settings → Roles → your bot role → turn **Administrator** off and leave the rest empty. The **Clear permissions** button in the upper-right can clear the page at once.
+   Because this scope is limited to channels the bot is an explicit member of, either platform-specific set can be a little wider than its invite set.
+2. Server Settings → Roles → your bot role → turn **Administrator** off and leave the rest empty. The **Clear permissions** button in the upper-right can clear the page at once. Humans, not the bot, configure this visibility — there is no ordering requirement between this step and step 1.
 
 > **Make sure you are editing the right role.** A server can carry several integration roles; the edit pane's title must show **your bot's** name.
 
@@ -200,17 +204,29 @@ Categories matter too: their permissions cascade to the channels inside them.
 | --- | --- |
 | `Administrator` | Bypasses **all** channel settings, which defeats the isolation above. |
 | `Manage Messages` | The program only deletes **its own** messages, which does not require this permission; granting it would let the bot delete yours. |
-| `Manage Channels` / `Manage Roles` | Not used. |
+| `Manage Channels` / `Manage Roles` | Deliberately **not granted** — humans configure channel/member visibility; the bot never needs to and must not edit its own visibility permissions. |
 | `Mention Everyone` | Not used. |
 
 ### Verify
 
 Do not trust the settings screen; test it:
 
-1. In an enabled work channel, run `/new`, send a message in the thread → it should reply.
-2. In a **different** channel, mention or tag the bot → it should not read or respond to that message. This proves message-read confinement only; slash-command visibility and interaction delivery are verified separately in [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md).
+1. **Positive**: in an enabled work channel, run `/new`, send a message in the thread → it should reply.
+2. **Negative**: in a channel the bot was never added to, mention or tag the bot → it should not read or respond to that message. This proves message-read confinement; slash-command visibility and interaction delivery are verified separately in [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md).
 
 Discord does not expose a true "view as bot" channel list, but the member list is a useful signal: the bot should appear only in the work channels' member lists.
+
+---
+
+## 4c. Command permission defaults: `default_member_permissions="0"`
+
+Every command this bot registers is created with `default_member_permissions="0"`. Per Discord's own semantics for that field, this means **nobody in the guild can use the command by default** unless they hold the guild's Administrator permission, or have an explicit per-user/per-role override added in Server Settings → Integrations → the app → Command permissions ([Discord docs](https://docs.discord.com/developers/interactions/application-commands#permissions)).
+
+This is on purpose: combined with the private-channel model above, it means a channel the bot is visible in still won't let an unintended guild member invoke its commands just because they happen to have access to that channel.
+
+**The catch:** the bot's own `isAuthorized` allow-list (`DISCORD_ALLOWED_USER_IDS`) never required its members to be guild Administrators — it is a separate authorization plane (see [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md)). If one of your allow-listed users is **not** a guild Administrator, `default_member_permissions="0"` will stop them from invoking any command at all, even in a work channel they can see, until an override is added for them in Integrations. The bot prints a startup warning naming any allow-listed user detected in this situation, with the exact escape hatch: add that user (or a role they hold) as an explicit allow in Integrations → Command permissions for this app.
+
+The guild **owner** is treated as implicitly satisfying this check (owners always have effective Administrator rights), so a normal single-owner setup does not trigger the warning.
 
 ---
 
@@ -221,24 +237,24 @@ Turn on **User Settings → Advanced → Developer Mode** first.
 | Field | How |
 | --- | --- |
 | `DISCORD_GUILD_ID` | Right-click the server icon → **Copy Server ID**. |
-| `DISCORD_PARENT_CHANNEL_ID` | Right-click the seed/primary text channel → **Copy Channel ID**. This is the always-enabled seed channel, not the only channel the bot can use. |
+| `DISCORD_PARENT_CHANNEL_ID` | Right-click your **seed default** text channel → **Copy Channel ID**. This is the channel automatically authorized the first time the bot ever starts (its first-run default) — not the only channel the bot can use, and not permanently protected from `/channel disable` once nothing needs it. |
 | `DISCORD_ALLOWED_USER_IDS` | Right-click **your own name** → **Copy User ID**. |
 | `DISCORD_BOT_TOKEN` | From §3. |
 
-- The seed channel must be a **text channel** (not a category, forum, announcement, voice channel, or thread); the bot checks this.
+- The seed default channel must be a **text channel** (not a category, forum, announcement, voice channel, or thread); the bot checks this.
 - `DISCORD_ALLOWED_USER_IDS` is comma-separated, but v1 should be **just you**. Anyone not listed cannot drive the bot even in an enabled channel.
 
 ### Moving to a different parent channel later
 
-The bot now supports multiple work channels. `DISCORD_PARENT_CHANNEL_ID` is the **seed** channel: it is always enabled, cannot be disabled from Discord, and changing it still requires editing `.env` and restarting. Additional work channels are managed at runtime with `/channel enable`; see [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md).
+The bot now supports multiple work channels. `DISCORD_PARENT_CHANNEL_ID` is only a **seed default**: the channel automatically authorized the very first time this bot instance ever starts, so there is at least one usable channel out of the box. After that first run, it is recorded in the channel registry exactly like a channel added later with `/channel enable` — an ordinary enabled-channel record, not a permanent, undisableable special case — and editing `.env` afterwards has **no effect** on already-persisted authorization, because the registry, once written, is authoritative. Additional or replacement work channels are managed at runtime with `/channel enable` / `/channel disable`; see [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md).
 
-To change the seed itself:
+To replace the seed default with a different work channel on an existing install:
 
-1. Edit `DISCORD_PARENT_CHANNEL_ID` in `.env`.
-2. **While the bot still has permission**, set the new channel's allows and the old channel's denies per §4b.
-3. Restart the bot (`./stop-bot.ps1` → `./run-bot.ps1`).
+1. Make the new channel private, add the bot and intended humans, and grant its complete work-permission set per §4b.
+2. **While the old channel is still enabled**, run `/channel enable channel:<new-id>` from it (or `/channel enable` in the new channel), then verify the new entry with `/channel list`.
+3. `/end` every session still pointing at the old channel, run `/channel disable` for it, then remove the bot's membership/overwrite from the old channel.
 
-Threads under the old seed channel **all stop working**: authorization is bound to enabled work channels, and changing the seed in `.env` removes the old seed from the always-enabled set unless you also enable it with `/channel` before the move. Those records do not disappear on their own — startup lists the stranded records in the new seed channel, and `/end thread:<id>` clears each one along with its worktree.
+Editing `DISCORD_PARENT_CHANNEL_ID` in `.env` at this point only matters for a **fresh install** that has never written a channel registry file yet — it does not retroactively re-seed or re-authorize anything for an install that has already started once. Sessions that get disabled out from under them do not disappear on their own: startup lists the stranded records, and `/end thread:<id>` clears each one along with its worktree.
 
 ---
 
@@ -247,16 +263,17 @@ Threads under the old seed channel **all stop working**: authorization is bound 
 After installing and starting per [`INSTALL.md`](../INSTALL.md):
 
 1. The bot shows **online** in the member list.
-2. Typing `/` in the seed channel lists `/new`, `/stop`, `/usage`, and the rest.
-3. `/new` opens a new thread.
-4. Type "hello" in the thread → **you get a reply**. No reply means the §2 intent is off.
+2. Typing `/` in the seed default channel lists `/new`, `/stop`, `/usage`, and the rest.
+3. `/channel list` reports the seed default as enabled and visible, with no unexpected visibility drift.
+4. `/new` opens a new thread.
+5. Type "hello" in the thread → **you get a reply**. No reply means the §2 intent is off.
 
-### If you locked it down per §4b
+### Verify the private-channel setup from §4b
 
 A settings screen that looks right is **not** proof: effective permissions are computed across four layers. Test the real thing:
 
-1. **Positive**: in an enabled work channel, `/new` → thread opens → typing gets a reply. This proves the allow set works.
-2. **Read-confinement negative**: in a different channel, mention the bot → it should not read or respond to that message. This proves the deny works for messages.
+1. **Positive**: in an enabled work channel, `/new` → thread opens → typing gets a reply. This proves the private-channel membership works.
+2. **Read-confinement negative**: in a channel the bot was never added to, mention the bot → it should not read or respond to that message. This proves the confinement works for messages.
 3. **Command-access negative**: in a channel you did not enable, `/` should not list the commands. If it still does, the Discord-plane integration setting is missing; see [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md).
 
 The negative checks are the point. Testing only the first proves it works, not that it is confined.
@@ -273,8 +290,8 @@ The negative checks are the point. Testing only the first proves it works, not t
 | Thread opens but the bot is mute in it | Missing `Send Messages in Threads`; `Send Messages` does not apply to threads. |
 | Command replies `Not authorized` | `DISCORD_ALLOWED_USER_IDS` does not contain your user ID. |
 | Commands appear only in some servers | Commands are registered to the one `DISCORD_GUILD_ID`. |
-| The bot vanished after locking it down | Grant View Channels on each work channel, see §4b; to recover fast, re-enable Administrator. |
-| Old threads stopped responding after changing `DISCORD_PARENT_CHANNEL_ID` | Expected: changing the seed can leave old threads outside the enabled channel set. Startup lists stranded records; clear them with `/end thread:<id>`. |
+| The bot vanished after locking it down | Add the bot back as an explicit member of each work channel and grant View Channel per §4b. Do **not** re-enable Administrator. |
+| Changing `DISCORD_PARENT_CHANNEL_ID` did not move the bot to another channel | Expected after the first start: the durable channel registry is authoritative. Add the bot to the new private channel, use `/channel enable`, then retire the old entry with `/channel disable` after ending its sessions. |
 
 ---
 
@@ -288,7 +305,7 @@ To move:
 
 1. Stop the old machine first: close the program, or run `schtasks /End /TN discord-copilot-sdk-default`.
 2. Install on the new machine with the **same** four values per [`INSTALL.md`](../INSTALL.md).
-3. To keep both machines, give each its **own Discord application**: own token and own seed/work channels. Do not share one token.
+3. To keep both machines, give each its **own Discord application**: own token and own seed default work channels. Do not share one token.
 
 > State under `~/.discord-copilot-sdk/` (resumable sessions, channel registry, remembered approvals) is **per machine** and does not follow you. A new machine starts clean, deliberately: approval grants and channel authorization should not silently travel to another host.
 

@@ -226,7 +226,7 @@ export class SessionStore {
     if (!this.sessions.has(threadId)) return false;
     return this.mutate((m, hw) => {
       const cur = m.get(threadId)!;
-      m.set(threadId, { ...cur, state: "active", updatedAt: Date.now() });
+      m.set(threadId, { ...cur, state: "active", reason: undefined, updatedAt: Date.now() });
       return hw;
     });
   }

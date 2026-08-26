@@ -119,7 +119,6 @@ const cfg = (): Parameters<typeof DiscordCopilotApp.createForTest>[0] =>
     REPOS_ROOT: reposRoot,
     DEFAULT_MODEL: "claude-sonnet-5",
     DEFAULT_CONTEXT_TIER: "default",
-    PERMISSION_POLICY: "ask",
     REPO_CLONE_HOST_POLICY: "github",
     REPO_CLONE_ALLOWED_HOSTS: [],
     REPO_CLONE_TIMEOUT_MS: 300_000,

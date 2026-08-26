@@ -80,7 +80,6 @@ const cfg = {
   REPOS_ROOT: REPOS_ROOT,
   DEFAULT_MODEL: "claude-sonnet-5",
   DEFAULT_CONTEXT_TIER: "default",
-  PERMISSION_POLICY: "ask",
   ENABLE_REPO_SKILLS: "false",
   ENABLE_USER_SKILLS: "false",
 } as unknown as Parameters<typeof DiscordCopilotApp.createForTest>[0];
@@ -700,6 +699,70 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       await expect(classifyThread(app, "t1", "c1")).resolves.toBe("inaccessible");
       expect(channels.disable("c2")).toBe(true);
       await expect(classifyThread(app, "t1", "c2")).resolves.toBe("inaccessible");
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("classifies Discord Missing Access separately from structural inaccessibility", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        new SessionStore(f),
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      (app as unknown as {
+        discord: { channels: { fetch(id: string): Promise<unknown> } };
+      }).discord = {
+        channels: {
+          async fetch() {
+            throw { code: 50001 };
+          },
+        },
+      };
+
+      await expect(classifyThread(app, "t1", "c1")).resolves.toBe("no-access");
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("classifies an obfuscated Gateway channel as retryable missing access", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        new SessionStore(f),
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      (app as unknown as {
+        discord: { channels: { fetch(id: string): Promise<unknown> } };
+      }).discord = {
+        channels: {
+          async fetch() {
+            return {
+              name: "___hidden___",
+              flags: 1 << 17,
+              isThread: () => false,
+              guildId: "g1",
+              parentId: null,
+            };
+          },
+        },
+      };
+
+      await expect(classifyThread(app, "t1", "c1")).resolves.toBe("no-access");
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });
