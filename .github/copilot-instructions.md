@@ -184,10 +184,11 @@ mis-parses the Chinese strings), every `.sh` has a shebang, and every `.sh` is c
 `.gitattributes` pins `*.sh`/`*.mjs` to LF and all six shipped user-facing `.ps1` files to CRLF.
 
 **Bilingual where users read it.** `README.md` / `README.zh-TW.md`, `INSTALL.md` /
-`INSTALL.zh-TW.md`, `docs/DISCORD-SETUP.md` / `docs/DISCORD-SETUP.zh-TW.md`, and
-`docs/CHANNEL-ACCESS.md` / `docs/CHANNEL-ACCESS.zh-TW.md` are separate English and zh-TW twin
-files; update both twins together. Installer strings live in `scripts/lib/i18n.mjs` and `zh` and
-`en` must be updated together. `docs/PLAN.md` is Chinese-only as the internal design record.
+`INSTALL.zh-TW.md`, `docs/DISCORD-SETUP.md` / `docs/DISCORD-SETUP.zh-TW.md`,
+`docs/CHANNEL-ACCESS.md` / `docs/CHANNEL-ACCESS.zh-TW.md`, and
+`docs/HARNESS-EVALUATION.md` / `docs/HARNESS-EVALUATION.zh-TW.md` are separate English and zh-TW
+twin files; update both twins together. Installer strings live in `scripts/lib/i18n.mjs` and `zh`
+and `en` must be updated together. `docs/PLAN.md` is Chinese-only as the internal design record.
 
 **Repository workflow and domain language.** GitHub issues in
 `lettucebo/discord-copilot-sdk` are the tracker; use `gh` and follow

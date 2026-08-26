@@ -12,6 +12,7 @@ const DOCUMENTATION_PAIRS = [
   ["INSTALL.md", "INSTALL.zh-TW.md"],
   ["docs/DISCORD-SETUP.md", "docs/DISCORD-SETUP.zh-TW.md"],
   ["docs/CHANNEL-ACCESS.md", "docs/CHANNEL-ACCESS.zh-TW.md"],
+  ["docs/HARNESS-EVALUATION.md", "docs/HARNESS-EVALUATION.zh-TW.md"],
 ] as const;
 
 function relativeMarkdownLinks(text: string): string[] {
