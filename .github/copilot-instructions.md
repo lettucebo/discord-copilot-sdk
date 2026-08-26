@@ -20,10 +20,12 @@ permission kind, and `onElicitationRequest`, are registered but deliberately fai
 | Watch-mode dev bot | `npm run dev` |
 | Verify local Copilot wiring | `npm run build && node dist/index.js --selfcheck` |
 | Live end-to-end smoke (real SDK, real login) | `npm run smoke:live` |
+| Verify skill loading (real SDK, real login) | `npm run smoke:skills` |
 
 - **There is no lint step for TypeScript.** CI runs `npm run typecheck` + `npm test` on
-  Node 20.19 and 22.12 × Ubuntu and Windows, plus a script job: `bash -n install.sh` and
-  `node --check` over `scripts/setup.mjs` and `scripts/lib/*.mjs` only.
+  Node 20.19 and 22.12 × Ubuntu and Windows. Its script job runs `bash -n` on every shipped
+  `.sh`, `node --check` on the installer/lifecycle entry `.mjs` files plus `scripts/lib/*.mjs`,
+  and a PowerShell parse check on every shipped `.ps1`.
 - **`npm test` serializes Vitest workers deliberately.** Several suites create real git
   repositories and worktrees; parallel workers cause nondeterministic ref-lock collisions and
   hook timeouts on CI.
@@ -60,7 +62,8 @@ flowchart LR
 
 - **`src/index.ts`** — entry: loads `.env`, reports pre-rename leftovers, takes the
   single-instance lock, starts `DiscordCopilotApp`. Also serves `--version` / `--selfcheck`.
-- **`src/app.ts`** (the orchestrator, ~2.3k lines) — owns **inbound** Discord: slash commands,
+- **`src/app.ts`** (the orchestrator, several thousand lines — by far the largest file in the
+  repo) — owns **inbound** Discord: slash commands,
   button interactions, thread messages, the thread⇄session map, startup reconciliation, worktree
   lifecycle, thread titling, `/queue` and steering. It imports discord.js directly; the
   `Transport` seam is for **outbound** UI, not a full abstraction of Discord. Correctness-critical
@@ -91,6 +94,14 @@ flowchart LR
   the disk write succeeds), corrupt ≠ absent, and `generationHighWater` persisted so a deleted
   record can't let a generation be reused. A resume error is `transient` unless it definitively
   says the session is gone — never lose conversation history on an ambiguous failure.
+- **`src/core/channel-registry.ts` + `platforms/discord/auth.ts` +
+  `platforms/discord/channel-fetch.ts`** — the Discord access model has two independent gates.
+  `ChannelRegistry` is the durable set where the bot may act; Discord private-channel membership
+  controls what the bot can see. Registry v1 migrates to v2 by importing
+  `DISCORD_PARENT_CHANNEL_ID` once as an ordinary removable entry. Channel fetches distinguish
+  gone, no-access/obfuscated, and transient failures: only no-access is retryable as
+  `thread-no-access`; structural binding mismatches remain terminal. Keep `/channel` as the sole
+  location-independent owner gate.
 - **`src/core/worktree.ts`** — concurrent sessions get their own worktree on branch
   `copilot/t-<threadId>`, rooted at `~/.discord-copilot-sdk-worktrees` — a *sibling* of the state
   dir, never a child, so no agent's cwd has the trust store as an ancestor. A worktree is removed
@@ -170,7 +181,7 @@ raise the limit explicitly, e.g. `describe(..., { timeout: 60_000 }, …)` in `a
 **Shipped scripts are covered by tests, and encodings matter.** `test/shipped-scripts.test.ts`
 asserts every user-facing `.ps1` starts with a UTF-8 BOM (Windows PowerShell 5.1 otherwise
 mis-parses the Chinese strings), every `.sh` has a shebang, and every `.sh` is committed `100755`.
-`.gitattributes` pins `*.sh`/`*.mjs` to LF and `install/get/run-bot/stop-bot.ps1` to CRLF.
+`.gitattributes` pins `*.sh`/`*.mjs` to LF and all six shipped user-facing `.ps1` files to CRLF.
 
 **Bilingual where users read it.** `README.md` / `README.zh-TW.md`, `INSTALL.md` /
 `INSTALL.zh-TW.md`, `docs/DISCORD-SETUP.md` / `docs/DISCORD-SETUP.zh-TW.md`,
@@ -178,6 +189,13 @@ mis-parses the Chinese strings), every `.sh` has a shebang, and every `.sh` is c
 `docs/HARNESS-EVALUATION.md` / `docs/HARNESS-EVALUATION.zh-TW.md` are separate English and zh-TW
 twin files; update both twins together. Installer strings live in `scripts/lib/i18n.mjs` and `zh`
 and `en` must be updated together. `docs/PLAN.md` is Chinese-only as the internal design record.
+
+**Repository workflow and domain language.** GitHub issues in
+`lettucebo/discord-copilot-sdk` are the tracker; use `gh` and follow
+`docs/agents/issue-tracker.md` plus `docs/agents/triage-labels.md`. This is a single-context
+codebase: use the root `CONTEXT.md` vocabulary and consult `docs/adr/` before changing a recorded
+domain or architecture decision. `AGENTS.md` deliberately points human-driven agents back to this
+file as the engineering source of truth.
 
 **`docs/PLAN.md` is the §-numbered design record** — decisions, rejected alternatives, accepted
 residual risks, and §9's map of required async-orchestration tests to the files covering them
@@ -207,9 +225,17 @@ would put every agent's cwd under it) and `validateBinding` (git must PROVE a wo
 belongs to the repo a record claims; a path prefix cannot, and a git failure is a refusal).
 
 **Discord channel authorization is fail-closed.** Other than `/channel`, every inbound action
-requires an allow-listed user, the configured guild, and an enabled parent channel (the
-`DISCORD_PARENT_CHANNEL_ID` seed or a durable `ChannelRegistry` entry). `/channel` alone uses
-the location-independent owner gate so an owner can bootstrap an unenabled channel; do not widen
-that gate to buttons, autocomplete, or other commands. Discord command visibility is a separate,
-manual server-admin setting in Integrations, not bot authorization: a visible command from an
-unauthorized location must receive the normal safe refusal and perform no work.
+requires an allow-listed user, the configured guild, and an enabled channel: a durable
+`ChannelRegistry` entry, initialized once from the configured `DISCORD_PARENT_CHANNEL_ID` default
+on first run and thereafter an ordinary record — not a permanent seed — indistinguishable from
+one added later with `/channel enable`, and equally disable-able. `/channel` alone uses the
+location-independent owner gate so an owner can bootstrap an unenabled channel; do not widen
+that gate to buttons, autocomplete, or other commands. **Private-channel membership is the
+primary bot-visibility whitelist**: a bot that is not a member of a channel neither receives its
+events nor lists its commands there (ADR-0001, `docs/CHANNEL-ACCESS.md`). Discord Integrations
+command-permission overrides are a secondary, manual server-admin layer, not bot authorization —
+a visible command from an unauthorized location must still receive the normal safe refusal and
+perform no work. Losing channel visibility (`50001`/Channel Obfuscation) classifies the affected
+session as retryable `thread-no-access`: it resumes automatically once access is restored or the
+bot restarts, and it is explicitly, manually clearable with `/end thread:<id>` after an informed
+owner decides to give up on recovery (ADR-0002) — it must never be treated as a permanent block.

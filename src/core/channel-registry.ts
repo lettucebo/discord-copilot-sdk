@@ -2,13 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { channelRegistryPath } from "./paths.js";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
+const LEGACY_SCHEMA_VERSION = 1;
+export const CONFIG_SEED_ADDED_BY = "configuration";
 
-/** One channel the owner enabled at runtime. The seed channel is NOT stored —
- *  it comes from `DISCORD_PARENT_CHANNEL_ID` and is always enabled. */
+/** One channel the owner enabled, or the first-run default imported from config. */
 export interface ChannelEntry {
   id: string;
-  /** Discord user id that ran `/channel enable`, for the audit trail in `/channel list`. */
+  /** Discord user id that ran `/channel enable`, or CONFIG_SEED_ADDED_BY. */
   addedBy: string;
   addedAt: number;
 }
@@ -27,15 +28,16 @@ interface RegistryFile {
  * ## Why corruption is FATAL here
  *
  * This store is unusual: degrading gracefully would cause irreversible damage.
- * If an unreadable file silently meant "only the seed channel", every session
- * living under a secondary channel would fail `bindingOk` at the next startup
+ * If an unreadable file silently meant "only the configured default", every
+ * session living under another channel would fail `bindingOk` at the next startup
  * and be marked `blocked` — and `blocked` is terminal (`reconcile.ts`), so
  * re-enabling the channel afterwards does NOT bring those conversations back.
  * So this class follows `SessionStore` (present-but-unreadable ⇒ refuse to
  * start) and deliberately NOT `ApprovalPolicy` (invalid ⇒ empty), whose
  * degradation only costs an extra approval prompt.
  *
- * A missing file is the ordinary first-run state and means "seed only".
+ * A missing file is the ordinary first-run state. The configured default is
+ * immediately persisted as an ordinary entry, so it can later be disabled.
  *
  * ## Write discipline
  *
@@ -55,8 +57,8 @@ export class ChannelRegistry {
   private cache?: ReadonlySet<string>;
 
   constructor(
-    /** `DISCORD_PARENT_CHANNEL_ID` — always enabled, never removable. */
-    readonly seedChannelId: string,
+    /** `DISCORD_PARENT_CHANNEL_ID` — imported once for a missing/v1 registry. */
+    private readonly configuredDefaultChannelId: string,
     /** `DISCORD_GUILD_ID` — a registry naming any other guild is refused. */
     private readonly guildId: string,
     file: string = channelRegistryPath()
@@ -80,29 +82,25 @@ export class ChannelRegistry {
     return this.generation;
   }
 
-  /** Channels the bot will act in: the seed plus everything enabled at runtime.
+  /** Channels the bot will act in.
    *
-   *  Empty while corrupt. Startup already refuses in that case, so this is only
+   * Empty while corrupt. Startup already refuses in that case, so this is only
    *  belt-and-braces — but the safe answer to "which channels are authorized"
    *  when the answer is unknown is "none", never "the seed", because callers
    *  cannot tell a deliberate seed-only setup from a lost one. */
   enabledSet(): ReadonlySet<string> {
     if (this.corrupt) return new Set();
     if (!this.cache) {
-      this.cache = new Set<string>([this.seedChannelId, ...this.enabled.keys()]);
+      this.cache = new Set<string>(this.enabled.keys());
     }
     return this.cache;
-  }
-
-  isSeed(channelId: string): boolean {
-    return channelId === this.seedChannelId;
   }
 
   has(channelId: string): boolean {
     return this.enabledSet().has(channelId);
   }
 
-  /** Runtime-enabled channels only, oldest first — the seed is not in here. */
+  /** Enabled channels, oldest first. */
   entries(): ChannelEntry[] {
     return [...this.enabled.values()].sort((a, b) => a.addedAt - b.addedAt);
   }
@@ -111,20 +109,16 @@ export class ChannelRegistry {
    * Enable a channel. Returns DURABILITY: `false` means nothing changed, in
    * memory or on disk, and the caller must report failure rather than success.
    *
-   * Enabling the seed is a no-op success — it is already permanently enabled,
-   * and writing it to the file would make the file disagree with `.env` the
-   * moment the seed changes.
    */
   enable(channelId: string, addedBy: string): boolean {
     if (this.corrupt) return false;
-    if (this.isSeed(channelId) || this.enabled.has(channelId)) return true;
+    if (this.enabled.has(channelId)) return true;
     const next = new Map(this.enabled);
     next.set(channelId, { id: channelId, addedBy, addedAt: Date.now() });
     return this.commit(next);
   }
 
-  /** Disable a channel. Returns durability. Refusing to remove the seed is the
-   *  CALLER's job (it needs to explain why); here it is simply never present. */
+  /** Disable a channel. Returns durability. */
   disable(channelId: string): boolean {
     if (this.corrupt) return false;
     if (!this.enabled.has(channelId)) return true;
@@ -152,11 +146,14 @@ export class ChannelRegistry {
     try {
       raw = fs.readFileSync(this.file, "utf8");
     } catch (err) {
-      // Only a genuinely-absent file is "seed only". Any OTHER read error
+      // Only a genuinely-absent file is a first run. Any OTHER read error
       // (permissions, a directory in the way, a sharing violation) is corrupt:
       // it is indistinguishable from a registry we simply cannot see, and
       // guessing "seed only" is the irreversible guess.
-      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return;
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        this.initializeWithConfiguredDefault();
+        return;
+      }
       this.markCorrupt(`cannot read it (${(err as Error).message})`);
       return;
     }
@@ -172,13 +169,6 @@ export class ChannelRegistry {
       this.markCorrupt("its contents do not match the expected schema");
       return;
     }
-    if (readIt.version !== SCHEMA_VERSION) {
-      // Forward AND backward: a newer file may carry fields whose meaning this
-      // build would silently ignore, and ignoring a field in an authorization
-      // list is exactly the failure this class exists to prevent.
-      this.markCorrupt(`it declares version ${readIt.version}, but this build only understands ${SCHEMA_VERSION}`);
-      return;
-    }
     if (readIt.guildId !== this.guildId) {
       this.markCorrupt(
         `it belongs to guild ${readIt.guildId}, but DISCORD_GUILD_ID is ${this.guildId}. ` +
@@ -186,10 +176,60 @@ export class ChannelRegistry {
       );
       return;
     }
+    if (readIt.version === LEGACY_SCHEMA_VERSION) {
+      this.migrateLegacy(readIt);
+      return;
+    }
+    if (readIt.version !== SCHEMA_VERSION) {
+      // Forward AND backward: a newer file may carry fields whose meaning this
+      // build would silently ignore, and ignoring a field in an authorization
+      // list is exactly the failure this class exists to prevent.
+      this.markCorrupt(`it declares version ${readIt.version}, but this build only understands ${SCHEMA_VERSION}`);
+      return;
+    }
     for (const c of readIt.channels) {
-      if (c.id === this.seedChannelId) continue; // the seed is config, not data
       this.enabled.set(c.id, c);
     }
+  }
+
+  private initializeWithConfiguredDefault(): void {
+    const entry: ChannelEntry = {
+      id: this.configuredDefaultChannelId,
+      addedBy: CONFIG_SEED_ADDED_BY,
+      addedAt: Date.now(),
+    };
+    const candidate: RegistryFile = {
+      version: SCHEMA_VERSION,
+      guildId: this.guildId,
+      channels: [entry],
+    };
+    this.writeRequired(candidate, "initialize");
+    this.enabled.set(entry.id, entry);
+  }
+
+  private migrateLegacy(legacy: RegistryFile): void {
+    const channels = new Map(legacy.channels.map((entry) => [entry.id, entry]));
+    if (!channels.has(this.configuredDefaultChannelId)) {
+      channels.set(this.configuredDefaultChannelId, {
+        id: this.configuredDefaultChannelId,
+        addedBy: CONFIG_SEED_ADDED_BY,
+        addedAt: Date.now(),
+      });
+    }
+    const candidate: RegistryFile = {
+      version: SCHEMA_VERSION,
+      guildId: this.guildId,
+      channels: [...channels.values()],
+    };
+    this.writeRequired(candidate, "migrate");
+    for (const [id, entry] of channels) this.enabled.set(id, entry);
+  }
+
+  private writeRequired(candidate: RegistryFile, operation: string): void {
+    if (this.write(candidate)) return;
+    throw new Error(
+      `could not ${operation} the channel registry at ${this.file}; refusing to start with an empty authorization set`
+    );
   }
 
   private markCorrupt(detail: string): void {

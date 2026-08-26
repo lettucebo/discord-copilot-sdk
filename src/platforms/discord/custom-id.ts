@@ -3,6 +3,14 @@
 
 const NS = "dp";
 
+function decodeParts(customId: string, kind: string): { action: string; nonce: string } | undefined {
+  const parts = customId.split(":");
+  if (parts.length !== 4) return undefined;
+  const [ns, actualKind, action, nonce] = parts;
+  if (ns !== NS || actualKind !== kind || !action || !nonce) return undefined;
+  return { action, nonce };
+}
+
 /** Permission button actions. Mirror the Transport `Decision` type. */
 export type PermAction = "once" | "session" | "always" | "deny";
 
@@ -18,13 +26,9 @@ export interface DecodedPermission {
 }
 
 export function decodePermissionId(customId: string): DecodedPermission | undefined {
-  const parts = customId.split(":");
-  if (parts.length !== 4) return undefined;
-  const [ns, kind, action, nonce] = parts;
-  if (ns !== NS || kind !== "perm") return undefined;
-  if (!action || !ACTIONS.has(action)) return undefined;
-  if (!nonce) return undefined;
-  return { nonce, action: action as PermAction };
+  const decoded = decodeParts(customId, "perm");
+  if (!decoded || !ACTIONS.has(decoded.action)) return undefined;
+  return { nonce: decoded.nonce, action: decoded.action as PermAction };
 }
 
 // ---- ask_user (choice) buttons -----------------------------------------
@@ -39,10 +43,9 @@ export interface DecodedChoice {
 }
 
 export function decodeChoiceId(customId: string): DecodedChoice | undefined {
-  const parts = customId.split(":");
-  if (parts.length !== 4) return undefined;
-  const [ns, kind, idx, nonce] = parts;
-  if (ns !== NS || kind !== "ask" || !nonce) return undefined;
+  const decoded = decodeParts(customId, "ask");
+  if (!decoded) return undefined;
+  const { action: idx, nonce } = decoded;
   if (!idx || !/^\d+$/.test(idx)) return undefined; // all-digit index only
   const index = Number.parseInt(idx, 10);
   if (!Number.isInteger(index)) return undefined;
@@ -67,12 +70,9 @@ export interface DecodedRepo {
 }
 
 export function decodeRepoId(customId: string): DecodedRepo | undefined {
-  const parts = customId.split(":");
-  if (parts.length !== 4) return undefined;
-  const [ns, kind, action, nonce] = parts;
-  if (ns !== NS || kind !== "repo" || !nonce) return undefined;
-  if (!action || !REBIND_ACTIONS.has(action)) return undefined;
-  return { nonce, action: action as RebindAction };
+  const decoded = decodeParts(customId, "repo");
+  if (!decoded || !REBIND_ACTIONS.has(decoded.action)) return undefined;
+  return { nonce: decoded.nonce, action: decoded.action as RebindAction };
 }
 
 // ---- exit-plan buttons --------------------------------------------------
@@ -90,10 +90,9 @@ export interface DecodedPlan {
 }
 
 export function decodePlanId(customId: string): DecodedPlan | undefined {
-  const parts = customId.split(":");
-  if (parts.length !== 4) return undefined;
-  const [ns, kind, action, nonce] = parts;
-  if (ns !== NS || kind !== "plan" || !action || !nonce) return undefined;
+  const decoded = decodeParts(customId, "plan");
+  if (!decoded) return undefined;
+  const { action, nonce } = decoded;
   if (action === "reject") return { nonce, action: "reject" };
   if (!/^\d+$/.test(action)) return undefined; // all-digit index only
   const index = Number.parseInt(action, 10);

@@ -15,7 +15,6 @@ describe("parseConfig", () => {
     expect(c.DISCORD_ALLOWED_USER_IDS).toEqual(["123456789012345"]);
     expect(c.DEFAULT_MODEL).toBe("claude-sonnet-5");
     expect(c.DEFAULT_CONTEXT_TIER).toBe("default");
-    expect(c.PERMISSION_POLICY).toBe("ask");
     expect(c.ENABLE_REPO_SKILLS).toBe("true");
     expect(c.ENABLE_USER_SKILLS).toBe("true");
     expect(c.REPO_CLONE_HOST_POLICY).toBe("github");

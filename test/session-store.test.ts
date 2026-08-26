@@ -51,6 +51,20 @@ describe("SessionStore — basics", () => {
     expect(s.get("t1")).toMatchObject({ state: "blocked", reason: "thread-gone" });
   });
 
+  it("commit clears a retry reason after the session successfully becomes active", () => {
+    const f = tmpFile();
+    const s = new SessionStore(f);
+    s.reserve(bind("t1"));
+    s.commit("t1");
+    expect(s.setState("t1", "active", "thread-no-access")).toBe(true);
+
+    expect(s.commit("t1")).toBe(true);
+
+    expect(s.get("t1")).toMatchObject({ state: "active" });
+    expect(s.get("t1")?.reason).toBeUndefined();
+    expect(new SessionStore(f).get("t1")?.reason).toBeUndefined();
+  });
+
   it("restore() writes a prior record back verbatim", () => {
     const s = new SessionStore(tmpFile());
     s.reserve(bind("t1"));

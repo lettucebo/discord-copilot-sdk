@@ -14,9 +14,9 @@
 - **Node.js** ≥ 20.19（或 ≥ 22.12）
 - **git**
 - **GitHub Copilot CLI**（`copilot`）— 已用 `copilot` → `/login` 登入
-- 一個 **Discord bot token**、你的 **Discord user ID**、目標 **guild ID** 與 **父頻道 ID**（建議私密頻道）
+- 一個 **Discord bot token**、你的 **Discord user ID**、目標 **guild ID**，以及一個**種子預設值**工作頻道 ID —— bot 第一次啟動時自動被授權的頻道（它的首次啟動預設值）。請使用**私密**頻道：建立它、只把 bot 的 application 和你自己加為成員，並依 `docs/DISCORD-SETUP.zh-TW.md` §4b 給予工作權限。
 
-> 🤖 **還沒有 bot？** 請先看 [`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) —— 建立 bot、開啟必要的 Message Content Intent、用正確權限邀請、取得上面四個值。
+> 🤖 **還沒有 bot？** 請先看 [`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) —— 建立 bot、開啟必要的 Message Content Intent、用正確權限邀請、設定私密工作頻道，並取得上面四個值。
 
 > 安裝器可以幫你自動安裝 Node / git / Copilot CLI（Windows 用 winget、macOS 用 brew、Linux 用 apt/dnf）。
 
@@ -136,6 +136,19 @@ bash install.sh --skip-auth
 > 重跑安裝器前請先停掉 bot（`./stop-bot.ps1` / `./stop-bot.sh`）—— npm 需要覆寫執行中程序正在使用的檔案。安裝器會偵測到並直接告訴你，不會再丟出難懂的 `EPERM` 錯誤。
 
 安裝器會：偵測前置需求 → 收集設定並**驗證** → `npm ci` + build → 用真實 schema 在記憶體驗證設定 → **最後**才安全寫入 `.env`（權限僅限本人、token 不顯示、原子寫入 + 備份）→（可選）設定常駐 → 完成報告。（先建置再寫入，`.env` 是最後一步；**全新安裝**時 npm 過程中磁碟上不會有 token。）
+
+### 設定問答會問什麼
+
+| 問題 | 收集的內容 |
+| --- | --- |
+| Bot token | `DISCORD_BOT_TOKEN` —— 來自 [`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) §3。 |
+| 允許的 user ID | `DISCORD_ALLOWED_USER_IDS` —— 你的 Discord user ID（多於一個時用逗號分隔）。 |
+| Guild ID | `DISCORD_GUILD_ID` —— 伺服器的 ID。 |
+| 種子預設值工作頻道 ID | `DISCORD_PARENT_CHANNEL_ID` —— **首次啟動的預設**工作頻道，只有 bot 第一次啟動時會自動被授權；之後就是一筆普通、可移除的頻道記錄。請用你依 [`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) 設好的**私密**頻道。 |
+| Repos 根目錄／預設 repo | `REPOS_ROOT` 與可選的 `DEFAULT_REPO` —— 見下面的 `REPOS_ROOT` 提示框。 |
+| 模型／context 層級／skills 開關 | `DEFAULT_MODEL`、`DEFAULT_CONTEXT_TIER`、`ENABLE_REPO_SKILLS`、`ENABLE_USER_SKILLS` —— 都有安全的預設值，直接按 Enter 即可採用。 |
+
+非互動執行（`-Yes`／`--yes`／`-y`）會跳過以上所有問答，直接沿用既有 `.env` 值（全新安裝則用預設值）。
 
 輸出會先顯示**安裝計畫**，再顯示五個編號階段：前置需求／登入狀態、設定、相依套件建置、驗證／寫入、常駐。完成摘要會列出已安裝版本，以及精確的啟動、停止、查看記錄、更新和解除安裝指令。成功的 build 輸出會寫入 `~/.discord-copilot-sdk/logs` 底下僅限本人的記錄檔；失敗時終端機只會顯示有限的尾段和完整記錄位置。Shell 請加上 `--verbose`，PowerShell 請加上 `-Verbose`，即可直接串流底層 npm/build 輸出。
 
@@ -307,7 +320,15 @@ ready proof 無效或逾時，會以失敗結束，且只終止這次剛啟動�
 
 ## 5. 最後一步（手動）
 
-到你的 Discord 頻道用 `/new` 開一個 session，或直接送一則訊息測試。
+安裝器會設定並啟動 bot 程序，但 Discord 那一側的頻道設定與驗證是手動的，請在這裡完成：
+
+1. **私密工作頻道**：如果還沒做（見 [`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) §0／§4b），把你的工作頻道設為**私密**，並把 bot 的 application 和你自己都加為成員，給予文件記載的工作權限。你 `.env` 裡的 `DISCORD_PARENT_CHANNEL_ID` 是**種子預設值**——只有 bot 第一次啟動時會自動被授權。
+2. **啟動 bot**（如果還沒在跑）：常駐設定會自動啟動；否則用 `./run-bot.ps1` / `./run-bot.sh`（見 §4）。
+3. **`/channel enable`**：種子預設值頻道第一次啟動就已授權，不需要額外步驟。之後要加入**不同或額外**的工作頻道時，才需要先把 bot 加進去，再對那個頻道執行 `/channel enable`。執行 `/channel list` 稽核已啟用授權與 Discord 實際可見度，找出漂移。
+4. **正向驗證**：在工作頻道 `/new` → 開出討論串 → 送一則訊息 → 你會收到回覆。
+5. **反向驗證**：在 bot 從未被加入的頻道，`/` **不應該**列出它的指令，提到 bot 也不會有任何回應。
+
+如果任何一項失敗，請參考下面的疑難排解，以及 [`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) §6–§7 的完整說明。
 
 ---
 
@@ -389,3 +410,6 @@ ready proof 無效或逾時，會以失敗結束，且只終止這次剛啟動�
 - **Copilot 未登入** → 執行 `copilot`，然後 `/login`。
 - **PowerShell 執行原則** → 用 `powershell -ExecutionPolicy Bypass -File ./install.ps1`。
 - **重跑安裝器** → 安全且冪等：會以既有 `.env` 為預設、先備份再寫入。
+- **allow-list 裡的使用者每個指令都回「Not authorized」（非管理員看不到指令）** → `default_member_permissions="0"` 代表預設只有 guild Administrator（與擁有者）能用指令；非 Administrator 的 allow-listed 使用者需要在 Server Settings → Integrations → 該 app → Command permissions 加上明確覆寫。見 [`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) §4c。
+- **工作頻道或其指令都看不到（頻道不可見）** → bot 必須是**私密**頻道的明確成員才看得到它、指令才會出現在那裡；請檢查頻道的成員清單，而不是只看身分組權限畫面。見 [`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) §4b 與 [`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md)。
+- **權限或頻道變動後某個討論串沒反應了（`thread-no-access`）** → 這是**可重試**的：把 bot 對該頻道的存取權還原，session 就會恢復。`/sessions` 會把它獨立列在別的區塊；如果你想直接清掉，用 `/end thread:<id>` 明確清除。見 [`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md)。

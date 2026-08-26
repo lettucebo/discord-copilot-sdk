@@ -28,8 +28,10 @@ function runtimeAccepts(values) {
 
 const corpus = [
   { name: "valid minimal", values: base() },
-  { name: "valid with DEV_GUILD_ID", values: { ...base(), DEV_GUILD_ID: "111111111" } },
-  { name: "empty DEV_GUILD_ID (shipped in .env.example) is accepted as unset", values: { ...base(), DEV_GUILD_ID: "" } },
+  {
+    name: "dead DEV_GUILD_ID and PERMISSION_POLICY leftovers are silently ignored",
+    values: { ...base(), DEV_GUILD_ID: "111111111", PERMISSION_POLICY: "ask" },
+  },
   { name: "valid multi user ids", values: { ...base(), DISCORD_ALLOWED_USER_IDS: "111111111, 222222222" } },
   { name: "valid long_context", values: { ...base(), DEFAULT_CONTEXT_TIER: "long_context" } },
   { name: "repo skills default", values: { ...base(), ENABLE_REPO_SKILLS: "true" } },
@@ -45,7 +47,6 @@ const corpus = [
   { name: "short snowflake", values: { ...base(), DISCORD_GUILD_ID: "12" } },
   { name: "bad user id in list", values: { ...base(), DISCORD_ALLOWED_USER_IDS: "111111111, abc" } },
   { name: "missing repos root", values: { ...base(), REPOS_ROOT: "" } },
-  { name: "bad dev guild id", values: { ...base(), DEV_GUILD_ID: "xx" } },
   { name: "bad context tier", values: { ...base(), DEFAULT_CONTEXT_TIER: "huge" } },
   { name: "whitespace-only token", values: { ...base(), DISCORD_BOT_TOKEN: "   " } },
   { name: "whitespace-only repos root", values: { ...base(), REPOS_ROOT: "  " } },

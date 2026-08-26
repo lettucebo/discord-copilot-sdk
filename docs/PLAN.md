@@ -235,19 +235,26 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 
 這項變更刻意把「指令看得到」和「bot 會不會動作」拆成兩個平面：
 
-1. **Discord Integrations 平面**由伺服器管理員手動設定 command visibility；它決定 `/`
-   選單是否顯示指令，但不是本 bot 的安全邊界。Discord 依使用者的
-   `USE_APPLICATION_COMMANDS`／Application Command Permissions v2 決定可見性，而非 bot 的
-   `VIEW_CHANNEL`：<https://docs.discord.com/developers/interactions/application-commands#application-command-permissions-object-using-default-permissions>。
-   Bot token 不能改 command-permissions；該 endpoint 要有人類 OAuth2 bearer token 的
-   `applications.commands.permissions.update`：<https://docs.discord.com/developers/interactions/application-commands#permissions>。
-   因此 command visibility 必須由管理員維護，且與 bot 重啟時的 guild-command bulk overwrite
-   分開：<https://docs.discord.com/developers/interactions/application-commands#bulk-overwrite-guild-application-commands-json-params>。
+> **2026-08-12 更正（見 §13.4）**：下面第 1 點原本主張「command visibility 與 bot 的
+> `VIEW_CHANNEL` 無關」——這個主張經查證是**錯的**，已在 §13.4 撤回並更正。§13.4 也把主要
+> 模型從「Discord Integrations 手動設定」改為「私密頻道原生白名單」，Integrations 降級為
+> 次要／未來選項。以下 1、2 兩點的授權不變式本身（bot ChannelRegistry 才是執行授權）維持
+> 不變，只有「command visibility 由誰／如何決定」的細節被 §13.4 取代。
+
+1. **Discord 平面（command visibility）**：`/` 選單是否顯示指令，不是本 bot 的安全邊界，且
+   bot token 不能改 Application Command Permissions；該 endpoint 要有人類 OAuth2 bearer token
+   的 `applications.commands.permissions.update`：
+   <https://docs.discord.com/developers/interactions/application-commands#permissions>。**這一步
+   永遠不能被本專案自動化**，因此文件將其列為次要／未來選項，主要模型改為私密頻道（見
+   §13.4、[`docs/CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md)）。command visibility 與 bot 重啟時的
+   guild-command bulk overwrite 是分開的兩件事：
+   <https://docs.discord.com/developers/interactions/application-commands#bulk-overwrite-guild-application-commands-json-params>。
 2. **Bot ChannelRegistry 平面**才是執行授權。除 `/channel` 外，`isAuthorized` 必須同時驗證
    allow-listed user、設定的 guild，以及目前頻道本身或其直屬 thread parent 在 enabled set。
-   enabled set 是永遠存在的 `DISCORD_PARENT_CHANNEL_ID` seed 加上持久化
-   `~/.discord-copilot-sdk/<instance>.channels.json` 的 `/channel enable` 項目。Discord 仍會把
-   interaction 送到 bot，且 initial response 不需要 `SEND_MESSAGES`：
+   enabled set 是 `DISCORD_PARENT_CHANNEL_ID` 種子預設值（首次啟動自動寫入，之後降級為一般
+   record，見 §13.4）加上持久化 `~/.discord-copilot-sdk/<instance>.channels.json` 的
+   `/channel enable` 項目。Discord 仍會把 interaction 送到 bot，且 initial response 不需要
+   `SEND_MESSAGES`：
    <https://docs.discord.com/developers/interactions/receiving-and-responding#responding-to-an-interaction>；
    所以所有未通過 bot 平面的請求都要 fail-closed，ephemeral 拒絕且不做任何工作
    （callback 規則：<https://docs.discord.com/developers/interactions/receiving-and-responding#interaction-callback>）。
@@ -276,23 +283,76 @@ resume 的錯誤。
 
 | 方案／風險 | 決定與理由 |
 |---|---|
-| bot token 自行用 OAuth2 改 command permissions | **否決**：bot token 沒有該 endpoint 所需的人類 OAuth2 bearer 權限；見 <https://docs.discord.com/developers/interactions/application-commands#permissions>。 |
-| 以 `VIEW_CHANNEL` 或可見頻道自動偵測授權 | **否決**：它不控制 slash-command visibility，也不阻止 interaction delivery；會把 Discord UI 設定誤當安全邊界。 |
+| bot token 自行用 OAuth2 改 command permissions | **否決**：bot token 沒有該 endpoint 所需的人類 OAuth2 bearer 權限；見 <https://docs.discord.com/developers/interactions/application-commands#permissions>。此否決在 §13.4 被重申為 ADR-0001 的一部分。 |
+| 以 `VIEW_CHANNEL` 或可見頻道自動偵測**授權** | **否決（更新原因，見 §13.4）**：原本的理由「它不控制 slash-command visibility」經查證是錯的——F6（§13.4）證實 bot 的 `VIEW_CHANNEL` **確實**控制 command visibility。但這不改變本列的結論：可見度仍然只是 Discord 平台顯示層的副作用，不是本 bot 能驗證、能稽核的授權事實來源；`isAuthorized` 仍必須查 ChannelRegistry，不能單靠「Discord 有沒有把這個頻道／指令顯示出來」代替。 |
 | 多 guild registry | **否決（v1）**：設定與 registry 都只屬一個 guild；跨 guild 的 registry 視為不可信並拒絕啟動。 |
-| Discord Integrations 設定需人工維護 | **接受**：管理員必須自行 deny-all 再 allow 工作頻道；bot 只保證自己的授權平面，不能替代平台可見性設定。 |
+| Discord Integrations 設定需人工維護 | **接受，且降級為次要選項（見 §13.4）**：管理員仍可用它做更細緻的覆寫，但主要的「bot 藏起來」機制改為私密頻道（§13.4），不再要求每個 app 都手動維護 Integrations 才能達到基本隔離。 |
 | allow-list 使用者可啟用公開頻道 | **接受**：`isOwner` 使每個 allow-listed user 都能把 agent 輸出導向公開頻道；v1 是單一 owner lab 工具，靠 allow-list 的信任邊界與操作紀律。 |
-| `blocked` 為終態 | **接受**：為避免誤把舊 conversation 接到新授權位置，重新啟用頻道不復活 record；以 `/end` 清理後才可 `/new`。 |
+| `blocked` 為終態 | **接受，但範圍縮小（見 §13.4）**：結構性不符（thread 消失、guild 不符、parent 未啟用）仍是終態 `blocked`／`inaccessible`；bot 單純失去頻道存取（`Missing Access`）改列為可重試的 `no-access`，見 [ADR-0002](adr/0002-missing-access-is-retryable.md)。 |
 
-### 13.3 §9.1 涵蓋補充（已實作）
+### 13.3 §9.1 涵蓋補充（已實作，含 §13.4 決策落地後的測試）
 
 | 測試檔 | 不變式 |
 |---|---|
-| `test/channel-registry.test.ts` | 缺檔以外的 read/parse/schema/version/guild 錯誤拒絕啟動；seed 永遠 enabled；成功 enable/disable 先持久化再變更記憶體，並遞增 epoch。 |
-| `test/discord-routing.test.ts` | 非 `/channel` 需要 user + guild + enabled channel／直屬 thread；`/channel` 的 `isOwner` 僅略過位置 gate，不能授權 button 或 autocomplete。 |
-| `test/app-channels.test.ts` / `test/app-channels-race.test.ts` | `/channel` 的 seed／權限／持久化失敗行為；`/new` 在目標頻道被 disable 時回復 thread/worktree 且不留 session，其他頻道變動不誤中止；disable 有 live 或 `active`/`creating` record 時拒絕。 |
-| `test/app-reconcile.test.ts` / `test/app-rebind.test.ts` | 每筆 record 的實際 thread parent 必須精確等於 `parentChannelId`；不是「任一 enabled parent」即可 resume，rebind 也保留該 binding；`config-mismatch` 不能靜默遺失 fallback 通知。 |
-| `test/transport.test.ts` | `noticeDelivered()` 對不存在或無法傳送的頻道回傳 `false`，讓 caller 能改投 seed。 |
+| `test/channel-registry.test.ts` | 缺檔以外的 read/parse/schema/version/guild 錯誤拒絕啟動；`DISCORD_PARENT_CHANNEL_ID` 只在首次啟動（檔案不存在）時寫入為一筆一般 record，並非永久種子，此後與 `/channel enable` 加入的頻道完全等價、可被個別停用；v1 registry 遷移為 v2 時保留既有頻道並補上缺少的設定值；成功 enable/disable 先持久化再變更記憶體，且只有實際發生變更才遞增 epoch。 |
+| `test/channel-fetch.test.ts` | 區分 `ok`／`gone`（10003）／`no-access`（403、50001，或已遮蔽頻道）／`transient`；涵蓋 F7 記錄的兩種 Channel Obfuscation 型態（`flags` 含 `CHANNEL_OBFUSCATED`、`name === "___hidden___"`）與 `botCanViewChannel` 的可見度判斷。 |
+| `test/discord-routing.test.ts` | 非 `/channel` 需要 user + guild + enabled channel／直屬 thread；`/channel` 的 `isOwner` 僅略過位置 gate，不能授權 button 或 autocomplete；命令註冊一律套用 `default_member_permissions="0"`（見 §13.4 決策 4）。 |
+| `test/app-channels.test.ts` / `test/app-channels-race.test.ts` | `/channel` 的首次啟動預設值／權限／持久化失敗行為；`/channel list` 對照 registry 與 Discord 實際可見度回報 drift，而非只顯示授權狀態（見 §13.4 決策 1）；`/new` 在目標頻道被 disable 時回復 thread/worktree 且不留 session，其他頻道變動不誤中止；disable 有 live 或 `active`/`creating` record 時拒絕；`thread-no-access` record 可被 `/end thread:<id>` 明確清除，其他 `retry-pending` record 則受保護、不可被清除（見 [ADR-0002](adr/0002-missing-access-is-retryable.md)）。 |
+| `test/app-reconcile.test.ts` / `test/app-rebind.test.ts` | 每筆 record 的實際 thread parent 必須精確等於 `parentChannelId`；不是「任一 enabled parent」即可 resume，rebind 也保留該 binding；`config-mismatch` 不能靜默遺失 fallback 通知；`403`／`50001` 分類為可重試的 `no-access`（`thread-no-access`），與結構性不符的終態 `blocked` 明確分開。 |
+| `test/transport.test.ts` | `noticeDelivered()` 對不存在或無法傳送的頻道回傳 `false`，讓 caller 能改投設定值頻道。 |
 | `test/shipped-scripts.test.ts` | 英／繁中 twin 皆含安全安裝命令，並驗證 language switcher 與本地 Markdown 連結。 |
+
+> 上表已反映 §13.4 決策落地後的行為：ChannelRegistry schema v2 遷移（首次啟動設定值降級為
+> 一般 record、可個別停用）、Channel Obfuscation 偵測、`no-access` 可重試分類與
+> `/end thread:<id>` 明確清除、`default_member_permissions="0"` 指令預設值，以及
+> `/channel list` 的可見度稽核，均已實作並由上表對應測試涵蓋。
+
+### 13.4 私密頻道原生白名單與 Channel Obfuscation 修正（2026-08-12）
+
+**觸發原因**：同一伺服器內同時執行本專案的多個 bot app（正式 + 測試）時，(a) 在任何頻道打
+`/` 都會看到這些 bot 的指令，且每個 app 各列一份；(b) 在任何頻道都能 `@` 到 bot。§13.1／
+§13.2 原本的模型把「Discord 平面」定位成純手動、與 bot 的 `VIEW_CHANNEL` 無關，這個定位本身
+就是問題的一部分（見下方 F6 對此的更正）。
+
+**事實依據（全部經過查證，附出處）：**
+
+| # | 事實 | 出處 |
+|---|---|---|
+| F1 | 修改 Application Command Permissions **必須**用「使用者的 OAuth bearer token + `applications.commands.permissions.update`」，且該使用者需具備 Manage Guild 與 Manage Roles。**bot token 做不到**。 | <https://docs.discord.com/developers/interactions/application-commands#permissions> |
+| F5 | bot 被 deny `VIEW_CHANNEL` 後，對該頻道的**任何** API 操作都會得到 `50001 Missing Access`，**包含改回自己的覆寫**——單向門。 | discord.js guide, Permissions；Error 50001 說明 |
+| F6 | bot 在某頻道沒有 View Channel，它的指令**不會**出現在該頻道的指令選單。**更正**：§13.1 舊文字聲稱兩者無關，是錯的。**證據等級：二手來源一致（Discord 支援文章、`discord-api-docs` 討論串），需靠 [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md) §9 的正反向人工實測收尾**。 | Discord Slash Commands FAQ、Command Permissions FAQ、discord-api-docs #4959 |
+| F7 | **Channel Obfuscation（2026-08-12 公告，2026-11-16 對所有 bot 強制）**：bot 看不到的頻道，Gateway 仍會派送但 `name` 變成 `"___hidden___"`、敏感欄位清空、`flags` 帶 `CHANNEL_OBFUSCATED`（`1 << 17`）、`permission_overwrites` 只剩一條 deny `VIEW_CHANNEL` for `@everyone`；HTTP 的 `GET /guilds/{guild.id}/channels` **整個省略**這些頻道。取得存取權的瞬間解除遮蔽並派送 `CHANNEL_UPDATE`。**Interaction payload 走另一條路徑，不套用遮蔽。** | <https://docs.discord.com/developers/change-log>，2026-08-12 |
+| F8 | 可用開發者後台 **Overview > Bot > Private Channel Obfuscation** 開關（或 IDENTIFY 的 `capabilities: 1 << 15`）**現在就測試** Gateway 行為；HTTP 端無提前開關。 | 同 F7 |
+
+**決策：**
+
+1. **主要模型改為私密頻道原生白名單**：把工作頻道設為私密、只把該 bot app 加進去，即取得
+   Discord 原生的「看不到就不會出現指令、也收不到內容」白名單效果（F6），不需人類 OAuth
+   授權即可持續運作。原 §13.1 point 1 的 Discord Integrations 手動設定**降級為次要／未來
+   選項**，保留給需要比「頻道成員資格」更細的覆寫時使用（見 [`CHANNEL-ACCESS.md`](CHANNEL-ACCESS.md) §5）。完整決策與否決方案見 [ADR-0001](adr/0001-private-channel-whitelist.md)。
+2. **種子頻道降級為「seed default」**：`DISCORD_PARENT_CHANNEL_ID` 只在**首次啟動**、registry
+   檔案不存在時，自動寫入 registry 成為一筆一般 record；此後與 `/channel enable` 加入的頻道
+   完全等價，可依一般規則被 `/channel disable`。這修正了「種子永遠不可停用」與新的私密頻道
+   模型之間的矛盾——工作頻道的生命週期不應該因為「它恰好是設定檔裡的第一個值」而永久特殊。
+   （對應程式變更已實作：`ChannelRegistry` schema v2 遷移，見 `src/core/channel-registry.ts`，
+   由 `test/channel-registry.test.ts` 涵蓋首次啟動寫入、v1→v2 遷移與個別停用；見 §13.3。）
+3. **`Missing Access`（bot 自己失去頻道存取）改列為可重試的 `no-access`**，與結構性不符
+   （thread 消失、guild 不符、parent 未啟用）維持的終態 `blocked`／`inaccessible` 明確分開。
+   完整理由、與已接受的殘留風險見 [ADR-0002](adr/0002-missing-access-is-retryable.md)。
+4. **`default_member_permissions="0"`** 套用到每個指令：除非持有 guild Administrator 或在
+   Integrations 有個別覆寫，否則沒有人能呼叫指令——即使頻道可見。這與私密頻道模型互補：
+   前者限制「誰看得到」，後者限制「看得到的人裡誰能用」。已知支援情境：`isAuthorized` 從不
+   要求 allow-listed user 是 Administrator，所以需要啟動期護欄警告（見
+   [`DISCORD-SETUP.md`](DISCORD-SETUP.md#4c-command-permission-defaults-default_member_permissions0) §4c）；程式端護欄已實作為 `restrictCommandDefaults()`（`src/app.ts`），
+   由 `test/discord-routing.test.ts` 涵蓋（見 §13.3）。
+
+**已接受的殘留風險（文件層級）：**
+
+| 風險 | 處置 |
+|---|---|
+| F6 只有二手來源佐證 | 已在 `CHANNEL-ACCESS.md` §4/§9 標註證據等級，並要求正反向人工實測；若被推翻，主模型仍對讀取限制與 `@` 不到成立，只有指令選單需退回 Integrations。 |
+| 文件當時先於程式記錄目標行為（ChannelRegistry schema 遷移、`default_member_permissions` 護欄、`no-access` 狀態機） | 已收斂：三者均已實作並由 §13.3 表格列出的測試涵蓋（`test/channel-registry.test.ts`、`test/discord-routing.test.ts`、`test/app-reconcile.test.ts` 等）；規格與實作不再分歧，未來再變更任一項時需同步更新本節與 §13.3。 |
+| Channel Obfuscation 的 HTTP 端無法提前測試 | Gateway 端可用 F8 的開發者後台開關；HTTP 端待 2026-11-16 生效後以本專案既有的 `no-access`／`gone` 分類涵蓋（`test/channel-fetch.test.ts`）。 |
 
 ## 14. 更新與發版機制（2026-08-06）
 

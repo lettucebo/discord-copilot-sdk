@@ -14,9 +14,9 @@ The installer is **bilingual** (Traditional Chinese + English): it defaults to y
 - **Node.js** ≥ 20.19 (or ≥ 22.12)
 - **git**
 - **GitHub Copilot CLI** (`copilot`) — signed in via `copilot` then `/login`
-- A Discord bot token, your Discord user ID, the target guild ID, and a parent channel ID (private channel recommended)
+- A Discord bot token, your Discord user ID, the target guild ID, and a **seed default** work channel ID — the channel auto-authorized the first time the bot starts (its first-run default). Use a **private** channel: create it, add only the bot's application and your own account as members, and grant the work permissions in `docs/DISCORD-SETUP.md` §4b.
 
-> 🤖 **No bot yet?** Start with [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) — create the bot, enable the required Message Content Intent, invite it with the right permissions, and collect the four values above.
+> 🤖 **No bot yet?** Start with [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) — create the bot, enable the required Message Content Intent, invite it with the right permissions, set up the private work channel, and collect the four values above.
 
 > The installer can auto-install Node / git / Copilot CLI (winget on Windows, brew on macOS, apt/dnf on Linux).
 
@@ -136,6 +136,19 @@ bash install.sh --skip-auth
 > Stop the bot (`./stop-bot.ps1` / `./stop-bot.sh`) before re-running the installer — npm has to replace files a running process holds open. The installer detects this and says so, instead of failing with a cryptic `EPERM`.
 
 The installer will: detect prerequisites → collect + **validate** config → `npm ci` + build → validate the config in memory against the real schema → **finally** write `.env` securely (owner-only, token never echoed, atomic write + backup) → (optional) residency → done report. (Build first, `.env` written last; on a **fresh install** npm never sees the token on disk.)
+
+### What the configuration prompts ask for
+
+| Prompt | What it collects |
+| --- | --- |
+| Bot token | `DISCORD_BOT_TOKEN` — from [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) §3. |
+| Allowed user ID(s) | `DISCORD_ALLOWED_USER_IDS` — your Discord user ID (comma-separated for more than one). |
+| Guild ID | `DISCORD_GUILD_ID` — the server's ID. |
+| Seed default work channel ID | `DISCORD_PARENT_CHANNEL_ID` — the **first-run default** work channel, auto-authorized only the first time the bot starts; afterwards it is an ordinary removable channel record. Use the **private** channel you set up per [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md). |
+| Repos root / default repo | `REPOS_ROOT` and optional `DEFAULT_REPO` — see the `REPOS_ROOT` callout below. |
+| Model / context tier / skills toggles | `DEFAULT_MODEL`, `DEFAULT_CONTEXT_TIER`, `ENABLE_REPO_SKILLS`, `ENABLE_USER_SKILLS` — all have safe defaults; press enter to accept them. |
+
+A non-interactive run (`-Yes`/`--yes`/`-y`) skips every prompt above and reuses your existing `.env` values (or defaults on a fresh install).
 
 Its output starts with an **Install plan**, then shows five numbered stages:
 prerequisites/sign-in state, configuration, dependency build, validation/write,
@@ -367,7 +380,15 @@ terminal and does not use the detached-launch handshake.
 
 ## 5. Final step (manual)
 
-In your Discord channel, run `/new` to start a session, or send a message to test.
+The installer configures and starts the bot process, but Discord-side channel setup and verification are manual and happen here:
+
+1. **Private work channel**: if you haven't already (see [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) §0/§4b), make your work channel **private**, and add both the bot's application and your own account as members with the documented work permissions. Your `.env`'s `DISCORD_PARENT_CHANNEL_ID` is the **seed default** — it is auto-authorized only the first time the bot ever starts.
+2. **Start the bot** if it isn't already running (residency starts it automatically; otherwise `./run-bot.ps1` / `./run-bot.sh`, see §4).
+3. **`/channel enable`**: the seed default channel needs no extra step on first run. Adding a **different or additional** work channel later requires adding the bot to it, then running `/channel enable` there. Run `/channel list` to audit enabled authorization against actual Discord visibility and catch drift.
+4. **Positive verification**: in the work channel, run `/new` → a thread opens → send a message → you get a reply.
+5. **Negative verification**: in a channel the bot was never added to, `/` must **not** list its commands, and mentioning the bot there gets no response.
+
+If any check fails, see the Troubleshooting entries below and [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) §6–§7 for the full breakdown.
 
 ---
 
@@ -449,3 +470,6 @@ This is a **local** uninstall. These are the things it cannot do, and says so at
 - **Copilot not signed in** → run `copilot`, then `/login`.
 - **PowerShell execution policy** → use `powershell -ExecutionPolicy Bypass -File ./install.ps1`.
 - **Re-running** → safe and idempotent: uses your existing `.env` as defaults and backs it up before writing.
+- **An allow-listed user gets "Not authorized" on every command (non-admin command visibility)** → `default_member_permissions="0"` means only guild Administrators (and the owner) can use commands by default; a non-Administrator allow-listed user needs an explicit override in Server Settings → Integrations → this app → Command permissions. See [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) §4c.
+- **The work channel, or its commands, don't show up (invisible channel)** → the bot must be an explicit member of a **private** channel to see it or show commands there; check the channel's member list, not just the role permission screen. See [`docs/DISCORD-SETUP.md`](docs/DISCORD-SETUP.md) §4b and [`docs/CHANNEL-ACCESS.md`](docs/CHANNEL-ACCESS.md).
+- **A thread stopped responding after a permission or channel change (`thread-no-access`)** → this is **retryable**: restore the bot's access to that channel and the session resumes. `/sessions` lists it separately from other records; if you want it gone instead, `/end thread:<id>` clears it explicitly. See [`docs/CHANNEL-ACCESS.md`](docs/CHANNEL-ACCESS.md).

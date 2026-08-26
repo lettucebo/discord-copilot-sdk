@@ -66,6 +66,26 @@ describe("message table parity", () => {
     expect(messageKeys().length).toBeGreaterThan(20);
   });
 
+  describe("Discord private-channel installer guidance", () => {
+    it("describes the seed default consistently in both languages", () => {
+      expect(MESSAGES.en.promptParentChannelId).toContain("Seed default");
+      expect(MESSAGES.en.promptParentChannelId).toContain("first-run default");
+      expect(MESSAGES.en.promptParentChannelId).toContain("/channel list");
+      expect(MESSAGES.zh.promptParentChannelId).toContain("種子預設值");
+      expect(MESSAGES.zh.promptParentChannelId).toContain("首次啟動");
+      expect(MESSAGES.zh.promptParentChannelId).toContain("/channel list");
+    });
+
+    it("ends with the private-channel audit and positive/negative checklist", () => {
+      expect(MESSAGES.en.doneManual).toContain("private work channel");
+      expect(MESSAGES.en.doneManual).toContain("/channel list");
+      expect(MESSAGES.en.doneManual).toContain("positive/negative verification checklist");
+      expect(MESSAGES.zh.doneManual).toContain("私密工作頻道");
+      expect(MESSAGES.zh.doneManual).toContain("/channel list");
+      expect(MESSAGES.zh.doneManual).toContain("正向／反向驗證清單");
+    });
+  });
+
   it("no translated value is an empty string", () => {
     for (const lang of LANGS) {
       for (const [k, v] of Object.entries(MESSAGES[lang])) {

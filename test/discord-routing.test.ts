@@ -13,6 +13,7 @@ import {
   decisionBindsToChannel,
   applyYoloToggle,
   approvalScopeKeys,
+  restrictCommandDefaults,
   yoloOnWarning,
 } from "../src/app.js";
 
@@ -23,6 +24,15 @@ describe("custom-id", () => {
     for (const action of ["once", "session", "always", "deny"] as const) {
       expect(decodePermissionId(encodePermissionId("n", action))).toEqual({ nonce: "n", action });
     }
+  });
+
+  describe("command registration defaults", () => {
+    it("hides every command from non-admins unless Discord has an explicit override", () => {
+      expect(restrictCommandDefaults([{ name: "new" }, { name: "channel" }])).toEqual([
+        { name: "new", default_member_permissions: "0" },
+        { name: "channel", default_member_permissions: "0" },
+      ]);
+    });
   });
 
   it("rejects malformed / foreign ids", () => {

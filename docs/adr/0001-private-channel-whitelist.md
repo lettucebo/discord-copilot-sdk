@@ -1,0 +1,10 @@
+# Private Discord channels are the primary command/visibility whitelist
+
+**Status:** accepted
+
+Running multiple bot instances (e.g. production and test) in the same guild made every instance's slash commands appear in every channel, and let anyone in the guild `@`-mention any of them and have it actually delivered and answered — the platform's command/visibility layer was never actually configured as a whitelist. We adopt **making each work channel private and adding only the relevant bot application to it** (see [`docs/CHANNEL-ACCESS.md`](../CHANNEL-ACCESS.md#3-primary-model--private-work-channels-the-recommended-way-to-hide-the-bot)) as the primary mechanism: a bot that is not a member of a channel neither receives its events nor has its commands listed there, so a mention typed there is never received, read, or responded to (Discord does not, and is not claimed to, prevent a user from syntactically typing the mention itself). This requires no Discord Integrations configuration and no human OAuth grant to keep working, and it is reinforced by Discord's own Channel Obfuscation change (mandatory 2026-11-16), which actively hides channel data from bots that lack access.
+
+## Considered and rejected
+
+- **Bot-token OAuth automation of Application Command Permissions.** Rejected: that endpoint (`applications.commands.permissions.update`) only accepts a human user's OAuth2 bearer token with Manage Guild and Manage Roles in the target guild — there is no bot-token or service-account path to it, so this can never be automated by the running bot process, only performed manually by an admin in Integrations (kept as the secondary option in `CHANNEL-ACCESS.md` §5).
+- **The bot denying itself `VIEW_CHANNEL` on channels it should not use.** Rejected: this is a one-way lockout. Once the bot's own permission overwrite denies it `VIEW_CHANNEL` on a channel, every subsequent API call the bot makes against that channel — including the call needed to undo the deny — returns `50001 Missing Access`. A mechanism that cannot reverse its own mistake without an out-of-band admin fix is not acceptable as the primary control.

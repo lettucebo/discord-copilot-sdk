@@ -80,10 +80,10 @@ const MESSAGES = {
     promptToken: "Discord Bot Token（輸入不會顯示）",
     promptUserIds: "允許使用的 Discord 使用者 ID（逗號分隔，至少一個＝擁有者）",
     promptGuildId: "Discord 伺服器（Guild）ID",
-    promptParentChannelId: "初始工作頻道 ID（永遠啟用；可在執行期間啟用其他工作頻道，建議使用私密頻道）",
+    promptParentChannelId:
+      "種子預設值工作頻道 ID（首次啟動的預設；之後成為可移除的一般頻道，用 /channel list 稽核；建議使用私密頻道）",
     promptReposRoot: "repos 根目錄的絕對路徑（裡面放你的各個 repo，例如 C:\\Source\\Repos）",
     promptDefaultRepo: "預設 repo 名稱（可選；留空則 /new 每次都要指定 repo）",
-    promptDevGuildId: "開發用 Guild ID（可選，填了可即時註冊斜線指令）",
     promptModel: "預設模型",
     promptContextTier: "context 層級（default / long_context）",
     promptRepoSkills: "預設載入 repo 內的 skills（true / false；repo 作者可影響 agent context）",
@@ -154,7 +154,8 @@ const MESSAGES = {
     doneLogResidency: "若啟用常駐：{0}",
     doneUpdate: "更新：",
     doneUninstall: "解除安裝：",
-    doneManual: "最後一步（需手動）：到 Discord 你的頻道送一則測試訊息或用 /new 開始。",
+    doneManual:
+      "最後一步（需手動）：把 bot 加入你的私密工作頻道、啟動它，需要時執行 /channel enable，用 /channel list 稽核，然後照 INSTALL 的正向／反向驗證清單確認。",
     doneSafety: "安全提醒：使用私人伺服器、開啟 2FA，且切勿把 .env／token 提交到版控。",
     dryNote: "（--dry-run：不會變更任何檔案或系統狀態。）",
     updateActiveThreads:
@@ -274,10 +275,10 @@ const MESSAGES = {
     promptToken: "Discord bot token (input hidden)",
     promptUserIds: "Allowed Discord user IDs (comma-separated, at least one = owner)",
     promptGuildId: "Discord guild (server) ID",
-    promptParentChannelId: "Seed work channel ID (always enabled; additional work channels can be enabled at runtime; use private channels)",
+    promptParentChannelId:
+      "Seed default work channel ID (first-run default; becomes an ordinary removable channel afterwards, audited with /channel list; use a private channel)",
     promptReposRoot: "Absolute path to your repos root (the folder that holds your repos, e.g. C:\\Source\\Repos)",
     promptDefaultRepo: "Default repo name (optional; leave blank to require `repo:` on every /new)",
-    promptDevGuildId: "Dev guild ID (optional; enables instant slash-command registration)",
     promptModel: "Default model",
     promptContextTier: "Context tier (default / long_context)",
     promptRepoSkills: "Load repository skills by default (true / false; repo authors can influence agent context)",
@@ -352,7 +353,8 @@ const MESSAGES = {
     doneLogResidency: "if residency is enabled, {0}",
     doneUpdate: "Update: ",
     doneUninstall: "Uninstall: ",
-    doneManual: "Final step (manual): send a test message in your Discord channel, or use /new to begin.",
+    doneManual:
+      "Final step (manual): add the bot to your private work channel, start it, run /channel enable if needed, audit with /channel list, then follow the INSTALL positive/negative verification checklist.",
     doneSafety: "Safety: use a private server, enable 2FA, and never commit .env / your token.",
     dryNote: "(--dry-run: no files or system state will be changed.)",
     updateActiveThreads:

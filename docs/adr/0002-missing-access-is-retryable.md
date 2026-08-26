@@ -1,0 +1,11 @@
+# Missing Access is retryable; structural mismatch stays terminal
+
+**Status:** accepted
+
+Under the private-channel whitelist ([ADR-0001](0001-private-channel-whitelist.md)), a bot can lose its own `VIEW_CHANNEL` on a work channel by an ordinary, reversible mistake — someone edits permissions, removes the bot, or a role changes — and every API call against that channel then fails with `403`/`50001 Missing Access`. Previously, every kind of "can't reach this channel/thread" condition was collapsed into one terminal `blocked` bucket, so this common, reversible failure destroyed sessions the same way a genuinely broken record did.
+
+We record `50001 Missing Access` on an otherwise-valid session as a distinct, **retryable** state (`no-access`), separate from — and not merged with — structural mismatches such as the thread being gone, not actually a thread, in the wrong guild, or under a parent that is no longer enabled, which remain terminal (`blocked`/`inaccessible`). The distinction is what changed: access loss can be undone by restoring the bot's channel membership, with no ambiguity about what the record should resume to; a structural mismatch means the record's claim about the world is no longer true, and blindly resuming it risks attaching a conversation to the wrong place.
+
+## Accepted residual risk
+
+A session stuck in `no-access` keeps its session record, its worktree, and — in local dev mode — its repo lease held indefinitely. It automatically resumes, with no further owner action, once the bot's channel access is restored or the bot restarts and re-observes the thread as reachable; nothing about `no-access` ever times out into a terminal state on its own. Separately, and only after an informed owner explicitly decides to give up on recovery, `/end thread:<id>` clears that same record on demand — the one deliberate, irreversible escape hatch for a record that would otherwise wait indefinitely. This is accepted as consistent with this project's existing preference for retaining inert state over irreversibly destroying work; `/sessions` surfaces the state, distinctly from other retry-pending records, so it is not silently forgotten and the explicit-clear option is not hidden.
