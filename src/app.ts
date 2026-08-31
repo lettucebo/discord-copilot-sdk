@@ -606,12 +606,16 @@ export class DiscordCopilotApp {
    *  makes `/end` refuse rather than proceed), only on how long an operator
    *  waits to be told so. */
   private accessResumeJoinTimeoutMs = TEARDOWN_TIMEOUT_MS;
+  /** Bound on one discard/barrier disconnect attempt. Same seam, same reason:
+   *  a test must be able to exercise a HANGING teardown, not only one that
+   *  rejects immediately, without spending the real bound. */
+  private resumeTeardownTimeoutMs = TEARDOWN_TIMEOUT_MS;
   /** Threads an explicit teardown has claimed but not yet finished. `/end` sets
    *  this synchronously, before its own first await, because its record removal
    *  happens several awaits later — long enough for a retry to resume and
    *  register a session that `/end` would then leave live with no record, and
    *  with its local lease released. */
-  private readonly endClaims = new Set<string>();
+  private readonly endClaims = new Map<string, number>();
   /** Threads already told, once, that a retry reached the runtime and failed
    *  transiently. Volatile on purpose: a restart may repeat it once. */
   private readonly accessRetryNoticed = new Set<string>();
@@ -1790,6 +1794,37 @@ export class DiscordCopilotApp {
       return;
     }
     const explicit = interaction.options.getString("thread")?.trim();
+    // Claim the target for the WHOLE command, both forms of it. The in-thread
+    // form tears a live session down and only then awaits git — a window in
+    // which the thread stops being live while its record still exists, and the
+    // retry loop must not treat that as an invitation. Counted, because the
+    // stale path below claims again.
+    const release = this.claimEnd(explicit || interaction.channelId);
+    try {
+      await this.cmdEndClaimed(interaction, explicit);
+    } finally {
+      release();
+    }
+  }
+
+  /** Claim a thread for an explicit teardown. Re-entrant: nested claims from the
+   *  same command must not release each other's. */
+  private claimEnd(threadId: string): () => void {
+    this.endClaims.set(threadId, (this.endClaims.get(threadId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.endClaims.get(threadId) ?? 1) - 1;
+      if (remaining > 0) this.endClaims.set(threadId, remaining);
+      else this.endClaims.delete(threadId);
+    };
+  }
+
+  private async cmdEndClaimed(
+    interaction: ChatInputCommandInteraction,
+    explicit: string | undefined
+  ): Promise<void> {
     // A record whose thread was DELETED is the commonest leftover, and it is
     // exactly the one you cannot type `/end` inside. `thread:` makes it
     // reachable from the parent channel; without it those worktrees were
@@ -2063,13 +2098,13 @@ export class DiscordCopilotApp {
     // a session that this command then leaves live with no durable record, and
     // with its local lease released. The claim makes `/end` win from its first
     // instruction rather than from its last.
-    this.endClaims.add(threadId);
+    const release = this.claimEnd(threadId);
     try {
       await this.endStaleRecordClaimed(interaction, threadId);
     } finally {
       // Released either way: a failed `/end` leaves the record `active`, and it
       // must stay eligible for the loop that is supposed to bring it back.
-      this.endClaims.delete(threadId);
+      release();
     }
   }
 
@@ -3891,6 +3926,20 @@ export class DiscordCopilotApp {
       if (this.endClaims.has(candidate.threadId)) continue;
       const rec = this.store.get(candidate.threadId);
       if (!rec || !this.isAccessRetryCandidate(rec)) continue;
+      // A previous attempt on this thread left a runtime we could not prove
+      // stopped. Resuming again would create a SECOND runtime for the same
+      // session and worktree, and its discard would overwrite the strong
+      // reference that is the first one's only fence. Retry the barrier first;
+      // only a CONFIRMED teardown earns another attempt.
+      if (this.unconfirmedResumes.has(rec.threadId)) {
+        if (!(await this.retryUnconfirmedResume(rec.threadId))) {
+          console.warn(
+            `access-retry: ${rec.threadId} still has an unconfirmed runtime from an earlier attempt; ` +
+              `not resuming it again this wake-up.`
+          );
+          continue;
+        }
+      }
       // Published BEFORE the first await, and settled only after any discard and
       // barrier registration below have finished. `/end` awaits THIS, so it can
       // never observe "no barrier yet" merely because its own bound expired
@@ -3946,6 +3995,11 @@ export class DiscordCopilotApp {
    * had the permission been present one minute earlier. Refusing it would strand
    * a conversation on a limit its owner never crossed, and there is no queue to
    * put it in.
+   *
+   * An unconfirmed-teardown barrier is deliberately NOT excluded here either:
+   * that would make the record stop being a candidate, the loop would go idle,
+   * and nothing would ever retry the barrier. It stays a candidate and the tick
+   * clears the barrier first — see `accessRetryTick`.
    */
   private isAccessRetryCandidate(rec: SessionRecord): boolean {
     return rec.state === "active" && rec.reason === "thread-no-access" && !this.sessions.has(rec.threadId);
@@ -4430,6 +4484,13 @@ export class DiscordCopilotApp {
     // BEFORE it removes the record; without this the resume would win a race it
     // has already lost and leave a live session no record points at.
     if (this.endClaims.has(rec.threadId)) return "an explicit /end claimed this thread";
+    // A runtime from an earlier attempt that we could not prove stopped may
+    // still hold this working tree. Registering a second one over it is exactly
+    // what the barrier exists to prevent, so this is a hard refusal even though
+    // the tick already checks it — the tick's check is several awaits old here.
+    if (this.unconfirmedResumes.has(rec.threadId)) {
+      return "an earlier resume for this thread was never confirmed stopped";
+    }
     if (this.sessions.has(rec.threadId)) return "another session is already registered for this thread";
     const now = this.store.get(rec.threadId);
     if (!now) return "the durable record was removed (/end)";
@@ -4512,10 +4573,21 @@ export class DiscordCopilotApp {
     // actor exists a runtime may be holding the checkout, and a caller that
     // looks while the disconnect is still in flight must see the barrier — not
     // an empty map that reads as "nothing is running here".
-    this.unconfirmedResumes.set(rec.threadId, { actor, binding: rec });
+    //
+    // NEVER overwritten: an existing entry is an OLDER runtime that was never
+    // proved stopped, and its strong reference is the only thing keeping its
+    // root capability alive. Replacing it would drop that fence while the thing
+    // it fences may still be running.
+    if (!this.unconfirmedResumes.has(rec.threadId)) {
+      this.unconfirmedResumes.set(rec.threadId, { actor, binding: rec });
+    }
     try {
-      await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS);
-      this.unconfirmedResumes.delete(rec.threadId); // confirmed gone; drop it
+      await withTimeout(actor.disconnect(), this.resumeTeardownTimeoutMs);
+      // Only drop the barrier if it is THIS actor's; an older unconfirmed one
+      // is not made safe by a newer actor's clean exit.
+      if (this.unconfirmedResumes.get(rec.threadId)?.actor === actor) {
+        this.unconfirmedResumes.delete(rec.threadId);
+      }
     } catch {
       console.warn(
         `resume: could not confirm the discarded runtime for ${rec.threadId} stopped; ` +
@@ -4535,11 +4607,11 @@ export class DiscordCopilotApp {
     const entry = this.unconfirmedResumes.get(threadId);
     if (!entry) return true;
     try {
-      await withTimeout(entry.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
+      await withTimeout(entry.actor.disconnect(), this.resumeTeardownTimeoutMs);
     } catch {
       return false;
     }
-    this.unconfirmedResumes.delete(threadId);
+    if (this.unconfirmedResumes.get(threadId) === entry) this.unconfirmedResumes.delete(threadId);
     return true;
   }
 

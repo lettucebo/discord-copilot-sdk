@@ -41,7 +41,7 @@ import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { tmpdir } from "node:os";
 import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
-import { existsSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 
 const isolatedHome = (() => {
   const value = process.env["DISCORD_COPILOT_SDK_VITEST_HOME"];
@@ -2742,5 +2742,245 @@ describe("access retry — settlement, durability and teardown retries", () => {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });
     }
+  });
+});
+
+describe("access retry must not resume behind its own unconfirmed barrier", () => {
+  /** A copilot whose resumes are ungated but whose disconnect can be made to
+   *  HANG — the timing the immediate-throw fakes never exercise, and the one a
+   *  wedged runtime actually produces. */
+  function hangingCopilot(): {
+    client: CopilotClient;
+    resumes: string[];
+    setHanging: (v: boolean) => void;
+    holdFirstResume: () => () => void;
+    disconnects: () => number;
+  } {
+    let hanging = true;
+    let disconnects = 0;
+    let resumeGate: Promise<void> | undefined;
+    const resumes: string[] = [];
+    const makeSession = (): unknown => ({
+      ...fakeSession,
+      async disconnect(): Promise<void> {
+        disconnects++;
+        if (hanging) await new Promise<void>(() => {}); // never settles
+      },
+    });
+    return {
+      client: {
+        createSession: async () => makeSession(),
+        async stop(): Promise<void> {},
+        resumeSession: async (id: string) => {
+          resumes.push(id);
+          if (resumeGate) {
+            const g = resumeGate;
+            resumeGate = undefined;
+            await g;
+          }
+          return makeSession();
+        },
+      } as unknown as CopilotClient,
+      resumes,
+      /** Hold the NEXT resume open, so a test can act while it is in flight. */
+      holdFirstResume: () => {
+        let open: () => void = () => {};
+        resumeGate = new Promise<void>((resolve) => {
+          open = resolve;
+        });
+        return open;
+      },
+      setHanging: (v: boolean) => {
+        hanging = v;
+      },
+      disconnects: () => disconnects,
+    };
+  }
+
+  /** Shrink the per-attempt teardown bound so a HANGING disconnect is testable
+   *  without spending the real one. The join bound is left comfortably longer,
+   *  so `/end` reaches the barrier it is supposed to find rather than expiring
+   *  first — that expiry has its own test. */
+  function shrinkTeardown(app: DiscordCopilotApp, teardownMs = 10, joinMs = 2_000): void {
+    (app as unknown as { resumeTeardownTimeoutMs: number }).resumeTeardownTimeoutMs = teardownMs;
+    (app as unknown as { accessResumeJoinTimeoutMs: number }).accessResumeJoinTimeoutMs = joinMs;
+  }
+
+  it("does not resume again while an earlier runtime was never confirmed stopped", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-again", sessionId: "sess-again" }));
+      store.commit("t-again");
+      const copilot = hangingCopilot();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        copilot.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      shrinkTeardown(app);
+      access = true;
+
+      // First attempt: the resume is held open, `/end` claims the thread while it
+      // is in flight, and the discard's teardown HANGS — so it is retained as a
+      // barrier and `/end` refuses.
+      const releaseResume = copilot.holdFirstResume();
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(copilot.resumes).toHaveLength(1));
+      const interaction = fakeInteraction();
+      const ending = (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(interaction, "t-again");
+      releaseResume();
+      await tick;
+      await ending;
+
+      expect(copilot.resumes).toEqual(["sess-again"]);
+      expect(interaction.replies.join("\n")).toContain("無法確認");
+      expect(unconfirmedResumesOf(app).has("t-again")).toBe(true);
+      const retained = unconfirmedResumesOf(app).get("t-again");
+      expect(retained).toBeDefined();
+      expect(store.get("t-again")?.state).toBe("active"); // /end refused, record kept
+      expect(store.get("t-again")?.reason).toBe("thread-no-access"); // still a candidate
+
+      // SECOND wake-up. The record is still a candidate, so without the barrier
+      // gate the loop would resume the same session again, build a second actor
+      // for one worktree, and overwrite the only reference fencing the first.
+      await fireRetry(app, jobs);
+
+      expect(copilot.resumes).toEqual(["sess-again"]); // no second resume
+      expect(sessionsOf(app).size).toBe(0);
+      expect(unconfirmedResumesOf(app).get("t-again")).toBe(retained); // same strong ref
+      expect(store.get("t-again")?.state).toBe("active");
+      expect(store.get("t-again")?.reason).toBe("thread-no-access");
+
+      // Once the runtime finally answers, the barrier clears and the very next
+      // wake-up recovers the thread for real.
+      //
+      // NOT for a HUNG teardown, though: `SessionActor.disconnect()` is
+      // single-flight over a promise that never settles, so no retry in this
+      // process can ever confirm it. That is why the barrier is held until a
+      // restart and why `/end` says so — a third wake-up must keep refusing
+      // rather than quietly deciding the runtime is probably fine by now.
+      copilot.setHanging(false);
+      await fireRetry(app, jobs);
+      expect(copilot.resumes).toEqual(["sess-again"]);
+      expect(sessionsOf(app).size).toBe(0);
+      expect(unconfirmedResumesOf(app).get("t-again")).toBe(retained);
+      expect(store.get("t-again")?.state).toBe("active"); // never terminalized
+      expect(store.get("t-again")?.reason).toBe("thread-no-access");
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("keeps the FIRST barrier if a discard ever races a second one", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-keepfirst", sessionId: "sess-keepfirst" }));
+      store.commit("t-keepfirst");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      shrinkTeardown(app);
+      const rec = store.get("t-keepfirst");
+      expect(rec).toBeDefined();
+      const first = { disconnect: async (): Promise<void> => new Promise<void>(() => {}) };
+      const second = { disconnect: async (): Promise<void> => {} };
+      const discard = (actor: unknown): Promise<void> =>
+        (
+          app as unknown as {
+            discardResumedActor(r: unknown, a: unknown, why: string): Promise<void>;
+          }
+        ).discardResumedActor(rec, actor, "test");
+
+      await discard(first);
+      expect(
+        (unconfirmedResumesOf(app).get("t-keepfirst") as { actor: unknown } | undefined)?.actor
+      ).toBe(first);
+
+      // A newer actor's clean exit does not make an older, unproven one safe.
+      await discard(second);
+      expect(
+        (unconfirmedResumesOf(app).get("t-keepfirst") as { actor: unknown } | undefined)?.actor
+      ).toBe(first);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("claims the thread for the in-thread /end too, not only /end thread:<id>", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-claim", sessionId: "sess-claim" }));
+      store.commit("t-claim");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      const claims = (app as unknown as { endClaims: Map<string, number> }).endClaims;
+      const seen: Array<number | undefined> = [];
+      const interaction = {
+        channelId: "t-claim",
+        guildId: "g1",
+        channel: { isThread: () => true, parentId: "c1" },
+        user: { id: "u1" },
+        options: { getString: () => null },
+        async reply(): Promise<void> {
+          seen.push(claims.get("t-claim")); // claimed while the command runs
+        },
+        async deferReply(): Promise<void> {},
+        async editReply(): Promise<void> {},
+      };
+      await (
+        app as unknown as { cmdEnd(i: unknown): Promise<void> }
+      ).cmdEnd(interaction);
+
+      expect(seen).toHaveLength(1);
+      expect(seen[0] ?? 0).toBeGreaterThanOrEqual(1); // claimed while the command runs
+      expect(claims.has("t-claim")).toBe(false); // and fully released afterwards
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("arms the retry loop in onReady, immediately after the phase gate opens", () => {
+    // No behavioural test can reach `onReady` without a real gateway and a REST
+    // command registration, and an unarmed loop in production is precisely the
+    // defect this whole feature exists to fix — so the wiring is asserted at the
+    // source, the way this repo already asserts shipped-script and doc contracts.
+    const src = readFileSync(join(process.cwd(), "src", "app.ts"), "utf8");
+    const armed = /this\.phase = "ready";\s*(?:\/\/[^\n]*\n\s*)*this\.startAccessRetryLoop\(\);/;
+    expect(src).toMatch(armed);
+    // And only there: a second arming site would be a second loop.
+    expect(src.match(/this\.startAccessRetryLoop\(\)/g)).toHaveLength(1);
   });
 });

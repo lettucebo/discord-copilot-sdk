@@ -916,7 +916,7 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 `InteractionCreate` / `MessageCreate`，所以同一個 process 內永遠不會再試一次。
 
 取得存取權時，Discord **確實**會對該**頻道**送出 `CHANNEL_UPDATE`（含去混淆資料，見
-`docs/CHANNEL-ACCESS.md` §7a）。但那個事件（a）不會指出「哪些綁定在它底下的討論串現在可以復原了」，
+`docs/CHANNEL-ACCESS.md` §8）。但那個事件（a）不會指出「哪些綁定在它底下的討論串現在可以復原了」，
 （b）討論串是另一個 channel 物件，可能從未被 cache、也不保證會收到對應更新。因此它是**有用的提示、
 不是充分的正確性來源**；正確性來源是週期掃描，事件未來最多只能 poke 這個 loop。
 
@@ -987,6 +987,23 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   - `discardResumedActor()` 在**嘗試 disconnect 之前**就把 actor 放進 `unconfirmedResumes`，只有
     **確認成功**才移除。從 actor 存在的那一刻起就可能有 runtime 抓著那個 checkout，正在進行中的丟棄
     必須是看得見的，而不是「還沒失敗所以 map 是空的」。
+  - **barrier 絕不被覆寫，而且會擋住下一次 resume**。舊版漏掉這一環：`/end` 因無法確認而拒絕、record
+    被保留成 `active`/`thread-no-access` 之後，**下一次 tick 仍然把它當候選**，於是對同一個 sessionId／
+    worktree 再 resume 出第二個 runtime，而它的丟棄會 `set()` 覆寫掉第一個的強引用——正好把 barrier
+    存在的理由（保住第一個 root capability）親手拆掉。現在：
+    (a) `unconfirmedResumes.set()` 只在沒有既有 entry 時寫入，confirmed 移除也只移除**同一個 actor** 的；
+    (b) tick 在 resume 之前先 `retryUnconfirmedResume()`，**只有確認清除才繼續**，否則跳過這個 candidate；
+    (c) `resumeOwnershipLost()` 也硬性檢查 barrier（tick 的檢查到這裡已經隔了好幾個 await）。
+    `isAccessRetryCandidate()` **刻意不**把有 barrier 的 record 排除：那會讓候選集合變空、迴圈轉入閒置，
+    barrier 就再也沒人重試了。
+  - **hung 與 reject 是兩種結局**：`SessionActor.disconnect()` 對同一次 teardown 是 single-flight，
+    所以一個**永遠不 settle** 的 disconnect 在這個 process 內永遠無法被確認——barrier 會一直留著、
+    record 一直是 `active`（不會被終態化），只有重啟能真正收乾淨，`/end` 也是這樣告訴操作者的。
+    會 reject 的 disconnect 則可以被之後的重試（`/end` 或 `stop()`）確認並清除 barrier。
+- **`endClaims` 同時覆蓋兩種 `/end`**：改為計數式（可重入）的 `Map<threadId, number>`，由 `cmdEnd()`
+  在授權檢查之後、任何 await 之前對 `explicit || channelId` 認領整個指令；`endStaleRecord()` 內層再認領
+  一次由計數處理。in-thread 的 `/end` 會先 `sessions.delete()` 再 await git，那個視窗裡討論串已經不是
+  live、record 卻還在，計數式認領讓 retry loop 不會把它當成邀請。
 - **成功的 resume 以 `commit()` 的回傳值為準**：`store.commit()` 是 persist-first，回 false 代表磁碟上
   （與記憶體中）的 record 仍寫著 `thread-no-access`。此時**不註冊 session、不貼成功通知**，而是把剛
   resume 出來的 actor 走 `discardResumedActor()`（無法確認就留成 barrier），record 與 local lease 原封
@@ -1029,8 +1046,10 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   證明乾淨時才會被刪。
 - 暫時性 fetch 失敗期間 `/sessions` 仍會顯示 `thread-no-access`（見 §19.2）。這是刻意的：非終態的 reason
   漂移會同時破壞重試資格與 `/end` 逃生口。
-- `unconfirmedResumes` 裡的 barrier 直到 process 結束都可能留著（`/end` 與 `stop()` 各再試一次）。這是
+- `unconfirmedResumes` 裡的 barrier 直到 process 結束都可能留著（`/end` 與 `stop()` 各再試一次；若 SDK
+  的 disconnect 是**永遠不 settle** 的 hang，single-flight 讓它在本 process 內根本無法被確認）。這是
   刻意的：無法證明已停止的 runtime 不該被當成已停止，記錄與 worktree 一起保留，重啟才是清乾淨的路。
+  期間該討論串**不會**被重複 resume（見 §19.3），也不會被終態化。
 - 重試路徑的 transient resume 失敗只會貼一次通知（每個 process、每個討論串）。第二次之後只有 log；
   狀態仍看得到（`/sessions`），成功復原時也會貼復原通知。
 - 一筆記錄的終態轉換寫入失敗時，retry loop 只能記錄（`console.error`）並讓它維持 `active`；沒有「讓啟動失敗」
@@ -1063,6 +1082,10 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | `/end` 落在 `addWorktree` **進行中**時，重建確實發生、而且必須被回收（後置 fence），不得留下無主 checkout | `test/app-reconcile.test.ts` |
 | `stop()` 對 `unconfirmedResumes` 再試一次：確認成功要清掉 barrier，仍無法確認要保留（連同 record） | `test/app-reconcile.test.ts` |
 | 第一次 tick 就沒有候選時，必須直接退到 5 分鐘閒置輪詢，且不碰非本迴圈的 `active` record | `test/app-reconcile.test.ts` |
+| **barrier 保留後的下一次 tick 不得再 resume 同一個 session**：不得有第二個 actor／resume 呼叫，第一個強引用必須原封不動；涵蓋 **hang**（不只立即 throw）的 disconnect 時序 | `test/app-reconcile.test.ts` |
+| 兩個丟棄競爭同一個 thread 時，barrier 必須保留**第一個**（較新的 actor 乾淨退出不代表較舊的安全） | `test/app-reconcile.test.ts` |
+| in-thread 的 `/end`（不加 `thread:`）也必須認領該討論串，並在結束後完全釋放 | `test/app-reconcile.test.ts` |
+| `onReady` 必須在 `phase = "ready"` 之後**立刻**啟動 retry loop，且全檔只有一處啟動點（source 契約，如同本 repo 既有的 shipped-script／docs 契約測試） | `test/app-reconcile.test.ts` |
 
 ### 19.7 後續工作（尚未做）
 
