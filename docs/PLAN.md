@@ -522,7 +522,11 @@ PR #35 合併後的 CI 在 Ubuntu 兩個 Node 版本失敗、Windows 兩個版�
 交付流程也重演了 §16 的失敗模式：PR #35 合併前只有 GitGuardian，
 **沒有 CI matrix check-run**；merge 後約 18 分鐘完整 CI 才開始。errno
 規則只能防這一種 test 缺陷；防止紅燈進 main 仍須 branch protection
-把完整 matrix 設為 required checks，不能以人工等待或「稍後再看」取代。
+把完整 matrix 設為 required checks，或採取同等強度的 server-side
+enforcement，不能以人工等待或「稍後再看」取代。**但不可直接開啟**：
+§16.3 的 release 目前依賴 `git push --atomic --follow-tags origin main`；
+`enforce_admins=true` 會阻斷該流程。必須先把 release 改為受保護分支相容
+的流程（或設計不會同時放寬一般 merge 的精確 bypass），再切換 enforcement。
 
 操作規則刻意限縮如下：
 
