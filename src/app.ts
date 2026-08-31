@@ -596,9 +596,16 @@ export class DiscordCopilotApp {
    *  without making "a candidate can never appear later" a correctness
    *  assumption. */
   private accessRetryIdle = false;
-  /** Threads a retry is resuming RIGHT NOW, published before its first await so
-   *  `/end` and `stop()` can join it rather than discover it afterwards. */
-  private readonly accessResumeInFlight = new Set<string>();
+  /** Threads a retry is resuming RIGHT NOW → a promise that settles only once
+   *  that whole attempt, INCLUDING any discard and barrier registration, is
+   *  finished. Published before the attempt's first await so `/end` and `stop()`
+   *  can join the real thing rather than race a timeout against it. */
+  private readonly accessResumeSettled = new Map<string, Promise<void>>();
+  /** How long `/end` waits for such an attempt before giving up on it. A test
+   *  seam: safety does not depend on this value (an attempt that has not settled
+   *  makes `/end` refuse rather than proceed), only on how long an operator
+   *  waits to be told so. */
+  private accessResumeJoinTimeoutMs = TEARDOWN_TIMEOUT_MS;
   /** Threads an explicit teardown has claimed but not yet finished. `/end` sets
    *  this synchronously, before its own first await, because its record removal
    *  happens several awaits later — long enough for a retry to resume and
@@ -2074,8 +2081,16 @@ export class DiscordCopilotApp {
     // going to discard itself (`resumeOwnershipLost` sees the claim), and
     // waiting for that means its actor is torn down BEFORE this command starts
     // proving worktrees removable, instead of racing it. Bounded, because a
-    // wedged runtime must not make `/end` unusable.
-    await this.joinAccessResume(threadId);
+    // wedged runtime must not make `/end` unusable — and if the bound expires
+    // the answer is a refusal, never "carry on as if nothing were running".
+    if (!(await this.joinAccessResume(threadId))) {
+      await interaction.reply({
+        content:
+          "⚠️ 這個討論串正在自動復原中，**還沒結束**，所以不能現在清除（可能會把它正在用的 worktree 抽掉）。請稍後再試一次。",
+        ...EPHEMERAL,
+      });
+      return;
+    }
     // That discard may not have been confirmable. A worktree must never be
     // deleted out from under a process that might still be writing to it, so
     // one more bounded attempt — and, failing that, the same honest refusal
@@ -3876,10 +3891,17 @@ export class DiscordCopilotApp {
       if (this.endClaims.has(candidate.threadId)) continue;
       const rec = this.store.get(candidate.threadId);
       if (!rec || !this.isAccessRetryCandidate(rec)) continue;
-      // Published BEFORE the first await, so `/end` and `stop()` can see that a
-      // resume is under way for this exact thread rather than discovering it
-      // afterwards. Cleared in `finally`, including on a thrown transition.
-      this.accessResumeInFlight.add(rec.threadId);
+      // Published BEFORE the first await, and settled only after any discard and
+      // barrier registration below have finished. `/end` awaits THIS, so it can
+      // never observe "no barrier yet" merely because its own bound expired
+      // while the discard was still running.
+      let settle: () => void = () => {};
+      this.accessResumeSettled.set(
+        rec.threadId,
+        new Promise<void>((resolve) => {
+          settle = resolve;
+        })
+      );
       try {
         // The SAME reconcile path startup uses: it re-validates the binding and
         // re-classifies the thread, and only a `valid` classification resumes.
@@ -3903,7 +3925,8 @@ export class DiscordCopilotApp {
         if (err instanceof FatalReconcileError) console.error(`access-retry: ${msg}`);
         else console.warn(`access-retry: ${rec.threadId} failed (${msg}); continuing.`);
       } finally {
-        this.accessResumeInFlight.delete(rec.threadId);
+        this.accessResumeSettled.delete(rec.threadId);
+        settle();
       }
       if (this.sessions.has(rec.threadId)) resumed = true;
     }
@@ -4346,6 +4369,23 @@ export class DiscordCopilotApp {
       await this.discardResumedActor(rec, actor, lost);
       return;
     }
+    // Make the record say "recovered" BEFORE registering the session, and treat
+    // a failed write as a failed resume. `commit()` is persist-first, so a false
+    // return means the record on disk (and in memory) still says
+    // `thread-no-access` — registering anyway would put a live session behind a
+    // durable record that denies it exists, which is the same "live session with
+    // no usable record" hazard the `/end` handshake exists to prevent. The
+    // record and its lease are left exactly as they were, so the next wake-up
+    // (or the next boot) simply tries again.
+    if (!this.store.commit(rec.threadId)) {
+      console.error(
+        `reconcile: could not persist the recovered state for ${rec.threadId} at ${sessionStorePath()}; ` +
+          `discarding the resumed session and leaving the record for a later retry.`
+      );
+      await this.discardResumedActor(rec, actor, "the recovered state could not be written to disk");
+      await this.noticeTransientResumeFailure(rec.threadId, "無法寫入磁碟更新 session 記錄", opts);
+      return;
+    }
     this.sessions.set(rec.threadId, {
       actor,
       broker,
@@ -4362,7 +4402,6 @@ export class DiscordCopilotApp {
       // what resume is FOR — so a rebind must always confirm before discarding it.
       hasRunTurn: true,
     });
-    this.store.commit(rec.threadId); // keep active, refresh updatedAt
     await this.transport
       .notice(
         rec.threadId,
@@ -4401,10 +4440,14 @@ export class DiscordCopilotApp {
     return undefined;
   }
 
-  /** Wait, boundedly, for an in-flight access retry on this thread to settle. */
-  private async joinAccessResume(threadId: string): Promise<void> {
-    if (!this.accessResumeInFlight.has(threadId)) return;
-    await withTimeout(this.accessRetryTickPromise ?? Promise.resolve(), TEARDOWN_TIMEOUT_MS).catch(() => {});
+  /** Wait, boundedly, for an in-flight access retry on this thread to settle.
+   *  Reports whether it actually did: a caller that is about to delete a
+   *  checkout may not treat "I stopped waiting" as "it finished". */
+  private async joinAccessResume(threadId: string): Promise<boolean> {
+    const settled = this.accessResumeSettled.get(threadId);
+    if (!settled) return true;
+    await withTimeout(settled, this.accessResumeJoinTimeoutMs).catch(() => {});
+    return !this.accessResumeSettled.has(threadId);
   }
 
   /**
@@ -4465,11 +4508,15 @@ export class DiscordCopilotApp {
     why: string
   ): Promise<void> {
     console.warn(`resume: discarding the resumed session for ${rec.threadId} — ${why}`);
+    // Registered BEFORE the attempt, not after it fails. From the instant this
+    // actor exists a runtime may be holding the checkout, and a caller that
+    // looks while the disconnect is still in flight must see the barrier — not
+    // an empty map that reads as "nothing is running here".
+    this.unconfirmedResumes.set(rec.threadId, { actor, binding: rec });
     try {
       await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS);
-      return;
+      this.unconfirmedResumes.delete(rec.threadId); // confirmed gone; drop it
     } catch {
-      this.unconfirmedResumes.set(rec.threadId, { actor, binding: rec });
       console.warn(
         `resume: could not confirm the discarded runtime for ${rec.threadId} stopped; ` +
           `retaining it as a barrier over ${rec.workDir} until a retry or restart confirms it.`

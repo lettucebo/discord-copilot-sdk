@@ -978,9 +978,20 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
     （`/end` 失敗時 record 仍是 `active`，必須重新回到迴圈）。
   - `accessRetryTick` 跳過 `endClaims` 中的 candidate；`resumeOwnershipLost()` 也檢查它（在讀 store 之前，
     因為 record 這時還在）。
-  - `accessResumeInFlight` 在**每個 candidate 的第一個 await 之前**發布，`/end` 用它決定要不要
-    `joinAccessResume()`——有界（`TEARDOWN_TIMEOUT_MS`）等待該 tick 結束，讓被丟棄的 actor 在 `/end`
-    開始證明 worktree 可刪之前就已經拆掉，而不是和它賽跑。
+  - `accessResumeSettled` 在**每個 candidate 的第一個 await 之前**發布一個「這次嘗試（含丟棄與 barrier
+    註冊）全部結束」的 promise。`/end` 有界 `joinAccessResume()` 等的是**這個**，不是 tick promise：
+    舊版外層 bound 與內層 discard 的 `disconnect()` bound 同為 `TEARDOWN_TIMEOUT_MS`，外層可能先到期、
+    `/end` 於是看到空的 barrier map 而放手去回收。現在**逾時本身不再影響安全性**——沒有 settle 的嘗試
+    會讓 `/end`**拒絕**（誠實回覆「還沒結束，請稍後再試」），而不是繼續。bound 只決定操作者等多久被
+    告知，因此是可注入的測試 seam，不是靠 2× 之類的魔術數字。
+  - `discardResumedActor()` 在**嘗試 disconnect 之前**就把 actor 放進 `unconfirmedResumes`，只有
+    **確認成功**才移除。從 actor 存在的那一刻起就可能有 runtime 抓著那個 checkout，正在進行中的丟棄
+    必須是看得見的，而不是「還沒失敗所以 map 是空的」。
+- **成功的 resume 以 `commit()` 的回傳值為準**：`store.commit()` 是 persist-first，回 false 代表磁碟上
+  （與記憶體中）的 record 仍寫著 `thread-no-access`。此時**不註冊 session、不貼成功通知**，而是把剛
+  resume 出來的 actor 走 `discardResumedActor()`（無法確認就留成 barrier），record 與 local lease 原封
+  不動留給下一次 wake-up／重啟。否則就會出現「活著的 session 背後是一筆否認它存在的 record」，正是
+  `/end` handshake 要防的同一類危險。`commit()` → `sessions.set()` 之間沒有 await，仍是原子步驟。
 - **shutdown 一定贏**：`stop()` 先設 `shuttingDown` / `phase`，再 `clearAccessRetryTimer()`，
   **然後有界地 `await accessRetryTickPromise`**。只清 timer 只擋得住下一次 tick；已經在飛的那一次仍可能
   正在寫 store，若讓 `stop()` 先 resolve，就會出現「process 宣告拆完、lock 已釋放之後才寫磁碟」。
@@ -1047,5 +1058,22 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | `stop()` resolve 之後不得再有任何持久寫入（有界 join in-flight tick） | `test/app-reconcile.test.ts` |
 | retry 路徑的 transient resume 失敗只貼**一次**、且文案不得叫使用者重啟 | `test/app-reconcile.test.ts` |
 | startup `skip` notice 必須依 reason 分流：no-access 說「恢復存取權後自動復原、不必重啟」，transient/unknown 說「重啟才會再試」 | `test/app-reconcile.test.ts` |
+| `/end` 的 join 在嘗試 settle 之前就到期時，必須**拒絕回收**（record 與 worktree 都不動），而不是當作沒有東西在跑 | `test/app-reconcile.test.ts` |
+| `commit()` 回 false 時不得註冊 session、不得貼成功通知；record／lease 保留，下一次 wake-up 仍能真正復原 | `test/app-reconcile.test.ts` |
+| `/end` 落在 `addWorktree` **進行中**時，重建確實發生、而且必須被回收（後置 fence），不得留下無主 checkout | `test/app-reconcile.test.ts` |
+| `stop()` 對 `unconfirmedResumes` 再試一次：確認成功要清掉 barrier，仍無法確認要保留（連同 record） | `test/app-reconcile.test.ts` |
+| 第一次 tick 就沒有候選時，必須直接退到 5 分鐘閒置輪詢，且不碰非本迴圈的 `active` record | `test/app-reconcile.test.ts` |
+
+### 19.7 後續工作（尚未做）
+
+`app.ts` 因這個功能增加約 330 行（loop、fence、handshake、barrier）。這些狀態彼此高度相關
+（`accessRetry*`、`accessResume*`、`endClaims`、`unconfirmedResumes`），已經是一個可以獨立命名的
+物件——`AccessRetryCoordinator`。**刻意不在這一輪做**：抽取會把剛剛用測試釘死的競態時序整批搬家，
+風險與收益不成比例。列為後續：連同它的測試一起搬，維持每個競態測試的顯式交錯寫法。
+
+測試側則**刻意不合併** fixture 樣板。每個案例在 copilot（fake／gated／resume 失敗／commit spy）、
+transport、record 形狀（local／worktree）、fetch 行為上至少差一項；把它們塞進一個多旋鈕的 helper 只會
+把「這個測試到底哪裡不一樣」藏起來，而這正是競態測試唯一重要的資訊。本檔案既有的 41 個測試也都用
+同樣的顯式寫法。
 | shutdown 穿插 in-flight retry：不註冊 session、不再 arm timer、record 原封不動留給下次開機 | `test/app-reconcile.test.ts` |
 | armed timer 必須 `unref`，`clearAccessRetryTimer()` 必須真的清掉 | `test/app-reconcile.test.ts` |

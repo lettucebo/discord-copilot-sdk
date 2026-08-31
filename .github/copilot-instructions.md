@@ -249,7 +249,9 @@ the thread (`no-access`, `transient`, unknown) writes **nothing**: rewriting the
 `thread-no-access` reason would drop it out of both the loop's candidate filter and `/end`'s escape
 hatch, parking it until a restart. `/end` claims a thread synchronously before its own first await
 and the loop skips claimed threads, because `/end` removes the record several awaits later — long
-enough for a resume to register a session it would then orphan. `resumeRecord` re-proves it still
-owns the record before it rebuilds a missing worktree, again after that rebuild, and once more
-immediately before `sessions.set`; a discarded session whose disconnect cannot be confirmed is
-retained as a barrier (`unconfirmedResumes`) and `/end` refuses to reclaim the checkout behind it.
+enough for a resume to register a session it would then orphan; an attempt that has not settled
+makes `/end` refuse rather than proceed, so no timeout value is load-bearing. `resumeRecord`
+re-proves it still owns the record before it rebuilds a missing worktree, again after that rebuild,
+and once more immediately before `sessions.set`; it registers a session only after `commit()` has
+durably recorded the recovery, and a discarded session is entered in `unconfirmedResumes` **before**
+its disconnect is attempted and removed only when that disconnect is confirmed.

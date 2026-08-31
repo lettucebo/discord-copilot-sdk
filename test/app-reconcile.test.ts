@@ -1,14 +1,20 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { DiscordCopilotApp } from "../src/app.js";
 
-/** Counts every real worktree recreation. `resumeRecord` rebuilds a MISSING
- *  worktree from its surviving branch, which is a disk side effect that must
- *  not happen for a record `/end` or shutdown already claimed — and "it did not
- *  happen" is only assertable by watching the call, since a fixture repo makes
- *  the git command fail either way. Delegates to the real implementation, so no
- *  other test in this file changes behaviour. */
-const { addWorktreeCalls } = vi.hoisted(() => ({
+/** Counts every real worktree recreation, and lets one test suspend INSIDE it.
+ *  `resumeRecord` rebuilds a MISSING worktree from its surviving branch, which
+ *  is a disk side effect that must not happen for a record `/end` or shutdown
+ *  already claimed — and "it did not happen" is only assertable by watching the
+ *  call, since a fixture repo makes the git command fail either way. With no
+ *  hook installed both delegate to the real implementation, so no other test in
+ *  this file changes behaviour. */
+const { addWorktreeCalls, worktreeHooks, removeWorktreeCalls } = vi.hoisted(() => ({
   addWorktreeCalls: [] as Array<{ repo: string; dir: string; branch: string }>,
+  removeWorktreeCalls: [] as Array<{ repo: string; dir: string; branch?: string }>,
+  worktreeHooks: {} as {
+    add?: (repo: string, dir: string, branch: string) => Promise<void>;
+    remove?: (repo: string, dir: string, branch?: string) => Promise<string>;
+  },
 }));
 vi.mock("../src/core/worktree.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/core/worktree.js")>();
@@ -16,7 +22,13 @@ vi.mock("../src/core/worktree.js", async (importOriginal) => {
     ...actual,
     addWorktree: async (repo: string, dir: string, branch: string): Promise<void> => {
       addWorktreeCalls.push({ repo, dir, branch });
+      if (worktreeHooks.add) return worktreeHooks.add(repo, dir, branch);
       return actual.addWorktree(repo, dir, branch);
+    },
+    removeWorktreeIfClean: async (repo: string, dir: string, branch?: string): Promise<unknown> => {
+      removeWorktreeCalls.push({ repo, dir, branch });
+      if (worktreeHooks.remove) return worktreeHooks.remove(repo, dir, branch);
+      return actual.removeWorktreeIfClean(repo, dir, branch);
     },
   };
 });
@@ -78,6 +90,8 @@ const wtBind = (id: string, over: Partial<SessionBinding> = {}): SessionBinding 
 };
 
 afterEach(() => {
+  delete worktreeHooks.add;
+  delete worktreeHooks.remove;
   for (const d of wtDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
@@ -1253,11 +1267,7 @@ describe("a record retired by reclaim stays announceable", () => {
   });
 });
 
-// 240 atomic write-then-rename store mutations (80 records × reserve/commit/
-// setState) is genuinely disk-bound, and it sits behind every other case in
-// this file. The explicit budget follows the same convention the subprocess
-// suites use rather than letting a slow disk read as a logic failure.
-describe("startup announcement length budget", { timeout: 30_000 }, () => {
+describe("startup announcement length budget", () => {
   class Cap extends FakeTransport {
     sent: string[] = [];
     override async noticeDelivered(_k: string, t: string): Promise<boolean> {
@@ -1371,7 +1381,7 @@ function runRetryTick(app: DiscordCopilotApp): void {
 
 /** A copilot whose resume is held open until the test releases it, so `/end`
  *  and shutdown can be driven while a resume really is in flight. */
-function gatedCopilot(opts: { disconnectError?: string } = {}): {
+function gatedCopilot(opts: { disconnectError?: string; disconnectFails?: () => boolean } = {}): {
   client: CopilotClient;
   calls: string[];
   release: () => void;
@@ -1387,7 +1397,9 @@ function gatedCopilot(opts: { disconnectError?: string } = {}): {
     ...fakeSession,
     async disconnect(): Promise<void> {
       disconnects++;
-      if (opts.disconnectError) throw new Error(opts.disconnectError);
+      if (opts.disconnectError ?? opts.disconnectFails?.()) {
+        throw new Error(opts.disconnectError ?? "runtime is not responding");
+      }
     },
   };
   return {
@@ -2397,6 +2409,335 @@ describe("access retry vs an explicit teardown that started FIRST", () => {
       expect(store.get("t-flaky")?.state).toBe("active");
       expect(store.get("t-flaky")?.reason).toBe("thread-no-access"); // still eligible
       expect(sessionsOf(app).has("t-flaky")).toBe(false);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});
+
+describe("access retry — settlement, durability and teardown retries", () => {
+  /** Shrink `/end`'s bounded join so the "it did not finish in time" branch is
+   *  reachable without a five-second test. Safety never depended on the value:
+   *  an unsettled attempt refuses, it does not proceed. */
+  function shrinkJoin(app: DiscordCopilotApp, ms = 10): void {
+    (app as unknown as { accessResumeJoinTimeoutMs: number }).accessResumeJoinTimeoutMs = ms;
+  }
+
+  it("refuses to reclaim when the join expires before the attempt has settled", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const wt = wtBind("t-join", { sessionId: "sess-join" });
+      store.reserve(wt);
+      store.commit("t-join");
+      const gated = gatedCopilot();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        gated.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      shrinkJoin(app);
+      access = true;
+
+      // Wedged INSIDE the runtime, i.e. before any actor exists to put in the
+      // barrier. The old join raced the discard's own 5s bound and could return
+      // to a `/end` that then saw an empty barrier map and reclaimed.
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(gated.calls).toHaveLength(1));
+
+      const interaction = fakeInteraction();
+      await (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(interaction, "t-join");
+
+      expect(interaction.replies.join("\n")).toContain("還沒結束");
+      expect(store.get("t-join")?.state).toBe("active"); // NOT reclaimed
+      expect(existsSync(wt.workDir)).toBe(true); // and its checkout is intact
+      expect(removeWorktreeCalls.filter((c) => c.dir === wt.workDir)).toHaveLength(0);
+
+      gated.release();
+      await tick;
+      // The refusal did no destructive work and cancelled nothing, so the
+      // recovery simply finishes. The owner is told to try again — and can now
+      // `/end` inside the thread that just came back.
+      expect(sessionsOf(app).has("t-join")).toBe(true);
+      expect(store.get("t-join")?.reason).toBeUndefined();
+      expect(existsSync(wt.workDir)).toBe(true);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("does not register, or announce, a recovery it could not write down", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-nodisk", sessionId: "sess-nodisk" }));
+      store.commit("t-nodisk");
+      const transport = new FakeTransport();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        transport,
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      expect(localLeasesOf(app).size).toBe(1);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+      const before = transport.notices.length;
+
+      const commit = vi.spyOn(store, "commit").mockReturnValue(false);
+      try {
+        await fireRetry(app, jobs);
+      } finally {
+        commit.mockRestore();
+      }
+
+      // Persist-first: the record still says it was never recovered, so a live
+      // session behind it would be a session no durable record admits exists.
+      expect(sessionsOf(app).has("t-nodisk")).toBe(false);
+      expect(store.get("t-nodisk")?.state).toBe("active");
+      expect(store.get("t-nodisk")?.reason).toBe("thread-no-access"); // still eligible
+      expect(localLeasesOf(app).size).toBe(1); // lease preserved with the record
+      const posted = transport.notices.slice(before);
+      expect(posted.some((n) => n.includes("已復原此對話"))).toBe(false); // no false success
+      expect(posted.some((n) => n.includes("無法寫入磁碟"))).toBe(true);
+
+      // And the very next wake-up recovers it for real.
+      await fireRetry(app, jobs);
+      expect(sessionsOf(app).has("t-nodisk")).toBe(true);
+      expect(store.get("t-nodisk")?.reason).toBeUndefined();
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("undoes a worktree it rebuilt when /end lands INSIDE the rebuild", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const wt = wtBind("t-mid", { sessionId: "sess-mid" });
+      store.reserve(wt);
+      store.commit("t-mid");
+      const gated = gatedCopilot();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        gated.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+
+      // Suspend INSIDE the rebuild: the pre-check cannot cover this window, so
+      // only the post-rebuild fence can stop a checkout being left behind.
+      let insideRebuild: () => void = () => {};
+      const entered = new Promise<void>((r) => {
+        insideRebuild = r;
+      });
+      let releaseRebuild: () => void = () => {};
+      const held = new Promise<void>((r) => {
+        releaseRebuild = r;
+      });
+      worktreeHooks.add = async (_repo, dir) => {
+        insideRebuild();
+        await held;
+        mkdirSync(dir, { recursive: true }); // a REAL rebuild would now exist
+      };
+      worktreeHooks.remove = async (_repo, dir) => {
+        rmSync(dir, { recursive: true, force: true });
+        return "removed";
+      };
+
+      rmSync(wt.workDir, { recursive: true, force: true });
+      const addsBefore = addWorktreeCalls.length;
+      const tick = beginRetry(app, jobs);
+      await entered;
+
+      const ending = (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(fakeInteraction(), "t-mid");
+      releaseRebuild();
+      gated.release();
+      await ending;
+      await tick;
+
+      expect(addWorktreeCalls.length).toBe(addsBefore + 1); // it really did rebuild
+      expect(removeWorktreeCalls.some((c) => c.dir === wt.workDir)).toBe(true); // and undid it
+      expect(existsSync(wt.workDir)).toBe(false);
+      expect(store.get("t-mid")).toBeUndefined();
+      expect(sessionsOf(app).has("t-mid")).toBe(false);
+      expect(gated.calls).toHaveLength(0); // never reached the runtime
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("clears a retained barrier when shutdown's retry finally confirms it", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-bar1", sessionId: "sess-bar1" }));
+      store.commit("t-bar1");
+      let failDisconnect = true;
+      const gated = gatedCopilot({ disconnectFails: () => failDisconnect });
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        gated.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(gated.calls).toHaveLength(1));
+      const ending = (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(fakeInteraction(), "t-bar1");
+      gated.release();
+      await ending;
+      await tick;
+      expect(unconfirmedResumesOf(app).has("t-bar1")).toBe(true);
+
+      failDisconnect = false; // the runtime finally answers
+      await app.stop();
+      expect(unconfirmedResumesOf(app).has("t-bar1")).toBe(false);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("keeps a retained barrier that shutdown still cannot confirm", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-bar2", sessionId: "sess-bar2" }));
+      store.commit("t-bar2");
+      const gated = gatedCopilot({ disconnectFails: () => true });
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        gated.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(gated.calls).toHaveLength(1));
+      const ending = (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(fakeInteraction(), "t-bar2");
+      gated.release();
+      await ending;
+      await tick;
+      expect(unconfirmedResumesOf(app).has("t-bar2")).toBe(true);
+
+      await app.stop();
+      // Still unconfirmed ⇒ still a barrier. It is not a leak: it is the only
+      // thing standing between a maybe-live runtime and its working tree.
+      expect(unconfirmedResumesOf(app).has("t-bar2")).toBe(true);
+      expect(store.get("t-bar2")?.state).toBe("active"); // record kept with it
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("idles at the longest interval when the very first tick finds no candidate", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-none", sessionId: "sess-none" }));
+      store.commit("t-none"); // active, but never parked on no-access
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let fetched = 0;
+      setChannelFetch(app, async () => {
+        fetched++;
+        return visibleThread;
+      });
+
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      expect(jobs.map((j) => j.ms)).toEqual([15_000]);
+
+      await fireRetry(app, jobs);
+
+      expect(fetched).toBe(0); // an ordinary active record is not this loop's business
+      expect(sessionsOf(app).size).toBe(0);
+      expect(jobs.map((j) => j.ms)).toEqual([300_000]); // idle poll, not a 15s spin
+      expect(store.get("t-none")?.state).toBe("active");
+
+      await fireRetry(app, jobs);
+      expect(jobs.map((j) => j.ms)).toEqual([300_000]); // and it stays there
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });
