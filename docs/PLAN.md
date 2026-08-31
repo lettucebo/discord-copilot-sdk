@@ -913,9 +913,12 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 [ADR-0002](adr/0002-missing-access-is-retryable.md) 承諾：`thread-no-access` 的 session 會在
 **bot 的頻道存取權恢復後，或 bot 重啟後**自動復原。實際上只有「重啟」那一半是真的——
 `reconcileOnStartup()` 在 production 只有 `onReady` 一個呼叫點，`login()` 也只註冊
-`InteractionCreate` / `MessageCreate`，所以同一個 process 內永遠不會再試一次。權限被還原時，
-bot 對「它原本看不到的討論串」不保證會收到任何可用的 gateway 事件（它先前就收不到那個頻道的
-事件），因此「等事件」無法作為正確性來源。
+`InteractionCreate` / `MessageCreate`，所以同一個 process 內永遠不會再試一次。
+
+取得存取權時，Discord **確實**會對該**頻道**送出 `CHANNEL_UPDATE`（含去混淆資料，見
+`docs/CHANNEL-ACCESS.md` §7a）。但那個事件（a）不會指出「哪些綁定在它底下的討論串現在可以復原了」，
+（b）討論串是另一個 channel 物件，可能從未被 cache、也不保證會收到對應更新。因此它是**有用的提示、
+不是充分的正確性來源**；正確性來源是週期掃描，事件未來最多只能 poke 這個 loop。
 
 ### 19.2 採納的設計
 
@@ -927,8 +930,18 @@ bot 對「它原本看不到的討論串」不保證會收到任何可用的 gat
   每個 candidate 在動手前會**重新讀取**目前的 durable record（`store.get`），因為上一個 candidate 的
   resume、`/end`、shutdown 都可能在 await 期間改變世界。
 - **cadence**：`ACCESS_RETRY_DELAYS_MS = [15s, 30s, 60s, 2m, 5m]`，掃到 candidate 但沒有任何 resume
-  成功就往上退避、封頂 5 分鐘；一旦有 resume 成功或候選集合為空就回到 15s。
+  成功就往上退避、封頂 5 分鐘；一旦有 resume 成功就回到 15s。候選集合為空時**固定用最長間隔輪詢**
+  （而不是每 15 秒空轉一次，也不是直接停掉 timer）——停掉 timer 會把「執行期間不會再出現新的
+  `thread-no-access`」從效能假設變成正確性假設。
   **永遠不會因為重試太多次而把記錄改成終態**——那正是 ADR-0002 反對的事。
+- **`MAX_LIVE_SESSIONS` 刻意不套用在這個 loop**：那個上限管的是 `/new`（要求更多工作）；這個 loop
+  只是把一筆**已經存在**、而且如果權限早一分鐘還在就會被 startup 無條件 resume 的 record 收尾。
+  用上限擋它等於讓一段對話卡在一個它的擁有者從未跨過的門檻上，而且沒有佇列可以放。
+- **每次重試都 `force` 重新抓取討論串**：discord.js 的 `channels.fetch(id)` 只要 cache 裡有非 partial
+  物件就直接回 cache，而失去存取權之後 cache 裡存的正是**混淆 stub**（`name === "___hidden___"`）。
+  不 force 的重試可能永遠回報「看不到」，即使 bot 其實已經看得到——那會讓整個 loop 在最重要的情境
+  下靜默失效。`fetchChannelSafe(client, id, { force })` 只讓這一個呼叫端 force；startup 與其他呼叫
+  端維持走 cache，不浪費 rate limit。
 - **retry 模式下的 `skip` 是完全的 no-op**：不寫 store、不 `console.warn`、不發 notice。
   這不只是為了避免洗版——**改寫 reason 會造成死結**。候選過濾用的是 `reason === "thread-no-access"`，
   而 `/end thread:<id>` 的 ADR-0002 逃生口也是用同一個字串判斷；只要一次 429/5xx 讓 record 被寫成
@@ -957,11 +970,26 @@ bot 對「它原本看不到的討論串」不保證會收到任何可用的 gat
      record 已非 `active`、record 的 `sessionId`/`generation` 已改變，任一成立就**丟棄**剛 resume 出來的
      session（bounded `disconnect()`）而不註冊。fence 與 `sessions.set()` 之間沒有 await，因此是一個
      不可被插入的原子步驟。startup 路徑同樣受惠：它以前也沒有這些保護。
-- **`/end` 一定贏**：`/end thread:<id>` 對 `thread-no-access` 的 record 本來就允許 reclaim。它移除
-  record（或在 worktree 保留時 retire 成 `blocked`）之後，in-flight 的 retry 會在 fence 撞上
-  「record 不見了 / 不是 active」，於是不復活它。
-- **shutdown 一定贏**：`stop()` 先設 `shuttingDown` / `phase`，再 `clearAccessRetryTimer()`。已經在飛的
-  tick 會在 fence 撞上 `shuttingDown`；tick 結束後的 `scheduleAccessRetry()` 因 `shuttingDown` 不再 arm。
+- **`/end` 一定贏（雙向 handshake，不只事後 fence）**：`/end thread:<id>` 的 record 移除發生在好幾個
+  await 之後，光靠事後 fence 只能擋「retry 先開始」的那一半；「`/end` 先開始」的那一半會讓 retry 在
+  `/end` 的 await 空隙裡 resume 並 `sessions.set`，最後留下一個**沒有 record、而且 local lease 已被釋放**
+  的 live session。因此：
+  - `endStaleRecord()` 在**自己的第一個 await 之前**同步把 threadId 放進 `endClaims`，`finally` 移除
+    （`/end` 失敗時 record 仍是 `active`，必須重新回到迴圈）。
+  - `accessRetryTick` 跳過 `endClaims` 中的 candidate；`resumeOwnershipLost()` 也檢查它（在讀 store 之前，
+    因為 record 這時還在）。
+  - `accessResumeInFlight` 在**每個 candidate 的第一個 await 之前**發布，`/end` 用它決定要不要
+    `joinAccessResume()`——有界（`TEARDOWN_TIMEOUT_MS`）等待該 tick 結束，讓被丟棄的 actor 在 `/end`
+    開始證明 worktree 可刪之前就已經拆掉，而不是和它賽跑。
+- **shutdown 一定贏**：`stop()` 先設 `shuttingDown` / `phase`，再 `clearAccessRetryTimer()`，
+  **然後有界地 `await accessRetryTickPromise`**。只清 timer 只擋得住下一次 tick；已經在飛的那一次仍可能
+  正在寫 store，若讓 `stop()` 先 resolve，就會出現「process 宣告拆完、lock 已釋放之後才寫磁碟」。
+- **無法確認關閉的被丟棄 runtime 會被保留成 barrier**：`discardResumedActor()` 若 `disconnect()` 失敗，
+  該 actor 會被**強引用**留在 `unconfirmedResumes`（Windows 上這個引用就是 root capability 的生命線，
+  掉了就等於允許把可能還活著的 runtime 的工作目錄改名/刪掉）。刻意**不**走 stale-rebind companion row：
+  那會在同一個 worktree 上產生第二個持久宣告，而主 record 通常還在、還指著同一個 session，兩個宣告會
+  互相把對方的 checkout 刪掉。改為沿用 `/end` 既有的慣用法——`/end` 會再試一次有界 disconnect，仍無法
+  確認就**拒絕回收**並誠實回覆（記錄與 worktree 都保留，請重啟），`stop()` 也會再試一次。
 - **lease / generation 不變式不變**：retry 不會另外取 lease（startup pre-scan 取的 local lease 在
   `thread-no-access` 期間本來就一直持有），terminal 轉換仍由既有的 `block` 分支釋放 lease；resume 一律
   以 record 上的 `sessionId` / `generation` / `workDir` 回到同一個 worktree 與同一個 conversation。
@@ -977,7 +1005,9 @@ bot 對「它原本看不到的討論串」不保證會收到任何可用的 gat
 - **在持久化 schema 增加 `nextRetryAt` 之類欄位**：重試節奏是 process 內的排程細節，不是需要跨重啟保存的
   事實（重啟本來就會立刻重試一次）。避免動 schema。
 - **`/end` 在 retry in-flight 時拒絕執行**：那會讓「唯一的放棄逃生口」在最需要它的時候不可用。改為
-  「`/end` 先贏、retry 事後自我丟棄」。
+  「`/end` 先宣告擁有權、有界 join、然後贏」。
+- **把被丟棄的 runtime 交給 stale-rebind companion 機制**：見 §19.3 的雙重宣告問題。
+- **startup 也一律 `force` 抓取**：startup 的 cache 本來就近乎空的，全面 force 只是多花 rate limit。
 
 ### 19.5 已接受的殘留風險
 
@@ -988,6 +1018,10 @@ bot 對「它原本看不到的討論串」不保證會收到任何可用的 gat
   證明乾淨時才會被刪。
 - 暫時性 fetch 失敗期間 `/sessions` 仍會顯示 `thread-no-access`（見 §19.2）。這是刻意的：非終態的 reason
   漂移會同時破壞重試資格與 `/end` 逃生口。
+- `unconfirmedResumes` 裡的 barrier 直到 process 結束都可能留著（`/end` 與 `stop()` 各再試一次）。這是
+  刻意的：無法證明已停止的 runtime 不該被當成已停止，記錄與 worktree 一起保留，重啟才是清乾淨的路。
+- 重試路徑的 transient resume 失敗只會貼一次通知（每個 process、每個討論串）。第二次之後只有 log；
+  狀態仍看得到（`/sessions`），成功復原時也會貼復原通知。
 - 一筆記錄的終態轉換寫入失敗時，retry loop 只能記錄（`console.error`）並讓它維持 `active`；沒有「讓啟動失敗」
   這個槓桿可用。維持 `active` 是不會弄丟對話的那個方向。
 - `/end` 若在 retry 已經 `sessions.set()` **之後**才抵達，走的是既有的 live-session `/end` 路徑，這裡沒有
@@ -1007,5 +1041,11 @@ bot 對「它原本看不到的討論串」不保證會收到任何可用的 gat
 | `/end` 穿插 in-flight retry：record 不得被復活，live map 保持空，孤兒 actor 被 disconnect | `test/app-reconcile.test.ts` |
 | retry 期間 classify 變成 `transient` 或未知狀態時，**不得**改寫 reason（否則同時掉出重試迴圈與 `/end` 逃生口）；仍維持退避、無 notice 洗版、之後恢復存取權仍能 resume | `test/app-reconcile.test.ts` |
 | `/end`（worktree 已不存在 → record 被移除）穿插 classify await 時，retry **不得**重建 worktree、不得建立 SDK session；shutdown 版本同理 | `test/app-reconcile.test.ts` |
+| retry 必須 `force` 抓取，才不會被失去存取權時留下的混淆 stub cache 永久蓋住；startup 仍走 cache | `test/app-reconcile.test.ts` |
+| **`/end` 先開始**、retry 在它的 await 空隙裡跑：不得註冊 session、不得留下沒有 record 的 live session 或已釋放的 lease；`/end` 失敗時 claim 必須釋放，record 回到迴圈 | `test/app-reconcile.test.ts` |
+| 被丟棄的 runtime `disconnect()` 失敗時必須保留成 barrier，`/end` 必須拒絕回收並誠實回覆 | `test/app-reconcile.test.ts` |
+| `stop()` resolve 之後不得再有任何持久寫入（有界 join in-flight tick） | `test/app-reconcile.test.ts` |
+| retry 路徑的 transient resume 失敗只貼**一次**、且文案不得叫使用者重啟 | `test/app-reconcile.test.ts` |
+| startup `skip` notice 必須依 reason 分流：no-access 說「恢復存取權後自動復原、不必重啟」，transient/unknown 說「重啟才會再試」 | `test/app-reconcile.test.ts` |
 | shutdown 穿插 in-flight retry：不註冊 session、不再 arm timer、record 原封不動留給下次開機 | `test/app-reconcile.test.ts` |
 | armed timer 必須 `unref`，`clearAccessRetryTimer()` 必須真的清掉 | `test/app-reconcile.test.ts` |

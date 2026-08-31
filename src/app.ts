@@ -302,15 +302,17 @@ const TITLE_TIMEOUT_MS = 25_000;
  *
  * ADR-0002 promises a `thread-no-access` session resumes once the bot's channel
  * access is restored **or** the bot restarts. Only the restart half was real:
- * `reconcileOnStartup` had exactly one production caller. Restoring a
- * permission does not reliably emit any gateway event for the affected THREAD
- * (the bot was not able to see the channel, so it received nothing about it),
- * so a bounded periodic scan — not an event — is the correctness source here.
- * An event may only ever poke this loop; it may never be the only trigger.
+ * `reconcileOnStartup` had exactly one production caller. Regaining access does
+ * emit a `CHANNEL_UPDATE` for the CHANNEL, but that event neither names the
+ * bound threads it makes resumable nor guarantees anything about a thread
+ * object the bot may never have cached — a useful hint, not a correctness
+ * source. A bounded periodic scan is. An event may only ever poke this loop; it
+ * may never be the only trigger.
  *
  * The cadence escalates while a scan keeps finding nothing to resume, so a
  * permission left revoked for days costs one wake-up every five minutes rather
- * than one every fifteen seconds, and resets the moment a resume succeeds.
+ * than one every fifteen seconds, and resets the moment a resume succeeds. With
+ * no candidates at all it idles at the longest interval.
  */
 const ACCESS_RETRY_DELAYS_MS = [15_000, 30_000, 60_000, 120_000, 300_000] as const;
 
@@ -564,8 +566,11 @@ export class DiscordCopilotApp {
   /** The thread classifier reconciliation actually used. Captured so the
    *  access-retry loop re-runs the SAME classification/resume path instead of
    *  growing a second, subtly different state machine beside it. */
-  private reconcileClassify: (threadId: string, expectedParentChannelId: string) => Promise<ThreadStatus> =
-    (id, parent) => this.classifyThread(id, parent);
+  private reconcileClassify: (
+    threadId: string,
+    expectedParentChannelId: string,
+    opts?: { force?: boolean }
+  ) => Promise<ThreadStatus> = (id, parent, opts) => this.classifyThread(id, parent, opts);
   /** Timer seam for the access-restoration retry loop; production uses an
    *  unref'd `setTimeout` so a pending wake-up never holds the process open. */
   private accessRetryScheduler: AccessRetryScheduler = {
@@ -586,6 +591,28 @@ export class DiscordCopilotApp {
   private accessRetryTickPromise?: Promise<void>;
   /** Index into `ACCESS_RETRY_DELAYS_MS`. */
   private accessRetryBackoff = 0;
+  /** True when the last tick found nothing to recover. Idling at the longest
+   *  delay keeps an otherwise-quiet bot from waking every 15 seconds for ever,
+   *  without making "a candidate can never appear later" a correctness
+   *  assumption. */
+  private accessRetryIdle = false;
+  /** Threads a retry is resuming RIGHT NOW, published before its first await so
+   *  `/end` and `stop()` can join it rather than discover it afterwards. */
+  private readonly accessResumeInFlight = new Set<string>();
+  /** Threads an explicit teardown has claimed but not yet finished. `/end` sets
+   *  this synchronously, before its own first await, because its record removal
+   *  happens several awaits later — long enough for a retry to resume and
+   *  register a session that `/end` would then leave live with no record, and
+   *  with its local lease released. */
+  private readonly endClaims = new Set<string>();
+  /** Threads already told, once, that a retry reached the runtime and failed
+   *  transiently. Volatile on purpose: a restart may repeat it once. */
+  private readonly accessRetryNoticed = new Set<string>();
+  /** Sessions a retry resumed and then had to discard, whose runtime could NOT
+   *  be confirmed stopped. Held STRONGLY: on Windows the reference is the only
+   *  thing keeping the root capability alive, and that capability is what stops
+   *  a maybe-live runtime from being handed a deleted working tree. */
+  private readonly unconfirmedResumes = new Map<string, { actor: SessionActor; binding: SessionRecord }>();
   /** Only createForTest sets this. Production must capture a native trusted
    * root, while app state-machine fixtures receive an opaque fail-closed root. */
   private actorCreateDependencies?: SessionActorCreateDependencies;
@@ -2023,6 +2050,44 @@ export class DiscordCopilotApp {
     interaction: ChatInputCommandInteraction,
     threadId: string
   ): Promise<void> {
+    // Claim the thread BEFORE the first await. Everything below — the deferral,
+    // the git proof, the store write — is awaited, and the access-retry loop is
+    // free to run in those gaps: without this claim it could resume and register
+    // a session that this command then leaves live with no durable record, and
+    // with its local lease released. The claim makes `/end` win from its first
+    // instruction rather than from its last.
+    this.endClaims.add(threadId);
+    try {
+      await this.endStaleRecordClaimed(interaction, threadId);
+    } finally {
+      // Released either way: a failed `/end` leaves the record `active`, and it
+      // must stay eligible for the loop that is supposed to bring it back.
+      this.endClaims.delete(threadId);
+    }
+  }
+
+  private async endStaleRecordClaimed(
+    interaction: ChatInputCommandInteraction,
+    threadId: string
+  ): Promise<void> {
+    // Join a resume that was already in flight when the claim landed. It is
+    // going to discard itself (`resumeOwnershipLost` sees the claim), and
+    // waiting for that means its actor is torn down BEFORE this command starts
+    // proving worktrees removable, instead of racing it. Bounded, because a
+    // wedged runtime must not make `/end` unusable.
+    await this.joinAccessResume(threadId);
+    // That discard may not have been confirmable. A worktree must never be
+    // deleted out from under a process that might still be writing to it, so
+    // one more bounded attempt — and, failing that, the same honest refusal
+    // `/end` already gives when a live session's runtime will not confirm.
+    if (!(await this.retryUnconfirmedResume(threadId))) {
+      await interaction.reply({
+        content:
+          "⚠️ 這個討論串剛才有一次自動復原，但**無法確認該 runtime 已關閉**。記錄與 worktree 都保留（不會被清除），請重啟 bot 後再試。",
+        ...EPHEMERAL,
+      });
+      return;
+    }
     const hasFallbackOwnership = (): boolean =>
       [...this.staleRebindActors.values()].some(
         (entry) => entry.threadId === threadId && entry.fallbackPrimary !== undefined
@@ -3661,7 +3726,8 @@ export class DiscordCopilotApp {
     validateBinding?: typeof validateBinding;
   }): Promise<void> {
     const classify =
-      deps?.classifyThread ?? ((id: string, parent: string) => this.classifyThread(id, parent));
+      deps?.classifyThread ??
+      ((id: string, parent: string, opts?: { force?: boolean }) => this.classifyThread(id, parent, opts));
     this.reconcileClassify = classify;
     this.bindingCheck = deps?.validateBinding ?? validateBinding;
     // BEFORE anything reads or writes a record. A registry that could not be
@@ -3735,6 +3801,7 @@ export class DiscordCopilotApp {
    */
   private startAccessRetryLoop(): void {
     this.accessRetryBackoff = 0;
+    this.accessRetryIdle = false;
     this.scheduleAccessRetry();
   }
 
@@ -3743,7 +3810,11 @@ export class DiscordCopilotApp {
   private scheduleAccessRetry(): void {
     this.clearAccessRetryTimer();
     if (this.shuttingDown) return;
-    const ms = ACCESS_RETRY_DELAYS_MS[this.accessRetryBackoff] ?? ACCESS_RETRY_DELAYS_MS[0];
+    const last = ACCESS_RETRY_DELAYS_MS.length - 1;
+    const ms =
+      (this.accessRetryIdle
+        ? ACCESS_RETRY_DELAYS_MS[last]
+        : ACCESS_RETRY_DELAYS_MS[this.accessRetryBackoff]) ?? ACCESS_RETRY_DELAYS_MS[0];
     this.accessRetryTimer = this.accessRetryScheduler.set(() => {
       this.accessRetryTimer = undefined;
       this.runAccessRetryTick();
@@ -3784,20 +3855,45 @@ export class DiscordCopilotApp {
     if (this.shuttingDown || this.phase !== "ready") return;
     const candidates = this.store.all().filter((r) => this.isAccessRetryCandidate(r));
     if (!candidates.length) {
-      this.accessRetryBackoff = 0;
+      // Nothing to recover: idle at the longest delay rather than waking every
+      // 15s for the life of the process. Only reconciliation writes
+      // `thread-no-access`, so a new candidate cannot appear mid-run today —
+      // this stays a poll, rather than disarming, so that remains a performance
+      // assumption instead of a correctness one.
+      this.accessRetryIdle = true;
       return;
+    }
+    if (this.accessRetryIdle) {
+      this.accessRetryIdle = false;
+      this.accessRetryBackoff = 0;
     }
     let resumed = false;
     for (const candidate of candidates) {
       if (this.shuttingDown || this.phase !== "ready") return;
+      // An explicit teardown that is mid-flight owns this thread. Skipping here
+      // is the cheap half of the handshake; `resumeOwnershipLost` is the half
+      // that holds when the claim lands after this point.
+      if (this.endClaims.has(candidate.threadId)) continue;
       const rec = this.store.get(candidate.threadId);
       if (!rec || !this.isAccessRetryCandidate(rec)) continue;
+      // Published BEFORE the first await, so `/end` and `stop()` can see that a
+      // resume is under way for this exact thread rather than discovering it
+      // afterwards. Cleared in `finally`, including on a thrown transition.
+      this.accessResumeInFlight.add(rec.threadId);
       try {
         // The SAME reconcile path startup uses: it re-validates the binding and
         // re-classifies the thread, and only a `valid` classification resumes.
         // A record that has meanwhile become genuinely terminal under those
         // existing rules gets the existing terminal outcome persisted.
-        await this.reconcileRecord(rec, this.reconcileClassify, { via: "access-retry" });
+        //
+        // `force` is not optional here: the cached channel object for a thread
+        // the bot lost access to is the obfuscated stub, so an unforced
+        // re-check can report "hidden" for ever (see `fetchChannelSafe`).
+        await this.reconcileRecord(
+          rec,
+          (id, parent) => this.reconcileClassify(id, parent, { force: true }),
+          { via: "access-retry" }
+        );
       } catch (err) {
         // Startup turns a failed terminal transition into a failed startup. A
         // running bot has no such lever, and one record's unwritable transition
@@ -3806,6 +3902,8 @@ export class DiscordCopilotApp {
         const msg = err instanceof Error ? err.message : String(err);
         if (err instanceof FatalReconcileError) console.error(`access-retry: ${msg}`);
         else console.warn(`access-retry: ${rec.threadId} failed (${msg}); continuing.`);
+      } finally {
+        this.accessResumeInFlight.delete(rec.threadId);
       }
       if (this.sessions.has(rec.threadId)) resumed = true;
     }
@@ -3814,9 +3912,18 @@ export class DiscordCopilotApp {
       : Math.min(this.accessRetryBackoff + 1, ACCESS_RETRY_DELAYS_MS.length - 1);
   }
 
-  /** A record this loop owns: still `active`, still parked on missing access,
-   *  and with no live session of its own. Never times out into a terminal
-   *  state — ADR-0002's whole point is that access loss is reversible. */
+  /**
+   * A record this loop owns: still `active`, still parked on missing access,
+   * and with no live session of its own. Never times out into a terminal
+   * state — ADR-0002's whole point is that access loss is reversible.
+   *
+   * `MAX_LIVE_SESSIONS` is deliberately NOT applied. That cap gates `/new`,
+   * i.e. asking for MORE work; this loop only finishes recovering a record that
+   * already existed and that the startup pass would have resumed unconditionally
+   * had the permission been present one minute earlier. Refusing it would strand
+   * a conversation on a limit its owner never crossed, and there is no queue to
+   * put it in.
+   */
   private isAccessRetryCandidate(rec: SessionRecord): boolean {
     return rec.state === "active" && rec.reason === "thread-no-access" && !this.sessions.has(rec.threadId);
   }
@@ -4042,10 +4149,22 @@ export class DiscordCopilotApp {
         console.warn(
           `reconcile: not resuming ${rec.threadId} this boot (${action.reason}); active record retained for retry.`
         );
+        // One notice used to serve all three skip reasons and promised every one
+        // of them that restoring Discord access would bring it back. Only
+        // `thread-no-access` has those semantics — it is the sole reason the
+        // runtime retry loop takes as a candidate — so a `transient` fetch
+        // failure was told to fix a permission that was never the problem, and
+        // to expect an automatic recovery that is not coming. `/sessions`
+        // already draws this line; this notice now draws the same one.
         await this.transport
           .notice(
             rec.threadId,
-            "⚠️ 啟動時暫時無法確認此執行緒狀態，本次未復原。session 記錄已保留——恢復存取權後會自動再試，重新啟動 bot 也可以。"
+            action.reason === "thread-no-access"
+              ? "⚠️ 啟動時無法存取這個討論串（Discord 權限）。session 記錄已保留——" +
+                  "**恢復 bot 對該頻道的存取權後會自動復原，不必重啟**（約 15 秒起、最長 5 分鐘掃一次）。" +
+                  "確定不要這段對話時，可在上層頻道用 `/end thread:<id>` 清除。"
+              : `⚠️ 啟動時暫時無法確認此執行緒狀態（${action.reason}），本次未復原。session 記錄已保留——` +
+                  "**重新啟動 bot 會再試一次**；執行中不會自動重試（自動重試只適用於 Discord 存取權問題）。"
           )
           .catch(() => {});
         return;
@@ -4151,12 +4270,7 @@ export class DiscordCopilotApp {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`reconcile: transient trusted-root capture failure for ${rec.threadId}: ${msg}`);
-      await this.transport
-        .notice(
-          rec.threadId,
-          `⚠️ 暫時無法復原此對話（${msg}）。session 記錄已保留——重新啟動 bot 可再嘗試復原；或用 /new 重新開始。`
-        )
-        .catch(() => {});
+      await this.noticeTransientResumeFailure(rec.threadId, msg, opts);
       return;
     }
     if (!captured.ok) {
@@ -4215,12 +4329,7 @@ export class DiscordCopilotApp {
         // restart retries. Do NOT lie that it's blocked. The thread is un-resumed
         // for THIS boot; the bot still comes up so /new remains usable.
         console.warn(`reconcile: transient resume failure for ${rec.threadId}: ${msg}`);
-        await this.transport
-          .notice(
-            rec.threadId,
-            `⚠️ 暫時無法復原此對話（${msg}）。session 記錄已保留——重新啟動 bot 可再嘗試復原；或用 /new 重新開始。`
-          )
-          .catch(() => {});
+        await this.noticeTransientResumeFailure(rec.threadId, msg, opts);
       }
       return;
     }
@@ -4234,8 +4343,7 @@ export class DiscordCopilotApp {
     // are one atomic step that a concurrent command cannot slip inside.
     const lost = this.resumeOwnershipLost(rec);
     if (lost) {
-      console.warn(`resume: discarding the resumed session for ${rec.threadId} — ${lost}`);
-      await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS).catch(() => {});
+      await this.discardResumedActor(rec, actor, lost);
       return;
     }
     this.sessions.set(rec.threadId, {
@@ -4279,6 +4387,10 @@ export class DiscordCopilotApp {
    */
   private resumeOwnershipLost(rec: SessionRecord): string | undefined {
     if (this.shuttingDown) return "shutdown started";
+    // Checked before the store, because `/end` claims the thread several awaits
+    // BEFORE it removes the record; without this the resume would win a race it
+    // has already lost and leave a live session no record points at.
+    if (this.endClaims.has(rec.threadId)) return "an explicit /end claimed this thread";
     if (this.sessions.has(rec.threadId)) return "another session is already registered for this thread";
     const now = this.store.get(rec.threadId);
     if (!now) return "the durable record was removed (/end)";
@@ -4287,6 +4399,101 @@ export class DiscordCopilotApp {
       return "the record now points at a different session/generation";
     }
     return undefined;
+  }
+
+  /** Wait, boundedly, for an in-flight access retry on this thread to settle. */
+  private async joinAccessResume(threadId: string): Promise<void> {
+    if (!this.accessResumeInFlight.has(threadId)) return;
+    await withTimeout(this.accessRetryTickPromise ?? Promise.resolve(), TEARDOWN_TIMEOUT_MS).catch(() => {});
+  }
+
+  /**
+   * The "couldn't resume it this time" notice, told truthfully per caller.
+   *
+   * On the startup path this is one message per boot and a restart really is
+   * what retries it. On the retry path neither half held: the loop wakes up
+   * again on its own — so "restart the bot" is wrong — and it wakes up
+   * repeatedly, so posting each time turns a transient runtime hiccup into an
+   * indefinite drip of identical warnings in the thread. It is posted ONCE per
+   * thread per process instead, and says what will actually happen.
+   */
+  private async noticeTransientResumeFailure(
+    threadId: string,
+    msg: string,
+    opts: { via?: "startup" | "access-retry" }
+  ): Promise<void> {
+    if (opts.via !== "access-retry") {
+      await this.transport
+        .notice(
+          threadId,
+          `⚠️ 暫時無法復原此對話（${msg}）。session 記錄已保留——重新啟動 bot 可再嘗試復原；或用 /new 重新開始。`
+        )
+        .catch(() => {});
+      return;
+    }
+    if (this.accessRetryNoticed.has(threadId)) return;
+    this.accessRetryNoticed.add(threadId);
+    await this.transport
+      .notice(
+        threadId,
+        `⚠️ 已可存取這個討論串，但暫時無法復原對話（${msg}）。session 記錄已保留，**會自動持續重試**` +
+          "（不必重啟；之後不會再重複貼這則訊息）。"
+      )
+      .catch(() => {});
+  }
+
+  /**
+   * Throw away a session we resumed but may not register.
+   *
+   * A confirmed disconnect ends it: the runtime is gone and the object can be
+   * dropped. An UNCONFIRMED one may not be, and simply logging it was the bug —
+   * dropping the last reference releases the Windows root capability that is
+   * the only fence stopping a possibly-live runtime from being handed a renamed
+   * or deleted working tree.
+   *
+   * It is deliberately NOT handed to the stale-rebind companion machinery. That
+   * writes a SECOND durable claim on one worktree, and here the main record is
+   * usually still present and still naming this exact session — two claimants
+   * would let one of them delete the tree the other still points at. Instead the
+   * actor is retained under its thread, exactly as `/end`'s own unconfirmed
+   * teardown keeps a spent session as a barrier, and `/end` and `stop()` both
+   * retry it before anything is allowed to reclaim that checkout.
+   */
+  private async discardResumedActor(
+    rec: SessionRecord,
+    actor: SessionActor,
+    why: string
+  ): Promise<void> {
+    console.warn(`resume: discarding the resumed session for ${rec.threadId} — ${why}`);
+    try {
+      await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS);
+      return;
+    } catch {
+      this.unconfirmedResumes.set(rec.threadId, { actor, binding: rec });
+      console.warn(
+        `resume: could not confirm the discarded runtime for ${rec.threadId} stopped; ` +
+          `retaining it as a barrier over ${rec.workDir} until a retry or restart confirms it.`
+      );
+    }
+  }
+
+  /**
+   * Make one more bounded attempt to stop a retained discarded runtime.
+   *
+   * Returns true when nothing (any more) may be holding that checkout — which is
+   * the precondition for reclaiming it. A failure keeps the barrier: a worktree
+   * must never be deleted out from under a process that might still write to it.
+   */
+  private async retryUnconfirmedResume(threadId: string): Promise<boolean> {
+    const entry = this.unconfirmedResumes.get(threadId);
+    if (!entry) return true;
+    try {
+      await withTimeout(entry.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
+    } catch {
+      return false;
+    }
+    this.unconfirmedResumes.delete(threadId);
+    return true;
   }
 
   // ----------------------------------------------------------- local leases --
@@ -4384,9 +4591,10 @@ export class DiscordCopilotApp {
    *  which is the whole point of storing the parent per record. */
   private async classifyThread(
     threadId: string,
-    expectedParentChannelId: string
+    expectedParentChannelId: string,
+    opts: { force?: boolean } = {}
   ): Promise<ThreadStatus> {
-    const result = await fetchChannelSafe(this.discord, threadId);
+    const result = await fetchChannelSafe(this.discord, threadId, opts);
     if (result.kind === "gone") return "gone";
     if (result.kind === "no-access") return "no-access";
     if (result.kind === "transient") return "transient";
@@ -5142,6 +5350,14 @@ export class DiscordCopilotApp {
     // already in flight from registering anything (`resumeOwnershipLost`), so
     // no session can appear behind this loop's back and survive it.
     this.clearAccessRetryTimer();
+    // Then JOIN it. Disarming only prevents the NEXT tick; one already inside
+    // git or the runtime can still be mid-transition, and letting `stop()`
+    // resolve first would mean the store could be written after the process
+    // declared itself torn down (and after the lock was released). Bounded, so
+    // a wedged runtime cannot make shutdown hang.
+    await withTimeout(this.accessRetryTickPromise ?? Promise.resolve(), TEARDOWN_TIMEOUT_MS).catch(
+      () => {}
+    );
     for (const [threadId, session] of this.sessions) {
       // Rebind can be suspended in its prepare phase while shutdown starts.
       // Mark first so it cannot install a replacement after this loop clears
@@ -5166,6 +5382,12 @@ export class DiscordCopilotApp {
     // process exit rather than being silently dropped.
     for (const actor of [...this.staleRebindActors.keys()]) {
       await withTimeout(this.retryStaleRebindActor(actor), TEARDOWN_TIMEOUT_MS).catch(() => {});
+    }
+    // Same courtesy for a retry-discarded runtime we could not confirm: one last
+    // bounded attempt. A still-unconfirmed one stays retained until the process
+    // exits, which is the point — it is a barrier, not a leak.
+    for (const threadId of [...this.unconfirmedResumes.keys()]) {
+      await this.retryUnconfirmedResume(threadId).catch(() => false);
     }
     try {
       this.discord.destroy();

@@ -241,10 +241,15 @@ session as retryable `thread-no-access`: a single bounded periodic scan armed af
 those records, so it resumes automatically once access is restored — without a restart, because
 restoring a permission emits no reliable gateway event for a thread the bot could not see — and it
 is explicitly, manually clearable with `/end thread:<id>` after an informed owner decides to give
-up on recovery (ADR-0002) — it must never be treated as a permanent block. A retry attempt that
-still cannot confirm the thread (`no-access`, `transient`, unknown) writes **nothing**: rewriting
-the record's `thread-no-access` reason would drop it out of both the loop's candidate filter and
-`/end`'s escape hatch, parking it until a restart. `resumeRecord` re-proves it still owns the
-record before it rebuilds a missing worktree, again after that rebuild, and once more immediately
-before `sessions.set`, so `/end` and shutdown win outright against an in-flight resume instead of
-being resurrected by it or leaving a checkout no record points at.
+up on recovery (ADR-0002) — it must never be treated as a permanent block. Each retry re-fetches the
+thread with `force`, because the cached channel object for a thread whose access was lost is the
+obfuscated stub; regaining access emits a `CHANNEL_UPDATE` for the *channel*, which is a hint, not a
+correctness source for *which bound threads* are resumable. A retry attempt that still cannot confirm
+the thread (`no-access`, `transient`, unknown) writes **nothing**: rewriting the record's
+`thread-no-access` reason would drop it out of both the loop's candidate filter and `/end`'s escape
+hatch, parking it until a restart. `/end` claims a thread synchronously before its own first await
+and the loop skips claimed threads, because `/end` removes the record several awaits later — long
+enough for a resume to register a session it would then orphan. `resumeRecord` re-proves it still
+owns the record before it rebuilds a missing worktree, again after that rebuild, and once more
+immediately before `sessions.set`; a discarded session whose disconnect cannot be confirmed is
+retained as a barrier (`unconfirmedResumes`) and `/end` refuses to reclaim the checkout behind it.

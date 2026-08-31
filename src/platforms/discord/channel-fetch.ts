@@ -5,7 +5,7 @@ export const OBFUSCATED_CHANNEL_NAME = "___hidden___";
 
 interface ChannelFetcher {
   channels: {
-    fetch(id: string): Promise<unknown>;
+    fetch(id: string, options?: { force?: boolean }): Promise<unknown>;
   };
 }
 
@@ -15,12 +15,26 @@ export type ChannelFetchResult =
   | { kind: "no-access" }
   | { kind: "transient"; error: unknown };
 
+/**
+ * Fetch a channel/thread and classify the failure honestly.
+ *
+ * `force` bypasses discord.js's channel cache. It matters for exactly one
+ * caller: re-checking whether LOST access has come back. `channels.fetch(id)`
+ * answers from the cache whenever it holds a non-partial object, and what it
+ * holds after access was lost is the obfuscated stub — so an unforced re-check
+ * can keep reporting "hidden" long after the bot can really see the thread
+ * again. Ordinary callers stay on the cached path: forcing REST everywhere
+ * would spend rate limit on questions the cache answers correctly.
+ */
 export async function fetchChannelSafe(
   client: ChannelFetcher,
-  id: string
+  id: string,
+  opts: { force?: boolean } = {}
 ): Promise<ChannelFetchResult> {
   try {
-    const channel = await client.channels.fetch(id);
+    const channel = opts.force
+      ? await client.channels.fetch(id, { force: true })
+      : await client.channels.fetch(id);
     if (!channel || typeof channel !== "object") return { kind: "gone" };
     if (isObfuscatedChannel(channel)) return { kind: "no-access" };
     return { kind: "ok", channel };

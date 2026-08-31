@@ -190,6 +190,11 @@ function sessionsOf(app: DiscordCopilotApp): Map<string, unknown> {
 function localLeasesOf(app: DiscordCopilotApp): Map<string, string> {
   return (app as unknown as { localLeases: Map<string, string> }).localLeases;
 }
+/** Retry-discarded runtimes retained as barriers because teardown was
+ *  unconfirmed; the strong reference is what holds the Windows root. */
+function unconfirmedResumesOf(app: DiscordCopilotApp): Map<string, unknown> {
+  return (app as unknown as { unconfirmedResumes: Map<string, unknown> }).unconfirmedResumes;
+}
 function reconcile(
   app: DiscordCopilotApp,
   classify: (threadId: string, expectedParentChannelId: string) => Promise<string>,
@@ -1248,7 +1253,11 @@ describe("a record retired by reclaim stays announceable", () => {
   });
 });
 
-describe("startup announcement length budget", () => {
+// 240 atomic write-then-rename store mutations (80 records × reserve/commit/
+// setState) is genuinely disk-bound, and it sits behind every other case in
+// this file. The explicit budget follows the same convention the subprocess
+// suites use rather than letting a slow disk read as a logic failure.
+describe("startup announcement length budget", { timeout: 30_000 }, () => {
   class Cap extends FakeTransport {
     sent: string[] = [];
     override async noticeDelivered(_k: string, t: string): Promise<boolean> {
@@ -1362,7 +1371,7 @@ function runRetryTick(app: DiscordCopilotApp): void {
 
 /** A copilot whose resume is held open until the test releases it, so `/end`
  *  and shutdown can be driven while a resume really is in flight. */
-function gatedCopilot(): {
+function gatedCopilot(opts: { disconnectError?: string } = {}): {
   client: CopilotClient;
   calls: string[];
   release: () => void;
@@ -1378,6 +1387,7 @@ function gatedCopilot(): {
     ...fakeSession,
     async disconnect(): Promise<void> {
       disconnects++;
+      if (opts.disconnectError) throw new Error(opts.disconnectError);
     },
   };
   return {
@@ -1423,14 +1433,19 @@ function reconcileReal(app: DiscordCopilotApp): Promise<void> {
 
 /** Records every channel fetch, so a test can wait for the retry tick to have
  *  actually reached the classification await before it acts. */
-const fetchCalls: string[] = [];
+const fetchCalls: Array<{ id: string; force: boolean }> = [];
 
-function setChannelFetch(app: DiscordCopilotApp, fetch: (id: string) => Promise<unknown>): void {
-  (app as unknown as { discord: { channels: { fetch(id: string): Promise<unknown> } } }).discord = {
+function setChannelFetch(
+  app: DiscordCopilotApp,
+  fetch: (id: string, options?: { force?: boolean }) => Promise<unknown>
+): void {
+  (app as unknown as {
+    discord: { channels: { fetch(id: string, options?: { force?: boolean }): Promise<unknown> } };
+  }).discord = {
     channels: {
-      async fetch(id: string): Promise<unknown> {
-        fetchCalls.push(id);
-        return fetch(id);
+      async fetch(id: string, options?: { force?: boolean }): Promise<unknown> {
+        fetchCalls.push({ id, force: options?.force === true });
+        return fetch(id, options);
       },
     },
   };
@@ -1708,14 +1723,17 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
       await vi.waitFor(() => expect(gated.calls).toHaveLength(1));
 
       // `/end thread:t-end` from the parent channel, while the resume is in the
-      // runtime. ADR-0002 makes this the owner's deliberate escape hatch.
+      // runtime. ADR-0002 makes this the owner's deliberate escape hatch, and it
+      // claims the thread synchronously — before its own first await — so the
+      // resume in flight is already beaten.
       const interaction = fakeInteraction();
-      await (
+      const ending = (
         app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
       ).endStaleRecord(interaction, "t-end");
+      gated.release();
+      await ending;
       expect(store.get("t-end")).toBeUndefined();
 
-      gated.release();
       await tick;
 
       expect(store.get("t-end")).toBeUndefined(); // NOT resurrected
@@ -1758,11 +1776,16 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
       const tick = beginRetry(app, jobs);
       await vi.waitFor(() => expect(gated.calls).toHaveLength(1));
 
-      await app.stop();
-
+      // `stop()` disarms the timer AND joins the tick already in flight, so
+      // nothing may still be mutating the store once it resolves.
+      const stopping = app.stop();
       gated.release();
+      await stopping;
+      const afterStop = JSON.stringify(store.get("t-shut"));
+
       await tick;
 
+      expect(JSON.stringify(store.get("t-shut"))).toBe(afterStop); // no late write
       expect(sessionsOf(app).size).toBe(0);
       expect(gated.disconnects()).toBe(1);
       expect(jobs).toHaveLength(0); // disarmed, and never re-armed after shutdown
@@ -1940,12 +1963,13 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
       // reaps the record outright — the exact shape that used to let the resume
       // rebuild a checkout nothing owns.
       rmSync(wt.workDir, { recursive: true, force: true });
-      await (
+      const ending = (
         app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
       ).endStaleRecord(fakeInteraction(), "t-wt");
+      releaseClassify();
+      await ending;
       expect(store.get("t-wt")).toBeUndefined();
 
-      releaseClassify();
       await tick;
 
       expect(addWorktreeCalls.length).toBe(before); // never even attempted
@@ -1999,9 +2023,10 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
       await vi.waitFor(() => expect(fetchCalls.length).toBeGreaterThan(fetchesBefore));
 
       rmSync(wt.workDir, { recursive: true, force: true });
-      await app.stop();
-
+      const stopping = app.stop();
       releaseClassify();
+      await stopping;
+
       await tick;
 
       expect(addWorktreeCalls.length).toBe(before);
@@ -2012,6 +2037,366 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
       // Untouched on disk, so the next boot still finds it resumable.
       expect(store.get("t-wt-shut")?.state).toBe("active");
       expect(store.get("t-wt-shut")?.reason).toBe("thread-no-access");
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});
+
+describe("startup skip notices promise only what will actually happen", () => {
+  /** Reconcile ONE active record to a `skip` and return the notice it posted. */
+  async function skipNotice(threadId: string, status: string): Promise<string> {
+    const f = tmpFile();
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId, sessionId: `s-${threadId}` }));
+      store.commit(threadId);
+      const transport = new FakeTransport();
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
+      await reconcile(app, async () => status);
+      expect(store.get(threadId)?.state).toBe("active");
+      expect(transport.notices).toHaveLength(1);
+      return transport.notices[0] ?? "";
+    } finally {
+      rmSync(f, { force: true });
+    }
+  }
+
+  it("tells a no-access thread that restoring access is enough, with no restart", async () => {
+    const text = await skipNotice("t-n1", "no-access");
+    expect(text).toContain("存取權");
+    expect(text).toContain("自動");
+    expect(text).toContain("不必重啟");
+    expect(text).toContain("/end thread:"); // ADR-0002's escape hatch stays visible
+  });
+
+  it("does NOT promise a transient record an access-restoration retry it never gets", async () => {
+    // Only `thread-no-access` is in the runtime loop's candidate set; a transient
+    // fetch failure is retried by a RESTART. The shared copy used to tell this
+    // record that restoring access would bring it back, which is simply untrue.
+    const text = await skipNotice("t-n2", "transient");
+    expect(text).toContain("重新啟動");
+    expect(text).not.toContain("恢復存取權");
+    expect(text).toContain("transient-thread-fetch"); // says which diagnosis it is
+  });
+
+  it("says the same honest thing for an unclassifiable status", async () => {
+    const text = await skipNotice("t-n3", "something-new-from-a-future-sdk");
+    expect(text).toContain("重新啟動");
+    expect(text).not.toContain("恢復存取權");
+    expect(text).toContain("unknown-thread-status");
+  });
+});
+
+describe("access retry must not trust the channel cache", () => {
+  it("forces a REST fetch, so a cached obfuscated stub cannot hide restored access for ever", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-cache", sessionId: "sess-cache" }));
+      store.commit("t-cache");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      // discord.js answers `channels.fetch(id)` from cache when it holds a
+      // non-partial object. Losing access leaves an OBFUSCATED stub cached, and
+      // regaining access does not necessarily replace that exact thread object —
+      // so an unforced fetch can report "hidden" for ever while the bot can
+      // really see the thread again.
+      let access = false;
+      const cachedObfuscatedStub = {
+        name: "___hidden___",
+        isThread: () => true,
+        guildId: "g1",
+        parentId: "c1",
+      };
+      setChannelFetch(app, async (_id, options) => {
+        if (options?.force !== true) return cachedObfuscatedStub;
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      expect(store.get("t-cache")?.reason).toBe("thread-no-access");
+
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+      const forcedBefore = fetchCalls.filter((c) => c.force).length;
+
+      await fireRetry(app, jobs);
+
+      expect(fetchCalls.filter((c) => c.force).length).toBe(forcedBefore + 1);
+      expect(sessionsOf(app).has("t-cache")).toBe(true);
+      expect(resumeCalls.filter((c) => c.id === "sess-cache")).toHaveLength(1);
+      expect(store.get("t-cache")?.reason).toBeUndefined();
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("leaves the startup pass on the ordinary cached path", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-boot", sessionId: "sess-boot" }));
+      store.commit("t-boot");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      setChannelFetch(app, async () => visibleThread);
+      const before = fetchCalls.length;
+      await reconcileReal(app);
+      expect(fetchCalls.slice(before).every((c) => !c.force)).toBe(true);
+      expect(sessionsOf(app).has("t-boot")).toBe(true);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});
+
+describe("access retry vs an explicit teardown that started FIRST", () => {
+  /** A `/end` interaction whose deferral the test controls, so the retry loop
+   *  really does run inside `/end`'s awaits — the ordering that used to leave a
+   *  live session behind with no durable record. */
+  function gatedInteraction(): { iface: unknown; release: () => void; replies: string[] } {
+    let open: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const replies: string[] = [];
+    return {
+      iface: {
+        async reply(o: { content: string }): Promise<void> {
+          await gate;
+          replies.push(o.content);
+        },
+        async deferReply(): Promise<void> {
+          await gate;
+        },
+        async editReply(o: string | { content: string }): Promise<void> {
+          replies.push(typeof o === "string" ? o : o.content);
+        },
+      },
+      release: () => open(),
+      replies,
+    };
+  }
+
+  it("leaves no live session without a record when /end is already in flight", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-first", sessionId: "sess-first" }));
+      store.commit("t-first");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async (_id, options) => {
+        if (!access && options?.force !== true) throw { code: 50001 };
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      expect(localLeasesOf(app).size).toBe(1);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+
+      // `/end` starts first and is suspended in its own deferral — the record is
+      // still `active`/`thread-no-access` on disk, so the loop would happily
+      // resume it and register a session this command then orphans.
+      const ending = gatedInteraction();
+      const endPromise = (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(ending.iface, "t-first");
+      expect(store.get("t-first")?.state).toBe("active"); // not removed yet
+
+      await fireRetry(app, jobs);
+
+      expect(sessionsOf(app).has("t-first")).toBe(false);
+      expect(resumeCalls.filter((c) => c.id === "sess-first")).toHaveLength(0);
+
+      ending.release();
+      await endPromise;
+
+      expect(store.get("t-first")).toBeUndefined();
+      expect(sessionsOf(app).has("t-first")).toBe(false);
+      expect(localLeasesOf(app).size).toBe(0); // lease released with the record
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("frees the record again when the /end that claimed it fails", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-freed", sessionId: "sess-freed" }));
+      store.commit("t-freed");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+      await reconcileReal(app);
+      expect(store.get("t-freed")?.reason).toBe("thread-no-access");
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+
+      const boom = {
+        async reply(): Promise<void> {
+          throw new Error("interaction expired");
+        },
+        async deferReply(): Promise<void> {
+          throw new Error("interaction expired");
+        },
+        async editReply(): Promise<void> {},
+      };
+      await expect(
+        (app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }).endStaleRecord(
+          boom,
+          "t-freed"
+        )
+      ).rejects.toThrow(/interaction expired/);
+
+      // The claim must not outlive the command: the record is still `active`,
+      // so the loop that exists to bring it back has to be allowed to.
+      await fireRetry(app, jobs);
+      expect(sessionsOf(app).has("t-freed")).toBe(true);
+      expect(store.get("t-freed")?.reason).toBeUndefined();
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("retains a discarded session whose teardown could NOT be confirmed", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-hung", sessionId: "sess-hung" }));
+      store.commit("t-hung");
+      const gated = gatedCopilot({ disconnectError: "runtime is not responding" });
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        gated.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(gated.calls).toHaveLength(1));
+      const interaction = fakeInteraction();
+      const ending = (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(interaction, "t-hung");
+      gated.release();
+      await ending;
+      await tick;
+
+      // A runtime we could not prove dead may still be holding the working tree
+      // (and, on Windows, the root capability). Dropping the last reference to it
+      // is exactly what this barrier exists to prevent — and `/end` must refuse
+      // to reclaim the checkout behind it rather than delete it underneath.
+      expect(sessionsOf(app).has("t-hung")).toBe(false);
+      expect(unconfirmedResumesOf(app).has("t-hung")).toBe(true);
+      expect(store.get("t-hung")?.state).toBe("active"); // NOT reaped
+      expect(interaction.replies.join("\n")).toContain("無法確認");
+      expect(interaction.replies.join("\n")).toContain("重啟");
+      expect(gated.disconnects()).toBeGreaterThanOrEqual(2); // discard + /end retry
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("posts the truthful transient-resume notice ONCE, not on every wake-up", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-flaky", sessionId: "sess-flaky" }));
+      store.commit("t-flaky");
+      const transport = new FakeTransport();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot({ resumeError: "getaddrinfo ENOTFOUND api.githubcopilot.com" }),
+        transport,
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+      const before = transport.notices.length;
+
+      await fireRetry(app, jobs);
+      await fireRetry(app, jobs);
+      await fireRetry(app, jobs);
+
+      const posted = transport.notices.slice(before);
+      expect(posted).toHaveLength(1); // once per thread per process, not per tick
+      expect(posted[0]).toContain("自動");
+      expect(posted[0]).not.toContain("重新啟動 bot 可再嘗試"); // the loop retries, not a restart
+      expect(store.get("t-flaky")?.state).toBe("active");
+      expect(store.get("t-flaky")?.reason).toBe("thread-no-access"); // still eligible
+      expect(sessionsOf(app).has("t-flaky")).toBe(false);
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });
