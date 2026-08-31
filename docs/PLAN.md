@@ -903,3 +903,92 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | v4 container mixed/downgraded row fail-closed；非 Windows 不診斷 Attach Files；YOLO 普通卡與撤銷檔案卡文字一致 | `test/session-store.test.ts`、`test/app-channels.test.ts`、`test/file-delivery-docs.test.ts` |
 | session dispose 後可重新顯示一次 Attach Files 缺權限提示 | `test/transport.test.ts` |
 | README / Discord setup 中英雙檔、PLAN 與 instructions 都如實說明 Windows-only availability；channel lockdown 的 Attach Files 與 mask 也只列於 Windows | `test/file-delivery-docs.test.ts` |
+
+---
+
+## 19. 存取恢復的同進程重試（2026-09-01）
+
+### 19.1 觸發原因
+
+[ADR-0002](adr/0002-missing-access-is-retryable.md) 承諾：`thread-no-access` 的 session 會在
+**bot 的頻道存取權恢復後，或 bot 重啟後**自動復原。實際上只有「重啟」那一半是真的——
+`reconcileOnStartup()` 在 production 只有 `onReady` 一個呼叫點，`login()` 也只註冊
+`InteractionCreate` / `MessageCreate`，所以同一個 process 內永遠不會再試一次。權限被還原時，
+bot 對「它原本看不到的討論串」不保證會收到任何可用的 gateway 事件（它先前就收不到那個頻道的
+事件），因此「等事件」無法作為正確性來源。
+
+### 19.2 採納的設計
+
+- **有界週期掃描（correctness source）**：`onReady` 把 `phase` 設為 `ready` 之後，`startAccessRetryLoop()`
+  只 arm **一個** timer。事件（若未來要加）只能 poke 這個 loop，不能取代它。
+- **重用既有狀態機**：每次 attempt 都走既有的 `reconcileRecord()` → `planReconcile()` → `resumeRecord()`，
+  只多一個 `via: "access-retry"` 旗標。不另外長第二套 resume 狀態機，也不改持久化 schema。
+- **候選集合**：`state === "active" && reason === "thread-no-access" && !sessions.has(threadId)`。
+  每個 candidate 在動手前會**重新讀取**目前的 durable record（`store.get`），因為上一個 candidate 的
+  resume、`/end`、shutdown 都可能在 await 期間改變世界。
+- **cadence**：`ACCESS_RETRY_DELAYS_MS = [15s, 30s, 60s, 2m, 5m]`，掃到 candidate 但沒有任何 resume
+  成功就往上退避、封頂 5 分鐘；一旦有 resume 成功或候選集合為空就回到 15s。
+  **永遠不會因為重試太多次而把記錄改成終態**——那正是 ADR-0002 反對的事。
+- **靜默的 no-op tick**：classification 仍是 `no-access` 且 record 內容未變時，retry 路徑不寫 store、
+  不 `console.warn`、不發 notice。否則一個權限被撤掉好幾天的討論串會每次 wake-up 都重寫一次磁碟並
+  重貼一次同樣的警告。startup 路徑的行為完全不變（仍然寫、仍然貼）。
+- **timer 不得留住 process**：production 的 `setTimeout` 立刻 `unref()`；測試用注入的
+  `accessRetryScheduler` 佇列手動觸發，不使用真實等待，也不用 `vi.useFakeTimers()`（那會連同一個 app
+  持有的 SDK / git timeout 一起凍住）。
+
+### 19.3 競態防護
+
+- **不重疊 tick**：`accessRetryTickPromise` 存在時 `runAccessRetryTick()` 直接返回；tick 結束才
+  `scheduleAccessRetry()`（先 `clear` 再 `set`），所以任何時刻最多一個 armed timer、最多一個 in-flight tick。
+- **`resumeOwnershipLost()`（新的共用 fence）**：`resumeRecord()` 在 `SessionActor.create()` 之後、
+  `sessions.set()` 之前重新證明它仍擁有這筆記錄——`shuttingDown`、已有 live session、record 已被移除、
+  record 已非 `active`、record 的 `sessionId`/`generation` 已改變，任一成立就**丟棄**剛 resume 出來的
+  session（bounded `disconnect()`）而不註冊。fence 與 `sessions.set()` 之間沒有 await，因此是一個
+  不可被插入的原子步驟。startup 路徑同樣受惠：它以前也沒有這個保護。
+- **`/end` 一定贏**：`/end thread:<id>` 對 `thread-no-access` 的 record 本來就允許 reclaim。它移除
+  record（或在 worktree 保留時 retire 成 `blocked`）之後，in-flight 的 retry 會在 fence 撞上
+  「record 不見了 / 不是 active」，於是不復活它。
+- **shutdown 一定贏**：`stop()` 先設 `shuttingDown` / `phase`，再 `clearAccessRetryTimer()`。已經在飛的
+  tick 會在 fence 撞上 `shuttingDown`；tick 結束後的 `scheduleAccessRetry()` 因 `shuttingDown` 不再 arm。
+- **lease / generation 不變式不變**：retry 不會另外取 lease（startup pre-scan 取的 local lease 在
+  `thread-no-access` 期間本來就一直持有），terminal 轉換仍由既有的 `block` 分支釋放 lease；resume 一律
+  以 record 上的 `sessionId` / `generation` / `workDir` 回到同一個 worktree 與同一個 conversation。
+
+### 19.4 否決的方案
+
+- **只靠 Discord 事件（`ChannelUpdate` / `GuildMemberUpdate` / `ThreadUpdate`）**：權限恢復不保證對
+  「先前不可見的討論串」產生可用事件，而且 discord.js 的 partial/cache 行為會讓「哪個 record 受影響」
+  變成猜測。否決為正確性來源；未來可作為 poke。
+- **每個 record 各自一個 timer**：N 個 timer 就是 N 個可能重疊的復原路徑，正好是最容易寫出 double-resume
+  的形狀。改為單一 loop 掃全部。
+- **重試次數上限 / 逾時後改為終態**：直接違反 ADR-0002。
+- **在持久化 schema 增加 `nextRetryAt` 之類欄位**：重試節奏是 process 內的排程細節，不是需要跨重啟保存的
+  事實（重啟本來就會立刻重試一次）。避免動 schema。
+- **`/end` 在 retry in-flight 時拒絕執行**：那會讓「唯一的放棄逃生口」在最需要它的時候不可用。改為
+  「`/end` 先贏、retry 事後自我丟棄」。
+
+### 19.5 已接受的殘留風險
+
+- retry 與 `/end` 恰好同時發生時，可能真的建立出一個 SDK session 又立刻 disconnect 掉；conversation 本身
+  不受影響（resume 不改變歷史），代價是一次多餘的 runtime 往返。同一個視窗裡 `/end` 也可能在 resume 落地前
+  就移除 worktree；這是安全方向：`removeWorktreeIfClean` 需要 git 證明乾淨，Windows 上 `captureValidatedRoot`
+  的 root handle 還會讓刪除失敗（於是 worktree 被保留），而被丟棄的 actor 從未被註冊、也就永遠收不到 prompt。
+- 一筆記錄的終態轉換寫入失敗時，retry loop 只能記錄（`console.error`）並讓它維持 `active`；沒有「讓啟動失敗」
+  這個槓桿可用。維持 `active` 是不會弄丟對話的那個方向。
+- `/end` 若在 retry 已經 `sessions.set()` **之後**才抵達，走的是既有的 live-session `/end` 路徑，這裡沒有
+  行為變更。
+- 若某筆 record 是在 process 執行期間（而非 startup）才變成 `thread-no-access`（目前沒有這種路徑），
+  最壞情況要等一個 idle 週期（≤15s，或退避後 ≤5 分鐘）才會被掃到。
+
+### 19.6 §9 測試對照補記
+
+| §9 需求 / 新增風險 | 覆蓋 |
+| --- | --- |
+| `50001` → 權限恢復 → **恰好一次** resume，且清掉 retry 狀態（`reason` 變 `undefined`）；後續 tick 不再 resume | `test/app-reconcile.test.ts` |
+| Channel Obfuscation → 重新可見 → resume | `test/app-reconcile.test.ts` |
+| 權限持續未恢復：永遠停在 `active` / `thread-no-access`、沒有 live actor、沒有 notice 洗版、退避 15s→5m 封頂 | `test/app-reconcile.test.ts` |
+| 重試期間討論串真的被刪除 → 走既有 terminal 規則（`blocked` / `thread-gone`）並釋放 local lease | `test/app-reconcile.test.ts` |
+| in-flight tick 期間再進來的 wake-up 不得產生第二次 resume，且結束後只 arm 一個 timer | `test/app-reconcile.test.ts` |
+| `/end` 穿插 in-flight retry：record 不得被復活，live map 保持空，孤兒 actor 被 disconnect | `test/app-reconcile.test.ts` |
+| shutdown 穿插 in-flight retry：不註冊 session、不再 arm timer、record 原封不動留給下次開機 | `test/app-reconcile.test.ts` |
+| armed timer 必須 `unref`，`clearAccessRetryTimer()` 必須真的清掉 | `test/app-reconcile.test.ts` |

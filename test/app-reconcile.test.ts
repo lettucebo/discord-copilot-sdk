@@ -1277,3 +1277,496 @@ describe("startup announcement length budget", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Same-process access-restoration retry (ADR-0002)
+// ---------------------------------------------------------------------------
+
+/** One scheduled retry wake-up, captured instead of slept through. */
+interface FakeRetryJob {
+  fn: () => void;
+  ms: number;
+  handle: object;
+}
+
+/** Replace the retry loop's timer with a queue a test can fire by hand. Real
+ *  waits would make this suite either slow or flaky, and `vi.useFakeTimers()`
+ *  would also freeze the SDK/git timeouts the same app owns. */
+function installFakeScheduler(app: DiscordCopilotApp): FakeRetryJob[] {
+  const jobs: FakeRetryJob[] = [];
+  (
+    app as unknown as {
+      accessRetryScheduler: { set(fn: () => void, ms: number): unknown; clear(h: unknown): void };
+    }
+  ).accessRetryScheduler = {
+    set(fn: () => void, ms: number): unknown {
+      const handle = {};
+      jobs.push({ fn, ms, handle });
+      return handle;
+    },
+    clear(h: unknown): void {
+      const i = jobs.findIndex((j) => j.handle === h);
+      if (i >= 0) jobs.splice(i, 1);
+    },
+  };
+  return jobs;
+}
+
+/** What `onReady` does once reconciliation is finished. */
+function readyAndStartRetry(app: DiscordCopilotApp): void {
+  (app as unknown as { phase: string }).phase = "ready";
+  (app as unknown as { startAccessRetryLoop(): void }).startAccessRetryLoop();
+}
+
+/** Fire the next scheduled wake-up and wait for the tick it starts. */
+async function fireRetry(app: DiscordCopilotApp, jobs: FakeRetryJob[]): Promise<void> {
+  await beginRetry(app, jobs);
+}
+
+/** Fire the next wake-up WITHOUT waiting, so a test can act while the tick is
+ *  suspended inside the runtime — which is where every race here lives. */
+function beginRetry(app: DiscordCopilotApp, jobs: FakeRetryJob[]): Promise<void> {
+  const job = jobs.shift();
+  expect(job, "expected a scheduled retry wake-up").toBeDefined();
+  job?.fn();
+  return (
+    (app as unknown as { accessRetryTickPromise?: Promise<void> }).accessRetryTickPromise ??
+    Promise.resolve()
+  );
+}
+
+/** A stray timer fire, as a second armed timer or an event poke would produce. */
+function runRetryTick(app: DiscordCopilotApp): void {
+  (app as unknown as { runAccessRetryTick(): void }).runAccessRetryTick();
+}
+
+/** A copilot whose resume is held open until the test releases it, so `/end`
+ *  and shutdown can be driven while a resume really is in flight. */
+function gatedCopilot(): {
+  client: CopilotClient;
+  calls: string[];
+  release: () => void;
+  disconnects: () => number;
+} {
+  let open: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const calls: string[] = [];
+  let disconnects = 0;
+  const session = {
+    ...fakeSession,
+    async disconnect(): Promise<void> {
+      disconnects++;
+    },
+  };
+  return {
+    client: {
+      createSession: async () => session,
+      async stop(): Promise<void> {},
+      resumeSession: async (id: string) => {
+        calls.push(id);
+        await gate;
+        return session;
+      },
+    } as unknown as CopilotClient,
+    calls,
+    release: () => open(),
+    disconnects: () => disconnects,
+  };
+}
+
+/** The slice of a slash-command interaction `/end thread:<id>` actually uses. */
+function fakeInteraction(): { replies: string[] } {
+  const replies: string[] = [];
+  return {
+    replies,
+    async reply(o: { content: string }): Promise<void> {
+      replies.push(o.content);
+    },
+    async deferReply(): Promise<void> {},
+    async editReply(o: string | { content: string }): Promise<void> {
+      replies.push(typeof o === "string" ? o : o.content);
+    },
+  } as unknown as { replies: string[] };
+}
+
+/** Reconcile through the REAL `classifyThread`, so these tests exercise the
+ *  actual 50001/obfuscation classification rather than an injected verdict. */
+function reconcileReal(app: DiscordCopilotApp): Promise<void> {
+  return (
+    app as unknown as {
+      reconcileOnStartup(d?: { validateBinding?: () => Promise<unknown> }): Promise<void>;
+    }
+  ).reconcileOnStartup({ validateBinding: async () => ({ ok: true }) });
+}
+
+function setChannelFetch(app: DiscordCopilotApp, fetch: (id: string) => Promise<unknown>): void {
+  (app as unknown as { discord: { channels: { fetch(id: string): Promise<unknown> } } }).discord = {
+    channels: { fetch },
+  };
+}
+
+const visibleThread = {
+  isThread: () => true,
+  guildId: "g1",
+  parentId: "c1",
+  archived: false,
+  sendable: true,
+};
+
+describe("same-process access-restoration retry (ADR-0002)", () => {
+  it("resumes a 50001 no-access record exactly once, once access is restored", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind());
+      store.commit("t1");
+      const transport = new FakeTransport();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        transport,
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      expect(store.get("t1")?.state).toBe("active");
+      expect(store.get("t1")?.reason).toBe("thread-no-access");
+      expect(sessionsOf(app).has("t1")).toBe(false);
+
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      expect(jobs.map((j) => j.ms)).toEqual([15_000]);
+
+      // Still no access: nothing changes, and the thread is not spammed.
+      const noticesBefore = transport.notices.length;
+      const resumesBefore = resumeCalls.filter((c) => c.id === "sess-1").length;
+      await fireRetry(app, jobs);
+      expect(sessionsOf(app).has("t1")).toBe(false);
+      expect(store.get("t1")?.state).toBe("active");
+      expect(store.get("t1")?.reason).toBe("thread-no-access");
+      expect(transport.notices.length).toBe(noticesBefore);
+      expect(resumeCalls.filter((c) => c.id === "sess-1").length).toBe(resumesBefore);
+
+      access = true;
+      await fireRetry(app, jobs);
+      expect(sessionsOf(app).has("t1")).toBe(true);
+      expect(resumeCalls.filter((c) => c.id === "sess-1").length).toBe(resumesBefore + 1);
+      expect(store.get("t1")?.state).toBe("active");
+      expect(store.get("t1")?.reason).toBeUndefined(); // retry state cleared
+
+      // A later wake-up must not resume the same record a second time.
+      await fireRetry(app, jobs);
+      expect(resumeCalls.filter((c) => c.id === "sess-1").length).toBe(resumesBefore + 1);
+      expect(sessionsOf(app).size).toBe(1);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("resumes an obfuscated-channel record once the channel becomes visible again", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-obf", sessionId: "sess-obf" }));
+      store.commit("t-obf");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let hidden = true;
+      setChannelFetch(app, async () =>
+        hidden ? { name: "___hidden___", isThread: () => true, guildId: "g1", parentId: "c1" } : visibleThread
+      );
+
+      await reconcileReal(app);
+      expect(store.get("t-obf")?.reason).toBe("thread-no-access");
+
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      await fireRetry(app, jobs);
+      expect(sessionsOf(app).has("t-obf")).toBe(false);
+
+      hidden = false;
+      await fireRetry(app, jobs);
+      expect(sessionsOf(app).has("t-obf")).toBe(true);
+      expect(resumeCalls.filter((c) => c.id === "sess-obf")).toHaveLength(1);
+      expect(store.get("t-obf")?.state).toBe("active");
+      expect(store.get("t-obf")?.reason).toBeUndefined();
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("stays active/thread-no-access for ever while access stays revoked, and backs off", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-stuck", sessionId: "sess-stuck" }));
+      store.commit("t-stuck");
+      const transport = new FakeTransport();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        transport,
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      setChannelFetch(app, async () => {
+        throw { code: 50001 };
+      });
+
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      const noticesAfterStartup = transport.notices.length;
+
+      const delays: number[] = [];
+      for (let i = 0; i < 6; i++) {
+        delays.push(jobs[0]?.ms ?? -1);
+        await fireRetry(app, jobs);
+      }
+      // Escalating, capped, and never terminal.
+      expect(delays).toEqual([15_000, 30_000, 60_000, 120_000, 300_000, 300_000]);
+      expect(jobs.map((j) => j.ms)).toEqual([300_000]);
+      expect(store.get("t-stuck")?.state).toBe("active");
+      expect(store.get("t-stuck")?.reason).toBe("thread-no-access");
+      expect(sessionsOf(app).size).toBe(0);
+      expect(resumeCalls.filter((c) => c.id === "sess-stuck")).toHaveLength(0);
+      // No per-wake-up spam into a thread the bot cannot even reach.
+      expect(transport.notices.length).toBe(noticesAfterStartup);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("persists the existing terminal outcome when the thread turns out to be gone", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-gone", sessionId: "sess-gone" }));
+      store.commit("t-gone");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let deleted = false;
+      setChannelFetch(app, async () => {
+        if (!deleted) throw { code: 50001 };
+        throw { code: 10003 };
+      });
+
+      await reconcileReal(app);
+      expect(localLeasesOf(app).size).toBe(1); // local-mode record holds its repo
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+
+      deleted = true;
+      await fireRetry(app, jobs);
+      expect(store.get("t-gone")?.state).toBe("blocked");
+      expect(store.get("t-gone")?.reason).toBe("thread-gone");
+      expect(sessionsOf(app).has("t-gone")).toBe(false);
+      expect(localLeasesOf(app).size).toBe(0); // terminal ⇒ the repo is free again
+      expect(resumeCalls.filter((c) => c.id === "sess-gone")).toHaveLength(0);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("cannot double-resume when a second wake-up lands inside one already in flight", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-race", sessionId: "sess-race" }));
+      store.commit("t-race");
+      const gated = gatedCopilot();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        gated.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(gated.calls).toHaveLength(1));
+      // Two more wake-ups while the first tick is suspended in the runtime.
+      runRetryTick(app);
+      runRetryTick(app);
+      expect(gated.calls).toHaveLength(1);
+      expect(jobs).toHaveLength(0); // nothing re-armed while a tick is in flight
+
+      gated.release();
+      await tick;
+
+      expect(gated.calls).toEqual(["sess-race"]);
+      expect(sessionsOf(app).size).toBe(1);
+      expect(sessionsOf(app).has("t-race")).toBe(true);
+      expect(gated.disconnects()).toBe(0);
+      expect(store.get("t-race")?.state).toBe("active");
+      expect(jobs).toHaveLength(1); // exactly ONE wake-up re-armed
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("lets /end win against an in-flight retry instead of resurrecting the record", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-end", sessionId: "sess-end" }));
+      store.commit("t-end");
+      const gated = gatedCopilot();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        gated.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(gated.calls).toHaveLength(1));
+
+      // `/end thread:t-end` from the parent channel, while the resume is in the
+      // runtime. ADR-0002 makes this the owner's deliberate escape hatch.
+      const interaction = fakeInteraction();
+      await (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(interaction, "t-end");
+      expect(store.get("t-end")).toBeUndefined();
+
+      gated.release();
+      await tick;
+
+      expect(store.get("t-end")).toBeUndefined(); // NOT resurrected
+      expect(sessionsOf(app).has("t-end")).toBe(false);
+      expect(localLeasesOf(app).size).toBe(0);
+      expect(gated.disconnects()).toBe(1); // the orphaned resume was torn down
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("starts no session, and arms no further wake-up, when shutdown races a retry", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-shut", sessionId: "sess-shut" }));
+      store.commit("t-shut");
+      const gated = gatedCopilot();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        gated.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(gated.calls).toHaveLength(1));
+
+      await app.stop();
+
+      gated.release();
+      await tick;
+
+      expect(sessionsOf(app).size).toBe(0);
+      expect(gated.disconnects()).toBe(1);
+      expect(jobs).toHaveLength(0); // disarmed, and never re-armed after shutdown
+      // Untouched, so the next boot still finds a resumable conversation.
+      expect(store.get("t-shut")?.state).toBe("active");
+      expect(store.get("t-shut")?.reason).toBe("thread-no-access");
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("does not arm a wake-up that can hold the process open", () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        new SessionStore(f),
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      (app as unknown as { phase: string }).phase = "ready";
+      (app as unknown as { startAccessRetryLoop(): void }).startAccessRetryLoop();
+      const timer = (app as unknown as { accessRetryTimer?: { hasRef?(): boolean } }).accessRetryTimer;
+      expect(timer?.hasRef?.()).toBe(false);
+      (app as unknown as { clearAccessRetryTimer(): void }).clearAccessRetryTimer();
+      expect((app as unknown as { accessRetryTimer?: unknown }).accessRetryTimer).toBeUndefined();
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});

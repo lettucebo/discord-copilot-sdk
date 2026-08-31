@@ -412,4 +412,4 @@ ready proof 無效或逾時，會以失敗結束，且只終止這次剛啟動�
 - **重跑安裝器** → 安全且冪等：會以既有 `.env` 為預設、先備份再寫入。
 - **allow-list 裡的使用者每個指令都回「Not authorized」（非管理員看不到指令）** → `default_member_permissions="0"` 代表預設只有 guild Administrator（與擁有者）能用指令；非 Administrator 的 allow-listed 使用者需要在 Server Settings → Integrations → 該 app → Command permissions 加上明確覆寫。見 [`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) §4c。
 - **工作頻道或其指令都看不到（頻道不可見）** → bot 必須是**私密**頻道的明確成員才看得到它、指令才會出現在那裡；請檢查頻道的成員清單，而不是只看身分組權限畫面。見 [`docs/DISCORD-SETUP.zh-TW.md`](docs/DISCORD-SETUP.zh-TW.md) §4b 與 [`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md)。
-- **權限或頻道變動後某個討論串沒反應了（`thread-no-access`）** → 這是**可重試**的：把 bot 對該頻道的存取權還原，session 就會恢復。`/sessions` 會把它獨立列在別的區塊；如果你想直接清掉，用 `/end thread:<id>` 明確清除。見 [`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md)。
+- **權限或頻道變動後某個討論串沒反應了（`thread-no-access`）** → 這是**可重試**的：把 bot 對該頻道的存取權還原，執行中的 bot 就會自己復原 session，不需要重啟（它每 15 秒起、逐步退避到最多每 5 分鐘重掃一次這類紀錄）。`/sessions` 會把它獨立列在別的區塊；如果你想直接清掉，用 `/end thread:<id>` 明確清除。見 [`docs/CHANNEL-ACCESS.zh-TW.md`](docs/CHANNEL-ACCESS.zh-TW.md)。

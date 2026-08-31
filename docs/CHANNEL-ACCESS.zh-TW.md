@@ -56,7 +56,7 @@ Interaction 會不受頻道收發權限影響送到 bot 的後端，而且初始
 
 **把頻道移出白名單**：先 `/end` 結束該頻道的 sessions → `/channel disable` → 從頻道移除 bot 的成員資格／覆寫。請先做 disable、再撤銷 Discord 層級的存取，否則如果那正是唯一還能管理授權的頻道，`/channel disable` 本身可能就變得無法觸及。
 
-> 如果 bot 意外失去它自己在某頻道的 View Channel（有人改了權限、身分組變動等），對該頻道的 API 呼叫——包括綁定在它上面的既有 session——都會得到 `50001 Missing Access`。依 [ADR-0002](adr/0002-missing-access-is-retryable.md)，這個特定失敗被視為**可重試**，不是終態：復原 bot 的存取權後，受影響的 session 預期可以恢復，這和 §7 描述的結構性不符不同。`/sessions` 會把這類 `thread-no-access` 紀錄列在專屬的區段——在存取權恢復或 restart 後可重試，但擁有者也可以刻意放棄它、用 `/end thread:<id>` 明確清除。
+> 如果 bot 意外失去它自己在某頻道的 View Channel（有人改了權限、身分組變動等），對該頻道的 API 呼叫——包括綁定在它上面的既有 session——都會得到 `50001 Missing Access`。依 [ADR-0002](adr/0002-missing-access-is-retryable.md)，這個特定失敗被視為**可重試**，不是終態：復原 bot 的存取權後，受影響的 session 就會恢復，這和 §7 描述的結構性不符不同。恢復**不需要重啟**——執行中的 bot 會定期重掃它的 `thread-no-access` 紀錄（第一次 15 秒後，之後逐步退避到最多每 5 分鐘一次），一旦該討論串重新判定為可存取就復原它；重啟只是把同一個檢查立刻跑一次而已。權限恢復不保證會針對「bot 原本看不到的討論串」送出任何 gateway 事件，所以讓這個承諾成真的是這個週期性掃描，而不是事件。`/sessions` 會把這類 `thread-no-access` 紀錄列在專屬的區段——存取權恢復後會自動重試，但擁有者也可以刻意放棄它、用 `/end thread:<id>` 明確清除。
 
 ---
 

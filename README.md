@@ -321,8 +321,8 @@ while the controlled repo stayed untouched.
   records are listed too, split by what can actually be done with them:
   *clearable*, *will retry on restart* (never deleted — the record is the only
   pointer to that Copilot conversation), and records the bot lost channel access to
-  (`thread-no-access`), which retry once access is restored or on restart but can
-  also be explicitly cleared by the owner with `/end thread:<id>`.
+  (`thread-no-access`), which retry automatically once access is restored — no restart needed —
+  but can also be explicitly cleared by the owner with `/end thread:<id>`.
 - `/end` — end **this** thread's session; the others keep running. In a thread
   whose session is gone but whose record survived, the same command reaps that
   record and its worktree.

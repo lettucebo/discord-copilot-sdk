@@ -236,6 +236,11 @@ events nor lists its commands there (ADR-0001, `docs/CHANNEL-ACCESS.md`). Discor
 command-permission overrides are a secondary, manual server-admin layer, not bot authorization —
 a visible command from an unauthorized location must still receive the normal safe refusal and
 perform no work. Losing channel visibility (`50001`/Channel Obfuscation) classifies the affected
-session as retryable `thread-no-access`: it resumes automatically once access is restored or the
-bot restarts, and it is explicitly, manually clearable with `/end thread:<id>` after an informed
-owner decides to give up on recovery (ADR-0002) — it must never be treated as a permanent block.
+session as retryable `thread-no-access`: a single bounded periodic scan armed after startup
+(`startAccessRetryLoop`, 15s backing off to 5 min) re-runs the ordinary reconcile/resume path for
+those records, so it resumes automatically once access is restored — without a restart, because
+restoring a permission emits no reliable gateway event for a thread the bot could not see — and it
+is explicitly, manually clearable with `/end thread:<id>` after an informed owner decides to give
+up on recovery (ADR-0002) — it must never be treated as a permanent block. `resumeRecord` re-proves
+it still owns the record immediately before `sessions.set`, so `/end` and shutdown win outright
+against an in-flight resume instead of being resurrected by it.
