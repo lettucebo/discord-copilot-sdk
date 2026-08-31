@@ -218,6 +218,7 @@ describe("ChannelRegistry", () => {
         expect(() => new ChannelRegistry(SEED, GUILD, file)).toThrow(
           /refusing to start with an empty authorization set/
         );
+        expect(rename).toHaveBeenCalledTimes(1);
       } finally {
         rename.mockRestore();
         warn.mockRestore();
@@ -245,6 +246,7 @@ describe("ChannelRegistry", () => {
         expect(() => new ChannelRegistry(SEED, GUILD, file)).toThrow(
           /refusing to start with an empty authorization set/
         );
+        expect(rename).toHaveBeenCalledTimes(1);
       } finally {
         rename.mockRestore();
         warn.mockRestore();
