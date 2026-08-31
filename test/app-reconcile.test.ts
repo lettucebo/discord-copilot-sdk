@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterAll, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { DiscordCopilotApp } from "../src/app.js";
 import { SessionActor, type SessionActorOpts } from "../src/copilot/session-actor.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
@@ -9,16 +9,13 @@ import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { tmpdir } from "node:os";
 import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
-import { existsSync, rmSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 
-// The app owns durable state beneath os.homedir(). Redirect it before any
-// fixture calls stateDir(), so this suite never reads a developer's registry
-// or leaves worktrees in their real home directory.
-const realHome = process.env.HOME;
-const realUserProfile = process.env.USERPROFILE;
-const fakeHome = mkdtempSync(join(tmpdir(), "dp-reconcile-home-"));
-process.env.HOME = fakeHome;
-process.env.USERPROFILE = fakeHome;
+const isolatedHome = (() => {
+  const value = process.env["DISCORD_COPILOT_SDK_VITEST_HOME"];
+  if (!value) throw new Error("Vitest home isolation is required");
+  return value;
+})();
 
 const REPOS_ROOT = join(tmpdir(), "dcs-fixture-repos");
 const REPO = join(REPOS_ROOT, "repo");
@@ -62,14 +59,6 @@ const wtBind = (id: string, over: Partial<SessionBinding> = {}): SessionBinding 
 
 afterEach(() => {
   for (const d of wtDirs.splice(0)) rmSync(d, { recursive: true, force: true });
-});
-
-afterAll(() => {
-  if (realHome === undefined) delete process.env.HOME;
-  else process.env.HOME = realHome;
-  if (realUserProfile === undefined) delete process.env.USERPROFILE;
-  else process.env.USERPROFILE = realUserProfile;
-  rmSync(fakeHome, { recursive: true, force: true });
 });
 
 const cfg = {
@@ -169,7 +158,7 @@ function productionStyleApp(
     { path: "(production-style-test)", release: async () => {} },
     transport,
     store,
-    new ChannelRegistry("c1", "g1", join(fakeHome, "production-style-channels.json"))
+    new ChannelRegistry("c1", "g1", join(isolatedHome, "production-style-channels.json"))
   );
   (app as unknown as { reposRoot: string }).reposRoot = REPOS_ROOT;
   return app;
