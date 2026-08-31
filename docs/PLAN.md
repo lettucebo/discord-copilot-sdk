@@ -502,6 +502,75 @@ npx vitest run test/version.test.ts test/session-actor.test.ts \
 # Tests       252 passed (252)
 ```
 
+### 15.6 錯誤分支不可依賴平台特定 errno（2026-09-01）
+
+PR #35 合併後的 CI 在 Ubuntu 兩個 Node 版本失敗、Windows 兩個版本通過。
+`test/channel-registry.test.ts` 原本把 `blocked-parent` 建成一般檔案，再讀
+`blocked-parent/channels.json`，希望命中「檔案不存在 → 首次初始化 →
+持久化失敗」：
+
+* Windows 的 `readFileSync` 對這個形狀回 `ENOENT`，因此確實進入首次初始化；
+* Linux 回 `ENOTDIR`，`ChannelRegistry` 正確把它視為「registry 無法讀取」
+  並標為 corrupt，因此建構子不會走首次初始化或丟出該測試預期的錯誤。
+
+兩邊的產品行為都 fail-closed；錯的是 test 用一個 errno 未跨平台定義成
+相同結果的模糊檔案系統形狀，來選擇內部錯誤分支。修正後，fixture 使用
+真正不存在的 registry 路徑穩定取得 `ENOENT`，再以
+`vi.spyOn(fs, "renameSync")` 注入非 transient 的 `EIO`，精確命中
+`writeRequired` 的首次初始化失敗路徑。
+
+交付流程也重演了 §16 的失敗模式：PR #35 合併前只有 GitGuardian，
+**沒有 CI matrix check-run**；merge 後約 18 分鐘完整 CI 才開始。errno
+規則只能防這一種 test 缺陷；防止紅燈進 main 仍須 branch protection
+把完整 matrix 設為 required checks，不能以人工等待或「稍後再看」取代。
+
+操作規則刻意限縮如下：
+
+* **需要精確命中某個錯誤分支時**，不要依賴模糊 path shape 在各 OS
+  會回同一個 errno；**in-process suite** 以 fault injection 控制失敗點
+  與錯誤碼。`setup-integration` / `update-integration` /
+  `shipped-scripts` 這類 spawned-child 測試不會繼承 `vi.spyOn`；必須使用
+  子行程真的可觀察到的 fixture / environment / preload seam。
+* 這**不是**「所有真實檔案系統形狀測試都不可攜」。目錄、symlink、
+  hardlink、ACL 與 git worktree 的 integration tests 仍有價值；只要測試
+  的 contract 是該真實形狀本身，而不是假定它會在所有平台被翻成同一 errno。
+* 注入 Node built-in 的 spy 必須在 `finally` 還原；錯誤碼要與測試目的
+  一致。**在 `fs.renameSync` atomic-replacement 邊界**，測立即
+  fail-closed 用非 transient `EIO`；測該邊界的 retry 才使用
+  `EPERM` / `EACCES` / `EBUSY`。這不是全域 errno 分類：在 registry
+  read 邊界，除了 `ENOENT` 之外的任何錯誤（包含上述三種）都應走
+  present-but-unreadable 的 corrupt / fail-closed 路徑。**後續
+  regression task** 會為現有兩個 EIO 測試補上注入點只呼叫一次的斷言；
+  落地前這仍是待執行控制，不是假稱現況已有。否則未來若 transient
+  集合加入 `EIO`，測試可能經 retry exhaustion 仍綠，卻不再證明
+  「不重試」的契約。
+* 同一檔案若要命中相同 product branch，應重用同一種已驗證的 fixture /
+  fault-injection pattern；不要讓兩個測試各自靠不同 OS errno 巧合進入
+  同一條路徑。
+
+同次盤點亦發現 app/actor tests 可因可選的 test dependency 而讀寫真實
+`~/.discord-copilot-sdk`、audit path、worktree root 或
+`~/.copilot/skills`。目前 `DiscordCopilotApp.createForTest` 尚不能注入
+approval storage、worktree root、actor audit log 或 actor skills home；
+因此**每個會建構 `DiscordCopilotApp` 的 suite** 都必須在第一次建構前，
+同時把 `HOME` 與 `USERPROFILE` 指向 suite-scoped fake home，並在 teardown
+還原兩個變數、移除 fake home。只有當 test seam 已能明確注入**全部**
+home-backed dependencies 時，個別 suite 才能不做這層隔離。直接建構
+actor 或呼叫 home-derived path helper 的 suite 也遵循同一規則。
+守門測試要能偵測**讀取**而不只寫入，且不可在檢查真實 home 時呼叫
+本身會建立目錄的 `stateDir()`。Home-derived path 必須從
+`src/core/paths.ts` 的 helper 取得；test 不得重新拼寫
+`.discord-copilot-sdk` 或其 worktree sibling 字面量（
+`app-rebind.test.ts` 現有 8 處屬待修技術債）。
+
+這個 per-suite 規則只是修復期間的最低要求，不是最終防線；它已經被漏掉
+過。最終控制應同時包含：(1) `createForTest` /
+`SessionActor.createForTest` 對 home-backed dependencies 採
+compile-enforced 必填注入；(2) 評估加入 Vitest `setupFiles`（目前 repo
+沒有 Vitest config）或等價的全 run bootstrap，在載入 product module 前
+統一重導並於結束後還原 `HOME` / `USERPROFILE`。若個別 integration suite
+刻意需要真實 home，必須明確 opt out，而不是依賴未隔離的預設。
+
 ## 16. PR #14 提前合併事故紀錄（2026-08-07）
 
 ### 16.1 已確認時間線
