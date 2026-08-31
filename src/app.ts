@@ -324,6 +324,23 @@ interface AccessRetryScheduler {
   clear(handle: unknown): void;
 }
 
+/**
+ * How one reconcile attempt was started, and how it learns it must stop.
+ *
+ * `cancelled` is the retry loop's cancellation token. Startup passes none — its
+ * semantics are unchanged, and it runs before the phase gate opens — but a retry
+ * attempt awaits Discord, git and the runtime while `stop()` is free to run to
+ * completion and release the single-instance lock. Without a token, a
+ * classification that resolves after that would happily persist a terminal
+ * state, drop a repo lease and post a Discord message on behalf of a process
+ * that no longer owns any of it (and whose replacement may already be running
+ * against the same store).
+ */
+interface ReconcileAttemptOpts {
+  via?: "startup" | "access-retry";
+  cancelled?: () => string | undefined;
+}
+
 /** Format an executable list for a compact reply. */
 function fmtList(items: string[]): string {
   return items.length ? items.map((e) => `\`${e}\``).join(", ") : "(none)";
@@ -601,11 +618,17 @@ export class DiscordCopilotApp {
    *  finished. Published before the attempt's first await so `/end` and `stop()`
    *  can join the real thing rather than race a timeout against it. */
   private readonly accessResumeSettled = new Map<string, Promise<void>>();
-  /** How long `/end` waits for such an attempt before giving up on it. A test
-   *  seam: safety does not depend on this value (an attempt that has not settled
-   *  makes `/end` refuse rather than proceed), only on how long an operator
-   *  waits to be told so. */
+  /** How long `/end` and `stop()` wait for such an attempt before giving up on
+   *  it. A test seam: safety does not depend on this value — an attempt that has
+   *  not settled makes `/end` refuse, and one that outlives `stop()` is fenced
+   *  by its cancellation token — only on how long a caller waits to find out. */
   private accessResumeJoinTimeoutMs = TEARDOWN_TIMEOUT_MS;
+  /** Bumped when this process gives up ownership of its durable state (today:
+   *  `stop()`). Every retry attempt captures it and re-checks it after each
+   *  await, so an attempt that outlives the shutdown it raced cannot write to a
+   *  store, drop a lease or post a message on behalf of a process that has
+   *  already released its single-instance lock. */
+  private accessRetryEpoch = 0;
   /** Bound on one discard/barrier disconnect attempt. Same seam, same reason:
    *  a test must be able to exercise a HANGING teardown, not only one that
    *  rejects immediately, without spending the real bound. */
@@ -3951,6 +3974,16 @@ export class DiscordCopilotApp {
           settle = resolve;
         })
       );
+      // Captured per attempt, checked after every await inside it. `phase` and
+      // `shuttingDown` are only read BEFORE the awaits below; this is what makes
+      // a late-resolving classification unable to act on behalf of a process
+      // that has since released its lock.
+      const epoch = this.accessRetryEpoch;
+      const cancelled = (): string | undefined => {
+        if (this.accessRetryEpoch !== epoch) return "this process gave up ownership of its state";
+        if (this.shuttingDown) return "shutdown started";
+        return undefined;
+      };
       try {
         // The SAME reconcile path startup uses: it re-validates the binding and
         // re-classifies the thread, and only a `valid` classification resumes.
@@ -3963,7 +3996,7 @@ export class DiscordCopilotApp {
         await this.reconcileRecord(
           rec,
           (id, parent) => this.reconcileClassify(id, parent, { force: true }),
-          { via: "access-retry" }
+          { via: "access-retry", cancelled }
         );
       } catch (err) {
         // Startup turns a failed terminal transition into a failed startup. A
@@ -4184,7 +4217,7 @@ export class DiscordCopilotApp {
   private async reconcileRecord(
     rec: SessionRecord,
     classify: (threadId: string, expectedParentChannelId: string) => Promise<ThreadStatus>,
-    opts: { via?: "startup" | "access-retry" } = {}
+    opts: ReconcileAttemptOpts = {}
   ): Promise<void> {
     const retry = opts.via === "access-retry";
     let bindingOk: boolean | undefined;
@@ -4192,6 +4225,14 @@ export class DiscordCopilotApp {
     if (rec.state === "active") {
       bindingOk = this.bindingOk(rec);
       if (bindingOk) threadStatus = await classify(rec.threadId, rec.parentChannelId);
+    }
+    // The one await above can outlive this process's ownership of its own state.
+    // Everything below writes to disk, releases a lease or posts to Discord, so
+    // the token is checked HERE, once, covering every branch of the switch.
+    const abandoned = opts.cancelled?.();
+    if (abandoned) {
+      console.warn(`reconcile: abandoning ${rec.threadId} — ${abandoned}`);
+      return;
     }
 
     const action = planReconcile({ corrupt: false, state: rec.state, bindingOk, threadStatus });
@@ -4274,7 +4315,7 @@ export class DiscordCopilotApp {
    *  retries — never dropping recoverable history). */
   private async resumeRecord(
     rec: SessionRecord,
-    opts: { via?: "startup" | "access-retry" } = {}
+    opts: ReconcileAttemptOpts = {}
   ): Promise<void> {
     // BEFORE the first side effect, not just before registration. The retry loop
     // reaches here after awaiting the thread classification, and `/end` or
@@ -4283,7 +4324,7 @@ export class DiscordCopilotApp {
     // points at, which is exactly the leftover `/end` had just finished
     // removing. `resumeOwnershipLost` is synchronous and the `addWorktree` call
     // is the next statement's first await, so nothing can land between them.
-    const claimedBefore = this.resumeOwnershipLost(rec);
+    const claimedBefore = this.resumeOwnershipLost(rec, opts);
     if (claimedBefore) {
       console.warn(`resume: not resuming ${rec.threadId} — ${claimedBefore}`);
       return;
@@ -4299,7 +4340,13 @@ export class DiscordCopilotApp {
         console.warn(`reconcile: recreated missing worktree for ${rec.threadId} at ${rec.workDir}`);
       } catch (err) {
         // Terminal, not transient: retrying every boot cannot fix a tree we
-        // just failed to rebuild.
+        // just failed to rebuild — but only if this attempt still speaks for
+        // the process. `addWorktree` was an await like any other.
+        const abandoned = this.resumeOwnershipLost(rec, opts);
+        if (abandoned) {
+          console.warn(`resume: not terminalizing ${rec.threadId} after a failed rebuild — ${abandoned}`);
+          return;
+        }
         if (!this.store.setState(rec.threadId, "blocked", "worktree-missing")) {
           throw new FatalReconcileError(`reconcile: could not persist blocked state for ${rec.threadId}`);
         }
@@ -4318,7 +4365,7 @@ export class DiscordCopilotApp {
       // Undo our own side effect rather than leave a checkout no record points
       // at. Failing to undo it is not fatal: it is retained (never deleted
       // without git's proof) and the startup stray-worktree scan reports it.
-      const claimedDuring = this.resumeOwnershipLost(rec);
+      const claimedDuring = this.resumeOwnershipLost(rec, opts);
       if (claimedDuring) {
         console.warn(
           `resume: ${rec.threadId} was claimed while its worktree was rebuilt (${claimedDuring}); removing it again.`
@@ -4347,11 +4394,17 @@ export class DiscordCopilotApp {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`reconcile: transient trusted-root capture failure for ${rec.threadId}: ${msg}`);
-      await this.noticeTransientResumeFailure(rec.threadId, msg, opts);
+      const abandoned = this.resumeOwnershipLost(rec, opts);
+      if (!abandoned) await this.noticeTransientResumeFailure(rec.threadId, msg, opts);
       return;
     }
     if (!captured.ok) {
       console.warn(`reconcile: refusing to resume ${rec.threadId} — ${captured.verdict.detail}`);
+      const abandoned = this.resumeOwnershipLost(rec, opts);
+      if (abandoned) {
+        console.warn(`resume: not persisting a binding refusal for ${rec.threadId} — ${abandoned}`);
+        return;
+      }
       if (!this.store.setState(rec.threadId, "blocked", `binding-${captured.verdict.problem}`)) {
         throw new FatalReconcileError(`reconcile: could not persist blocked state for ${rec.threadId}`);
       }
@@ -4390,6 +4443,14 @@ export class DiscordCopilotApp {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // `SessionActor.create` is the longest await in this method; a shutdown
+      // can easily complete inside it. Nothing below may run on behalf of a
+      // process that has surrendered its state.
+      const abandoned = this.resumeOwnershipLost(rec, opts);
+      if (abandoned) {
+        console.warn(`resume: dropping the resume failure for ${rec.threadId} (${msg}) — ${abandoned}`);
+        return;
+      }
       if (classifyResumeError(msg) === "session-lost") {
         // Definitive: the session id is gone. Mark terminal; a failed persist of
         // that transition is a disk problem we must surface (fail startup).
@@ -4418,7 +4479,7 @@ export class DiscordCopilotApp {
     // ownership of the exact record we resumed BEFORE registering it: from here
     // to `sessions.set` there is no await, so this check and the registration
     // are one atomic step that a concurrent command cannot slip inside.
-    const lost = this.resumeOwnershipLost(rec);
+    const lost = this.resumeOwnershipLost(rec, opts);
     if (lost) {
       await this.discardResumedActor(rec, actor, lost);
       return;
@@ -4478,8 +4539,13 @@ export class DiscordCopilotApp {
    * both allowed to win outright; this is how they do it without having to
    * cancel work they cannot see.
    */
-  private resumeOwnershipLost(rec: SessionRecord): string | undefined {
+  private resumeOwnershipLost(rec: SessionRecord, opts: ReconcileAttemptOpts = {}): string | undefined {
     if (this.shuttingDown) return "shutdown started";
+    // The attempt's own cancellation token. `shuttingDown` above catches the
+    // common case; this catches an attempt that was cancelled for any other
+    // reason (an epoch bump) without having to enumerate them here.
+    const cancelled = opts.cancelled?.();
+    if (cancelled) return cancelled;
     // Checked before the store, because `/end` claims the thread several awaits
     // BEFORE it removes the record; without this the resume would win a race it
     // has already lost and leave a live session no record points at.
@@ -5469,14 +5535,29 @@ export class DiscordCopilotApp {
     // already in flight from registering anything (`resumeOwnershipLost`), so
     // no session can appear behind this loop's back and survive it.
     this.clearAccessRetryTimer();
+    // Cancel every in-flight attempt's token BEFORE waiting for it. This is the
+    // fence that matters: the wait below is bounded, so an attempt CAN outlive
+    // it, and it must not still be able to write a terminal state, drop a repo
+    // lease or post a message once the lock below is released.
+    this.accessRetryEpoch++;
     // Then JOIN it. Disarming only prevents the NEXT tick; one already inside
     // git or the runtime can still be mid-transition, and letting `stop()`
     // resolve first would mean the store could be written after the process
-    // declared itself torn down (and after the lock was released). Bounded, so
-    // a wedged runtime cannot make shutdown hang.
-    await withTimeout(this.accessRetryTickPromise ?? Promise.resolve(), TEARDOWN_TIMEOUT_MS).catch(
-      () => {}
+    // declared itself torn down. Bounded, so a wedged runtime cannot make
+    // shutdown hang — the token, not this bound, is what makes that safe.
+    const quiesced = await withTimeout(
+      this.accessRetryTickPromise ?? Promise.resolve(),
+      this.accessResumeJoinTimeoutMs
+    ).then(
+      () => true,
+      () => false
     );
+    if (!quiesced) {
+      console.warn(
+        "shutdown: an access-retry attempt was still running; it has been cancelled and will " +
+          "make no further durable change, but this process is exiting without having joined it."
+      );
+    }
     for (const [threadId, session] of this.sessions) {
       // Rebind can be suspended in its prepare phase while shutdown starts.
       // Mark first so it cannot install a replacement after this loop clears

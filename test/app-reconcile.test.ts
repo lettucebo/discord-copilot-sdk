@@ -159,6 +159,8 @@ function fakeCopilot(
 ): CopilotClient {
   return {
     createSession: async () => fakeSession,
+    // A no-op `stop`, so a test may drive the real `app.stop()` teardown.
+    async stop(): Promise<void> {},
     resumeSession: async (id: string, cfg: Record<string, unknown>) => {
       resumeCalls.push({ id, cfg });
       const e = typeof opts.resumeError === "function" ? opts.resumeError(id) : opts.resumeError;
@@ -2982,5 +2984,88 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
     expect(src).toMatch(armed);
     // And only there: a second arming site would be a second loop.
     expect(src.match(/this\.startAccessRetryLoop\(\)/g)).toHaveLength(1);
+  });
+});
+
+describe("a retry attempt that outlives shutdown must touch nothing", () => {
+  it("persists no terminal transition, and no side effect, after stop() released the lock", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-late", sessionId: "sess-late" }));
+      store.commit("t-late");
+      const transport = new FakeTransport();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        transport,
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let lockReleased = false;
+      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+        path: "(test)",
+        async release(): Promise<void> {
+          lockReleased = true;
+        },
+      };
+
+      let access = false;
+      let deleted = false;
+      let hold: Promise<void> | undefined;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        if (hold) await hold;
+        if (deleted) throw { code: 10003 }; // definitively gone ⇒ terminal
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      expect(store.get("t-late")?.reason).toBe("thread-no-access");
+      expect(localLeasesOf(app).size).toBe(1);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+
+      // The classification is wedged — a slow/hanging Discord call — so the
+      // bounded join in `stop()` cannot succeed.
+      let release: () => void = () => {};
+      hold = new Promise<void>((r) => {
+        release = r;
+      });
+      (app as unknown as { accessResumeJoinTimeoutMs: number }).accessResumeJoinTimeoutMs = 10;
+      const fetchesBefore = fetchCalls.length;
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(fetchCalls.length).toBeGreaterThan(fetchesBefore));
+
+      await app.stop();
+      expect(lockReleased).toBe(true); // ownership of the state dir is surrendered
+
+      const bytesAfterStop = readFileSync(f, "utf8");
+      const recordAfterStop = JSON.stringify(store.get("t-late"));
+      const leasesAfterStop = JSON.stringify([...localLeasesOf(app)]);
+      const noticesAfterStop = transport.notices.length;
+
+      // Only NOW does the classification come back — and it says the thread is
+      // gone, which on any other day is a terminal transition that rewrites the
+      // record, drops the lease and posts a notice. This process no longer owns
+      // any of that.
+      deleted = true;
+      release();
+      await tick;
+
+      expect(readFileSync(f, "utf8")).toBe(bytesAfterStop); // byte-for-byte
+      expect(JSON.stringify(store.get("t-late"))).toBe(recordAfterStop);
+      expect(JSON.stringify([...localLeasesOf(app)])).toBe(leasesAfterStop);
+      expect(transport.notices.length).toBe(noticesAfterStop);
+      expect(store.get("t-late")?.state).toBe("active"); // still resumable next boot
+      expect(store.get("t-late")?.reason).toBe("thread-no-access");
+      expect(sessionsOf(app).size).toBe(0);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
   });
 });

@@ -1010,8 +1010,15 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   不動留給下一次 wake-up／重啟。否則就會出現「活著的 session 背後是一筆否認它存在的 record」，正是
   `/end` handshake 要防的同一類危險。`commit()` → `sessions.set()` 之間沒有 await，仍是原子步驟。
 - **shutdown 一定贏**：`stop()` 先設 `shuttingDown` / `phase`，再 `clearAccessRetryTimer()`，
-  **然後有界地 `await accessRetryTickPromise`**。只清 timer 只擋得住下一次 tick；已經在飛的那一次仍可能
-  正在寫 store，若讓 `stop()` 先 resolve，就會出現「process 宣告拆完、lock 已釋放之後才寫磁碟」。
+  **接著 bump `accessRetryEpoch` 取消所有在飛的 attempt**，最後才有界地 `await accessRetryTickPromise`。
+  只清 timer 只擋得住下一次 tick；已經在飛的那一次仍可能正在寫 store。而且**那個 join 是有界的**——
+  attempt 可以活得比它久：`stop()` 逾時後仍會繼續 `copilot.stop()` 並**釋放 single-instance lock**，
+  此時一個延遲回來的 classify 若回報 `gone`，舊版就會在「本 process 已交出狀態所有權（下一個 instance
+  可能已經接手同一個 store）」之後，寫入 blocked、釋放 repo lease、還往 Discord 貼訊息。
+- **每個 retry attempt 都帶一個取消 token（epoch）**，在**每一個 await 之後、任何持久轉換或外部副作用
+  之前**檢查：`reconcileRecord` 在 classify await 之後檢查一次（涵蓋 `block`／`skip`／`orphan` 全部分支），
+  `resumeRecord` 則在重建 worktree 失敗、trusted-root 擷取失敗、binding 拒絕、`SessionActor.create`
+  失敗，以及註冊前的 fence 各檢查一次。startup 不傳 token（`opts.cancelled` 為 undefined），語意完全不變。
 - **無法確認關閉的被丟棄 runtime 會被保留成 barrier**：`discardResumedActor()` 若 `disconnect()` 失敗，
   該 actor 會被**強引用**留在 `unconfirmedResumes`（Windows 上這個引用就是 root capability 的生命線，
   掉了就等於允許把可能還活著的 runtime 的工作目錄改名/刪掉）。刻意**不**走 stale-rebind companion row：
@@ -1086,6 +1093,7 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | 兩個丟棄競爭同一個 thread 時，barrier 必須保留**第一個**（較新的 actor 乾淨退出不代表較舊的安全） | `test/app-reconcile.test.ts` |
 | in-thread 的 `/end`（不加 `thread:`）也必須認領該討論串，並在結束後完全釋放 | `test/app-reconcile.test.ts` |
 | `onReady` 必須在 `phase = "ready"` 之後**立刻**啟動 retry loop，且全檔只有一處啟動點（source 契約，如同本 repo 既有的 shipped-script／docs 契約測試） | `test/app-reconcile.test.ts` |
+| `stop()` 的有界 join 逾時、lock 已釋放之後，延遲回來的 classify（即使是 `gone` 這種終態）**不得**有任何持久寫入、lease 變更或 Discord 副作用——store 檔案 byte-for-byte 不變 | `test/app-reconcile.test.ts` |
 
 ### 19.7 後續工作（尚未做）
 
