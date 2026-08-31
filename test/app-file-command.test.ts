@@ -176,6 +176,13 @@ function invokeInteraction(app: DiscordCopilotApp, interaction: FakeSlash): Prom
   );
 }
 
+function invokePreReadyInteraction(app: DiscordCopilotApp, interaction: FakeSlash): Promise<void> {
+  (app as unknown as { phase: "booting" | "reconciling" | "ready" | "shuttingDown" }).phase = "booting";
+  return (app as unknown as { onInteraction(i: ChatInputCommandInteraction): Promise<void> }).onInteraction(
+    interactionOf(interaction)
+  );
+}
+
 type FileResolverActor = Pick<SessionActor, "resolveFileForDelivery">;
 
 function actorResolving(result: ResolveOutboundFileResult): {
@@ -273,6 +280,47 @@ describe("/file", () => {
       app as unknown as { onInteraction(i: ChatInputCommandInteraction): Promise<void> }
     ).onInteraction(interactionOf(interaction));
 
+    expect(interaction.replies[0]?.content).toContain("啟動中");
+  });
+
+  it("does not extend the startup owner bypass to other commands", async () => {
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as CopilotClient,
+      new FakeTransport(),
+      new SessionStore(storeFile),
+      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+    );
+    const interaction = slash({ channelId: "55555", parentId: "66666", commandName: "file" });
+    const handler = vi
+      .spyOn(app as unknown as { cmdFile(interaction: ChatInputCommandInteraction): Promise<void> }, "cmdFile")
+      .mockResolvedValue(undefined);
+
+    await invokePreReadyInteraction(app, interaction);
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(interaction.replies[0]?.content).toContain("啟動中");
+    expect(interaction.replies[0]?.content).toContain("啟動完成後");
+  });
+
+  it("does not dispatch an authorized command before startup completes", async () => {
+    const app = DiscordCopilotApp.createForTest(
+      config(reposRoot),
+      reposRoot,
+      {} as CopilotClient,
+      new FakeTransport(),
+      new SessionStore(storeFile),
+      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+    );
+    const interaction = slash();
+    const handler = vi
+      .spyOn(app as unknown as { cmdFile(interaction: ChatInputCommandInteraction): Promise<void> }, "cmdFile")
+      .mockResolvedValue(undefined);
+
+    await invokePreReadyInteraction(app, interaction);
+
+    expect(handler).not.toHaveBeenCalled();
     expect(interaction.replies[0]?.content).toContain("啟動中");
   });
 
