@@ -1193,7 +1193,30 @@ export class DiscordCopilotApp {
       // can't race startup resume. Also blocks during shutdown.
       if (this.phase !== "ready") {
         if (!interaction.channelId) return;
-        if (!isOwner(ctxOf(interaction), this.policyNow())) return;
+        const command = interaction.isChatInputCommand() ? interaction : undefined;
+        const button = interaction.isButton() ? interaction : undefined;
+        const input = command ?? button;
+        if (!input) return;
+        const authorized =
+          command?.commandName === "channel"
+            ? isOwner(ctxOf(command), this.policyNow())
+            : isAuthorized(ctxOf(input), this.policyNow());
+        if (!authorized) {
+          // Preserve the pre-ready no-response behavior for unknown users. An
+          // owner's channel may be absent from Discord's cache while booting,
+          // so do not claim it is disabled or suggest a command that cannot run
+          // until reconciliation finishes.
+          if (isOwner(ctxOf(input), this.policyNow())) {
+            await input
+              .reply(
+                ephemeralReply(
+                  "⏳ 啟動中，請稍候重試；啟動完成後若仍看到「頻道尚未啟用」，再執行 `/channel enable`。"
+                )
+              )
+              .catch(() => {});
+          }
+          return;
+        }
         if (interaction.isRepliable()) {
           await interaction
             .reply(ephemeralReply("⏳ 啟動中，請稍候重試。"))
