@@ -209,14 +209,17 @@ describe("ChannelRegistry", () => {
 
   it("throws when the first-run default cannot be persisted", () => {
     inTempDir((dir) => {
-      const parent = join(dir, "blocked-parent");
-      writeFileSync(parent, "not a directory", "utf8");
+      const file = join(dir, "channels.json");
       const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+        throw Object.assign(new Error("disk write failed"), { code: "EIO" });
+      });
       try {
-        expect(() => new ChannelRegistry(SEED, GUILD, join(parent, "channels.json"))).toThrow(
+        expect(() => new ChannelRegistry(SEED, GUILD, file)).toThrow(
           /refusing to start with an empty authorization set/
         );
       } finally {
+        rename.mockRestore();
         warn.mockRestore();
       }
     });
