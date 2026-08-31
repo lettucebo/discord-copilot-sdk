@@ -1,5 +1,25 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { DiscordCopilotApp } from "../src/app.js";
+
+/** Counts every real worktree recreation. `resumeRecord` rebuilds a MISSING
+ *  worktree from its surviving branch, which is a disk side effect that must
+ *  not happen for a record `/end` or shutdown already claimed — and "it did not
+ *  happen" is only assertable by watching the call, since a fixture repo makes
+ *  the git command fail either way. Delegates to the real implementation, so no
+ *  other test in this file changes behaviour. */
+const { addWorktreeCalls } = vi.hoisted(() => ({
+  addWorktreeCalls: [] as Array<{ repo: string; dir: string; branch: string }>,
+}));
+vi.mock("../src/core/worktree.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/core/worktree.js")>();
+  return {
+    ...actual,
+    addWorktree: async (repo: string, dir: string, branch: string): Promise<void> => {
+      addWorktreeCalls.push({ repo, dir, branch });
+      return actual.addWorktree(repo, dir, branch);
+    },
+  };
+});
 import { SessionActor, type SessionActorOpts } from "../src/copilot/session-actor.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
@@ -1401,9 +1421,18 @@ function reconcileReal(app: DiscordCopilotApp): Promise<void> {
   ).reconcileOnStartup({ validateBinding: async () => ({ ok: true }) });
 }
 
+/** Records every channel fetch, so a test can wait for the retry tick to have
+ *  actually reached the classification await before it acts. */
+const fetchCalls: string[] = [];
+
 function setChannelFetch(app: DiscordCopilotApp, fetch: (id: string) => Promise<unknown>): void {
   (app as unknown as { discord: { channels: { fetch(id: string): Promise<unknown> } } }).discord = {
-    channels: { fetch },
+    channels: {
+      async fetch(id: string): Promise<unknown> {
+        fetchCalls.push(id);
+        return fetch(id);
+      },
+    },
   };
 }
 
@@ -1764,6 +1793,225 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
       expect(timer?.hasRef?.()).toBe(false);
       (app as unknown as { clearAccessRetryTimer(): void }).clearAccessRetryTimer();
       expect((app as unknown as { accessRetryTimer?: unknown }).accessRetryTimer).toBeUndefined();
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("keeps a record eligible after a TRANSIENT classification instead of parking it until restart", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-tr", sessionId: "sess-tr" }));
+      store.commit("t-tr");
+      const transport = new FakeTransport();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        transport,
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let mode: "no-access" | "transient" | "ok" = "no-access";
+      setChannelFetch(app, async () => {
+        if (mode === "no-access") throw { code: 50001 };
+        if (mode === "transient") throw { status: 500 };
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      expect(store.get("t-tr")?.reason).toBe("thread-no-access");
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      const noticesAfterStartup = transport.notices.length;
+
+      // A 5xx/429 blip during a retry attempt must NOT rewrite the reason: the
+      // loop's own candidate filter and `/end`'s ADR-0002 escape hatch both key
+      // on `thread-no-access`, so rewriting it parks the record until a restart.
+      mode = "transient";
+      await fireRetry(app, jobs);
+      expect(store.get("t-tr")?.state).toBe("active");
+      expect(store.get("t-tr")?.reason).toBe("thread-no-access");
+      expect(sessionsOf(app).has("t-tr")).toBe(false);
+      expect(transport.notices.length).toBe(noticesAfterStartup); // no spam
+      expect(jobs.map((j) => j.ms)).toEqual([30_000]); // still backing off, still armed
+
+      await fireRetry(app, jobs);
+      expect(store.get("t-tr")?.reason).toBe("thread-no-access");
+
+      mode = "ok";
+      await fireRetry(app, jobs);
+      expect(sessionsOf(app).has("t-tr")).toBe(true);
+      expect(resumeCalls.filter((c) => c.id === "sess-tr")).toHaveLength(1);
+      expect(store.get("t-tr")?.reason).toBeUndefined();
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("keeps a record eligible after an UNKNOWN thread status too", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-unk", sessionId: "sess-unk" }));
+      store.commit("t-unk");
+      const transport = new FakeTransport();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        transport,
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let status = "no-access";
+      await reconcile(app, async () => status);
+      expect(store.get("t-unk")?.reason).toBe("thread-no-access");
+
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      const noticesAfterStartup = transport.notices.length;
+
+      // planReconcile's defensive default (`unknown-thread-status`) must not be
+      // able to park a record either.
+      status = "something-new-from-a-future-sdk";
+      await fireRetry(app, jobs);
+      expect(store.get("t-unk")?.state).toBe("active");
+      expect(store.get("t-unk")?.reason).toBe("thread-no-access");
+      expect(sessionsOf(app).has("t-unk")).toBe(false);
+      expect(transport.notices.length).toBe(noticesAfterStartup);
+
+      status = "valid";
+      await fireRetry(app, jobs);
+      expect(sessionsOf(app).has("t-unk")).toBe(true);
+      expect(store.get("t-unk")?.reason).toBeUndefined();
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("does not recreate a worktree /end just removed while the retry was classifying", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const wt = wtBind("t-wt", { sessionId: "sess-wt" });
+      store.reserve(wt);
+      store.commit("t-wt");
+      const gated = gatedCopilot();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        gated.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      let holdClassify: Promise<void> | undefined;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        if (holdClassify) await holdClassify;
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      expect(store.get("t-wt")?.reason).toBe("thread-no-access");
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+
+      access = true;
+      let releaseClassify: () => void = () => {};
+      holdClassify = new Promise<void>((r) => {
+        releaseClassify = r;
+      });
+      const before = addWorktreeCalls.length;
+      const fetchesBefore = fetchCalls.length;
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(fetchCalls.length).toBeGreaterThan(fetchesBefore));
+
+      // The worktree is already gone (hand-deleted / disk cleaned), so `/end`
+      // reaps the record outright — the exact shape that used to let the resume
+      // rebuild a checkout nothing owns.
+      rmSync(wt.workDir, { recursive: true, force: true });
+      await (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(fakeInteraction(), "t-wt");
+      expect(store.get("t-wt")).toBeUndefined();
+
+      releaseClassify();
+      await tick;
+
+      expect(addWorktreeCalls.length).toBe(before); // never even attempted
+      expect(existsSync(wt.workDir)).toBe(false); // no resurrected checkout
+      expect(store.get("t-wt")).toBeUndefined();
+      expect(sessionsOf(app).has("t-wt")).toBe(false);
+      expect(gated.calls).toHaveLength(0); // no SDK session was created either
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("does not recreate a worktree when shutdown races the same window", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const wt = wtBind("t-wt-shut", { sessionId: "sess-wt-shut" });
+      store.reserve(wt);
+      store.commit("t-wt-shut");
+      const gated = gatedCopilot();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        gated.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      let holdClassify: Promise<void> | undefined;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        if (holdClassify) await holdClassify;
+        return visibleThread;
+      });
+
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+
+      access = true;
+      let releaseClassify: () => void = () => {};
+      holdClassify = new Promise<void>((r) => {
+        releaseClassify = r;
+      });
+      const before = addWorktreeCalls.length;
+      const fetchesBefore = fetchCalls.length;
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(fetchCalls.length).toBeGreaterThan(fetchesBefore));
+
+      rmSync(wt.workDir, { recursive: true, force: true });
+      await app.stop();
+
+      releaseClassify();
+      await tick;
+
+      expect(addWorktreeCalls.length).toBe(before);
+      expect(existsSync(wt.workDir)).toBe(false);
+      expect(gated.calls).toHaveLength(0);
+      expect(sessionsOf(app).size).toBe(0);
+      expect(jobs).toHaveLength(0);
+      // Untouched on disk, so the next boot still finds it resumable.
+      expect(store.get("t-wt-shut")?.state).toBe("active");
+      expect(store.get("t-wt-shut")?.reason).toBe("thread-no-access");
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });

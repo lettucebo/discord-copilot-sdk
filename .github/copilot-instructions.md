@@ -241,6 +241,10 @@ session as retryable `thread-no-access`: a single bounded periodic scan armed af
 those records, so it resumes automatically once access is restored — without a restart, because
 restoring a permission emits no reliable gateway event for a thread the bot could not see — and it
 is explicitly, manually clearable with `/end thread:<id>` after an informed owner decides to give
-up on recovery (ADR-0002) — it must never be treated as a permanent block. `resumeRecord` re-proves
-it still owns the record immediately before `sessions.set`, so `/end` and shutdown win outright
-against an in-flight resume instead of being resurrected by it.
+up on recovery (ADR-0002) — it must never be treated as a permanent block. A retry attempt that
+still cannot confirm the thread (`no-access`, `transient`, unknown) writes **nothing**: rewriting
+the record's `thread-no-access` reason would drop it out of both the loop's candidate filter and
+`/end`'s escape hatch, parking it until a restart. `resumeRecord` re-proves it still owns the
+record before it rebuilds a missing worktree, again after that rebuild, and once more immediately
+before `sessions.set`, so `/end` and shutdown win outright against an in-flight resume instead of
+being resurrected by it or leaving a checkout no record points at.

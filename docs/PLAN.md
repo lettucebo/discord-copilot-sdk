@@ -929,9 +929,14 @@ bot 對「它原本看不到的討論串」不保證會收到任何可用的 gat
 - **cadence**：`ACCESS_RETRY_DELAYS_MS = [15s, 30s, 60s, 2m, 5m]`，掃到 candidate 但沒有任何 resume
   成功就往上退避、封頂 5 分鐘；一旦有 resume 成功或候選集合為空就回到 15s。
   **永遠不會因為重試太多次而把記錄改成終態**——那正是 ADR-0002 反對的事。
-- **靜默的 no-op tick**：classification 仍是 `no-access` 且 record 內容未變時，retry 路徑不寫 store、
-  不 `console.warn`、不發 notice。否則一個權限被撤掉好幾天的討論串會每次 wake-up 都重寫一次磁碟並
-  重貼一次同樣的警告。startup 路徑的行為完全不變（仍然寫、仍然貼）。
+- **retry 模式下的 `skip` 是完全的 no-op**：不寫 store、不 `console.warn`、不發 notice。
+  這不只是為了避免洗版——**改寫 reason 會造成死結**。候選過濾用的是 `reason === "thread-no-access"`，
+  而 `/end thread:<id>` 的 ADR-0002 逃生口也是用同一個字串判斷；只要一次 429/5xx 讓 record 被寫成
+  `transient-thread-fetch`（或未知狀態的 `unknown-thread-status`），這筆 record 就會**同時**掉出重試
+  迴圈、也不能被擁有者清除，一路卡到下次重啟為止——正好把「no-access 永遠不會走進死路」這個承諾打破。
+  真正終態的判定仍走 `block` 分支，retry 模式與 startup 完全相同。
+  刻意接受的簡化：暫時性 fetch 失敗期間 `/sessions` 仍顯示 `thread-no-access`（兩者都是「無法確認這個
+  討論串」），我們不用非終態的 reason 漂移換取那點精確度。
 - **timer 不得留住 process**：production 的 `setTimeout` 立刻 `unref()`；測試用注入的
   `accessRetryScheduler` 佇列手動觸發，不使用真實等待，也不用 `vi.useFakeTimers()`（那會連同一個 app
   持有的 SDK / git timeout 一起凍住）。
@@ -940,11 +945,18 @@ bot 對「它原本看不到的討論串」不保證會收到任何可用的 gat
 
 - **不重疊 tick**：`accessRetryTickPromise` 存在時 `runAccessRetryTick()` 直接返回；tick 結束才
   `scheduleAccessRetry()`（先 `clear` 再 `set`），所以任何時刻最多一個 armed timer、最多一個 in-flight tick。
-- **`resumeOwnershipLost()`（新的共用 fence）**：`resumeRecord()` 在 `SessionActor.create()` 之後、
-  `sessions.set()` 之前重新證明它仍擁有這筆記錄——`shuttingDown`、已有 live session、record 已被移除、
-  record 已非 `active`、record 的 `sessionId`/`generation` 已改變，任一成立就**丟棄**剛 resume 出來的
-  session（bounded `disconnect()`）而不註冊。fence 與 `sessions.set()` 之間沒有 await，因此是一個
-  不可被插入的原子步驟。startup 路徑同樣受惠：它以前也沒有這個保護。
+- **`resumeOwnershipLost()`（新的共用 fence，用於三個點）**：
+  1. `resumeRecord()` **最開頭**，也就是任何 side effect 之前。retry 是在 classify 的 await 之後才走到這裡，
+     `/end`／shutdown 可能已經在那個視窗裡贏走這筆 record；若不擋，接下來的
+     `addWorktree()` 會從還存在的 branch **重建**一個沒有任何 record 指向的 worktree——正好是 `/end` 剛清掉的
+     那種殘留。fence 是同步的，而 `addWorktree` 是下一個 await，兩者之間插不進任何東西。
+  2. `addWorktree()` **成功之後**：重建本身就是一個 await，`/end`／shutdown 可以落在那段時間裡，第 1 點蓋不到。
+     此時**回收我們自己造成的 side effect**（`removeWorktreeIfClean`）。回收失敗不算致命：worktree 只在 git
+     證明乾淨時才會被刪，留下來的目錄會被 startup 的 stray-worktree 掃描報出來。
+  3. `SessionActor.create()` 之後、`sessions.set()` 之前——`shuttingDown`、已有 live session、record 已被移除、
+     record 已非 `active`、record 的 `sessionId`/`generation` 已改變，任一成立就**丟棄**剛 resume 出來的
+     session（bounded `disconnect()`）而不註冊。fence 與 `sessions.set()` 之間沒有 await，因此是一個
+     不可被插入的原子步驟。startup 路徑同樣受惠：它以前也沒有這些保護。
 - **`/end` 一定贏**：`/end thread:<id>` 對 `thread-no-access` 的 record 本來就允許 reclaim。它移除
   record（或在 worktree 保留時 retire 成 `blocked`）之後，in-flight 的 retry 會在 fence 撞上
   「record 不見了 / 不是 active」，於是不復活它。
@@ -970,9 +982,12 @@ bot 對「它原本看不到的討論串」不保證會收到任何可用的 gat
 ### 19.5 已接受的殘留風險
 
 - retry 與 `/end` 恰好同時發生時，可能真的建立出一個 SDK session 又立刻 disconnect 掉；conversation 本身
-  不受影響（resume 不改變歷史），代價是一次多餘的 runtime 往返。同一個視窗裡 `/end` 也可能在 resume 落地前
-  就移除 worktree；這是安全方向：`removeWorktreeIfClean` 需要 git 證明乾淨，Windows 上 `captureValidatedRoot`
-  的 root handle 還會讓刪除失敗（於是 worktree 被保留），而被丟棄的 actor 從未被註冊、也就永遠收不到 prompt。
+  不受影響（resume 不改變歷史），代價是一次多餘的 runtime 往返。同一個視窗裡「重建 worktree」已由 §19.3 的
+  前置 fence 擋掉，`addWorktree` 進行中才落地的 `/end` 則由後置 fence 回收；只有「回收也失敗」時會留下一個
+  沒有 record 的目錄，而它會被 startup 的 stray-worktree 掃描報出來（既有機制），且 worktree 仍只在 git
+  證明乾淨時才會被刪。
+- 暫時性 fetch 失敗期間 `/sessions` 仍會顯示 `thread-no-access`（見 §19.2）。這是刻意的：非終態的 reason
+  漂移會同時破壞重試資格與 `/end` 逃生口。
 - 一筆記錄的終態轉換寫入失敗時，retry loop 只能記錄（`console.error`）並讓它維持 `active`；沒有「讓啟動失敗」
   這個槓桿可用。維持 `active` 是不會弄丟對話的那個方向。
 - `/end` 若在 retry 已經 `sessions.set()` **之後**才抵達，走的是既有的 live-session `/end` 路徑，這裡沒有
@@ -990,5 +1005,7 @@ bot 對「它原本看不到的討論串」不保證會收到任何可用的 gat
 | 重試期間討論串真的被刪除 → 走既有 terminal 規則（`blocked` / `thread-gone`）並釋放 local lease | `test/app-reconcile.test.ts` |
 | in-flight tick 期間再進來的 wake-up 不得產生第二次 resume，且結束後只 arm 一個 timer | `test/app-reconcile.test.ts` |
 | `/end` 穿插 in-flight retry：record 不得被復活，live map 保持空，孤兒 actor 被 disconnect | `test/app-reconcile.test.ts` |
+| retry 期間 classify 變成 `transient` 或未知狀態時，**不得**改寫 reason（否則同時掉出重試迴圈與 `/end` 逃生口）；仍維持退避、無 notice 洗版、之後恢復存取權仍能 resume | `test/app-reconcile.test.ts` |
+| `/end`（worktree 已不存在 → record 被移除）穿插 classify await 時，retry **不得**重建 worktree、不得建立 SDK session；shutdown 版本同理 | `test/app-reconcile.test.ts` |
 | shutdown 穿插 in-flight retry：不註冊 session、不再 arm timer、record 原封不動留給下次開機 | `test/app-reconcile.test.ts` |
 | armed timer 必須 `unref`，`clearAccessRetryTimer()` 必須真的清掉 | `test/app-reconcile.test.ts` |

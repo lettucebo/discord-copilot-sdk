@@ -4024,16 +4024,21 @@ export class DiscordCopilotApp {
         }
         return;
       case "skip": {
-        // A retry tick that changes nothing must BE nothing: the same record,
-        // still unreachable, would otherwise rewrite the store and re-post the
-        // same warning on every wake-up for as long as the permission stays gone.
-        const unchanged = rec.state === "active" && rec.reason === action.reason;
-        if (!(retry && unchanged) && !this.store.setState(rec.threadId, "active", action.reason)) {
+        // In retry mode a `skip` means only "still cannot confirm this thread",
+        // and it must change NOTHING. Persisting the new reason looks harmless
+        // and is not: `thread-no-access` is both this loop's candidate filter
+        // and the key `/end thread:<id>` uses for ADR-0002's escape hatch, so a
+        // single 429/5xx blip would park the record — un-retryable until a
+        // restart, and un-clearable by its owner — which is precisely the
+        // "no-access never times out into a dead end" promise being broken.
+        // (A record that is genuinely terminal takes the `block` branch below,
+        // in retry mode exactly as at startup.)
+        if (retry) return;
+        if (!this.store.setState(rec.threadId, "active", action.reason)) {
           throw new FatalReconcileError(
             `reconcile: could not persist retry reason for ${rec.threadId} at ${sessionStorePath()}`
           );
         }
-        if (retry) return;
         console.warn(
           `reconcile: not resuming ${rec.threadId} this boot (${action.reason}); active record retained for retry.`
         );
@@ -4075,6 +4080,18 @@ export class DiscordCopilotApp {
     rec: SessionRecord,
     opts: { via?: "startup" | "access-retry" } = {}
   ): Promise<void> {
+    // BEFORE the first side effect, not just before registration. The retry loop
+    // reaches here after awaiting the thread classification, and `/end` or
+    // shutdown can have claimed the record in that window — at which point
+    // rebuilding its worktree below would put a checkout on disk that no record
+    // points at, which is exactly the leftover `/end` had just finished
+    // removing. `resumeOwnershipLost` is synchronous and the `addWorktree` call
+    // is the next statement's first await, so nothing can land between them.
+    const claimedBefore = this.resumeOwnershipLost(rec);
+    if (claimedBefore) {
+      console.warn(`resume: not resuming ${rec.threadId} — ${claimedBefore}`);
+      return;
+    }
     // The worktree may be gone (hand-deleted, disk cleaned). Recreate it from
     // the branch, which git still has. Without this the resume fails, gets
     // classified `transient`, and the record is retried on EVERY boot forever —
@@ -4098,6 +4115,24 @@ export class DiscordCopilotApp {
               `分支 \`${rec.branch}\` 仍在，請用 /new 開新的。`
           )
           .catch(() => {});
+        return;
+      }
+      // `addWorktree` is itself an await, so `/end` or shutdown can land WHILE
+      // the checkout is being built — the pre-check above cannot cover that.
+      // Undo our own side effect rather than leave a checkout no record points
+      // at. Failing to undo it is not fatal: it is retained (never deleted
+      // without git's proof) and the startup stray-worktree scan reports it.
+      const claimedDuring = this.resumeOwnershipLost(rec);
+      if (claimedDuring) {
+        console.warn(
+          `resume: ${rec.threadId} was claimed while its worktree was rebuilt (${claimedDuring}); removing it again.`
+        );
+        const undone = await removeWorktreeIfClean(rec.repoPath, rec.workDir, rec.branch).catch(
+          () => "failed" as const
+        );
+        if (undone !== "removed" && undone !== "already-absent") {
+          console.warn(`resume: could not remove the rebuilt worktree at ${rec.workDir} (${undone})`);
+        }
         return;
       }
     }
