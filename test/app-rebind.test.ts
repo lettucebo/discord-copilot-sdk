@@ -19,6 +19,13 @@ import type { DevMode } from "../src/core/binding.js";
 import type { SecureOpenBackend } from "../src/core/secure-open.js";
 import { worktreePath } from "../src/core/worktree.js";
 import { worktreeRoot } from "../src/core/paths.js";
+import type { InstanceLock } from "../src/core/single-instance.js";
+import {
+  strictInteraction,
+  asCommandInteraction,
+  type StrictInteraction,
+  type StrictInteractionFields,
+} from "./support/strict-interaction.js";
 
 const run = promisify(execFile);
 
@@ -131,7 +138,9 @@ function fakeCopilot(opts: { createFails?: boolean } = {}): CopilotClient {
       if (opts.createFails) throw new Error("runtime refused");
       return { on() {}, async send() {}, async disconnect() {} };
     },
-    async stop() {},
+    async stop(): Promise<Error[]> {
+      return [];
+    },
   } as unknown as CopilotClient;
 }
 
@@ -246,6 +255,21 @@ const applyRebind = (app: DiscordCopilotApp, target: { repoPath: string; devMode
       applyRebind(t: string, x: { repoPath: string; devMode: DevMode }): Promise<string>;
     }
   ).applyRebind("t1", target);
+const beginRebind = (
+  app: DiscordCopilotApp,
+  interaction: StrictInteraction & StrictInteractionFields,
+  want: { repoPath?: string; devMode?: DevMode },
+  opts: { alreadyReplied?: boolean } = {}
+): Promise<void> =>
+  (
+    app as unknown as {
+      beginRebind(
+        i: ChatInputCommandInteraction,
+        w: { repoPath?: string; devMode?: DevMode },
+        o: { alreadyReplied?: boolean }
+      ): Promise<void>;
+    }
+  ).beginRebind(asCommandInteraction(interaction), want, opts);
 const blocker = (
   app: DiscordCopilotApp,
   session: Session,
@@ -258,16 +282,19 @@ const blocker = (
   ).rebindBlocker("t1", session, target);
 
 function endInteraction(): ChatInputCommandInteraction {
-  return {
-    user: { id: "u1" },
-    guildId: "g1",
-    channelId: "t1",
-    channel: { isThread: () => true, parentId: "c1" },
-    options: { getString: () => null },
-    reply: async () => {},
-    deferReply: async () => {},
-    editReply: async () => {},
-  } as unknown as ChatInputCommandInteraction;
+  // The STRICT shared fake: it throws `InteractionAlreadyReplied` exactly where
+  // discord.js does, so `/end`'s answer path cannot pass here while failing in
+  // production. The permissive local fake this replaced was the reason a
+  // reply-after-defer went unnoticed.
+  return asCommandInteraction(
+    strictInteraction({
+      user: { id: "u1" },
+      guildId: "g1",
+      channelId: "t1",
+      channel: { isThread: () => true, parentId: "c1" },
+      options: { getString: () => null },
+    })
+  );
 }
 
 const endThread = (app: DiscordCopilotApp): Promise<void> =>
@@ -276,6 +303,56 @@ const endThread = (app: DiscordCopilotApp): Promise<void> =>
       cmdEnd(i: ChatInputCommandInteraction): Promise<void>;
     }
   ).cmdEnd(endInteraction());
+
+/** The coordinator's read-only view of the sets its release conclusion is drawn
+ *  from. A detached rebind incarnation this process could not prove stopped is
+ *  an OBLIGATION here, keyed by its DURABLE identity. */
+type Inspector = {
+  exclusiveThreads(): string[];
+  teardownClaims(): string[];
+  obligationKeys(): string[];
+  obligation(key: string): unknown;
+  released(): boolean;
+};
+function inspectOwnership(app: DiscordCopilotApp): Inspector {
+  const inspector = (app as unknown as { ownershipInspector?: Inspector }).ownershipInspector;
+  if (!inspector) throw new Error("this app was not built with the test ownership seam");
+  return inspector;
+}
+/** Give the app a lock the test can watch. The lock lives INSIDE the lifecycle
+ *  coordinator — the only thing allowed to release it — so the only honest way
+ *  to count releases is to hand that coordinator an observable lock. */
+function useObservableLock(app: DiscordCopilotApp, lock: InstanceLock): void {
+  (app as unknown as { useOwnershipForTest(l: InstanceLock): void }).useOwnershipForTest(lock);
+}
+/** …and its log, for the shutdown messages that are supposed to be true. */
+function useObservableOwnership(
+  app: DiscordCopilotApp,
+  lock: InstanceLock,
+  log: (m: string) => void
+): void {
+  (
+    app as unknown as {
+      useOwnershipForTest(l: InstanceLock, o: { log(m: string): void }): void;
+    }
+  ).useOwnershipForTest(lock, { log });
+}
+const staleRebindKey = (b: { threadId: string; sessionId: string; generation: number }): string =>
+  `stale-rebind:${b.threadId}:${b.sessionId}:${b.generation}`;
+/** The invariant the two indexes must agree on: anything the app still holds a
+ *  strong reference to must also be something the coordinator is owed. An entry
+ *  in one and not the other is exactly how a live runtime kept a checkout while
+ *  the process lock was free to go. */
+function assertEveryRetainedRuntimeIsOwed(app: DiscordCopilotApp): void {
+  const keys = inspectOwnership(app).obligationKeys();
+  for (const entry of staleRebindActors(app).values()) {
+    const binding = (entry as { binding: { threadId: string; sessionId: string; generation: number } })
+      .binding;
+    expect(keys, `retained stale incarnation ${binding.sessionId} is not owed`).toContain(
+      staleRebindKey(binding)
+    );
+  }
+}
 
 /** A REAL git repo: the rebind path runs `git worktree add`, `git status` and
  *  `git symbolic-ref` for real, and a `.git` directory alone makes all of them
@@ -1751,5 +1828,267 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     const { app } = harness();
     sessions(app).delete("t1");
     expect(await applyRebind(app, { repoPath: repoB, devMode: "local" })).toMatch(/沒有進行中的 session/);
+  });
+});
+
+
+describe("applyRebind — the process lock", { timeout: 60_000 }, () => {
+  it("holds the lock for an unconfirmed retired incarnation, and lets go once a real retry confirms it", async () => {
+    // The end-to-end shape of the defect: a NORMAL, successful rebind retires
+    // the old actor, its disconnect cannot be confirmed, and the process still
+    // owns a runtime that may be holding the old checkout. Before the stale
+    // incarnation became a coordinator obligation this route only added the
+    // app's own index entry, so `stop()` released the single-instance lock and
+    // a successor could start against a repo this process had not let go of.
+    const { app, actor } = harness({ devMode: "local", repo: repoA });
+    let releases = 0;
+    useObservableLock(app, {
+      path: "(observable)",
+      release: async () => {
+        releases++;
+      },
+    });
+    // The old runtime does not answer. Its cleanup is therefore unprovable.
+    actor.disconnectFails = true;
+
+    const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+    expect(out).toMatch(/已改綁/);
+
+    // The app kept the actor, and the coordinator was told about it.
+    expect(staleRebindActors(app).size).toBe(1);
+    assertEveryRetainedRuntimeIsOwed(app);
+    const entry = [...staleRebindActors(app).values()][0] as {
+      binding: { threadId: string; sessionId: string; generation: number };
+    };
+    const key = staleRebindKey(entry.binding);
+    expect(inspectOwnership(app).obligationKeys()).toContain(key);
+
+    // A full shutdown may NOT release the lock: the sweep re-attempts the
+    // disconnect, it still fails, and the obligation stays.
+    await app.stop();
+    expect(releases).toBe(0);
+    expect(inspectOwnership(app).obligationKeys()).toContain(key);
+    assertEveryRetainedRuntimeIsOwed(app);
+
+    // The runtime finally answers, through the REAL retry path — not by poking
+    // the coordinator. Confirmation discharges the obligation by identity, the
+    // coordinator re-draws its conclusion, and the lock goes exactly once.
+    actor.disconnectFails = false;
+    await retryStaleRebinds(app);
+    expect(staleRebindActors(app).size).toBe(0);
+    expect(inspectOwnership(app).obligationKeys()).not.toContain(key);
+    assertEveryRetainedRuntimeIsOwed(app);
+    await vi.waitFor(() => expect(releases).toBe(1));
+
+    await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
+  });
+
+  it("says nothing about a retained lock when the runtime confirmed and only the tree was kept", async () => {
+    // The runtime stopping is what ends this incarnation's claim on the PROCESS
+    // lock; a worktree kept because it was dirty is durably recorded and is the
+    // operator's to reclaim. The app therefore discharges the obligation on
+    // `confirmed` while its bounded attempt still reports `confirmed && cleaned`
+    // — i.e. false. Reading that `false` as "still owed" made shutdown announce
+    // a retention that had not happened, about an obligation already gone.
+    const wtRoot = `${path.join(os.homedir(), ".discord-copilot-sdk")}-worktrees`;
+    const oldWt = path.join(wtRoot, `rebind-dirty-${Date.now()}`, "t1");
+    const branch = "copilot/t-t1";
+    await addWorktree(repoA, oldWt, branch);
+    try {
+      const { app, store, actor } = harness({ devMode: "worktree" });
+      const messages: string[] = [];
+      let releases = 0;
+      useObservableOwnership(
+        app,
+        {
+          path: "(test)",
+          release: async () => {
+            releases++;
+          },
+        },
+        (m) => messages.push(m)
+      );
+      const oldRecord = store.get("t1")!;
+      expect(store.restore({ ...oldRecord, workDir: oldWt, branch, devMode: "worktree" })).toBe(true);
+      const s = sessions(app).get("t1")!;
+      s.workDir = oldWt;
+      s.branch = branch;
+      // The rebind cannot confirm the old runtime, so it is retained and owed.
+      actor.disconnectFails = true;
+      await expect(applyRebind(app, { repoPath: repoB, devMode: "local" })).resolves.toMatch(
+        /無法確認舊的 runtime/
+      );
+      assertEveryRetainedRuntimeIsOwed(app);
+
+      // …and by shutdown the runtime answers, but the tree has work in it.
+      actor.disconnectFails = false;
+      fs.writeFileSync(path.join(oldWt, "unsaved.txt"), "work in progress");
+
+      await app.stop();
+
+      expect(messages.filter((m) => /could not be discharged/.test(m))).toEqual([]);
+      expect(fs.existsSync(oldWt)).toBe(true); // kept, exactly as promised
+      expect(releases).toBe(1); // …and the process lock genuinely goes
+    } finally {
+      fs.rmSync(path.dirname(oldWt), { recursive: true, force: true });
+    }
+  });
+});
+
+describe("beginRebind answers through whichever door is still open", () => {
+  /** `/repo` can reach `beginRebind` in three acknowledgement states, and each
+   *  has exactly one legal method. Getting it wrong throws
+   *  `InteractionAlreadyReplied`/`InteractionNotReplied` in production and used
+   *  to be invisible in tests. The no-session branch answers immediately, so it
+   *  exercises the door without any git work. */
+  const noSession = (app: DiscordCopilotApp): void => {
+    sessions(app).delete("t1");
+  };
+
+  it("replies when nothing has acknowledged yet", async () => {
+    const { app } = harness();
+    noSession(app);
+    const interaction = strictInteraction();
+
+    await beginRebind(app, interaction, { devMode: "worktree" });
+
+    expect(interaction.replyCalls).toBe(1);
+    expect(interaction.editCalls).toBe(0);
+    expect(interaction.followUpCalls).toBe(0);
+    expect(interaction.answers[0]).toMatch(/沒有進行中的 session/);
+  });
+
+  it("edits when the interaction was already deferred", async () => {
+    const { app } = harness();
+    noSession(app);
+    const interaction = strictInteraction();
+    await interaction.deferReply();
+
+    await beginRebind(app, interaction, { devMode: "worktree" });
+
+    expect(interaction.replyCalls).toBe(0);
+    expect(interaction.editCalls).toBe(1);
+    expect(interaction.followUpCalls).toBe(0);
+  });
+
+  it("follows up when /repo clone has already deferred AND edited", async () => {
+    // This is the `alreadyReplied` path. The interaction is fully answered, so
+    // `reply` and a second `editReply` would both be wrong: a follow-up is the
+    // only way to add the rebind confirmation to the same interaction.
+    const { app } = harness();
+    noSession(app);
+    const interaction = strictInteraction();
+    await interaction.deferReply();
+    await interaction.editReply({ content: "cloned" });
+
+    await beginRebind(app, interaction, { devMode: "worktree" }, { alreadyReplied: true });
+
+    expect(interaction.replyCalls).toBe(0);
+    expect(interaction.editCalls).toBe(1); // just the clone's own answer
+    expect(interaction.followUpCalls).toBe(1);
+    expect(interaction.answers[1]).toMatch(/沒有進行中的 session/);
+  });
+});
+
+describe("a shutdown mid-rebind keeps the OLD conversation resumable", { timeout: 60_000 }, () => {
+  it("restores the displaced primary instead of leaving the thread with none", async () => {
+    // The pre-swap state this exercises is the real one: the old record has been
+    // moved aside as a stale companion and the thread slot now holds the target
+    // `creating` reservation. Abandoning by REMOVING the target — which is right
+    // for `/end`, because the operator gave the conversation up — left a
+    // shutdown-interrupted thread with no resumable record at all: its only
+    // durable trace was a terminal stale-rebind pointer, and the next boot could
+    // not bring the conversation back. The operator never even completed the
+    // rebind.
+    const { app, store, actor } = harness({ devMode: "local", repo: repoA });
+    const before = store.get("t1")!;
+    expect(before.state).toBe("active");
+
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let creating = false;
+    const create = vi
+      .spyOn(SessionActor, "create")
+      .mockImplementation(async () => {
+        creating = true;
+        await held;
+        return {
+          disconnect: async () => {},
+          isFaulted: () => false,
+          generationOf: () => 1,
+          stop: async () => true,
+          suspendFileDelivery: () => 1,
+          resumeFileDeliveryIfCurrent: () => true,
+          canDeliverFiles: () => false,
+        } as unknown as SessionActor;
+      });
+
+    try {
+      const rebinding = applyRebind(app, { repoPath: repoB, devMode: "local" });
+      await vi.waitFor(() => expect(creating).toBe(true));
+
+      // Mid-create the store really is in the pre-swap shape.
+      expect(store.get("t1")).toMatchObject({ repoPath: repoB, state: "creating" });
+      expect(staleRebinds(store)).toHaveLength(1);
+
+      // A SIGTERM, NOT an explicit /end.
+      const stopping = app.stop().catch(() => {});
+      await Promise.resolve();
+      release();
+      await rebinding;
+      await stopping;
+
+      // Reloaded from disk: the old conversation is back, active and resumable,
+      // the target reservation is gone, and the stale companion was reconciled.
+      const reloaded = new SessionStore(storeFile);
+      expect(reloaded.get("t1")).toMatchObject({
+        sessionId: before.sessionId,
+        repoPath: repoA,
+        state: "active",
+      });
+      expect(staleRebinds(reloaded)).toEqual([]);
+    } finally {
+      create.mockRestore();
+      void actor;
+    }
+  });
+
+  it("still REMOVES the target when an explicit /end gave the conversation up", async () => {
+    // The other half of the same decision, unchanged: `/end` is the winner.
+    const { app, store } = harness({ devMode: "local", repo: repoA });
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let creating = false;
+    const create = vi.spyOn(SessionActor, "create").mockImplementation(async () => {
+      creating = true;
+      await held;
+      return {
+        disconnect: async () => {},
+        isFaulted: () => false,
+        generationOf: () => 1,
+        stop: async () => true,
+        suspendFileDelivery: () => 1,
+        resumeFileDeliveryIfCurrent: () => true,
+        canDeliverFiles: () => false,
+      } as unknown as SessionActor;
+    });
+
+    try {
+      const rebinding = applyRebind(app, { repoPath: repoB, devMode: "local" });
+      await vi.waitFor(() => expect(creating).toBe(true));
+
+      await endThread(app); // the operator ends the thread mid-rebind
+      release();
+      await rebinding;
+
+      const reloaded = new SessionStore(storeFile);
+      expect(reloaded.get("t1")).toBeUndefined(); // given up on purpose
+    } finally {
+      create.mockRestore();
+    }
   });
 });

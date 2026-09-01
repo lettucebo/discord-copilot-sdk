@@ -903,3 +903,247 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | v4 container mixed/downgraded row fail-closed；非 Windows 不診斷 Attach Files；YOLO 普通卡與撤銷檔案卡文字一致 | `test/session-store.test.ts`、`test/app-channels.test.ts`、`test/file-delivery-docs.test.ts` |
 | session dispose 後可重新顯示一次 Attach Files 缺權限提示 | `test/transport.test.ts` |
 | README / Discord setup 中英雙檔、PLAN 與 instructions 都如實說明 Windows-only availability；channel lockdown 的 Attach Files 與 mask 也只列於 Windows | `test/file-delivery-docs.test.ts` |
+
+---
+
+## 19. 存取恢復的同進程重試（2026-09-01）
+
+### 19.1 觸發原因
+
+[ADR-0002](adr/0002-missing-access-is-retryable.md) 承諾：`thread-no-access` 的 session 會在
+**bot 的頻道存取權恢復後，或 bot 重啟後**自動復原。實際上只有「重啟」那一半是真的——
+`reconcileOnStartup()` 在 production 只有 `onReady` 一個呼叫點，`login()` 也只註冊
+`InteractionCreate` / `MessageCreate`，所以同一個 process 內永遠不會再試一次。
+
+取得存取權時，Discord **確實**會對該**頻道**送出 `CHANNEL_UPDATE`（含去混淆資料，見
+`docs/CHANNEL-ACCESS.md` §8）。但那個事件（a）不會指出「哪些綁定在它底下的討論串現在可以復原了」，
+（b）討論串是另一個 channel 物件，可能從未被 cache、也不保證會收到對應更新。因此它是**有用的提示、
+不是充分的正確性來源**；正確性來源是週期掃描，事件未來最多只能 poke 這個 loop。
+
+### 19.2 採納的設計
+
+- **有界週期掃描（correctness source）**：`onReady` 把 `phase` 設為 `ready` 之後，`startAccessRetryLoop()`
+  只 arm **一個** timer。事件（若未來要加）只能 poke 這個 loop，不能取代它。
+- **重用既有狀態機**：每次 attempt 都走既有的 `reconcileRecord()` → `planReconcile()` → `resumeRecord()`，
+  只多一個 `via: "access-retry"` 旗標。不另外長第二套 resume 狀態機，也不改持久化 schema。
+- **候選集合**：`state === "active" && reason === "thread-no-access" && !sessions.has(threadId)`。
+  每個 candidate 在動手前會**重新讀取**目前的 durable record（`store.get`），因為上一個 candidate 的
+  resume、`/end`、shutdown 都可能在 await 期間改變世界。
+- **cadence**：`ACCESS_RETRY_DELAYS_MS = [15s, 30s, 60s, 2m, 5m]`，掃到 candidate 但沒有任何 resume
+  成功就往上退避、封頂 5 分鐘；一旦有 resume 成功就回到 15s。候選集合為空時**固定用最長間隔輪詢**
+  （而不是每 15 秒空轉一次，也不是直接停掉 timer）——停掉 timer 會把「執行期間不會再出現新的
+  `thread-no-access`」從效能假設變成正確性假設。
+  **永遠不會因為重試太多次而把記錄改成終態**——那正是 ADR-0002 反對的事。
+- **`MAX_LIVE_SESSIONS` 刻意不套用在這個 loop**：那個上限管的是 `/new`（要求更多工作）；這個 loop
+  只是把一筆**已經存在**、而且如果權限早一分鐘還在就會被 startup 無條件 resume 的 record 收尾。
+  用上限擋它等於讓一段對話卡在一個它的擁有者從未跨過的門檻上，而且沒有佇列可以放。
+- **每次重試都 `force` 重新抓取討論串**：discord.js 的 `channels.fetch(id)` 只要 cache 裡有非 partial
+  物件就直接回 cache，而失去存取權之後 cache 裡存的正是**混淆 stub**（`name === "___hidden___"`）。
+  不 force 的重試可能永遠回報「看不到」，即使 bot 其實已經看得到——那會讓整個 loop 在最重要的情境
+  下靜默失效。`fetchChannelSafe(client, id, { force })` 只讓這一個呼叫端 force；startup 與其他呼叫
+  端維持走 cache，不浪費 rate limit。
+- **retry 模式下的 `skip` 是完全的 no-op**：不寫 store、不 `console.warn`、不發 notice。
+  這不只是為了避免洗版——**改寫 reason 會造成死結**。候選過濾用的是 `reason === "thread-no-access"`，
+  而 `/end thread:<id>` 的 ADR-0002 逃生口也是用同一個字串判斷；只要一次 429/5xx 讓 record 被寫成
+  `transient-thread-fetch`（或未知狀態的 `unknown-thread-status`），這筆 record 就會**同時**掉出重試
+  迴圈、也不能被擁有者清除，一路卡到下次重啟為止——正好把「no-access 永遠不會走進死路」這個承諾打破。
+  真正終態的判定仍走 `block` 分支，retry 模式與 startup 完全相同。
+  刻意接受的簡化：暫時性 fetch 失敗期間 `/sessions` 仍顯示 `thread-no-access`（兩者都是「無法確認這個
+  討論串」），我們不用非終態的 reason 漂移換取那點精確度。
+- **timer 不得留住 process**：production 的 `setTimeout` 立刻 `unref()`；測試用注入的
+  `accessRetryScheduler` 佇列手動觸發，不使用真實等待，也不用 `vi.useFakeTimers()`（那會連同一個 app
+  持有的 SDK / git timeout 一起凍住）。
+
+### 19.3 競態防護 —— 由 `LifecycleOwnership` 統一裁決（2026-09-01 重構後）
+
+前六輪 review 在同一組不變式上抓出十幾個問題，每一個的形狀都一樣：**「這個 process 現在可以放手了嗎」
+這件事被分散在四、五個地方各自回答**，而任兩個答案之間永遠隔著一個 await。最後的設計把它收斂成一個
+deep module：`src/core/lifecycle-ownership.ts`。
+
+**對外只有四個操作**（任何「需要第五個」的需求，都是某個呼叫端又想自己推理所有權——正是要移除的東西）：
+
+- `arm(teardown)`：可重複武裝、**最後一次生效**。production 武裝兩次：Copilot client 一存在就武裝
+  **窄**的清理（在 `copilot.start()` **之前**，因為從 client 存在那一刻起它就是要收拾的東西），app 建好、
+  **且 signal handler 安裝之前**再武裝**寬**的 `teardownResources`。shutdown 已開始才 arm 會回 `false`，
+  該清理本身變成一筆 obligation，呼叫端必須中止建構。
+- `runExclusive(threadId, body)`：**同步**發布 scope（在 body 的第一個 await 之前）。只有 shutdown 與
+  該 thread 的 teardown claim 會拒絕；**barrier 刻意不拒絕**——清掉 barrier 正是 body 自己的第一步。
+- `runTeardown(threadId, body)`：計數式（可重入）claim，同步發布；`joinExclusive` 有界，
+  **回 `false` 就是要拒絕**，不是「當作跑完了」。
+- `shutdown()`：single-flight，**非 `async`**（呼叫端必須拿到同一個 promise，第二個 signal 是 join 而不是
+  等一個新包裝物件）。它回傳的 promise 有界，但**釋放與否不由它決定**。
+
+**釋放是每次 transition 重新推導出來的結論**，不是倒數、也不是對快照做判斷：只有 exclusive scopes、
+teardown claims、obligations **同時為空**才釋放，且只釋放一次。
+
+**Obligation 自帶 payload**（actor、retained root、cleanup plan 都在 closure 裡），所以不存在第二份會
+跟它走歪的 barrier map；同一個 key **先到先贏**，因為既有的那筆是「更早、而且沒人證明它停了」的東西，
+它的強引用就是唯一的柵欄。`ObligationHandle` 的 `attempt`/`discharge` 都是**身分安全**的。
+
+在這個基礎上，各個競態的答案變成：
+
+- **不重疊 tick**：`accessRetryTickPromise` 存在時 `runAccessRetryTick()` 直接返回；tick 結束才
+  `scheduleAccessRetry()`（先 `clear` 再 `set`），所以任何時刻最多一個 armed timer、最多一個 in-flight tick。
+  timer 與退避政策**仍留在 app**，coordinator 不管排程。
+- **`resumeOwnershipLost()`（共用 fence，用於三個點）**：
+  1. `resumeRecord()` **最開頭**，任何 side effect 之前。若不擋，`addWorktree()` 會從還在的 branch
+     **重建**一個沒有任何 record 指向的 worktree——正好是 `/end` 剛清掉的那種殘留。
+  2. `addWorktree()` **成功之後**：重建本身是 await，第 1 點蓋不到；此時**回收自己造成的 side effect**。
+  3. `SessionActor.create()` 之後、`sessions.set()` 之前。三處都只問 scope 一個問題
+     （`lostReason()` + barrier `retained`），不再自己查三張表。
+- **`/end` 一定贏**：`cmdEnd` 對兩種形式都用 `runTeardown` 認領整個指令（計數式，所以 stale 路徑可再認領
+  一次）。claim 在指令自己的第一個 await 之前就同步成立，於是 retry 的 `runExclusive` 被拒絕；已經在飛的
+  attempt 則在 fence 撞上 `lostReason()`。`/end` 用 `scope.joinExclusive()` 有界等待，**沒 settle 就拒絕回收**。
+- **rebind 也是一次 teardown**：`applyRebind` 同樣跑在 `runTeardown(threadId)` 內。它會停掉舊 runtime、
+  可能留下沒人證明停止的 detached incarnation、並決定一個 worktree 的去留——這正是 teardown 的定義。
+  因此 rebind 進行中，該 thread 的 access retry 會被拒絕；巢狀的 `/end` 是計數 claim，安全。
+- **shutdown 一定贏**：`app.stop()` **同步**關上 phase gate（`shuttingDown` + `phase`）之後才叫
+  `shutdown()`；`stop()` 自己不再有 single-flight（coordinator 就是），而且**武裝的一定是
+  `teardownResources`、絕不是 `stop()`**，否則會 re-enter 正在呼叫它的 single-flight。
+  post-construction 的啟動失敗一律走 `app.stop()`，只有 app 還不存在時才直接叫 coordinator。
+- **武裝的 teardown 有界，而且先上閘**：`copilot.stop()` 是可能卡住的 RPC，而 shutdown 的契約是有界的。
+  閘門在 teardown **執行前**就掛上，只有它**真正完成**才 discharge。於是：卡住 ⇒ `shutdown()` 誠實地以
+  timeout reject、**lock 續持**；晚一點才回來 ⇒ discharge 觸發重新評估、**那時才釋放**；
+  回來但是失敗 ⇒ 閘門留著，因為失敗不是完成。**不重試**：把死到一半的 teardown 再跑一次只會傷得更重。
+- **token 擋不住「已經發出去」的外部工作，所以 lock 才是最後一道**：epoch 可以讓 app 不再寫任何東西，
+  但收不回已送出的 REST 呼叫、正在跑的 `git worktree add`、或已交給 runtime 的 `SessionActor.create`。
+  因此 `stop()` 若沒 join 到 in-flight scope，就**不釋放** lock：交給該 scope settle 後的重新評估；
+  永遠不 settle 就留到 process 結束，後繼者依 `acquireSingleInstanceLock` 把「holder pid 已不在」的 lock
+  視為 stale 回收（`releaseIfOwner` 也拒絕刪掉已被接管的 lock）。
+- **lock 的所有權轉移在 bootstrap 被形式化**：coordinator 在拿到 lock 的當下就建立，並**原封傳進**
+  `runtime.start`。bootstrap 沒有 `transferred` 旗標、沒有 `lock.release()`；它唯一的責任是把失敗導向
+  `app.stop()`（app 已存在）或 `ownership.shutdown()`（還不存在）。`DiscordCopilotApp.start` 的
+  **每一個 throw site 都在自己的 `try` 內**，包括 `resolveReposRoot` 與 SDK 版本檢查。
+  `--selfcheck` 自己持有一組不經過 app 的 lock，是唯一的例外。
+### 19.4 否決的方案
+
+- **只靠 Discord 事件（`ChannelUpdate` / `GuildMemberUpdate` / `ThreadUpdate`）**：權限恢復不保證對
+  「先前不可見的討論串」產生可用事件，而且 discord.js 的 partial/cache 行為會讓「哪個 record 受影響」
+  變成猜測。否決為正確性來源；未來可作為 poke。
+- **每個 record 各自一個 timer**：N 個 timer 就是 N 個可能重疊的復原路徑，正好是最容易寫出 double-resume
+  的形狀。改為單一 loop 掃全部。
+- **重試次數上限 / 逾時後改為終態**：直接違反 ADR-0002。
+- **在持久化 schema 增加 `nextRetryAt` 之類欄位**：重試節奏是 process 內的排程細節，不是需要跨重啟保存的
+  事實（重啟本來就會立刻重試一次）。避免動 schema。
+- **`/end` 在 retry in-flight 時拒絕執行**：那會讓「唯一的放棄逃生口」在最需要它的時候不可用。改為
+  「`/end` 先宣告擁有權、有界 join、然後贏」。
+- **把被丟棄的 runtime 交給 stale-rebind companion 機制**：見 §19.3 的雙重宣告問題。
+- **startup 也一律 `force` 抓取**：startup 的 cache 本來就近乎空的，全面 force 只是多花 rate limit。
+
+### 19.5 已接受的殘留風險
+
+- retry 與 `/end` 恰好同時發生時，可能真的建立出一個 SDK session 又立刻 disconnect 掉；conversation 本身
+  不受影響（resume 不改變歷史），代價是一次多餘的 runtime 往返。同一個視窗裡「重建 worktree」已由 §19.3 的
+  前置 fence 擋掉，`addWorktree` 進行中才落地的 `/end` 則由後置 fence 回收；只有「回收也失敗」時會留下一個
+  沒有 record 的目錄，而它會被 startup 的 stray-worktree 掃描報出來（既有機制），且 worktree 仍只在 git
+  證明乾淨時才會被刪。
+- 暫時性 fetch 失敗期間 `/sessions` 仍會顯示 `thread-no-access`（見 §19.2）。這是刻意的：非終態的 reason
+  漂移會同時破壞重試資格與 `/end` 逃生口。
+- 無法確認停止的 runtime（obligation）直到 process 結束都可能留著（`/end` 與 shutdown sweep 各再試一次；若 SDK
+  的 disconnect 是**永遠不 settle** 的 hang，single-flight 讓它在本 process 內根本無法被確認）。這是
+  刻意的：無法證明已停止的 runtime 不該被當成已停止，記錄與 worktree 一起保留，重啟才是清乾淨的路。
+  期間該討論串**不會**被重複 resume（見 §19.3），也不會被終態化。
+- 同理，`stop()` 沒 join 到的 attempt 會讓 single-instance lock 一直被持有到它 settle 或 process 結束。
+  代價是：在這種情況下**立刻**重啟 bot 會因為「另一個 instance 還活著」而被拒（那是實話）；等這個
+  process 真的結束之後，後繼者就能把 stale PID lock 回收。用「可能要多等一下才能重啟」換掉「兩個
+  process 同時對同一批 record 與 checkout 動手」，是刻意的取捨。
+- 重試路徑的 transient resume 失敗只會貼一次通知（每個 process、每個討論串）。第二次之後只有 log；
+  狀態仍看得到（`/sessions`），成功復原時也會貼復原通知。
+- 一筆記錄的終態轉換寫入失敗時，retry loop 只能記錄（`console.error`）並讓它維持 `active`；沒有「讓啟動失敗」
+  這個槓桿可用。維持 `active` 是不會弄丟對話的那個方向。
+- `/end` 若在 retry 已經 `sessions.set()` **之後**才抵達，走的是既有的 live-session `/end` 路徑，這裡沒有
+  行為變更。
+- 若某筆 record 是在 process 執行期間（而非 startup）才變成 `thread-no-access`（目前沒有這種路徑），
+  最壞情況要等一個 idle 週期（≤15s，或退避後 ≤5 分鐘）才會被掃到。
+
+### 19.6 §9 測試對照補記
+
+| §9 需求 / 新增風險 | 覆蓋 |
+| --- | --- |
+| `50001` → 權限恢復 → **恰好一次** resume，且清掉 retry 狀態（`reason` 變 `undefined`）；後續 tick 不再 resume | `test/app-reconcile.test.ts` |
+| Channel Obfuscation → 重新可見 → resume | `test/app-reconcile.test.ts` |
+| 權限持續未恢復：永遠停在 `active` / `thread-no-access`、沒有 live actor、沒有 notice 洗版、退避 15s→5m 封頂 | `test/app-reconcile.test.ts` |
+| 重試期間討論串真的被刪除 → 走既有 terminal 規則（`blocked` / `thread-gone`）並釋放 local lease | `test/app-reconcile.test.ts` |
+| in-flight tick 期間再進來的 wake-up 不得產生第二次 resume，且結束後只 arm 一個 timer | `test/app-reconcile.test.ts` |
+| `/end` 穿插 in-flight retry：record 不得被復活，live map 保持空，孤兒 actor 被 disconnect | `test/app-reconcile.test.ts` |
+| retry 期間 classify 變成 `transient` 或未知狀態時，**不得**改寫 reason（否則同時掉出重試迴圈與 `/end` 逃生口）；仍維持退避、無 notice 洗版、之後恢復存取權仍能 resume | `test/app-reconcile.test.ts` |
+| `/end`（worktree 已不存在 → record 被移除）穿插 classify await 時，retry **不得**重建 worktree、不得建立 SDK session；shutdown 版本同理 | `test/app-reconcile.test.ts` |
+| retry 必須 `force` 抓取，才不會被失去存取權時留下的混淆 stub cache 永久蓋住；startup 仍走 cache | `test/app-reconcile.test.ts` |
+| **`/end` 先開始**、retry 在它的 await 空隙裡跑：不得註冊 session、不得留下沒有 record 的 live session 或已釋放的 lease；`/end` 失敗時 claim 必須釋放，record 回到迴圈 | `test/app-reconcile.test.ts` |
+| 被丟棄的 runtime `disconnect()` 失敗時必須保留成 barrier，`/end` 必須拒絕回收並誠實回覆 | `test/app-reconcile.test.ts` |
+| `stop()` resolve 之後不得再有任何持久寫入（有界 join in-flight tick） | `test/app-reconcile.test.ts` |
+| retry 路徑的 transient resume 失敗只貼**一次**、且文案不得叫使用者重啟 | `test/app-reconcile.test.ts` |
+| startup `skip` notice 必須依 reason 分流：no-access 說「恢復存取權後自動復原、不必重啟」，transient/unknown 說「重啟才會再試」 | `test/app-reconcile.test.ts` |
+| `/end` 的 join 在嘗試 settle 之前就到期時，必須**拒絕回收**（record 與 worktree 都不動），而不是當作沒有東西在跑 | `test/app-reconcile.test.ts` |
+| `commit()` 回 false 時不得註冊 session、不得貼成功通知；record／lease 保留，下一次 wake-up 仍能真正復原 | `test/app-reconcile.test.ts` |
+| `/end` 落在 `addWorktree` **進行中**時，重建確實發生、而且必須被回收（後置 fence），不得留下無主 checkout | `test/app-reconcile.test.ts` |
+| shutdown sweep 對未確認的 runtime obligation 再試一次：確認成功要清掉，仍無法確認要保留（連同 record）；一般 live session 的 disconnect throw／hang 也必須成為 obligation 並擋住釋放 | `test/app-reconcile.test.ts` |
+| 第一次 tick 就沒有候選時，必須直接退到 5 分鐘閒置輪詢，且不碰非本迴圈的 `active` record | `test/app-reconcile.test.ts` |
+| **barrier 保留後的下一次 tick 不得再 resume 同一個 session**：不得有第二個 actor／resume 呼叫，第一個強引用必須原封不動；涵蓋 **hang**（不只立即 throw）的 disconnect 時序 | `test/app-reconcile.test.ts` |
+| 兩個丟棄競爭同一個 thread 時，barrier 必須保留**第一個**（較新的 actor 乾淨退出不代表較舊的安全） | `test/app-reconcile.test.ts` |
+| in-thread 的 `/end`（不加 `thread:`）也必須認領該討論串，並在結束後完全釋放 | `test/app-reconcile.test.ts` |
+| `onReady` 必須在 `phase = "ready"` 之後**立刻**啟動 retry loop，且全檔只有一處啟動點（source 契約，如同本 repo 既有的 shipped-script／docs 契約測試） | `test/app-reconcile.test.ts` |
+| `stop()` 的有界 join 逾時後，延遲回來的 classify（即使是 `gone` 這種終態）**不得**有任何持久寫入、lease 變更或 Discord 副作用——store 檔案 byte-for-byte 不變；而且 lock **不得**在那之前被釋放，要等該 attempt settle 才釋放 | `test/app-reconcile.test.ts` |
+| 同上，但卡在 `addWorktree`（已發出的 git 工作）：lock 保留到重建結束才釋放 | `test/app-reconcile.test.ts` |
+| attempt **永遠不 settle** 時，lock 在整個 process 生命期內都不得釋放（靠後繼者回收 stale PID lock） | `test/app-reconcile.test.ts` |
+| `startBot()` 失敗時：app 已建立 ⇒ 走 `app.stop()`（先關 phase gate 再 teardown，release 恰好一次）；armed teardown 有未決 obligation 時**不得**釋放；app 未建立 ⇒ 由 coordinator 釋放早期 lock | `test/bootstrap.test.ts` |
+| coordinator 本身：pre-shutdown settle 不釋放／健康 shutdown 只釋放一次且 sweep 在 armed teardown 之前／join 逾時延後釋放／sweep 之後才 retain 的 obligation 仍擋住／obligation 失敗與 hang／first-wins 身分／teardown claim 拒絕 admission 但 barrier 不拒絕／計數式重入 claim／late arm 變 obligation／last-arm-wins／armed teardown 有界（永不返回、晚返回、返回但失敗）／timer 必須 unref | `test/lifecycle-ownership.test.ts` |
+| `app.stop()` 一被呼叫就**同步**關上 phase gate：teardown 進行中不得接受任何指令，coordinator 也不得再 admit owned work | `test/app-reconcile.test.ts` |
+| rebind 進行中，該 thread 的 access retry 必須被拒絕（其他 thread 不受影響）；巢狀 `/end` 是計數 claim；teardown body reject 不得洩漏 claim | `test/app-reconcile.test.ts` |
+| shutdown 開始後不得再 admit 新的 rebind；已 admit 的 rebind 在**每一個既有 checkpoint**（binding/capture、addWorktree、`SessionActor.create`、reserve 之後 swap 之前、swap 之後）都必須回報失去擁有權，`/end` 重疊同理 | `test/app-reconcile.test.ts`、`test/app-rebind.test.ts`（39 個既有斷言不變） |
+| startup 全程為 owned scope：shutdown 落在 reconcile 中途時不得開 phase gate、不得有遲到寫入、lock 不得在 scope 結束前釋放 | `test/app-reconcile.test.ts` |
+| startup resume 的 `commit()` 失敗 + disconnect hang ⇒ 留下 obligation，且 retry loop 啟動後不得建立第二個 runtime | `test/app-reconcile.test.ts` |
+| 一般 live session 的 disconnect throw／hang ⇒ obligation 保留、lock 不釋放；`/end thread:` 必須先 defer 再做兩段有界等待 | `test/app-reconcile.test.ts` |
+| 無法確認停止的 detached rebind incarnation 必須擋住 lock 釋放，直到它被 discharge | `test/app-reconcile.test.ts` |
+| **真實** `DiscordCopilotApp.start()` 的每一種失敗都必須釋放 lock 恰好一次：`REPOS_ROOT` 不存在、`REPOS_ROOT` 涵蓋 trust store、SDK 版本不符（三者皆不得建立 Copilot client）、以及 runtime 啟動失敗（要 stop client 再 release） | `test/app-start-ownership.test.ts` |
+| `stop()` 必須 single-flight：三個並行呼叫只跑一次拆解，且拿到**同一個** promise | `test/app-reconcile.test.ts` |
+| termination signal：single-flight `stop()` + 設 `process.exitCode`，**不得**呼叫 `process.exit`（source 契約）；`stop()` 失敗要 `console.error` 且 `exitCode = 1` | `test/app-reconcile.test.ts` |
+| capture 成功但（取消或 resume 失敗）沒交給 actor 時，`trustedRoot.close()` 必須被呼叫恰好一次 | `test/app-reconcile.test.ts` |
+| shutdown 穿插 in-flight retry：不註冊 session、不再 arm timer、record 原封不動留給下次開機 | `test/app-reconcile.test.ts` |
+| armed timer 必須 `unref`，`clearAccessRetryTimer()` 必須真的清掉 | `test/app-reconcile.test.ts` |
+| 建構完成後、login 之前收到 `app.stop()`：`start()` 必須以 `StartupAbandonedError` 失敗、永遠不回傳 app，`startBot()` 因此不會 publish readiness（走真實 `start()` 的 `beforeLogin` 測試接縫） | `test/app-start-ownership.test.ts` |
+| **一般成功改綁**退役的舊 actor：disconnect 無法確認時必須成為 obligation，`app.stop()` 不得釋放 lock；真實 retry 路徑確認後才 discharge 並釋放恰好一次 | `test/app-rebind.test.ts` |
+| `/end` 在 defer **之後**的每一個分支都必須用 `editReply` 回答（表格驅動）；唯一仍用 `reply` 的是 claim 被拒的關閉中分支 | `test/app-reconcile.test.ts` |
+| `CopilotClient.stop()` 是 `Promise<Error[]>`：**fulfil 非空陣列＝失敗**。兩個 armed teardown 都必須走同一個 `stopCopilotClient()`，回報錯誤時 lock 不得釋放；空陣列才算乾淨 | `test/sdk-env.test.ts`、`test/app-reconcile.test.ts`、`test/app-start-ownership.test.ts` |
+| 有界 disconnect 逾時後，底層 single-flight promise **晚點成功**仍必須 identity-discharge 該 obligation 並讓 lock 釋放；晚點**失敗**則什麼都不 discharge | `test/app-reconcile.test.ts` |
+| obligation attempt 的回傳值必須反映**集合狀態**而非 body 的回傳值：body 自行 identity-discharge（runtime 已確認、只是 worktree 髒而保留）後回 false，shutdown 不得謊報「lock retained」，lock 要真的釋放 | `test/lifecycle-ownership.test.ts`、`test/app-rebind.test.ts` |
+| `beginRebind` 的三種 acknowledgement 狀態各只有一種合法方法：未回應→`reply`、已 defer→`editReply`、`/repo clone` 已 defer+edit→`followUp` | `test/app-rebind.test.ts` |
+| **每個會改變狀態的 inbound 操作都是 owned work**：`/new` 在 worktree 已存在時遇到 shutdown 必須整筆回滾（worktree 移除、討論串刪除、無 record、無 session），且 lock 要等回滾完成才釋放 | `test/app-inbound-ownership.test.ts` |
+| `/channel enable` 在 durable 寫入前遇到 shutdown ⇒ registry（記憶體與磁碟）都不得改變 | `test/app-inbound-ownership.test.ts` |
+| button 的 ack 期間遇到 shutdown ⇒ 交付**安全預設值**（deny／reject／cancel），不得交付操作者按下的擴權選項 | `test/app-inbound-ownership.test.ts` |
+| thread 訊息在啟動 SDK turn 之前遇到 shutdown ⇒ 不得開始新的 turn | `test/app-inbound-ownership.test.ts` |
+| 唯讀指令不需要 scope，且 coordinator 不得因此持有任何 exclusive；`/end`／rebind 不被包成 exclusive，與並行的 owned 操作不得死結 | `test/app-inbound-ownership.test.ts` |
+| shutdown 對所有 exclusive scope 只用**一個**共用 bound（不是每個 key 一個）：10 個掛住的 scope 只能觸發一次 join 逾時 | `test/lifecycle-ownership.test.ts` |
+| `/new` 的 `commit` 失敗與失去所有權兩條路徑必須**同形**：runtime 轉成 obligation（非塞進 live map 當屏障），無法確認就不得釋放 lock | `test/app-inbound-ownership.test.ts` |
+| 訊息的所有權閘門必須在 `startTitling` **之前**：titler 會自行建立 Copilot session，關機時不得產生無人拆除的 runtime | `test/app-inbound-ownership.test.ts` |
+| `/file`：所有權只在**送出前**判斷；交給 transport 的述詞僅代表 session 現時性，Discord 已接受的附件不得只因關機而被收回 | `test/app-inbound-ownership.test.ts` |
+| phase gate 必須區分「啟動中，請稍候重試」與關機中的誠實回覆 | `test/app-inbound-ownership.test.ts` |
+| `runOwnedMessage` 必須攔截並記錄 handler 的 rejection（否則會是 unhandled rejection，Node 20+ 會終止 process） | `test/app-inbound-ownership.test.ts` |
+| `/queue` 的回滾只能移除**自己新增的那一則**，不得誤刪操作者先前排入的同字串提示 | `test/app-inbound-ownership.test.ts` |
+| readiness 發布本身是 owned work：發布中途 shutdown ⇒ 撤回 marker、`startBot` 必須失敗，且 lock 要等撤回落定才釋放 | `test/bootstrap.test.ts` |
+| **shutdown（非 `/end`）中斷 pre-swap 改綁**必須把被移開的 primary 記錄**還原**（真實 `SessionStore`：old active → stale 伴隨列 + target creating → 卡在 `SessionActor.create` → shutdown → 還原後 old 仍 `active`/可復原、target 移除、stale 列已對帳）；只有明確的 `/end` 才選擇移除 | `test/app-rebind.test.ts` |
+| `/new prompt:` 在最後一則回覆之後、`startTitling`／`runTurn` 之前必須再問一次所有權：關機中不得起 titler runtime 或第一個 turn（session 本身仍完整且 durable） | `test/app-inbound-ownership.test.ts` |
+| `stop()` 必須**同步**清空每個 session 的 queue（在第一個 await 之前）；`drainQueue` 另需自行拒絕 `shuttingDown`／`phase !== "ready"`，因為它是由無 scope 的 `void` 續傳呼叫的 | `test/app-inbound-ownership.test.ts` |
+| readiness 撤回必須移除**兩個** marker（status 與 launcher 輪詢的 token marker），且只移除屬於本 pid／instance 的檔案（不得刪掉後繼者的） | `test/startup-ready.test.ts` |
+
+### 19.7 抽取結果與仍未做的事
+
+**已做（2026-09-01）**：所有權判斷已抽成 deep module `src/core/lifecycle-ownership.ts`（見 §19.3）。
+隨之從 `app.ts` **刪除**的分散狀態：`accessRetryEpoch` 與每次 attempt 的 `cancelled` closure、
+`endClaims` + `claimEnd()`、`accessResumeSettled` + `joinAccessResume()` + `accessResumeJoinTimeoutMs`、
+`unconfirmedResumes` + `retryUnconfirmedResume()`、`stopPromise` + `stopOnce()`，以及 app 上的 `lock`
+欄位與**每一處** `lock.release()`。bootstrap 也拿掉了 `transferred` 旗標與它自己的 release。
+留在 app 的是**政策**而非所有權：timer／退避（`accessRetryScheduler`、`accessRetryTimer`、
+`accessRetryTickPromise`、`accessRetryBackoff`、`accessRetryIdle`）、`reconcileClassify`、
+`resumeTeardownTimeoutMs`，以及 `staleRebindActors`（app 自己做 retry／`/end`／fallback 對帳的索引，
+所有權事實則記在 obligation 裡）。
+
+**仍未做**：`app.ts` 依然很大，retry loop 的排程與 `reconcileRecord`／`resumeRecord` 仍在同一個檔案。
+若要再切，下一刀應該是把「access-retry 排程 + 候選判定」與「reconcile/resume 狀態機」分開，而**不是**
+再切所有權——那一刀已經切完了。（此處刻意不記行數：那是會隨每次改動就過期的數字，
+`git diff --stat main...HEAD -- src/app.ts` 隨時可以得到當下的真值。）
+
+測試側則**刻意不合併** fixture 樣板。每個案例在 copilot（fake／gated／resume 失敗／commit spy）、
+transport、record 形狀（local／worktree）、fetch 行為上至少差一項；把它們塞進一個多旋鈕的 helper 只會
+把「這個測試到底哪裡不一樣」藏起來，而這正是競態測試唯一重要的資訊。本檔案既有的 41 個測試也都用
+同樣的顯式寫法。

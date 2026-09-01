@@ -122,7 +122,41 @@ export async function clearStartupReady(
   pid: number = process.pid,
   directory: string = startupReadyDirectory()
 ): Promise<void> {
-  const marker = startupReadyStatusPath(instance, directory);
+  await removeOwnedMarker(startupReadyStatusPath(instance, directory), instance, pid);
+}
+
+/**
+ * Take back a readiness publication this process must not have made.
+ *
+ * `publishStartupReady` writes TWO files: the current-ready status, and — when a
+ * launcher supplied a token — the marker that launcher polls. `clearStartupReady`
+ * removes only the first, which is right for a graceful shutdown of a bot that
+ * really did serve: the launcher has long since consumed its token marker.
+ *
+ * A RETRACTION is different. The publication is being withdrawn because the
+ * process abandoned its startup, and the launcher is very likely still polling.
+ * Leaving the token marker there reports a successful start for a bot that is
+ * going away. Both files are removed, and both are removed OWNER-SAFELY: a
+ * successor may already hold the lock and have published its own readiness, and
+ * deleting its files would make the launcher wait for a bot that is in fact
+ * serving.
+ */
+export async function retractStartupReady(
+  request: StartupReadyRequest | undefined = startupReadyRequest(),
+  options: PublishStartupReadyOptions = {}
+): Promise<void> {
+  const instance = options.instance ?? instanceId();
+  const dir = options.directory ?? startupReadyDirectory();
+  const pid = options.pid ?? process.pid;
+  await removeOwnedMarker(startupReadyStatusPath(instance, dir), instance, pid);
+  if (request) {
+    await removeOwnedMarker(startupReadyMarkerPath(instance, request.token, dir), instance, pid);
+  }
+}
+
+/** Delete `marker` only when it names THIS process and instance. A file we did
+ *  not write is a successor's, and it is not ours to remove. */
+async function removeOwnedMarker(marker: string, instance: string, pid: number): Promise<void> {
   let parsed: StartupReadyMarker;
   try {
     parsed = JSON.parse(readFileSync(marker, "utf8")) as StartupReadyMarker;

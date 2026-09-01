@@ -15,6 +15,8 @@ import { ChannelRegistry } from "../src/core/channel-registry.js";
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { isAuthorized, type AuthPolicy } from "../src/platforms/discord/auth.js";
+import type { OwnedScope } from "../src/core/lifecycle-ownership.js";
+import { inOwnedScope } from "./support/owned-scope.js";
 
 const OWNER = "10000";
 const GUILD = "20000";
@@ -168,11 +170,16 @@ function harness(registryFile = join(FIXTURES, "channels.json")): Harness {
 }
 
 function cmdChannel(app: DiscordCopilotApp, interaction: ChatInputCommandInteraction): Promise<void> {
-  return (
-    app as unknown as {
-      cmdChannel(i: ChatInputCommandInteraction): Promise<void>;
-    }
-  ).cmdChannel(interaction);
+  // Through a REAL scope from the app's own coordinator: the handler now
+  // requires one, and a fabricated "never lost" scope would make every
+  // shutdown-race assertion in this area vacuous.
+  return inOwnedScope(app, (scope) =>
+    (
+      app as unknown as {
+        cmdChannel(i: ChatInputCommandInteraction, s: OwnedScope): Promise<void>;
+      }
+    ).cmdChannel(interaction, scope)
+  );
 }
 
 function cmdSessions(app: DiscordCopilotApp, interaction: ChatInputCommandInteraction): Promise<void> {
@@ -184,11 +191,16 @@ function cmdSessions(app: DiscordCopilotApp, interaction: ChatInputCommandIntera
 }
 
 function cmdYolo(app: DiscordCopilotApp, interaction: ChatInputCommandInteraction): Promise<void> {
-  return (
-    app as unknown as {
-      cmdYolo(i: ChatInputCommandInteraction): Promise<void>;
-    }
-  ).cmdYolo(interaction);
+  // Through a REAL scope from the app's own coordinator: the handler now
+  // requires one, and a fabricated "never lost" scope would make every
+  // shutdown-race assertion in this area vacuous.
+  return inOwnedScope(app, (scope) =>
+    (
+      app as unknown as {
+        cmdYolo(i: ChatInputCommandInteraction, s: OwnedScope): Promise<void>;
+      }
+    ).cmdYolo(interaction, scope)
+  );
 }
 
 type DiscordForTest = {

@@ -5,7 +5,7 @@ import { acquireSingleInstanceLock } from "./core/single-instance.js";
 import { startBot } from "./core/bootstrap.js";
 import { lockPath, legacyStateDir, legacyNameWarnings } from "./core/paths.js";
 import { formatVersionInfo, readAppVersion, readCommitSha } from "./core/version.js";
-import { publishStartupReady, startupReadyRequest } from "./core/startup-ready.js";
+import { publishStartupReady, startupReadyRequest, retractStartupReady } from "./core/startup-ready.js";
 
 /** Load ./.env into process.env if present (Node built-in; no dependency). */
 function loadDotEnv(): void {
@@ -83,6 +83,10 @@ async function main(): Promise<void> {
       };
     },
     publishReady: () => publishStartupReady(readyRequest),
+    // The publication is retractable: a shutdown that lands inside it must not
+    // leave a marker claiming this pid is serving — and that means BOTH files,
+    // because the launcher polls the token marker, not the status one.
+    retractReady: () => retractStartupReady(readyRequest),
   });
   // The Discord gateway connection keeps the event loop alive; shutdown is
   // handled by the app's SIGINT/SIGTERM handlers.

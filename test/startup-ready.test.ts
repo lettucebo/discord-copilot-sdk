@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   STARTUP_READY_TOKEN_ENV,
   clearStartupReady,
   publishStartupReady,
+  retractStartupReady,
   startupReadyMarkerPath,
   startupReadyRequest,
   startupReadyStatusPath,
@@ -83,5 +84,69 @@ describe("startup readiness request", () => {
 
     await clearStartupReady("test", 4242, readyDir);
     expect(() => readFileSync(status, "utf8")).toThrow();
+  });
+});
+
+
+describe("retractStartupReady (a publication this process must not have made)", () => {
+  it("removes BOTH the status and the request-token marker", async () => {
+    // `publishStartupReady` writes two files: the current-ready status AND the
+    // token marker the launcher polls. `clearStartupReady` only ever removed the
+    // first, so a retraction left the token marker behind — and the launcher
+    // consumes exactly that, reporting a successful start for a process that had
+    // already abandoned its startup.
+    const stateDir = directory();
+    const dir = path.join(stateDir, "startup-ready");
+    const request = { token };
+    await publishStartupReady(request, { directory: dir, instance: "default", pid: 4321 });
+    const status = startupReadyStatusPath("default", dir);
+    const marker = startupReadyMarkerPath("default", token, dir);
+    expect(readFileSync(status, "utf8")).toContain("4321");
+    // The launcher sees a successful start — this is what it polls.
+    expect(inspectReadyMarker(launcherMarkerPath(stateDir, "default", token), "default", 4321)).toEqual({
+      kind: "ready",
+    });
+
+    await retractStartupReady(request, { directory: dir, instance: "default", pid: 4321 });
+
+    expect(existsSync(status)).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+    // …and now it does NOT report a success for a bot that abandoned startup.
+    expect(inspectReadyMarker(launcherMarkerPath(stateDir, "default", token), "default", 4321)).toEqual({
+      kind: "absent",
+    });
+  });
+
+  it("refuses to delete a SUCCESSOR's markers", async () => {
+    // The retraction runs while a successor may already own the lock and have
+    // published its own readiness. Deleting either of its files would make the
+    // launcher wait for a bot that is in fact serving.
+    const dir = directory();
+    const request = { token };
+    await publishStartupReady(request, { directory: dir, instance: "default", pid: 5555 });
+
+    await retractStartupReady(request, { directory: dir, instance: "default", pid: 4321 });
+
+    expect(existsSync(startupReadyStatusPath("default", dir))).toBe(true);
+    expect(existsSync(startupReadyMarkerPath("default", token, dir))).toBe(true);
+  });
+
+  it("removes the status alone when there was no launcher request", async () => {
+    const dir = directory();
+    await publishStartupReady(undefined, { directory: dir, instance: "default", pid: 4321 });
+
+    await retractStartupReady(undefined, { directory: dir, instance: "default", pid: 4321 });
+
+    expect(existsSync(startupReadyStatusPath("default", dir))).toBe(false);
+  });
+
+  it("leaves a DIFFERENT instance alone", async () => {
+    const dir = directory();
+    await publishStartupReady({ token }, { directory: dir, instance: "other", pid: 4321 });
+
+    await retractStartupReady({ token }, { directory: dir, instance: "default", pid: 4321 });
+
+    expect(existsSync(startupReadyStatusPath("other", dir))).toBe(true);
+    expect(existsSync(startupReadyMarkerPath("other", token, dir))).toBe(true);
   });
 });

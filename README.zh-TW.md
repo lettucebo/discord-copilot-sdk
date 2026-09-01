@@ -187,7 +187,7 @@ curl -fsSL https://raw.githubusercontent.com/lettucebo/discord-copilot-sdk/main/
 
 > 這種隔離防的是*意外*互相覆蓋，不是 sandbox。Lab mode 仍以你的 OS user 無沙箱執行 tools，所以被刻意引導的 session（例如受 repo content prompt injection 影響）仍可用 path 存取另一個 session 的 worktree。上方安全模型仍全部適用。
 
-- `/sessions` — 顯示 live sessions、各自 state 與 branch（最多 8 個）。殘留 records 也會列出，並依實際可做的事分成 *clearable*、*will retry on restart*（絕不直接刪除——record 是該 Copilot conversation 唯一 pointer），以及 bot 失去 channel 存取權的紀錄（`thread-no-access`）——這類紀錄在存取權恢復或 restart 後會重試，但擁有者也可以用 `/end thread:<id>` 明確清除。
+- `/sessions` — 顯示 live sessions、各自 state 與 branch（最多 8 個）。殘留 records 也會列出，並依實際可做的事分成 *clearable*、*will retry on restart*（絕不直接刪除——record 是該 Copilot conversation 唯一 pointer），以及 bot 失去 channel 存取權的紀錄（`thread-no-access`）——這類紀錄在存取權恢復後會自動重試（不必重啟），但擁有者也可以用 `/end thread:<id>` 明確清除。
 - `/end` — 結束**此** thread 的 session；其他 session 繼續跑。在 session 已消失但 record 還在的 thread 中，同一指令會清掉該 record 與 worktree。
 - `/end thread:<id>` — 最常見殘留是**已刪除**的 thread，你無法在裡面輸入。請改從 parent channel 執行；bot 啟動時也會在那裡貼出 ids，以及任何沒有 record 的 worktree directory。只有 git 證明安全時才移除 worktree——任何 local content、detached HEAD，或 HEAD 在不同 branch，都會保留它，**且 record 會跟著保留**，讓 `/sessions` 仍能顯示磁碟狀態。處理該 tree（`git worktree remove`）後再執行同一指令完成清理。
 

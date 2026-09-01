@@ -27,8 +27,10 @@ All notable changes to this project are documented in this file.
 
 - **Losing Discord channel access (`50001 Missing Access`, including Channel Obfuscation) is
   now retryable, not a terminal block**: an affected session resumes automatically once access
-  is restored or the bot restarts, `/sessions` lists it separately from both permanently
-  blocked and other transient-retry records, and an owner can still explicitly clear it with
+  is restored — the running bot rescans its `thread-no-access` records on a bounded periodic
+  timer (15s, backing off to at most every 5 minutes), so recovery no longer requires a
+  restart — `/sessions` lists it separately from both permanently blocked and other
+  transient-retry records, and an owner can still explicitly clear it with
   `/end thread:<id>` after deciding to give up on recovery.
 - Slash commands now register with `default_member_permissions="0"`: only the guild owner or an
   Administrator can invoke them by default, and every other allow-listed user needs an explicit
