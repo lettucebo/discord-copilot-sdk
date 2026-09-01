@@ -214,9 +214,33 @@ export interface SessionActorCreateDependencies {
   postRpcCleanupTimeoutMs?: number;
 }
 
+/**
+ * What `createForTest` REQUIRES on top of the optional seams above.
+ *
+ * Both of these are home-backed in production: the audit sink defaults to
+ * `~/.discord-copilot-sdk/<instance>.audit.jsonl`, and an absent
+ * `skillsHomeDirectory` lets the SDK load the skills of whoever runs the suite.
+ * A test that omitted them therefore wrote to, and read from, a real home; the
+ * Vitest-wide `HOME` redirect hides that but fails OPEN, so the requirement is
+ * expressed here where the compiler enforces it. They are deliberately NOT in
+ * `SessionActorCreateForTestOpts`: two sources for one value is how one of them
+ * ends up unset. The other three fields stay optional precisely because none of
+ * them resolves through the home directory.
+ */
+export interface SessionActorCreateForTestDependencies extends SessionActorCreateDependencies {
+  /** Durable record of auto-approved actions, for THIS test. */
+  auditLog: AuditSink;
+  /** The home the skill sources are resolved under, for THIS test. */
+  skillsHomeDirectory: string;
+}
+
 /** Test-only creation input. Production callers must supply a root capability
- * captured before binding validation to `create()`. */
-export type SessionActorCreateForTestOpts = Omit<SessionActorOpts, "trustedRoot">;
+ * captured before binding validation to `create()`. The two home-backed opts
+ * live in `SessionActorCreateForTestDependencies`, where they are required. */
+export type SessionActorCreateForTestOpts = Omit<
+  SessionActorOpts,
+  "trustedRoot" | "auditLog" | "skillsHomeDirectory"
+>;
 
 function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -407,11 +431,15 @@ export class SessionActor {
   }
 
   /** Test-only constructor path. It is intentionally the only place that can
-   * create a fake root backend; production must use `create()` above. */
+   * create a fake root backend; production must use `create()` above.
+   *
+   * `dependencies` has NO default: it carries the audit sink and skills home,
+   * whose production defaults are the real home directory of whoever runs the
+   * suite. */
   static async createForTest(
     client: CopilotClient,
     opts: SessionActorCreateForTestOpts,
-    dependencies: SessionActorCreateDependencies = {}
+    dependencies: SessionActorCreateForTestDependencies
   ): Promise<SessionActor> {
     const fileDeliveryAvailable = isFileDeliveryAvailable(dependencies.fileDeliveryPlatform ?? "win32");
     const trustedRoot = fileDeliveryAvailable
@@ -419,6 +447,8 @@ export class SessionActor {
       : undefined;
     return this.create(client, {
       ...opts,
+      auditLog: dependencies.auditLog,
+      skillsHomeDirectory: dependencies.skillsHomeDirectory,
       ...(trustedRoot ? { trustedRoot } : {}),
       ...(dependencies.postRpcCleanupTimeoutMs === undefined
         ? {}

@@ -10,7 +10,8 @@ import type { DiscordCopilotAppTestDependencies } from "../../src/app.js";
  *
  * Every default this replaces resolves through `os.homedir()`, so an app built
  * without them reads — and in several cases creates — the state of whoever runs
- * the suite: the session store, the channel registry and `approvals.json`.
+ * the suite: the session store, the channel registry, `approvals.json`, the
+ * per-instance audit log and the user's `~/.copilot/skills`.
  * Vitest also redirects `HOME`/`USERPROFILE` for the whole run, but that is one
  * process-wide setting away from being removed, and it fails OPEN: nothing about
  * it makes a missing injection visible. The required parameter is the part that
@@ -52,6 +53,15 @@ export function appTestDependencies(
         path.join(options.directory, `channels${suffix}.json`)
       ),
     approvals: over.approvals ?? new ApprovalPolicy(path.join(options.directory, `approvals${suffix}.json`)),
+    // Never persisted anywhere: the production default appends to
+    // `~/.discord-copilot-sdk/<instance>.audit.jsonl`, and an app-level test has
+    // no reason to leave a real audit trail behind.
+    actorAuditLog: over.actorAuditLog ?? { append: (): boolean => true },
+    // A directory that need not exist: the actor only resolves skill roots under
+    // it. What matters is that it is NOT the `~/.copilot/skills` of whoever runs
+    // the suite, whose contents would otherwise steer these sessions.
+    actorSkillsHomeDirectory:
+      over.actorSkillsHomeDirectory ?? path.join(options.directory, `skills-home${suffix}`),
     ...(over.fileDeliveryPlatform === undefined
       ? {}
       : { fileDeliveryPlatform: over.fileDeliveryPlatform }),

@@ -149,18 +149,24 @@ function fakeCopilot(opts: { createFails?: boolean } = {}): CopilotClient {
 }
 
 async function createActiveActor(workDir: string, transport: Transport): Promise<SessionActor> {
-  return SessionActor.createForTest(fakeCopilot(), {
-    sessionKey: "t1",
-    workingDirectory: workDir,
-    skillsHomeDirectory: path.join(tmp, "no-user-skills"),
-    broker: new PendingInteractionBroker(),
-    transport,
-    policy: new ApprovalPolicy(path.join(tmp, `approvals-${Math.random()}.json`)),
-    auditLog: { append: () => true },
-    initialFileDeliveryBytes: 0,
-    fileDeliverySessionId: "s1",
-    reserveFileDeliveryBytes: () => true,
-  });
+  return SessionActor.createForTest(
+    fakeCopilot(),
+    {
+      sessionKey: "t1",
+      workingDirectory: workDir,
+      broker: new PendingInteractionBroker(),
+      transport,
+      policy: new ApprovalPolicy(path.join(tmp, `approvals-${Math.random()}.json`)),
+      initialFileDeliveryBytes: 0,
+      fileDeliverySessionId: "s1",
+      reserveFileDeliveryBytes: () => true,
+    },
+    {
+      // Required: both default to the home of whoever runs this suite.
+      auditLog: { append: () => true },
+      skillsHomeDirectory: path.join(tmp, "no-user-skills"),
+    }
+  );
 }
 
 interface Harness {

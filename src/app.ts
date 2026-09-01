@@ -73,6 +73,7 @@ import {
   formatTodos,
 } from "./copilot/session-actor.js";
 import { ApprovalPolicy } from "./core/approval-policy.js";
+import type { AuditSink } from "./core/audit-log.js";
 import { DiscordTransport, NO_MENTIONS } from "./platforms/discord/discord-transport.js";
 import {
   botCanViewChannel,
@@ -622,6 +623,12 @@ export interface DiscordCopilotAppTestDependencies {
   channels: ChannelRegistry;
   /** Approval memory. Real default: `~/.discord-copilot-sdk/approvals.json`. */
   approvals: ApprovalPolicy;
+  /** Audit sink handed to EVERY actor this app creates. Real default:
+   *  `~/.discord-copilot-sdk/<instance>.audit.jsonl`. */
+  actorAuditLog: AuditSink;
+  /** Skills home handed to every actor. Real default: the `~/.copilot/skills`
+   *  of whoever runs the suite. */
+  actorSkillsHomeDirectory: string;
   /** Not home-backed: the platform whose file-delivery rules apply. */
   fileDeliveryPlatform?: NodeJS.Platform;
 }
@@ -683,6 +690,14 @@ export class DiscordCopilotApp {
    *  as a side effect of merely EXISTING, which is exactly what a test that only
    *  builds an app must not do. */
   private readonly approvals: ApprovalPolicy;
+  /** Home-backed collaborators EVERY actor this app creates must be handed.
+   *  Undefined in production, where the actor applies its own real defaults;
+   *  `createForTest` always sets it, so no creation path can quietly fall back
+   *  to the audit log or skills home of whoever runs the suite. */
+  private readonly actorHomeDependencies?: Pick<
+    SessionActorOpts,
+    "auditLog" | "skillsHomeDirectory"
+  >;
   private modelIds: string[] = [];
   private readonly modelEfforts = new Map<string, string[]>();
   private shuttingDown = false;
@@ -827,6 +842,12 @@ export class DiscordCopilotApp {
         channelRegistryPath()
       );
     this.approvals = testDependencies?.approvals ?? new ApprovalPolicy();
+    if (testDependencies) {
+      this.actorHomeDependencies = {
+        auditLog: testDependencies.actorAuditLog,
+        skillsHomeDirectory: testDependencies.actorSkillsHomeDirectory,
+      };
+    }
     this.allowedUserIds = new Set(this.config.DISCORD_ALLOWED_USER_IDS);
   }
 
@@ -846,13 +867,23 @@ export class DiscordCopilotApp {
     };
   }
 
-  /** Keep every SessionActor creation path on the same skill-source policy.
-   *  Duplicating these conversions at /new, /repo rebind and resume would let a
-   *  restart silently load a different trust boundary than a fresh session. */
-  private skillSourceOptions(): { enableRepoSkills: boolean; enableUserSkills: boolean } {
+  /** Keep every SessionActor creation path on the same skill-source policy AND
+   *  the same audit/skills home.
+   *
+   *  These are deliberately ONE method. Duplicating the skill conversions at
+   *  /new, /repo rebind and resume would let a restart silently load a different
+   *  trust boundary than a fresh session, and a per-path audit/skills spread is
+   *  how one of three creation sites would keep the real home-backed defaults
+   *  after `createForTest` injected test ones. Every path spreads this; adding a
+   *  fourth path that forgets it is the failure this shape prevents. */
+  private actorSourceOptions(): Pick<
+    SessionActorOpts,
+    "enableRepoSkills" | "enableUserSkills" | "auditLog" | "skillsHomeDirectory"
+  > {
     return {
       enableRepoSkills: this.config.ENABLE_REPO_SKILLS === "true",
       enableUserSkills: this.config.ENABLE_USER_SKILLS === "true",
+      ...(this.actorHomeDependencies ?? {}),
     };
   }
 
@@ -2039,7 +2070,7 @@ export class DiscordCopilotApp {
           generation,
           createSessionId: sessionId,
           ...this.fileDeliveryQuotaOptions(thread.id, fileDeliveryBytes, sessionId, generation),
-          ...this.skillSourceOptions(),
+          ...this.actorSourceOptions(),
         });
       } catch (err) {
         // Create failed. The RPC may or may not have created the assigned id, so
@@ -4019,7 +4050,7 @@ export class DiscordCopilotApp {
         generation,
         createSessionId: sessionId,
         ...this.fileDeliveryQuotaOptions(threadId, fileDeliveryBytes, sessionId, generation),
-        ...this.skillSourceOptions(),
+        ...this.actorSourceOptions(),
       });
       replacementActor = actor;
       trustedRoot = undefined; // ownership transferred to the returned actor
@@ -5016,7 +5047,7 @@ export class DiscordCopilotApp {
         generation: rec.generation,
         resumeSessionId: rec.sessionId,
         ...this.fileDeliveryQuotaOptions(rec.threadId, rec.fileDeliveryBytes, rec.sessionId, rec.generation),
-        ...this.skillSourceOptions(),
+        ...this.actorSourceOptions(),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
