@@ -44,16 +44,21 @@ export async function startBot({
   publishReady,
 }: StartBotOptions): Promise<void> {
   let ownership: LifecycleOwnership | undefined;
+  let app: StartedBot | undefined;
   try {
     ownership = createLifecycleOwnership(await acquireLock());
     const runtime = await loadRuntime();
-    await runtime.start(runtime.loadConfig(), ownership);
+    app = await runtime.start(runtime.loadConfig(), ownership);
     await publishReady();
   } catch (err) {
-    // Idempotent, and correct at every point above: before anything is armed it
-    // simply releases; after the narrow or wide arm it runs that teardown first;
-    // and if an obligation is outstanding it holds the lock, which is the point.
-    if (ownership) await ownership.shutdown().catch(() => {});
+    // Once the app exists, `app.stop()` is the door — not the coordinator.
+    // `stop()` closes the phase gate SYNCHRONOUSLY before shutdown begins, so no
+    // command is admitted while the teardown runs; going straight to the
+    // coordinator would tear the app down underneath a bot that still believed
+    // it was ready. Before the app exists there is nothing to gate and the
+    // coordinator is the only thing that can answer.
+    if (app) await app.stop().catch(() => {});
+    else if (ownership) await ownership.shutdown().catch(() => {});
     throw err;
   }
 }

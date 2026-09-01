@@ -951,10 +951,13 @@ export class DiscordCopilotApp {
       await app.login();
       return app;
     } catch (err) {
-      // One answer for every failure. Whatever was armed last is what gets torn
-      // down, and the lock is released by the coordinator only once nothing is
-      // outstanding — including an obligation this teardown may have discovered.
-      await ownership.shutdown().catch(() => {});
+      // Once the app exists it owns the phase gate, and `stop()` closes it
+      // synchronously before the teardown starts — so a failure after
+      // construction goes through the app, never straight to the coordinator.
+      // Before construction there is nothing to gate, and the coordinator is the
+      // only thing that can answer for the lock.
+      if (app) await app.stop().catch(() => {});
+      else await ownership.shutdown().catch(() => {});
       throw err;
     }
   }

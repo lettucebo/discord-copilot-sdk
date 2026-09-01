@@ -142,6 +142,9 @@ export interface LifecycleOwnershipOptions {
   joinTimeoutMs?: number;
   /** Bound on ONE obligation attempt. */
   obligationTimeoutMs?: number;
+  /** Bound on the whole armed resource teardown. Shutdown's contract is
+   *  bounded, and copilot.stop() is an RPC to a runtime that can wedge. */
+  teardownTimeoutMs?: number;
   /** Timer seam. Production unrefs, so a pending bound never holds the process. */
   timers?: { set(fn: () => void, ms: number): unknown; clear(handle: unknown): void };
   log?: (message: string) => void;
@@ -149,6 +152,7 @@ export interface LifecycleOwnershipOptions {
 
 const DEFAULT_JOIN_TIMEOUT_MS = 5_000;
 const DEFAULT_OBLIGATION_TIMEOUT_MS = 5_000;
+const DEFAULT_TEARDOWN_TIMEOUT_MS = 15_000;
 
 const defaultTimers = {
   set(fn: () => void, ms: number): unknown {
@@ -204,6 +208,7 @@ class Ownership implements LifecycleOwnership {
   private lateArmSeq = 0;
   private readonly joinTimeoutMs: number;
   private readonly obligationTimeoutMs: number;
+  private readonly teardownTimeoutMs: number;
   private readonly timers: NonNullable<LifecycleOwnershipOptions["timers"]>;
   private readonly log: (message: string) => void;
 
@@ -213,6 +218,7 @@ class Ownership implements LifecycleOwnership {
   ) {
     this.joinTimeoutMs = options.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS;
     this.obligationTimeoutMs = options.obligationTimeoutMs ?? DEFAULT_OBLIGATION_TIMEOUT_MS;
+    this.teardownTimeoutMs = options.teardownTimeoutMs ?? DEFAULT_TEARDOWN_TIMEOUT_MS;
     this.timers = options.timers ?? defaultTimers;
     this.log = options.log ?? ((m) => console.warn(m));
   }
@@ -409,25 +415,34 @@ class Ownership implements LifecycleOwnership {
     this.armed = undefined;
     let teardownError: unknown;
     if (teardown) {
-      try {
-        await teardown(this.teardownScope());
-      } catch (err) {
-        // A teardown that threw did NOT prove it put everything down. "The three
-        // sets are empty" is then a statement about bookkeeping, not about the
-        // world, and releasing on it would hand the state directory to a
-        // successor on the strength of a cleanup that failed. So the failure
-        // itself becomes an unresolved obligation: it gates the release exactly
-        // like an unconfirmed runtime, and only a natural process exit (after
-        // which the successor reclaims a stale PID lock) resolves it.
-        //
-        // Deliberately NOT retried: re-running a teardown that died half-way is
+      // Gated BEFORE it runs, discharged only when it actually completes.
+      //
+      // Two failures share one answer here. A teardown that throws did not prove
+      // it put everything down, and a teardown that has not RETURNED has not
+      // proved it either — `copilot.stop()` is an RPC to a runtime that can
+      // wedge, and shutdown's contract is bounded. So the wait below is bounded
+      // and the gate outlives it: `shutdown()` settles truthfully (rejecting
+      // with the timeout) while the lock stays held until the teardown really
+      // finishes. If it finishes later, the discharge below re-evaluates and the
+      // release happens then; if it never does, the process exits with the PID
+      // lock on disk for the successor to reclaim as stale.
+      const gate = this.retain("armed-teardown", {
+        describe: () => "resource teardown that has not been proved complete",
+        // Never retried: re-running a teardown that died or wedged half-way is
         // how a half-torn-down process does more damage, not less.
+        attempt: async () => false,
+      });
+      const running = (async () => teardown(this.teardownScope()))();
+      void running.then(
+        () => gate.discharge(),
+        () => {
+          /* a failed teardown cannot be proved complete; the gate stays */
+        }
+      );
+      try {
+        await this.bounded(running, this.teardownTimeoutMs);
+      } catch (err) {
         teardownError = err;
-        this.retain("armed-teardown", {
-          describe: () =>
-            `resource teardown failed (${err instanceof Error ? err.message : String(err)}) and cannot be proved complete`,
-          attempt: async () => false,
-        });
         this.log(`ownership: armed teardown failed (${err instanceof Error ? err.message : String(err)})`);
       }
     }

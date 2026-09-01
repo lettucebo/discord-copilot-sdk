@@ -369,6 +369,63 @@ describe("lifecycle ownership — the release conclusion", () => {
     expect(releases()).toBe(0);
   });
 
+  it("bounds the armed teardown, and keeps holding while it has not returned", async () => {
+    // Shutdown's contract is bounded, and `copilot.stop()` is an RPC to a
+    // runtime that can wedge. A teardown that has not RETURNED has proved no
+    // more than one that threw.
+    const { ownership, inspect, releases } = build({ teardownTimeoutMs: 20 });
+    let finish: () => void = () => {};
+    ownership.arm(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        })
+    );
+
+    await expect(ownership.shutdown()).rejects.toThrow(/timeout/);
+
+    expect(releases()).toBe(0);
+    expect(inspect.obligationKeys()).toEqual(["armed-teardown"]);
+    expect(inspect.released()).toBe(false);
+    void finish; // never called: this teardown does not come back
+  });
+
+  it("releases when a teardown that outran its bound finally returns", async () => {
+    const { ownership, inspect, releases } = build({ teardownTimeoutMs: 20 });
+    let finish: () => void = () => {};
+    ownership.arm(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        })
+    );
+
+    await expect(ownership.shutdown()).rejects.toThrow(/timeout/);
+    expect(releases()).toBe(0);
+
+    finish(); // the runtime finally answered
+    await vi.waitFor(() => expect(releases()).toBe(1));
+    expect(inspect.obligationKeys()).toEqual([]);
+  });
+
+  it("does not release for a teardown that returns AFTER failing", async () => {
+    const { ownership, inspect, releases } = build({ teardownTimeoutMs: 20 });
+    let fail: (e: Error) => void = () => {};
+    ownership.arm(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          fail = reject;
+        })
+    );
+
+    await expect(ownership.shutdown()).rejects.toThrow(/timeout/);
+    fail(new Error("could not destroy the gateway client"));
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(releases()).toBe(0); // a failure is not a completion
+    expect(inspect.obligationKeys()).toEqual(["armed-teardown"]);
+  });
+
   it("never arms a timer that could hold the process open", () => {
     // Every bound here is something we are WAITING on; if it were ref'd, a
     // wedged runtime would keep the process alive purely to watch its own

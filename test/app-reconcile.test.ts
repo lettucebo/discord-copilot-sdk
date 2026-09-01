@@ -3489,3 +3489,69 @@ describe("shutdown ownership: single-flight, no forced exit, no leaked capabilit
     }
   });
 });
+
+describe("the phase gate closes before the teardown, not after it", () => {
+  it("admits nothing from the instant stop() is asked for, while teardown runs", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-gate", sessionId: "sess-gate" }));
+      store.commit("t-gate");
+      let releaseTeardown: () => void = () => {};
+      const held = new Promise<void>((r) => {
+        releaseTeardown = r;
+      });
+      // `copilot.stop()` is the last thing `teardownResources` awaits, and in
+      // production it is an RPC that can take a while. Holding it open is how a
+      // test stands inside the teardown.
+      const copilot = {
+        createSession: async () => fakeSession,
+        resumeSession: async () => fakeSession,
+        stop: async () => {
+          await held;
+        },
+      } as unknown as CopilotClient;
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        copilot,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      (app as unknown as { phase: string }).phase = "ready";
+
+      const stopping = app.stop();
+
+      // Synchronously, before a single await of the teardown: the bot is no
+      // longer ready, so `onInteraction`'s gate refuses every command, and the
+      // coordinator declines to admit any new owned work.
+      expect((app as unknown as { phase: string }).phase).toBe("shuttingDown");
+      const admitted = await (
+        app as unknown as {
+          ownership: { runExclusive(id: string, b: () => Promise<void>): Promise<{ ran: boolean }> };
+        }
+      ).ownership.runExclusive("t-gate", async () => {});
+      expect(admitted.ran).toBe(false);
+
+      releaseTeardown();
+      await stopping;
+      expect((app as unknown as { phase: string }).phase).toBe("shuttingDown");
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("closes that gate for a post-construction startup failure too", async () => {
+    // `DiscordCopilotApp.start` fails after the app exists ⇒ it must go through
+    // `app.stop()`, which closes the gate, rather than straight to the
+    // coordinator, which would tear the app down underneath a bot that still
+    // believed it was ready.
+    const src = readFileSync(join(process.cwd(), "src", "app.ts"), "utf8");
+    const startCatch = src.slice(src.indexOf("static async start("), src.indexOf("private assertChannelRegistryUsable"));
+    expect(startCatch).toMatch(/if \(app\) await app\.stop\(\)/);
+    expect(startCatch).toMatch(/else await ownership\.shutdown\(\)/);
+  });
+});

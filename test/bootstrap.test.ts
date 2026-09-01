@@ -53,9 +53,16 @@ describe("startBot", () => {
     expect(release).not.toHaveBeenCalled(); // a running bot keeps its lock
   });
 
-  it("tears down through the coordinator, once, when readiness cannot be published", async () => {
+  it("tears down through app.stop, not the coordinator, when readiness cannot be published", async () => {
+    // `app.stop()` closes the phase gate synchronously before shutdown begins.
+    // Reaching for the coordinator instead would tear the app down underneath a
+    // bot that still believed it was ready and was still admitting commands.
     const release = vi.fn(async () => {});
-    const teardown = vi.fn(async () => {});
+    const order: string[] = [];
+    const teardown = vi.fn(async () => void order.push("teardown"));
+    const stop = vi.fn(async () => {
+      order.push("app.stop");
+    });
 
     await expect(
       startBot({
@@ -64,7 +71,12 @@ describe("startBot", () => {
           loadConfig: () => config(),
           start: async (_c: Config, ownership: LifecycleOwnership) => {
             ownership.arm(teardown);
-            return { stop: async () => {} };
+            return {
+              stop: async () => {
+                await stop();
+                await ownership.shutdown();
+              },
+            };
           },
         }),
         publishReady: async () => {
@@ -73,7 +85,8 @@ describe("startBot", () => {
       })
     ).rejects.toThrow(/marker write denied/);
 
-    expect(teardown).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalledOnce();
+    expect(order).toEqual(["app.stop", "teardown"]); // the gate closes FIRST
     expect(release).toHaveBeenCalledOnce();
   });
 
@@ -95,7 +108,7 @@ describe("startBot", () => {
                 attempt: async () => false,
               });
             });
-            return { stop: async () => {} };
+            return { stop: () => ownership.shutdown() };
           },
         }),
         publishReady: async () => {
