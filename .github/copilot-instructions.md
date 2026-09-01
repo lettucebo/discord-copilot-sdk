@@ -253,7 +253,7 @@ enough for a resume to register a session it would then orphan; an attempt that 
 makes `/end` refuse rather than proceed, so no timeout value is load-bearing. `resumeRecord`
 re-proves it still owns the record before it rebuilds a missing worktree, again after that rebuild,
 and once more immediately before `sessions.set`; it registers a session only after `commit()` has
-durably recorded the recovery, and a discarded session is entered in `unconfirmedResumes` **before**
+durably recorded the recovery, and a discarded session is entered as a coordinator obligation **before**
 its disconnect is attempted, is never overwritten by a later one, and is removed only when that
 exact actor's disconnect is confirmed. A thread carrying such a barrier stays a retry candidate but
 the tick must clear the barrier first, so a runtime that was never proved stopped can never have a

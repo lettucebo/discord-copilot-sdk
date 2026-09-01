@@ -81,6 +81,15 @@ export interface OwnedScope {
 /** What a body running under `runTeardown` may ask and record. */
 export interface TeardownScope {
   /**
+   * Why this body must stop, or `undefined`.
+   *
+   * A teardown is admitted only while the process is running, but it is a long
+   * chain of awaits and shutdown can begin inside it — so this must be re-read
+   * after every await, before anything new is created. A rebind that builds an
+   * SDK session after `stop()` began is a runtime nobody is left to tear down.
+   */
+  lostReason(): string | undefined;
+  /**
    * Wait, boundedly, for every exclusive scope on this thread to settle.
    * `false` means one did not — the caller must REFUSE to do anything
    * destructive, not assume it finished.
@@ -91,6 +100,9 @@ export interface TeardownScope {
 }
 
 export type ExclusiveOutcome<T> = { ran: true; value: T } | { ran: false; reason: string };
+/** A teardown is declined once shutdown has begun: starting one then would
+ *  build resources the armed teardown has already walked past. */
+export type TeardownOutcome<T> = { ran: true; value: T } | { ran: false; reason: string };
 
 export interface LifecycleOwnership {
   /**
@@ -123,7 +135,7 @@ export interface LifecycleOwnership {
    * synchronously and is counted, so a nested claim from the same command does
    * not release the outer one.
    */
-  runTeardown<T>(threadId: string, body: (scope: TeardownScope) => Promise<T>): Promise<T>;
+  runTeardown<T>(threadId: string, body: (scope: TeardownScope) => Promise<T>): Promise<TeardownOutcome<T>>;
   /**
    * Begin (or join) shutdown. Single-flight, and NOT `async`, so every caller
    * gets the identical promise instead of a fresh wrapper around a teardown
@@ -247,6 +259,10 @@ class Ownership implements LifecycleOwnership {
 
   private teardownScope(): TeardownScope {
     return {
+      // A teardown is admitted only while running, but it is a long chain of
+      // awaits and shutdown can begin inside it. A rebind that builds an SDK
+      // session after `stop()` began is a runtime nobody will tear down.
+      lostReason: () => (this.state === "running" ? undefined : "shutdown started"),
       joinExclusive: (id) => this.joinExclusive(id),
       retain: (key, obligation) => this.retain(key, obligation),
       obligation: (key) => this.obligations.get(key)?.handle,
@@ -303,15 +319,19 @@ class Ownership implements LifecycleOwnership {
 
   // ---------------------------------------------------------- teardown work --
 
-  async runTeardown<T>(threadId: string, body: (scope: TeardownScope) => Promise<T>): Promise<T> {
+  async runTeardown<T>(
+    threadId: string,
+    body: (scope: TeardownScope) => Promise<T>
+  ): Promise<TeardownOutcome<T>> {
+    // Declined once shutdown has begun. A teardown started then would run past
+    // the armed teardown that has already walked the live sessions — and a
+    // rebind, which is one of these, would create an SDK session nobody is left
+    // to tear down.
+    if (this.state !== "running") return { ran: false, reason: "shutdown has begun" };
     const release = this.claimTeardown(threadId); // synchronous, counted
-    const scope: TeardownScope = {
-      joinExclusive: (id) => this.joinExclusive(id),
-      retain: (key, obligation) => this.retain(key, obligation),
-      obligation: (key) => this.obligations.get(key)?.handle,
-    };
+    const scope = this.teardownScope();
     try {
-      return await body(scope);
+      return { ran: true, value: await body(scope) };
     } finally {
       release();
       this.onTransition();

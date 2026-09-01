@@ -2977,10 +2977,19 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
       expect(retained).toBeDefined();
       expect(firstDisconnects).toBe(1);
 
-      // A newer actor's clean exit does not make an older, unproven one safe.
+      // A newer actor's clean exit does not make an older, unproven one safe —
+      // the primary key keeps the FIRST. But the second actor is a real, possibly
+      // live SDK session: it must NOT be dropped just because it lost the key.
+      // (This previously asserted `secondDisconnects === 0`, which was the leak.)
       await discard(second);
       expect(obligationHandle(app, "t-keepfirst")).toBe(retained); // same registration
-      expect(secondDisconnects).toBe(0); // never registered, never attempted
+      expect(secondDisconnects).toBe(1); // disconnected on its own account
+      // It exited cleanly, so it owes nothing further; the first still gates.
+      expect(
+        inspectOwnership(app)
+          .obligationKeys()
+          .filter((k) => k.startsWith("runtime:t-keepfirst"))
+      ).toEqual(["runtime:t-keepfirst"]);
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });
@@ -3817,6 +3826,152 @@ describe("nothing this process started may be dropped unnoticed at shutdown", ()
       expect(releases()).toBe(0); // a hang proves no more than a throw
       expect(hasRuntimeBarrier(app, "t-live")).toBe(true);
       void finish;
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});
+
+describe("late findings: declines, defers and superseded runtimes", () => {
+  it("defers /end BEFORE its bounded waits, and answers by editing", async () => {
+    // Both waits below are bounded in seconds; Discord invalidates an unanswered
+    // interaction after 3s and shows "the application did not respond".
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-defer", sessionId: "sess-defer" }));
+      store.commit("t-defer");
+      const gated = gatedCopilot();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        gated.client,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      useOwnershipBounds(app, { joinTimeoutMs: 10 });
+      access = true;
+
+      const order: string[] = [];
+      const interaction = {
+        deferred: false,
+        replied: false,
+        async deferReply(): Promise<void> {
+          order.push("defer");
+          (interaction as { deferred: boolean }).deferred = true;
+        },
+        async reply(): Promise<void> {
+          order.push("reply");
+        },
+        async editReply(o: string | { content: string }): Promise<void> {
+          order.push(typeof o === "string" ? o : o.content);
+        },
+      };
+
+      const tick = beginRetry(app, jobs);
+      await vi.waitFor(() => expect(gated.calls).toHaveLength(1));
+      await (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(interaction, "t-defer");
+
+      expect(order[0]).toBe("defer"); // before the join, not after it
+      expect(order.some((o) => o.includes("還沒結束"))).toBe(true);
+      expect(order).not.toContain("reply"); // answered by editing the deferral
+      gated.release();
+      await tick;
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("declines a teardown once shutdown has begun, and says so", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      await app.stop();
+
+      // A rebind admitted now would build an SDK session and a worktree that the
+      // armed teardown has already walked past.
+      let ran = false;
+      const outcome = await (
+        app as unknown as {
+          ownership: {
+            runTeardown(id: string, b: () => Promise<void>): Promise<{ ran: boolean; reason?: string }>;
+          };
+        }
+      ).ownership.runTeardown("t-late", async () => {
+        ran = true;
+      });
+
+      expect(outcome.ran).toBe(false);
+      expect(outcome.reason).toMatch(/shutdown/);
+      expect(ran).toBe(false);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("tells a teardown body that shutdown began underneath it", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      const seen: Array<string | undefined> = [];
+      let release: () => void = () => {};
+      const held = new Promise<void>((r) => {
+        release = r;
+      });
+
+      const running = (
+        app as unknown as {
+          ownership: {
+            runTeardown(id: string, b: (s: { lostReason(): string | undefined }) => Promise<void>): Promise<unknown>;
+          };
+        }
+      ).ownership.runTeardown("t-mid", async (scope) => {
+        seen.push(scope.lostReason());
+        await held;
+        // A rebind checks this after every await before creating anything.
+        seen.push(scope.lostReason());
+      });
+
+      const stopping = app.stop();
+      release();
+      await running;
+      await stopping;
+
+      expect(seen[0]).toBeUndefined();
+      expect(seen[1]).toMatch(/shutdown/);
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });

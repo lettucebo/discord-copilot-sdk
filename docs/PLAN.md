@@ -1039,7 +1039,7 @@ teardown claims、obligations **同時為空**才釋放，且只釋放一次。
   證明乾淨時才會被刪。
 - 暫時性 fetch 失敗期間 `/sessions` 仍會顯示 `thread-no-access`（見 §19.2）。這是刻意的：非終態的 reason
   漂移會同時破壞重試資格與 `/end` 逃生口。
-- `unconfirmedResumes` 裡的 barrier 直到 process 結束都可能留著（`/end` 與 `stop()` 各再試一次；若 SDK
+- 無法確認停止的 runtime（obligation）直到 process 結束都可能留著（`/end` 與 shutdown sweep 各再試一次；若 SDK
   的 disconnect 是**永遠不 settle** 的 hang，single-flight 讓它在本 process 內根本無法被確認）。這是
   刻意的：無法證明已停止的 runtime 不該被當成已停止，記錄與 worktree 一起保留，重啟才是清乾淨的路。
   期間該討論串**不會**被重複 resume（見 §19.3），也不會被終態化。
@@ -1077,7 +1077,7 @@ teardown claims、obligations **同時為空**才釋放，且只釋放一次。
 | `/end` 的 join 在嘗試 settle 之前就到期時，必須**拒絕回收**（record 與 worktree 都不動），而不是當作沒有東西在跑 | `test/app-reconcile.test.ts` |
 | `commit()` 回 false 時不得註冊 session、不得貼成功通知；record／lease 保留，下一次 wake-up 仍能真正復原 | `test/app-reconcile.test.ts` |
 | `/end` 落在 `addWorktree` **進行中**時，重建確實發生、而且必須被回收（後置 fence），不得留下無主 checkout | `test/app-reconcile.test.ts` |
-| `stop()` 對 `unconfirmedResumes` 再試一次：確認成功要清掉 barrier，仍無法確認要保留（連同 record） | `test/app-reconcile.test.ts` |
+| shutdown sweep 對未確認的 runtime obligation 再試一次：確認成功要清掉，仍無法確認要保留（連同 record）；一般 live session 的 disconnect throw／hang 也必須成為 obligation 並擋住釋放 | `test/app-reconcile.test.ts` |
 | 第一次 tick 就沒有候選時，必須直接退到 5 分鐘閒置輪詢，且不碰非本迴圈的 `active` record | `test/app-reconcile.test.ts` |
 | **barrier 保留後的下一次 tick 不得再 resume 同一個 session**：不得有第二個 actor／resume 呼叫，第一個強引用必須原封不動；涵蓋 **hang**（不只立即 throw）的 disconnect 時序 | `test/app-reconcile.test.ts` |
 | 兩個丟棄競爭同一個 thread 時，barrier 必須保留**第一個**（較新的 actor 乾淨退出不代表較舊的安全） | `test/app-reconcile.test.ts` |

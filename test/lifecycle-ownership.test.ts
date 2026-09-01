@@ -162,13 +162,18 @@ describe("lifecycle ownership — the release conclusion", () => {
     expect(inspect.obligationKeys()).toEqual(["runtime:t1"]);
 
     confirmable = true;
-    const handle = (
-      await ownership.runTeardown("t1", async (scope) => scope.obligation("runtime:t1"))
-    );
+    // A NEW teardown is declined after shutdown (that is the point of the
+    // decline), but an obligation already retained can still be attempted — by
+    // whoever kept its handle, or by a late-settling promise.
+    const handle = inspect.obligation("runtime:t1");
     expect(handle).toBeDefined();
     await handle?.attempt();
+    expect(await ownership.runTeardown("t1", async () => "nope")).toEqual({
+      ran: false,
+      reason: "shutdown has begun",
+    });
 
-    expect(inspect.obligationKeys()).toEqual([]);
+    await vi.waitFor(() => expect(inspect.obligationKeys()).toEqual([]));
     await vi.waitFor(() => expect(releases()).toBe(1));
   });
 
@@ -271,13 +276,13 @@ describe("lifecycle ownership — the release conclusion", () => {
     });
 
     const joined = await ownership.runTeardown("t1", async (scope) => scope.joinExclusive("t1"));
-    expect(joined).toBe(false); // still running ⇒ refuse, do not assume
+    expect(joined).toEqual({ ran: true, value: false }); // still running ⇒ refuse
 
     release();
     await running;
 
     const joinedAgain = await ownership.runTeardown("t1", async (scope) => scope.joinExclusive("t1"));
-    expect(joinedAgain).toBe(true);
+    expect(joinedAgain).toEqual({ ran: true, value: true });
   });
 
   it("turns an arm that arrives after shutdown into an obligation and refuses it", async () => {

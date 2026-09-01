@@ -97,6 +97,7 @@ import {
   type LifecycleOwnership,
   createLifecycleOwnershipForTest,
   type LifecycleOwnershipOptions,
+  type ObligationHandle,
   type OwnedScope,
   type OwnershipInspector,
   type TeardownScope,
@@ -185,6 +186,11 @@ interface StaleRebindActor {
   /** Concurrent `/end`, normal rebind completion and shutdown must join ONE
    * teardown attempt rather than issue duplicate SDK disconnects. */
   disconnecting?: Promise<StaleRebindTeardown>;
+  /** The ownership obligation this incarnation gates the process lock with. Kept
+   * here so whichever path finally confirms the runtime stopped can discharge it
+   * by identity, rather than leaving the coordinator holding the lock for a
+   * runtime that has in fact been proved gone. */
+  obligation?: ObligationHandle;
 }
 
 interface StaleRebindTeardown {
@@ -645,6 +651,8 @@ export class DiscordCopilotApp {
    *  exercise a HANGING teardown, not only one that rejects immediately,
    *  without spending the real bound. */
   private resumeTeardownTimeoutMs = TEARDOWN_TIMEOUT_MS;
+  /** Distinguishes a second unconfirmed runtime for one thread from the first. */
+  private supersededResumeSeq = 0;
   /** Only createForTest/useOwnershipForTest set this: a read-only view of the
    *  coordinator's three sets, for the race tests that must assert on them. */
   private ownershipInspector?: OwnershipInspector;
@@ -1873,9 +1881,17 @@ export class DiscordCopilotApp {
     // which the thread stops being live while its record still exists, and the
     // retry loop must not treat that as an invitation. The claim is counted by
     // the coordinator, so the stale path below may claim again.
-    return this.ownership.runTeardown(explicit || interaction.channelId, (scope) =>
+    const outcome = await this.ownership.runTeardown(explicit || interaction.channelId, (scope) =>
       this.cmdEndClaimed(interaction, explicit, scope)
     );
+    // Declined ⇒ shutdown began. Answer honestly rather than silently doing
+    // nothing: Discord shows an unanswered command as a broken bot.
+    if (!outcome.ran) {
+      await interaction.reply({
+        content: "⚠️ bot 正在關閉中，這次沒有執行。請等它重新啟動後再試。",
+        ...EPHEMERAL,
+      });
+    }
   }
 
   private async cmdEndClaimed(
@@ -2157,9 +2173,15 @@ export class DiscordCopilotApp {
     // with its local lease released. The claim makes `/end` win from its first
     // instruction rather than from its last, and it is counted, so the outer
     // `cmdEnd` claim is not released by this one.
-    return this.ownership.runTeardown(threadId, (scope) =>
+    const outcome = await this.ownership.runTeardown(threadId, (scope) =>
       this.endStaleRecordClaimed(interaction, threadId, scope)
     );
+    if (!outcome.ran) {
+      await interaction.reply({
+        content: "⚠️ bot 正在關閉中，這次沒有執行。請等它重新啟動後再試。",
+        ...EPHEMERAL,
+      });
+    }
   }
 
   private async endStaleRecordClaimed(
@@ -2167,6 +2189,15 @@ export class DiscordCopilotApp {
     threadId: string,
     scope: TeardownScope
   ): Promise<void> {
+    // Defer FIRST. Both waits below are bounded in SECONDS — joining an
+    // in-flight resume, then attempting a barrier disconnect — and Discord
+    // invalidates an unanswered interaction after 3s, showing "the application
+    // did not respond". That reads as a broken bot at exactly the moment this
+    // command is being careful on the operator's behalf. Deferring costs
+    // nothing: every branch below answers through `editReply`.
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ ...EPHEMERAL });
+    }
     // Join a resume that was already in flight when the claim landed. It is
     // going to discard itself (its scope reports the claim), and waiting for
     // that means its actor is torn down BEFORE this command starts proving
@@ -2174,10 +2205,9 @@ export class DiscordCopilotApp {
     // runtime must not make `/end` unusable — and if the bound expires the
     // answer is a refusal, never "carry on as if nothing were running".
     if (!(await scope.joinExclusive(threadId))) {
-      await interaction.reply({
+      await interaction.editReply({
         content:
           "⚠️ 這個討論串正在自動復原中，**還沒結束**，所以不能現在清除（可能會把它正在用的 worktree 抽掉）。請稍後再試一次。",
-        ...EPHEMERAL,
       });
       return;
     }
@@ -2187,10 +2217,9 @@ export class DiscordCopilotApp {
     // `/end` already gives when a live session's runtime will not confirm.
     const barrier = scope.obligation(runtimeObligationKey(threadId));
     if (barrier && !(await barrier.attempt())) {
-      await interaction.reply({
+      await interaction.editReply({
         content:
           "⚠️ 這個討論串剛才有一次自動復原，但**無法確認該 runtime 已關閉**。記錄與 worktree 都保留（不會被清除），請重啟 bot 後再試。",
-        ...EPHEMERAL,
       });
       return;
     }
@@ -3018,9 +3047,12 @@ export class DiscordCopilotApp {
       // what makes the access-retry loop decline this thread for the duration —
       // a retry resuming into a thread mid-rebind is the same hazard `/end`
       // already guards. The claim is counted, so a nested `/end` is safe.
-      return await this.ownership.runTeardown(threadId, (scope) =>
+      const outcome = await this.ownership.runTeardown(threadId, (scope) =>
         this.applyRebindInner(threadId, target, scope)
       );
+      // Declined ⇒ shutdown began. Starting a rebind then would build an SDK
+      // session and a worktree that the armed teardown has already walked past.
+      return outcome.ran ? outcome.value : "⚠️ bot 正在關閉中，這次沒有改綁。";
     } finally {
       this.rebinding.delete(threadId);
     }
@@ -3261,6 +3293,11 @@ export class DiscordCopilotApp {
       if (cleaned && this.staleRebindActors.get(entry.actor) === entry) {
         this.staleRebindActors.delete(entry.actor);
       }
+      // The RUNTIME is confirmed stopped, whatever happened to the worktree, so
+      // this incarnation is no longer a reason to hold the process lock. Any
+      // kept tree is recorded durably and reclaimable by `/end`; identity-safe,
+      // so a newer incarnation's handle is untouched.
+      entry.obligation?.discharge();
       return { confirmed: true, cleaned, tail: `${cleanup.tail}${fallback.tail}` };
     })();
     entry.disconnecting = attempt;
@@ -4718,14 +4755,21 @@ export class DiscordCopilotApp {
       });
       return;
     }
-    // Registered BEFORE the attempt, not after it fails. From the instant this
-    // actor exists a runtime may be holding the checkout, and a caller that
-    // looks while the disconnect is still in flight must see the barrier — not
-    // an empty set that reads as "nothing is running here". Registration is
-    // first-wins, so an existing entry (an OLDER runtime nobody proved stopped,
-    // whose strong reference is the only thing keeping its root alive) is never
-    // replaced by this one.
-    const handle = scope.retain(runtimeObligationKey(rec.threadId), {
+    const key = runtimeObligationKey(rec.threadId);
+    // First-wins is right about which runtime OWNS the key, and wrong as an
+    // answer for the loser: `retain` would hand back the older handle and this
+    // actor — a real, possibly-live SDK session — would be dropped with nobody
+    // holding it. It gets its own key instead, so it is disconnected and, if that
+    // cannot be confirmed, retained and gating the lock like any other.
+    const primaryTaken = scope.obligation(key)?.retained === true;
+    const ownKey = primaryTaken ? `${key}#superseded-${++this.supersededResumeSeq}` : key;
+    if (primaryTaken) {
+      console.warn(
+        `resume: ${rec.threadId} already has an unconfirmed runtime; retaining this second one ` +
+          `separately under ${ownKey} rather than dropping it.`
+      );
+    }
+    const handle = scope.retain(ownKey, {
       describe: () => `a resumed runtime for ${rec.threadId} over ${rec.workDir}`,
       attempt: async () => {
         try {
