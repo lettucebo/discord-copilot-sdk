@@ -21,6 +21,7 @@ import {
   appTestDependencies,
   type AppTestDependencyOverrides,
 } from "./support/app-test-dependencies.js";
+import { asCommandInteraction, strictInteraction } from "./support/strict-interaction.js";
 
 const OWNER = "10000";
 const GUILD = "20000";
@@ -190,6 +191,15 @@ function cmdChannel(app: DiscordCopilotApp, interaction: ChatInputCommandInterac
   );
 }
 
+function dispatch(app: DiscordCopilotApp, interaction: ChatInputCommandInteraction): Promise<void> {
+  (app as unknown as { phase: "ready" }).phase = "ready";
+  return (
+    app as unknown as {
+      onInteraction(i: ChatInputCommandInteraction): Promise<void>;
+    }
+  ).onInteraction(interaction);
+}
+
 function cmdSessions(app: DiscordCopilotApp, interaction: ChatInputCommandInteraction): Promise<void> {
   return (
     app as unknown as {
@@ -269,6 +279,66 @@ afterEach(() => {
 });
 
 describe("/channel", () => {
+  it("denies a non-owner through the real dispatch without mutating the registry", async () => {
+    const { app, registry } = harness();
+    const interaction = strictInteraction({
+      id: "channel-non-owner",
+      commandName: "channel",
+      user: { id: "99999" },
+      guildId: GUILD,
+      channelId: SECONDARY,
+      channel: { isThread: () => false },
+      options: {
+        getSubcommand: () => "enable",
+        getString: () => null,
+        getBoolean: () => null,
+      },
+      isAutocomplete: () => false,
+      isButton: () => false,
+      isRepliable: () => true,
+      isChatInputCommand: () => true,
+    });
+
+    await dispatch(app, asCommandInteraction(interaction));
+
+    expect(interaction.answers).toEqual(["Not authorized."]);
+    expect(registry.enabledSet()).toEqual(new Set([SEED]));
+  });
+
+  it("lets the owner enable a disabled channel through the real dispatch", async () => {
+    const { app, registry } = harness();
+    patchChannelFetch(app, async () => ({
+      type: ChannelType.GuildText,
+      guildId: GUILD,
+      guild: { members: { me: {} } },
+      permissionsFor: () => ({ has: () => true }),
+    }));
+    const interaction = strictInteraction({
+      id: "channel-owner-bootstrap",
+      commandName: "channel",
+      user: { id: OWNER },
+      guildId: GUILD,
+      channelId: SECONDARY,
+      channel: { isThread: () => false },
+      options: {
+        getSubcommand: () => "enable",
+        getString: () => null,
+        getBoolean: () => null,
+      },
+      isAutocomplete: () => false,
+      isButton: () => false,
+      isRepliable: () => true,
+      isChatInputCommand: () => true,
+    });
+
+    await dispatch(app, asCommandInteraction(interaction));
+
+    expect(interaction.replyCalls).toBe(0);
+    expect(interaction.editCalls).toBe(2);
+    expect(interaction.answers.at(-1)).toContain("已啟用");
+    expect(registry.has(SECONDARY)).toBe(true);
+  });
+
   it("enables an owner-selected text channel only after acknowledging, despite missing operational permissions", async () => {
     const { app, registry } = harness();
     let releaseAck!: () => void;
