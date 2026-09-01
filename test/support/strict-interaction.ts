@@ -30,12 +30,17 @@ import type { ChatInputCommandInteraction } from "discord.js";
 /** The non-acknowledgement half of an interaction — the only part a test may
  *  supply. Everything to do with answering belongs to this module. */
 export interface StrictInteractionFields {
+  id?: string;
   user?: { id: string };
   guildId?: string | null;
   channelId?: string;
   channel?: unknown;
   options?: unknown;
   commandName?: string;
+  isAutocomplete?: () => boolean;
+  isButton?: () => boolean;
+  isRepliable?: () => boolean;
+  isChatInputCommand?: () => boolean;
 }
 
 /** What a test may read back. `answers` is every user-visible answer in order,

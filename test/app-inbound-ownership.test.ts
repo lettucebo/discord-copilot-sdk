@@ -445,6 +445,76 @@ describe("a button click is owned work", () => {
     expect(decided).toEqual([{ nonce: settled.nonce, decision: "deny" }]);
     await expect(settled.promise).resolves.toBe("deny");
   });
+
+  it("does not settle a real pending decision from the wrong thread", async () => {
+    const reposRoot = join(FIXTURES, "repos");
+    mkdirSync(reposRoot, { recursive: true });
+    const registry = new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels.json"));
+    const store = new SessionStore(join(FIXTURES, "sessions.json"));
+    const { app } = appWith(reposRoot, store, registry);
+    const threadId = "t-owner";
+    const broker = new PendingInteractionBroker();
+    const decided: Array<{ nonce: string; decision: string }> = [];
+    (app as unknown as { sessions: Map<string, unknown> }).sessions.set(threadId, {
+      actor: {} as never,
+      broker,
+      running: false,
+      titled: true,
+      titleEpoch: 0,
+      queue: [],
+      workDir: reposRoot,
+      repoPath: reposRoot,
+      devMode: "local",
+      parentChannelId: SEED,
+      hasRunTurn: true,
+    });
+    const pending = broker.register<string>({
+      sessionKey: threadId,
+      generation: 1,
+      kind: "shell",
+      timeoutMs: 60_000,
+      onDefault: () => "deny",
+    });
+    (
+      app as unknown as { transport: { deliverDecision(nonce: string, decision: string): void } }
+    ).transport.deliverDecision = (nonce, decision) => {
+      decided.push({ nonce, decision });
+      broker.settle(nonce, decision);
+    };
+    const replies: string[] = [];
+    let updated = false;
+    const interaction = {
+      id: "btn-wrong-thread",
+      customId: encodePermissionId(pending.nonce, "always"),
+      user: { id: OWNER },
+      guildId: GUILD,
+      channelId: "t-other",
+      channel: { isThread: () => true, parentId: SEED },
+      isButton: () => true,
+      async update(): Promise<void> {
+        updated = true;
+      },
+      async reply(value: { content?: string }): Promise<void> {
+        replies.push(value.content ?? "");
+      },
+    };
+
+    await tryOwnedScope(app, (scope) =>
+      (
+        app as unknown as {
+          onButton(i: unknown, s: OwnedScope): Promise<void>;
+        }
+      ).onButton(interaction, scope)
+    );
+
+    expect(updated).toBe(false);
+    expect(decided).toEqual([]);
+    expect(broker.size).toBe(1);
+    expect(replies).toEqual([expect.stringContaining("不屬於目前的討論串")]);
+
+    expect(broker.abort()).toBe(1);
+    await expect(pending.promise).resolves.toBe("deny");
+  });
 });
 
 describe("a thread message is owned work", () => {
