@@ -109,10 +109,16 @@ export interface LifecycleOwnership {
    * Register the process-wide resource teardown, re-armably; the LAST arm wins.
    *
    * Called twice on purpose: a narrow cleanup as soon as there is something to
-   * clean (the Copilot client), and a wider one once the app owns more. Returns
-   * `false` when shutdown has already begun — in which case the cleanup is taken
-   * on as an obligation and attempted, and the caller must abort construction
-   * rather than hand over a resource nobody will tear down.
+   * clean (the Copilot client), and a wider one once the app owns more.
+   *
+   * Returns `false` when shutdown has already begun. The cleanup is then run as
+   * a best-effort obligation, but **that is defensive, not a guarantee**: if the
+   * lock has already been released, no obligation registered afterwards can
+   * retroactively gate it. The structural guarantee is the caller's, and it is
+   * the reason startup runs inside an exclusive scope — a scope prevents any
+   * release until it settles, so construction and its arm cannot straddle a
+   * release. A caller that sees `false` must abort construction rather than
+   * treat the returned obligation as cover.
    *
    * The teardown receives a `TeardownScope` because tearing down is exactly when
    * a process discovers what it still owes: a runtime it could not confirm
@@ -242,9 +248,10 @@ class Ownership implements LifecycleOwnership {
       this.armed = teardown;
       return true;
     }
-    // Too late to be torn down by shutdown — but the resource exists, so this
-    // process owes its cleanup exactly like any other obligation, and the lock
-    // stays held until it is discharged.
+    // Too late to be torn down by shutdown. Best effort only: if the lock has
+    // already been released, an obligation registered now cannot retroactively
+    // gate it. This is why construction runs inside an exclusive scope — that
+    // scope, not this branch, is what makes "no release before the arm" true.
     const key = `late-arm:${++this.lateArmSeq}`;
     const handle = this.retain(key, {
       describe: () => "a resource armed after shutdown began",
@@ -253,6 +260,12 @@ class Ownership implements LifecycleOwnership {
         return true;
       },
     });
+    if (this.released) {
+      this.log(
+        "ownership: a resource was armed after the lock had already been released; " +
+          "cleaning it up, but it could not have gated the release. Construct inside a scope."
+      );
+    }
     void handle.attempt();
     return false;
   }

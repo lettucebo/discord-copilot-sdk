@@ -369,6 +369,13 @@ interface ReconcileAttemptOpts {
  *  the coordinator's first-wins rule IS the "never overwrite a barrier" rule. */
 const runtimeObligationKey = (threadId: string): string => `runtime:${threadId}`;
 
+/** The whole of process startup is owned work: it constructs the runtime, then
+ *  mutates the store for every persisted record, and finally opens the phase
+ *  gate. A signal arriving in the middle used to be able to complete a shutdown
+ *  and release the lock while all of that was still happening. Held as an
+ *  exclusive scope, it gates the release structurally rather than by checking. */
+const PROCESS_STARTUP_KEY = "<process-startup>";
+
 /** Where a detached rebind incarnation is recorded. Keyed by its DURABLE
  *  identity, not by thread: one thread can legitimately have two of them, and
  *  first-wins must not drop the older unproven one. */
@@ -656,6 +663,11 @@ export class DiscordCopilotApp {
   /** Only createForTest/useOwnershipForTest set this: a read-only view of the
    *  coordinator's three sets, for the race tests that must assert on them. */
   private ownershipInspector?: OwnershipInspector;
+  /** The process-startup scope, while startup is running. onReady consults it
+   *  after every await: a signal can complete a shutdown mid-startup, and none
+   *  of the mutations below — least of all opening the phase gate — may happen
+   *  on behalf of a process that has been told to stop. */
+  private startupScope?: OwnedScope;
   /** The lock a test asked the coordinator to observe, kept across rebuilds. */
   private ownershipLockForTest: InstanceLock = { path: "(test)", release: async () => {} };
   /** Threads already told, once, that a retry reached the runtime and failed
@@ -920,60 +932,83 @@ export class DiscordCopilotApp {
   /** Fully start after bootstrap has already acquired the instance lock and
    *  wrapped it in the one thing allowed to release it. */
   static async start(config: Config, ownership: LifecycleOwnership): Promise<DiscordCopilotApp> {
-    let copilot: CopilotClient | undefined;
-    let app: DiscordCopilotApp | undefined;
-    try {
-      // INSIDE the try, both of them: a throw that escaped it used to leave the
-      // lock held by nobody. These two are the earliest things that can fail — a
-      // REPOS_ROOT that does not exist or overlaps the trust store, and an SDK
-      // version mismatch.
-      const reposRoot = resolveReposRoot(config.REPOS_ROOT);
-      const compat = checkSdkCompat();
-      if (!compat.ok) {
-        // Fatal in bot mode: our event-field and permission-shape assumptions are
-        // pinned to the declared SDK version; a mismatch could silently break
-        // streaming or, worse, permission handling.
-        throw new Error(
-          `Installed @github/copilot-sdk ${compat.installed} != declared ${compat.declared}. ` +
-            `Refusing to start the bot; run \`npm install\` to align.`
-        );
+    // The ENTIRE startup runs as owned work, published before its first await.
+    // Everything inside constructs runtimes, mutates the store for every
+    // persisted record and finally opens the phase gate; a signal arriving in
+    // the middle used to complete a shutdown and release the lock while all of
+    // that carried on. Holding a scope makes the release wait structurally,
+    // rather than depending on each step remembering to ask.
+    let built: DiscordCopilotApp | undefined;
+    let failure: unknown;
+    const outcome = await ownership.runExclusive(PROCESS_STARTUP_KEY, async (scope) => {
+      try {
+        built = await DiscordCopilotApp.startInScope(config, ownership, scope);
+      } catch (err) {
+        failure = err;
       }
-      // A NEUTRAL working directory. Every session sets its own, and pointing the
-      // shared client at a repo would make whichever repo happens to be
-      // "default" the implicit cwd for anything that forgets to.
-      copilot = createCopilotClient();
-      // NARROW arm, before `copilot.start()` rather than after: the client
-      // exists from here, so from here it is something shutdown must put down.
-      const client = copilot;
-      if (!ownership.arm(async () => void (await client.stop().catch(() => {})))) {
-        throw new Error("shutdown began before the Copilot client could be armed for teardown");
-      }
-      await copilot.start();
-      await preflightModel(copilot, config.DEFAULT_MODEL);
-      app = new DiscordCopilotApp(config, copilot, ownership);
-      app.reposRoot = reposRoot;
-      // Before the gateway, not after: a registry we cannot trust must not reach
-      // a state where the bot is online and answering with the wrong channel set.
-      app.assertChannelRegistryUsable();
-      // WIDER arm, before signal handlers are installed by `login()`: from the
-      // moment a signal can arrive, shutdown must already know how to put down
-      // everything this app owns, not just the client.
-      const started = app;
-      if (!ownership.arm((scope) => started.teardownResources(scope))) {
-        throw new Error("shutdown began before the app could be armed for teardown");
-      }
-      await app.login();
-      return app;
-    } catch (err) {
-      // Once the app exists it owns the phase gate, and `stop()` closes it
-      // synchronously before the teardown starts — so a failure after
-      // construction goes through the app, never straight to the coordinator.
-      // Before construction there is nothing to gate, and the coordinator is the
-      // only thing that can answer for the lock.
-      if (app) await app.stop().catch(() => {});
+    });
+    // Both teardown paths run OUTSIDE the scope: `shutdown()` joins exclusive
+    // scopes, so calling it from within this one would stall on itself.
+    if (failure !== undefined) {
+      if (built) await built.stop().catch(() => {});
       else await ownership.shutdown().catch(() => {});
-      throw err;
+      throw failure;
     }
+    if (!outcome.ran) throw new Error(`refusing to start: ${outcome.reason}`);
+    if (!built) throw new Error("refusing to start: startup produced no app");
+    return built;
+  }
+
+  private static async startInScope(
+    config: Config,
+    ownership: LifecycleOwnership,
+    scope: OwnedScope
+  ): Promise<DiscordCopilotApp> {
+    // INSIDE the try, both of them: a throw that escaped it used to leave the
+    // lock held by nobody. These two are the earliest things that can fail — a
+    // REPOS_ROOT that does not exist or overlaps the trust store, and an SDK
+    // version mismatch.
+    const reposRoot = resolveReposRoot(config.REPOS_ROOT);
+    const compat = checkSdkCompat();
+    if (!compat.ok) {
+      // Fatal in bot mode: our event-field and permission-shape assumptions are
+      // pinned to the declared SDK version; a mismatch could silently break
+      // streaming or, worse, permission handling.
+      throw new Error(
+        `Installed @github/copilot-sdk ${compat.installed} != declared ${compat.declared}. ` +
+          `Refusing to start the bot; run \`npm install\` to align.`
+      );
+    }
+    // Constructed and armed INSIDE the startup scope, which is what makes the
+    // arm meaningful: the scope prevents any release until it settles, so there
+    // is no window in which the lock is gone but the client exists unarmed.
+    const copilot = createCopilotClient();
+    // NARROW arm, before `copilot.start()` rather than after: the client exists
+    // from here, so from here it is something shutdown must put down. Failure is
+    // NOT swallowed — an unclosed client is exactly the kind of thing that must
+    // gate the lock rather than be logged.
+    if (!ownership.arm(async () => void (await copilot.stop()))) {
+      await copilot.stop().catch(() => {});
+      throw new Error("shutdown began before the Copilot client could be armed for teardown");
+    }
+    await copilot.start();
+    const lostAfterStart = scope.lostReason();
+    if (lostAfterStart) throw new Error(`refusing to start: ${lostAfterStart}`);
+    await preflightModel(copilot, config.DEFAULT_MODEL);
+    const app = new DiscordCopilotApp(config, copilot, ownership);
+    app.reposRoot = reposRoot;
+    app.startupScope = scope;
+    // Before the gateway, not after: a registry we cannot trust must not reach
+    // a state where the bot is online and answering with the wrong channel set.
+    app.assertChannelRegistryUsable();
+    // WIDER arm, before signal handlers are installed by `login()`: from the
+    // moment a signal can arrive, shutdown must already know how to put down
+    // everything this app owns, not just the client.
+    if (!ownership.arm((teardown) => app.teardownResources(teardown))) {
+      throw new Error("shutdown began before the app could be armed for teardown");
+    }
+    await app.login();
+    return app;
   }
 
   /**
@@ -1047,17 +1082,33 @@ export class DiscordCopilotApp {
     });
   }
 
-  private async onReady(clientId: string): Promise<void> {
-    await this.loadModels();
+  /** Has this process been told to stop while startup was still running? Every
+   *  await in `onReady` is followed by this: a signal can complete a shutdown
+   *  in any of those gaps, and nothing below one may then mutate the store,
+   *  announce success, or open the phase gate. */
+  private startupLost(where: string): boolean {
+    const lost = this.startupScope?.lostReason();
+    if (!lost) return false;
+    console.warn(`startup: abandoning ${where} — ${lost}`);
+    return true;
+  }
+
+  private async onReady(clientId: string): Promise<void> {    await this.loadModels();
     await this.warnOperatorsWithoutCommandAccess();
     await this.registerCommands(clientId);
     // Reconcile persisted sessions BEFORE accepting input (phase gate), so a
     // /new can't race startup resume and double-register a thread.
     this.phase = "reconciling";
+    if (this.startupLost("before reconciliation")) return;
     await this.reconcileOnStartup();
+    if (this.startupLost("after reconciliation")) return;
     // Clear scratch left by a clone that died mid-flight. Safe here: nothing is
     // provisioning yet, and only directories carrying our own marker are swept.
     await sweepStaleStaging(this.reposRoot);
+    // The gate is opened LAST, and only if this process is still the one that
+    // was asked to start. Declaring readiness after a shutdown would admit
+    // commands into an app whose resources are already being torn down.
+    if (this.startupLost("before opening the phase gate")) return;
     this.phase = "ready";
     // ADR-0002's other half: a `thread-no-access` record must also come back
     // WITHOUT a restart, once the permission is restored. Armed only now, so a
@@ -3963,7 +4014,16 @@ export class DiscordCopilotApp {
     // startup competes with the reconnect the runtime is already doing.
     for (const rec of this.store.all()) {
       try {
-        await this.reconcileRecord(rec, classify);
+        // Owned per thread, exactly like a retry attempt. A startup resume can
+        // fail its `commit()` or leave a runtime it cannot confirm stopped, and
+        // both must become obligations that gate the lock and stop the retry
+        // loop from starting a SECOND runtime over the same worktree once the
+        // phase gate opens. Nested under the process-startup scope, which is
+        // keyed separately.
+        const outcome = await this.ownership.runExclusive(rec.threadId, (scope) =>
+          this.reconcileRecord(rec, classify, { via: "startup", scope })
+        );
+        if (!outcome.ran) console.warn(`reconcile: skipping ${rec.threadId} — ${outcome.reason}`);
       } catch (err) {
         // One unusable record must not stop the others from coming back.
         if (err instanceof FatalReconcileError) throw err;

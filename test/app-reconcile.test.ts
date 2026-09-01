@@ -3559,9 +3559,15 @@ describe("the phase gate closes before the teardown, not after it", () => {
     // coordinator, which would tear the app down underneath a bot that still
     // believed it was ready.
     const src = readFileSync(join(process.cwd(), "src", "app.ts"), "utf8");
-    const startCatch = src.slice(src.indexOf("static async start("), src.indexOf("private assertChannelRegistryUsable"));
-    expect(startCatch).toMatch(/if \(app\) await app\.stop\(\)/);
-    expect(startCatch).toMatch(/else await ownership\.shutdown\(\)/);
+    const startBody = src.slice(
+      src.indexOf("static async start("),
+      src.indexOf("private assertChannelRegistryUsable")
+    );
+    expect(startBody).toMatch(/if \(built\) await built\.stop\(\)/);
+    expect(startBody).toMatch(/else await ownership\.shutdown\(\)/);
+    // …and the whole of startup is owned work, so a signal cannot complete a
+    // shutdown and release the lock while construction is still running.
+    expect(startBody).toContain("runExclusive(PROCESS_STARTUP_KEY");
   });
 });
 
@@ -3972,6 +3978,136 @@ describe("late findings: declines, defers and superseded runtimes", () => {
 
       expect(seen[0]).toBeUndefined();
       expect(seen[1]).toMatch(/shutdown/);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});
+
+describe("startup is owned work, and its resumes are owned per thread", () => {
+  it("opens no phase gate, and writes nothing, when shutdown lands mid-reconciliation", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-boot", sessionId: "sess-boot" }));
+      store.commit("t-boot");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let released = 0;
+      useObservableLock(app, {
+        path: "(test)",
+        release: async () => {
+          released++;
+        },
+      });
+
+      // Stand where `onReady` stands: inside the process-startup scope, before
+      // the phase gate is opened.
+      let release: () => void = () => {};
+      const held = new Promise<void>((r) => {
+        release = r;
+      });
+      let bytesAtStop = "";
+      let sawLost: string | undefined;
+      const startup = (
+        app as unknown as {
+          ownership: {
+            runExclusive(id: string, b: (s: { lostReason(): string | undefined }) => Promise<void>): Promise<unknown>;
+          };
+        }
+      ).ownership.runExclusive("<process-startup>", async (scope) => {
+        (app as unknown as { startupScope: unknown }).startupScope = scope;
+        await held;
+        sawLost = scope.lostReason();
+        // What onReady does with that answer.
+        if (!(app as unknown as { startupLost(w: string): boolean }).startupLost("test")) {
+          (app as unknown as { phase: string }).phase = "ready";
+        }
+      });
+
+      const stopping = app.stop();
+      // The scope is still open, so the lock cannot have gone.
+      expect(released).toBe(0);
+      bytesAtStop = readFileSync(f, "utf8");
+
+      release();
+      await startup;
+      await stopping;
+
+      expect(sawLost).toMatch(/shutdown/);
+      expect((app as unknown as { phase: string }).phase).toBe("shuttingDown"); // never "ready"
+      expect(readFileSync(f, "utf8")).toBe(bytesAtStop); // no late write
+      expect(sessionsOf(app).size).toBe(0);
+      await vi.waitFor(() => expect(released).toBe(1)); // released only after it settled
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("keeps a startup resume's unconfirmed runtime as an obligation, blocking the retry loop", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-scommit", sessionId: "sess-scommit" }));
+      store.commit("t-scommit");
+      const resumes: string[] = [];
+      const session = {
+        ...fakeSession,
+        async disconnect(): Promise<void> {
+          await new Promise<void>(() => {}); // hangs: never confirmable
+        },
+      };
+      const copilot = {
+        createSession: async () => session,
+        async stop(): Promise<void> {},
+        resumeSession: async (id: string) => {
+          resumes.push(id);
+          return session;
+        },
+      } as unknown as CopilotClient;
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        copilot,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      useOwnershipBounds(app, { obligationTimeoutMs: 20 });
+      (app as unknown as { resumeTeardownTimeoutMs: number }).resumeTeardownTimeoutMs = 20;
+      setChannelFetch(app, async () => visibleThread);
+
+      // The startup resume succeeds at the runtime and then cannot record it.
+      const commit = vi.spyOn(store, "commit").mockReturnValue(false);
+      try {
+        await reconcileReal(app);
+      } finally {
+        commit.mockRestore();
+      }
+
+      expect(resumes).toEqual(["sess-scommit"]);
+      expect(sessionsOf(app).has("t-scommit")).toBe(false);
+      // The runtime it built could not be confirmed stopped, so it is owed —
+      // which both gates the lock and stops the retry loop building a SECOND
+      // runtime over the same worktree once the phase gate opens.
+      expect(hasRuntimeBarrier(app, "t-scommit")).toBe(true);
+
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      await fireRetry(app, jobs);
+
+      expect(resumes).toEqual(["sess-scommit"]); // no second runtime
+      expect(sessionsOf(app).size).toBe(0);
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });
