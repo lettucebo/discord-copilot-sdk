@@ -410,12 +410,22 @@ class Ownership implements LifecycleOwnership {
       try {
         await teardown(this.teardownScope());
       } catch (err) {
-        // Logged, and the release conclusion is still drawn below — a teardown
-        // that failed half-way must not strand the lock decision. But it is
-        // RETHROWN afterwards: a caller that asked this process to stop is
-        // entitled to know it did not fully manage to, and the signal handler
-        // turns that into a non-zero exit rather than a quiet success.
+        // A teardown that threw did NOT prove it put everything down. "The three
+        // sets are empty" is then a statement about bookkeeping, not about the
+        // world, and releasing on it would hand the state directory to a
+        // successor on the strength of a cleanup that failed. So the failure
+        // itself becomes an unresolved obligation: it gates the release exactly
+        // like an unconfirmed runtime, and only a natural process exit (after
+        // which the successor reclaims a stale PID lock) resolves it.
+        //
+        // Deliberately NOT retried: re-running a teardown that died half-way is
+        // how a half-torn-down process does more damage, not less.
         teardownError = err;
+        this.retain("armed-teardown", {
+          describe: () =>
+            `resource teardown failed (${err instanceof Error ? err.message : String(err)}) and cannot be proved complete`,
+          attempt: async () => false,
+        });
         this.log(`ownership: armed teardown failed (${err instanceof Error ? err.message : String(err)})`);
       }
     }

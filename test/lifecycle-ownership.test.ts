@@ -331,6 +331,44 @@ describe("lifecycle ownership — the release conclusion", () => {
     expect(seen[1]).toMatch(/shutdown/);
   });
 
+  it("refuses to release when the armed teardown could not prove it cleaned up", async () => {
+    // "The three sets are empty" is a statement about bookkeeping. If the
+    // teardown threw, it is not a statement about the world, and releasing on it
+    // would hand the state directory to a successor on the strength of a cleanup
+    // that failed.
+    const { ownership, inspect, releases } = build();
+    ownership.arm(async () => {
+      throw new Error("could not destroy the gateway client");
+    });
+
+    await expect(ownership.shutdown()).rejects.toThrow(/could not destroy the gateway client/);
+
+    expect(releases()).toBe(0);
+    expect(inspect.exclusiveThreads()).toEqual([]);
+    expect(inspect.teardownClaims()).toEqual([]);
+    expect(inspect.obligationKeys()).toEqual(["armed-teardown"]); // the gate
+    expect(inspect.released()).toBe(false);
+  });
+
+  it("does not retry a teardown that died half-way, and keeps holding for it", async () => {
+    const { ownership, inspect, releases } = build();
+    let runs = 0;
+    ownership.arm(async () => {
+      runs++;
+      throw new Error("teardown exploded");
+    });
+
+    await expect(ownership.shutdown()).rejects.toThrow(/teardown exploded/);
+    const handle = inspect.obligationKeys();
+    expect(handle).toEqual(["armed-teardown"]);
+
+    // Joining shutdown again must not re-run it: re-running a teardown that
+    // died half-way is how a half-torn-down process does more damage.
+    await expect(ownership.shutdown()).rejects.toThrow(/teardown exploded/);
+    expect(runs).toBe(1);
+    expect(releases()).toBe(0);
+  });
+
   it("never arms a timer that could hold the process open", () => {
     // Every bound here is something we are WAITING on; if it were ref'd, a
     // wedged runtime would keep the process alive purely to watch its own
