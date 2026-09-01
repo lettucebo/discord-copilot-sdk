@@ -1989,3 +1989,106 @@ describe("beginRebind answers through whichever door is still open", () => {
     expect(interaction.answers[1]).toMatch(/沒有進行中的 session/);
   });
 });
+
+describe("a shutdown mid-rebind keeps the OLD conversation resumable", { timeout: 60_000 }, () => {
+  it("restores the displaced primary instead of leaving the thread with none", async () => {
+    // The pre-swap state this exercises is the real one: the old record has been
+    // moved aside as a stale companion and the thread slot now holds the target
+    // `creating` reservation. Abandoning by REMOVING the target — which is right
+    // for `/end`, because the operator gave the conversation up — left a
+    // shutdown-interrupted thread with no resumable record at all: its only
+    // durable trace was a terminal stale-rebind pointer, and the next boot could
+    // not bring the conversation back. The operator never even completed the
+    // rebind.
+    const { app, store, actor } = harness({ devMode: "local", repo: repoA });
+    const before = store.get("t1")!;
+    expect(before.state).toBe("active");
+
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let creating = false;
+    const create = vi
+      .spyOn(SessionActor, "create")
+      .mockImplementation(async () => {
+        creating = true;
+        await held;
+        return {
+          disconnect: async () => {},
+          isFaulted: () => false,
+          generationOf: () => 1,
+          stop: async () => true,
+          suspendFileDelivery: () => 1,
+          resumeFileDeliveryIfCurrent: () => true,
+          canDeliverFiles: () => false,
+        } as unknown as SessionActor;
+      });
+
+    try {
+      const rebinding = applyRebind(app, { repoPath: repoB, devMode: "local" });
+      await vi.waitFor(() => expect(creating).toBe(true));
+
+      // Mid-create the store really is in the pre-swap shape.
+      expect(store.get("t1")).toMatchObject({ repoPath: repoB, state: "creating" });
+      expect(staleRebinds(store)).toHaveLength(1);
+
+      // A SIGTERM, NOT an explicit /end.
+      const stopping = app.stop().catch(() => {});
+      await Promise.resolve();
+      release();
+      await rebinding;
+      await stopping;
+
+      // Reloaded from disk: the old conversation is back, active and resumable,
+      // the target reservation is gone, and the stale companion was reconciled.
+      const reloaded = new SessionStore(storeFile);
+      expect(reloaded.get("t1")).toMatchObject({
+        sessionId: before.sessionId,
+        repoPath: repoA,
+        state: "active",
+      });
+      expect(staleRebinds(reloaded)).toEqual([]);
+    } finally {
+      create.mockRestore();
+      void actor;
+    }
+  });
+
+  it("still REMOVES the target when an explicit /end gave the conversation up", async () => {
+    // The other half of the same decision, unchanged: `/end` is the winner.
+    const { app, store } = harness({ devMode: "local", repo: repoA });
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let creating = false;
+    const create = vi.spyOn(SessionActor, "create").mockImplementation(async () => {
+      creating = true;
+      await held;
+      return {
+        disconnect: async () => {},
+        isFaulted: () => false,
+        generationOf: () => 1,
+        stop: async () => true,
+        suspendFileDelivery: () => 1,
+        resumeFileDeliveryIfCurrent: () => true,
+        canDeliverFiles: () => false,
+      } as unknown as SessionActor;
+    });
+
+    try {
+      const rebinding = applyRebind(app, { repoPath: repoB, devMode: "local" });
+      await vi.waitFor(() => expect(creating).toBe(true));
+
+      await endThread(app); // the operator ends the thread mid-rebind
+      release();
+      await rebinding;
+
+      const reloaded = new SessionStore(storeFile);
+      expect(reloaded.get("t1")).toBeUndefined(); // given up on purpose
+    } finally {
+      create.mockRestore();
+    }
+  });
+});

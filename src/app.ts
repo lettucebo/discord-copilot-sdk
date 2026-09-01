@@ -3620,15 +3620,33 @@ export class DiscordCopilotApp {
      * way to add shutdown-awareness without inventing rollback that does not
      * already exist.
      */
-    const ownsOldSession = (): boolean =>
-      this.sessions.get(threadId) === session &&
-      !this.endedSessions.has(session) &&
-      scope.lostReason() === undefined;
+    /** Why this transaction lost the old session, decided at the FIRST moment it
+     *  is observed lost and never re-asked.
+     *
+     *  `endedByCommand()` reads the live map and the ended set — and shutdown's
+     *  own teardown clears the map and marks every session ended. So by the time
+     *  the abandon path runs, "did the operator give this conversation up?"
+     *  answers YES for a process that was merely stopping, and the old primary
+     *  gets removed instead of restored. Latch it while the two are still
+     *  distinguishable: if the scope reports a shutdown, it was not the
+     *  operator. */
+    let lostToOperator: boolean | undefined;
+    const ownsOldSession = (): boolean => {
+      const owns =
+        this.sessions.get(threadId) === session &&
+        !this.endedSessions.has(session) &&
+        scope.lostReason() === undefined;
+      if (!owns && lostToOperator === undefined) {
+        lostToOperator = scope.lostReason() === undefined;
+      }
+      return owns;
+    };
     /** Lost to an explicit `/end` rather than to shutdown. The distinction
      *  matters for the fallback plan below: `/end` deliberately gives up the old
      *  record, while a shutdown expects the next boot to resume it. */
     const endedByCommand = (): boolean =>
-      this.endedSessions.has(session) || this.sessions.get(threadId) !== session;
+      lostToOperator ??
+      (this.endedSessions.has(session) || this.sessions.get(threadId) !== session);
     const endedRebind = "⚠️ 這個討論串已結束，改綁已取消。";
     // Fence old attachments synchronously, before rebindBlocker or any git/SDK
     // await. A stale actor must not reserve or send against the replacement
@@ -3659,6 +3677,11 @@ export class DiscordCopilotApp {
     let replacementActor: SessionActor | undefined;
     let replacementBinding: SessionRecord | undefined;
     let oldStale: StaleRebindActor | undefined;
+    /** The primary record this transaction moved aside, kept for the rollback
+     *  that has to put it back. Set only once `reserve()` has actually replaced
+     *  the thread slot, so `abandonEndedRebind` cannot "restore" something that
+     *  was never displaced. */
+    let restorablePrevious: SessionRecord | undefined;
     let targetLeaseHeld = false;
     if (target.devMode === "worktree" && branch) {
       try {
@@ -3687,9 +3710,21 @@ export class DiscordCopilotApp {
       if (this.localLeases.get(key) === threadId) this.localLeases.delete(key);
       targetLeaseHeld = false;
     };
-    /** Dispose resources that were prepared after `/end` claimed the old
-     * session. Crucially this never restores the old record or file fence:
-     * `/end` is the winner, not a failed rebind rollback. */
+    /** Dispose resources prepared after this transaction lost the old session.
+     *
+     * TWO different losers reach here, and they want opposite things.
+     *
+     * `/end` is the winner and deliberately gave the old conversation up: its
+     * target reservation is REMOVED and the old primary stays gone.
+     *
+     * A shutdown gave up nothing. The old record was moved aside (a stale
+     * companion row) and its thread slot overwritten with the target
+     * reservation, so removing the target alone leaves the thread with NO
+     * resumable primary — the conversation survives only as a terminal
+     * stale-rebind pointer, and the next boot cannot bring it back. The
+     * pre-swap rollbacks above already restore `previous` under the exact CAS;
+     * this does the same, so a signal in the middle of a rebind costs the
+     * operator the rebind and nothing else. */
     const abandonEndedRebind = async (): Promise<string> => {
       // The first commit-failure disconnect may have raced `/end` before its
       // fallback tracker was registered. Flip an existing plan synchronously;
@@ -3700,6 +3735,10 @@ export class DiscordCopilotApp {
       // resume it. Overwriting `/end`'s outcome, or a shutdown's, with the
       // other's is exactly what this distinction prevents.
       if (endedByCommand()) this.markFallbackPrimaryEnded(threadId);
+      // Decided ONCE, before any await: `endedByCommand()` reads the live map,
+      // which shutdown's teardown clears, so asking again later would silently
+      // turn "the process is stopping" into "the operator ended it".
+      const givenUpByOperator = endedByCommand();
       const trackedReplacement =
         replacementActor === undefined ? undefined : this.staleRebindActors.get(replacementActor);
       if (trackedReplacement?.fallbackPrimary) {
@@ -3723,8 +3762,24 @@ export class DiscordCopilotApp {
           // Retain the actor and root fence until a retry can CONFIRM teardown;
           // do not let a timed-out `/end` turn it into an invisible writer.
           if (replacementBinding) {
-            const fallback = this.fallbackPrimaryPlan(replacementBinding);
-            this.setFallbackPrimaryRemoval(fallback);
+            const fallback = this.fallbackPrimaryPlan(
+              replacementBinding,
+              // A shutdown keeps the RESTORE plan: when a later retry finally
+              // confirms this replacement stopped, the old primary comes back
+              // under the target's exact CAS. `/end` gets the removal-only
+              // plan, because it gave the old conversation up on purpose.
+              givenUpByOperator ? undefined : restorablePrevious,
+              givenUpByOperator ? undefined : ownsOldSession,
+              givenUpByOperator
+                ? undefined
+                : () => {
+                    if (oldStale && this.pendingRebindOlds.get(session) === oldStale) {
+                      this.pendingRebindOlds.delete(session);
+                    }
+                  },
+              givenUpByOperator ? undefined : restoreOldFileDelivery
+            );
+            if (givenUpByOperator) this.setFallbackPrimaryRemoval(fallback);
             const stale = this.staleRebindActor(replacementActor, replacementBinding, true);
             replacementDurablyRetained = this.retainStaleRebindActor(
               stale,
@@ -3751,7 +3806,31 @@ export class DiscordCopilotApp {
       // Never remove it until teardown is durably represented elsewhere.
       if (!fallbackPrimaryRetained) {
         if (reservedIdentity && (replacementClosed || replacementDurablyRetained)) {
-          this.store.removeIfCurrent(threadId, reservedIdentity.sessionId, reservedIdentity.generation);
+          if (givenUpByOperator || !restorablePrevious) {
+            this.store.removeIfCurrent(threadId, reservedIdentity.sessionId, reservedIdentity.generation);
+          } else {
+            // Shutdown: put the old primary BACK. Removing the target alone
+            // left the thread with no resumable record at all, so the next boot
+            // saw only a terminal stale pointer and the conversation was lost —
+            // for a rebind the operator never even completed. The same CAS the
+            // create-failure path uses, so a newer reservation cannot be
+            // clobbered.
+            const restored = restorablePrevious;
+            const rollback = this.store.restoreIfCurrent(
+              restored,
+              reservedIdentity.sessionId,
+              reservedIdentity.generation
+            );
+            if (rollback.ok) {
+              this.pendingRebindOlds.delete(session);
+              this.store.removeStaleRebind(restored.threadId, restored.sessionId, restored.generation);
+            } else {
+              console.warn(
+                `rebind: could not restore the primary record for ${threadId} after a shutdown; ` +
+                  "leaving the target reservation and the stale companion for reconcile."
+              );
+            }
+          }
         } else if (reservedIdentity) {
           console.warn(
             `rebind: retaining target reservation ${reservedIdentity.sessionId} as fallback after stale ownership write failure`
@@ -3879,6 +3958,7 @@ export class DiscordCopilotApp {
       return "⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未改綁。請檢查磁碟／權限後重試。";
     }
     reservedIdentity = { sessionId, generation };
+    restorablePrevious = previous;
     replacementBinding = this.store.get(threadId);
 
     const broker = new PendingInteractionBroker();

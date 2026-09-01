@@ -1120,6 +1120,8 @@ teardown claims、obligations **同時為空**才釋放，且只釋放一次。
 | phase gate 必須區分「啟動中，請稍候重試」與關機中的誠實回覆 | `test/app-inbound-ownership.test.ts` |
 | `runOwnedMessage` 必須攔截並記錄 handler 的 rejection（否則會是 unhandled rejection，Node 20+ 會終止 process） | `test/app-inbound-ownership.test.ts` |
 | `/queue` 的回滾只能移除**自己新增的那一則**，不得誤刪操作者先前排入的同字串提示 | `test/app-inbound-ownership.test.ts` |
+| readiness 發布本身是 owned work：發布中途 shutdown ⇒ 撤回 marker、`startBot` 必須失敗，且 lock 要等撤回落定才釋放 | `test/bootstrap.test.ts` |
+| **shutdown（非 `/end`）中斷 pre-swap 改綁**必須把被移開的 primary 記錄**還原**（真實 `SessionStore`：old active → stale 伴隨列 + target creating → 卡在 `SessionActor.create` → shutdown → 還原後 old 仍 `active`/可復原、target 移除、stale 列已對帳）；只有明確的 `/end` 才選擇移除 | `test/app-rebind.test.ts` |
 
 ### 19.7 抽取結果與仍未做的事
 

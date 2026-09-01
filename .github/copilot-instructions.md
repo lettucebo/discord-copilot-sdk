@@ -131,7 +131,15 @@ through `runTeardown`, and an exclusive scope around them would deadlock their o
 no scope, because there is nothing for the lock to wait for. Ownership is asked **before** an
 irreversible external effect, never after one: `/file` checks it before the upload starts and
 hands the transport only a session-currentness predicate, because the transport answers "no"
-after Discord has accepted an attachment by *retracting* it.
+after Discord has accepted an attachment by *retracting* it. `startBot`'s readiness publication is
+owned the same way and is retractable (`retractReady`), because the marker is an externally
+visible claim that this PID is serving.
+
+**A lost rebind asks WHY it was lost, once.** `/end` is a winner that deliberately gives the old
+conversation up, so its target reservation is removed. A shutdown gave up nothing, so the
+displaced primary is restored under the same CAS the pre-swap rollbacks use. The two are only
+distinguishable *before* teardown runs — it clears the live map and marks every session ended —
+so `applyRebindInner` latches the reason at the first observation instead of re-asking later.
 
 **Fail-closed is the house rule.** For a newly presented approval card: unsupported permissionkinds deny; timeouts and aborts resolve to deny/cancel; `ask_user` throws rather than fabricating
 an answer; a summary that is too long or contains bidi/control characters is auto-denied rather

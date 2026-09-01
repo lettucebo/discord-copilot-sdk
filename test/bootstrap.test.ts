@@ -47,6 +47,9 @@ describe("startBot", () => {
       publishReady: async () => {
         events.push("ready");
       },
+      retractReady: async () => {
+        events.push("retract");
+      },
     });
 
     expect(events).toEqual(["lock", "runtime", "start", "ready"]);
@@ -82,6 +85,7 @@ describe("startBot", () => {
         publishReady: async () => {
           throw new Error("marker write denied");
         },
+        retractReady: async () => {},
       })
     ).rejects.toThrow(/marker write denied/);
 
@@ -114,6 +118,7 @@ describe("startBot", () => {
         publishReady: async () => {
           throw new Error("marker write denied");
         },
+        retractReady: async () => {},
       })
     ).rejects.toThrow(/marker write denied/);
 
@@ -135,6 +140,7 @@ describe("startBot", () => {
           },
         }),
         publishReady: async () => {},
+      retractReady: async () => {},
       })
     ).rejects.toThrow(/gateway login failed/);
 
@@ -155,6 +161,7 @@ describe("startBot", () => {
           },
         }),
         publishReady: async () => {},
+      retractReady: async () => {},
       })
     ).rejects.toThrow(/SDK version mismatch/);
 
@@ -171,6 +178,7 @@ describe("startBot", () => {
           throw new Error("runtime import failed");
         },
         publishReady: async () => {},
+      retractReady: async () => {},
       })
     ).rejects.toThrow(/runtime import failed/);
 
@@ -188,7 +196,94 @@ describe("startBot", () => {
           start: async () => ({ stop: async () => {} }),
         }),
         publishReady: async () => {},
+      retractReady: async () => {},
       })
     ).rejects.toThrow(/another instance is already running/);
+  });
+});
+
+
+describe("readiness publication is part of the owned startup transaction", () => {
+  it("retracts a marker this process must not have published, and reports failure", async () => {
+    // The schedule: `publishReady` suspends mid-write, a signal completes the
+    // shutdown, and the publication then resumes. Outside the coordinator it
+    // wrote a marker naming a PID that is going away — or worse, overwrote a
+    // successor's, since the lock had already been released — and `startBot`
+    // returned SUCCESS for a bot that was gone.
+    const events: string[] = [];
+    const release = vi.fn(async () => {
+      events.push("lock-released");
+    });
+    let unblock: () => void = () => {};
+    const publishing = new Promise<void>((r) => {
+      unblock = r;
+    });
+    let published = false;
+    let stopped: Promise<void> | undefined;
+    let coordinator: LifecycleOwnership | undefined;
+
+    const started = startBot({
+      acquireLock: async () => lock(release),
+      loadRuntime: async () => ({
+        loadConfig: () => config(),
+        start: async (_c: Config, ownership: LifecycleOwnership) => {
+          coordinator = ownership;
+          ownership.arm(async () => void events.push("teardown"));
+          return { stop: async () => ownership.shutdown() };
+        },
+      }),
+      publishReady: async () => {
+        events.push("publish-start");
+        await publishing;
+        published = true;
+        events.push("publish-done");
+      },
+      retractReady: async () => {
+        published = false;
+        events.push("retract");
+      },
+    });
+
+    // Let startup reach the publication, then tear the process down underneath it.
+    await vi.waitFor(() => expect(events).toContain("publish-start"));
+    stopped = coordinator!.shutdown();
+    await Promise.resolve();
+    unblock();
+
+    await expect(started).rejects.toThrow();
+    await stopped;
+
+    expect(published).toBe(false); // the marker was taken back
+    expect(events).toContain("retract");
+    // …and the lock did not go until the retraction had settled.
+    expect(events.indexOf("lock-released")).toBeGreaterThan(events.indexOf("retract"));
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("leaves a healthy publication alone", async () => {
+    const release = vi.fn(async () => {});
+    let published = false;
+    let retracted = false;
+
+    await startBot({
+      acquireLock: async () => lock(release),
+      loadRuntime: async () => ({
+        loadConfig: () => config(),
+        start: async (_c: Config, ownership: LifecycleOwnership) => {
+          ownership.arm(async () => {});
+          return { stop: async () => ownership.shutdown() };
+        },
+      }),
+      publishReady: async () => {
+        published = true;
+      },
+      retractReady: async () => {
+        retracted = true;
+      },
+    });
+
+    expect(published).toBe(true);
+    expect(retracted).toBe(false);
+    expect(release).not.toHaveBeenCalled();
   });
 });

@@ -250,6 +250,7 @@ describe("startup torn down between construction and login", () => {
         publishReady: async () => {
           published++;
         },
+        retractReady: async () => {},
       })
     ).rejects.toThrow(StartupAbandonedError);
 
