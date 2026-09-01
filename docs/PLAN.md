@@ -1038,6 +1038,13 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   不是成功回傳的當下。`DiscordCopilotApp.start()` 自己的 catch 已經負責兩種結局（有 app 就 `app.stop()`，
   沒有就自己 release），所以 `runtime.start` 一旦 reject，bootstrap 再碰 lock 就是第二次釋放。
   這個契約寫進 `BotRuntime.start` 的 doc comment。`--selfcheck` 自己持有一組不經過 app 的 lock，不受影響。
+  **配套的必要修正**：`DiscordCopilotApp.start()` 原本把 `resolveReposRoot()` 與 SDK 版本檢查放在自己的
+  `try` **之外**。所有權既然在「呼叫的當下」就轉移，這兩個 throw 就會從 `start()` 的 catch 上方逃出去——
+  bootstrap 不會再碰 lock，`start()` 的 catch 也看不到它，於是 lock **完全沒有人釋放**。兩者已移進 try，
+  讓 `app ? stop : (copilot?.stop, lock.release)` 這個 catch 涵蓋 `start()` 的每一種結局。
+  這條契約用**真實的 `DiscordCopilotApp.start`**（不是 fake `BotRuntime`）測：壞掉的 `REPOS_ROOT`、
+  與 trust store 重疊的 `REPOS_ROOT`、SDK 版本不符、以及 runtime 啟動失敗，各自斷言 `release` 恰好一次、
+  且前三者根本沒有建立過 Copilot client（因此也沒碰過 Discord）。
 - **`stop()` 是 single-flight**：`stopPromise` 存起來並回傳**同一個** promise（`stop()` 刻意不是 `async`，
   否則每次呼叫都是新的包裝物件）。第二個 SIGTERM、bot startup 失敗路徑與 signal 撞在一起、或測試重複呼叫，
   都會 **join** 第一次拆解，而不是從一個只做到一半的 shutdown 提早返回——而 `stop()` 正是「做到一半」
@@ -1135,6 +1142,7 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | 同上，但卡在 `addWorktree`（已發出的 git 工作）：lock 保留到重建結束才釋放 | `test/app-reconcile.test.ts` |
 | attempt **永遠不 settle** 時，lock 在整個 process 生命期內都不得釋放（靠後繼者回收 stale PID lock） | `test/app-reconcile.test.ts` |
 | `startBot()` 失敗時：app 已建立 ⇒ 只呼叫 `app.stop()`（release 恰好一次，由 app 自己發出）；app 刻意保留 lock 時 bootstrap **不得**代它釋放；`runtime.start` **reject** 時（不論它自己 release 了或刻意保留）bootstrap 都不得再碰 lock；app 未建立（轉移之前失敗）⇒ 仍要釋放早期 lock | `test/bootstrap.test.ts` |
+| **真實** `DiscordCopilotApp.start()` 的每一種失敗都必須釋放 lock 恰好一次：`REPOS_ROOT` 不存在、`REPOS_ROOT` 涵蓋 trust store、SDK 版本不符（三者皆不得建立 Copilot client）、以及 runtime 啟動失敗（要 stop client 再 release） | `test/app-start-ownership.test.ts` |
 | `stop()` 必須 single-flight：三個並行呼叫只跑一次拆解，且拿到**同一個** promise | `test/app-reconcile.test.ts` |
 | termination signal：single-flight `stop()` + 設 `process.exitCode`，**不得**呼叫 `process.exit`（source 契約）；`stop()` 失敗要 `console.error` 且 `exitCode = 1` | `test/app-reconcile.test.ts` |
 | capture 成功但（取消或 resume 失敗）沒交給 actor 時，`trustedRoot.close()` 必須被呼叫恰好一次 | `test/app-reconcile.test.ts` |

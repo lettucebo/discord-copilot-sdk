@@ -268,7 +268,9 @@ does, the PID lock stays until the process exits and the successor reclaims it a
 (`src/core/single-instance.ts`). Holding it is what makes an already-issued REST/git/runtime call
 cross-process safe, so nothing may release it behind the app's back: `startBot`'s failure path
 releases the lock only when it has not yet been transferred, and the transfer happens when
-`runtime.start` is **invoked** (a rejection means the runtime already dealt with it). `stop()` is
+`runtime.start` is **invoked** (a rejection means the runtime already dealt with it), and every
+throw site in `DiscordCopilotApp.start` — including `resolveReposRoot` and the SDK-version check —
+must live inside its own `try`, or the lock ends up released by nobody. `stop()` is
 single-flight and returns the identical promise, and a termination signal sets `process.exitCode`
 rather than forcing an exit — a forced exit orphans a git/SDK child still running under this pid and
 abandons the deferred lock release that waits for it. Any successful `captureValidatedRoot` that

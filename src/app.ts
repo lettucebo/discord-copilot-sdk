@@ -880,20 +880,26 @@ export class DiscordCopilotApp {
 
   /** Fully start after bootstrap has already acquired the instance lock. */
   static async start(config: Config, lock: InstanceLock): Promise<DiscordCopilotApp> {
-    const reposRoot = resolveReposRoot(config.REPOS_ROOT);
-    const compat = checkSdkCompat();
-    if (!compat.ok) {
-      // Fatal in bot mode: our event-field and permission-shape assumptions are
-      // pinned to the declared SDK version; a mismatch could silently break
-      // streaming or, worse, permission handling.
-      throw new Error(
-        `Installed @github/copilot-sdk ${compat.installed} != declared ${compat.declared}. ` +
-          `Refusing to start the bot; run \`npm install\` to align.`
-      );
-    }
     let copilot: CopilotClient | undefined;
     let app: DiscordCopilotApp | undefined;
     try {
+      // INSIDE the try, both of them. Ownership of `lock` transfers to this
+      // function the moment it is CALLED (see `BotRuntime.start`), so a throw
+      // that escapes before the catch below leaves the lock held by nobody —
+      // bootstrap will not release it, and this process is about to die. These
+      // two are the earliest things that can fail: a REPOS_ROOT that does not
+      // exist or overlaps the trust store, and an SDK version mismatch.
+      const reposRoot = resolveReposRoot(config.REPOS_ROOT);
+      const compat = checkSdkCompat();
+      if (!compat.ok) {
+        // Fatal in bot mode: our event-field and permission-shape assumptions are
+        // pinned to the declared SDK version; a mismatch could silently break
+        // streaming or, worse, permission handling.
+        throw new Error(
+          `Installed @github/copilot-sdk ${compat.installed} != declared ${compat.declared}. ` +
+            `Refusing to start the bot; run \`npm install\` to align.`
+        );
+      }
       // A NEUTRAL working directory. Every session sets its own, and pointing the
       // shared client at a repo would make whichever repo happens to be
       // "default" the implicit cwd for anything that forgets to.
@@ -910,7 +916,8 @@ export class DiscordCopilotApp {
     } catch (err) {
       // Full teardown on any startup failure. If the app was constructed, its
       // stop() also destroys the (possibly logged-in) Discord client — so a
-      // registration failure after gateway-ready doesn't leak a connection.
+      // registration failure after gateway-ready doesn't leak a connection — and
+      // stop() alone decides the lock's fate. Otherwise the lock is still ours.
       if (app) await app.stop().catch(() => {});
       else {
         if (copilot) await copilot.stop().catch(() => {});
