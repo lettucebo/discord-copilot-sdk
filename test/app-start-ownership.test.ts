@@ -49,6 +49,13 @@ vi.mock("../src/copilot/sdk.js", () => ({
 const { DiscordCopilotApp } = await import("../src/app.js");
 const { parseConfig } = await import("../src/config.js");
 import type { InstanceLock } from "../src/core/single-instance.js";
+import { createLifecycleOwnership } from "../src/core/lifecycle-ownership.js";
+
+/** Bootstrap wraps the lock in the coordinator before start ever sees it; the
+ *  release assertions below are unchanged, because the coordinator releases the
+ *  same lock. */
+const own = (held: { lock: InstanceLock }): ReturnType<typeof createLifecycleOwnership> =>
+  createLifecycleOwnership(held.lock);
 
 const reposRoot = mkdtempSync(join(tmpdir(), "dp-start-repos-"));
 
@@ -107,7 +114,7 @@ describe("DiscordCopilotApp.start owns the lock from the moment it is called", (
     const held = lock();
 
     await expect(
-      DiscordCopilotApp.start(config({ REPOS_ROOT: join(reposRoot, "does-not-exist") }), held.lock)
+      DiscordCopilotApp.start(config({ REPOS_ROOT: join(reposRoot, "does-not-exist") }), own(held))
     ).rejects.toThrow(/REPOS_ROOT does not exist/);
 
     expect(held.releases()).toBe(1);
@@ -117,7 +124,7 @@ describe("DiscordCopilotApp.start owns the lock from the moment it is called", (
   it("releases the lock when REPOS_ROOT would contain the bot's own state directory", async () => {
     const held = lock();
 
-    await expect(DiscordCopilotApp.start(config({ REPOS_ROOT: fakeHome }), held.lock)).rejects.toThrow(
+    await expect(DiscordCopilotApp.start(config({ REPOS_ROOT: fakeHome }), own(held))).rejects.toThrow(
       /state directory|worktree directory/
     );
 
@@ -129,7 +136,7 @@ describe("DiscordCopilotApp.start owns the lock from the moment it is called", (
     sdk.compat = { ok: false, installed: "9.9.9", declared: "1.0.0" };
     const held = lock();
 
-    await expect(DiscordCopilotApp.start(config(), held.lock)).rejects.toThrow(
+    await expect(DiscordCopilotApp.start(config(), own(held))).rejects.toThrow(
       /Installed @github\/copilot-sdk 9\.9\.9 != declared 1\.0\.0/
     );
 
@@ -143,7 +150,7 @@ describe("DiscordCopilotApp.start owns the lock from the moment it is called", (
     sdk.clientStartError = "copilot runtime unavailable";
     const held = lock();
 
-    await expect(DiscordCopilotApp.start(config(), held.lock)).rejects.toThrow(
+    await expect(DiscordCopilotApp.start(config(), own(held))).rejects.toThrow(
       /copilot runtime unavailable/
     );
 
@@ -158,8 +165,8 @@ describe("DiscordCopilotApp.start owns the lock from the moment it is called", (
     const cases: Array<() => Promise<unknown>> = [];
     const locks: Array<{ lock: InstanceLock; releases: () => number }> = [];
     for (const build of [
-      () => DiscordCopilotApp.start(config({ REPOS_ROOT: join(reposRoot, "nope") }), locks[0]!.lock),
-      () => DiscordCopilotApp.start(config(), locks[1]!.lock),
+      () => DiscordCopilotApp.start(config({ REPOS_ROOT: join(reposRoot, "nope") }), own(locks[0]!)),
+      () => DiscordCopilotApp.start(config(), own(locks[1]!)),
     ]) {
       locks.push(lock());
       cases.push(build);

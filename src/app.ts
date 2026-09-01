@@ -92,6 +92,12 @@ import { ChannelRegistry, CONFIG_SEED_ADDED_BY } from "./core/channel-registry.j
 import type { Decision, SendFileResult, Transport } from "./core/transport.js";
 import { captureTrustedRoot, type SecureOpenBackend, type TrustedRoot } from "./core/secure-open.js";
 import { isFileDeliveryAvailable } from "./core/file-delivery-availability.js";
+import {
+  createLifecycleOwnership,
+  type LifecycleOwnership,
+  type LifecycleOwnershipOptions,
+  type TeardownScope,
+} from "./core/lifecycle-ownership.js";
 
 /** One live Discord thread ↔ Copilot session. Exported so tests can build a
  *  TYPED fixture — an untyped `as Record<string, unknown>` fixture is how a
@@ -693,7 +699,7 @@ export class DiscordCopilotApp {
   private constructor(
     private readonly config: Config,
     private readonly copilot: CopilotClient,
-    private readonly lock: InstanceLock,
+    private ownership: LifecycleOwnership,
     transportOverride?: Transport,
     storeOverride?: SessionStore,
     channelsOverride?: ChannelRegistry
@@ -871,24 +877,40 @@ export class DiscordCopilotApp {
     options: { fileDeliveryPlatform?: NodeJS.Platform } = {}
   ): DiscordCopilotApp {
     const noopLock: InstanceLock = { path: "(test)", release: async () => {} };
-    const app = new DiscordCopilotApp(config, copilot, noopLock, transport, store, channels);
+    const app = new DiscordCopilotApp(
+      config,
+      copilot,
+      createLifecycleOwnership(noopLock),
+      transport,
+      store,
+      channels
+    );
     app.reposRoot = reposRoot;
     app.actorCreateDependencies = createForTestActorDependencies(options.fileDeliveryPlatform ?? "win32");
     app.approvalKeyForTest = async (validationPath) => validationPath;
+    // The arm production does, so a test that drives `stop()` exercises the same
+    // teardown path rather than a shortcut.
+    app.ownership.arm((scope) => app.teardownResources(scope));
     return app;
   }
 
-  /** Fully start after bootstrap has already acquired the instance lock. */
-  static async start(config: Config, lock: InstanceLock): Promise<DiscordCopilotApp> {
+  /** Test-only: rebuild the coordinator around a lock the test can observe.
+   *  Re-arms, because a fresh coordinator has nothing armed. */
+  private useOwnershipForTest(lock: InstanceLock, options?: LifecycleOwnershipOptions): void {
+    this.ownership = createLifecycleOwnership(lock, options);
+    this.ownership.arm((scope) => this.teardownResources(scope));
+  }
+
+  /** Fully start after bootstrap has already acquired the instance lock and
+   *  wrapped it in the one thing allowed to release it. */
+  static async start(config: Config, ownership: LifecycleOwnership): Promise<DiscordCopilotApp> {
     let copilot: CopilotClient | undefined;
     let app: DiscordCopilotApp | undefined;
     try {
-      // INSIDE the try, both of them. Ownership of `lock` transfers to this
-      // function the moment it is CALLED (see `BotRuntime.start`), so a throw
-      // that escapes before the catch below leaves the lock held by nobody —
-      // bootstrap will not release it, and this process is about to die. These
-      // two are the earliest things that can fail: a REPOS_ROOT that does not
-      // exist or overlaps the trust store, and an SDK version mismatch.
+      // INSIDE the try, both of them: a throw that escaped it used to leave the
+      // lock held by nobody. These two are the earliest things that can fail — a
+      // REPOS_ROOT that does not exist or overlaps the trust store, and an SDK
+      // version mismatch.
       const reposRoot = resolveReposRoot(config.REPOS_ROOT);
       const compat = checkSdkCompat();
       if (!compat.ok) {
@@ -904,25 +926,33 @@ export class DiscordCopilotApp {
       // shared client at a repo would make whichever repo happens to be
       // "default" the implicit cwd for anything that forgets to.
       copilot = createCopilotClient();
+      // NARROW arm, before `copilot.start()` rather than after: the client
+      // exists from here, so from here it is something shutdown must put down.
+      const client = copilot;
+      if (!ownership.arm(async () => void (await client.stop().catch(() => {})))) {
+        throw new Error("shutdown began before the Copilot client could be armed for teardown");
+      }
       await copilot.start();
       await preflightModel(copilot, config.DEFAULT_MODEL);
-      app = new DiscordCopilotApp(config, copilot, lock);
+      app = new DiscordCopilotApp(config, copilot, ownership);
       app.reposRoot = reposRoot;
       // Before the gateway, not after: a registry we cannot trust must not reach
       // a state where the bot is online and answering with the wrong channel set.
       app.assertChannelRegistryUsable();
+      // WIDER arm, before signal handlers are installed by `login()`: from the
+      // moment a signal can arrive, shutdown must already know how to put down
+      // everything this app owns, not just the client.
+      const started = app;
+      if (!ownership.arm((scope) => started.teardownResources(scope))) {
+        throw new Error("shutdown began before the app could be armed for teardown");
+      }
       await app.login();
       return app;
     } catch (err) {
-      // Full teardown on any startup failure. If the app was constructed, its
-      // stop() also destroys the (possibly logged-in) Discord client — so a
-      // registration failure after gateway-ready doesn't leak a connection — and
-      // stop() alone decides the lock's fate. Otherwise the lock is still ours.
-      if (app) await app.stop().catch(() => {});
-      else {
-        if (copilot) await copilot.stop().catch(() => {});
-        await lock.release().catch(() => {});
-      }
+      // One answer for every failure. Whatever was armed last is what gets torn
+      // down, and the lock is released by the coordinator only once nothing is
+      // outstanding — including an obligation this teardown may have discovered.
+      await ownership.shutdown().catch(() => {});
       throw err;
     }
   }
@@ -5601,36 +5631,43 @@ export class DiscordCopilotApp {
   }
 
   /**
-   * Reverse-order teardown; the single-instance lock is released LAST.
+   * Ask for shutdown, and get back the ONE teardown.
    *
-   * Single-flight: a second signal, a bootstrap failure path racing a signal, or
-   * a test calling it twice all JOIN the first teardown. Returning early instead
-   * would let a caller believe cleanup had finished while it was still half done
-   * — and `stop()` is precisely where "half done" means a live SDK child and an
-   * unreleased lock.
+   * Single-flight lives in the coordinator now: a second signal, a bootstrap
+   * failure racing a signal, or a test calling it twice all join the identical
+   * promise. Returning early instead would let a caller believe cleanup had
+   * finished while it was still half done — and here "half done" means a live
+   * SDK child and an unreleased lock.
    */
   stop(): Promise<void> {
-    // Not `async`: callers must get the IDENTICAL promise, so a second signal
-    // joins the first teardown rather than awaiting a fresh wrapper around it.
-    this.stopPromise ??= this.stopOnce();
-    return this.stopPromise;
+    // Synchronous, before any await: input is rejected and every in-flight scope
+    // learns it has lost the thread the instant a caller asks for shutdown.
+    this.shuttingDown = true;
+    this.phase = "shuttingDown";
+    // The armed callback is `teardownResources`, never this method: shutdown
+    // CALLS the armed teardown, so arming `stop()` would deadlock its own
+    // single-flight.
+    return this.ownership.shutdown();
   }
 
-  private async stopOnce(): Promise<void> {
-    this.shuttingDown = true;
-    this.phase = "shuttingDown"; // reject any late input while tearing down
+  /**
+   * Everything this process must put down, minus the lock.
+   *
+   * This is what `stop()` arms the coordinator with — never `stop()` itself,
+   * which would re-enter the single-flight that is calling it. It deliberately
+   * does not release the lock: what it does instead, when it cannot prove an
+   * attempt finished, is hand the coordinator an OBLIGATION, and the lock stays
+   * held until that obligation is discharged or this process exits.
+   */
+  private async teardownResources(scope: TeardownScope): Promise<void> {
     // Disarm before the teardown loop. `shuttingDown` also stops a tick that is
     // already in flight from registering anything (`resumeOwnershipLost`), so
     // no session can appear behind this loop's back and survive it.
     this.clearAccessRetryTimer();
-    // Cancel every in-flight attempt's token BEFORE waiting for it. This is the
-    // fence that matters: the wait below is bounded, so an attempt CAN outlive
-    // it, and it must not still be able to write a terminal state, drop a repo
-    // lease or post a message once the lock below is released.
+    // Cancel every in-flight attempt's token BEFORE waiting for it: the wait
+    // below is bounded, so an attempt CAN outlive it, and it must not still be
+    // able to write a terminal state, drop a repo lease or post a message.
     this.accessRetryEpoch++;
-    // Then JOIN it. Disarming only prevents the NEXT tick; one already inside
-    // git or the runtime can still be mid-transition. Bounded, so a wedged
-    // runtime cannot make shutdown hang.
     const pendingTick = this.accessRetryTickPromise;
     const quiesced = pendingTick
       ? await withTimeout(pendingTick, this.accessResumeJoinTimeoutMs).then(
@@ -5638,6 +5675,31 @@ export class DiscordCopilotApp {
           () => false
         )
       : true;
+    if (!quiesced && pendingTick) {
+      // Its already-issued REST/git/runtime work cannot be recalled, and a
+      // successor instance must not start reconciling the same records while it
+      // finishes. Recorded as an obligation rather than as a private promise
+      // chain, so the ONE thing that decides about the lock can see it.
+      const handle = scope.retain("access-retry-tick", {
+        describe: () => "an access-retry attempt that shutdown could not join",
+        attempt: async () => {
+          const settled = await withTimeout(pendingTick, this.accessResumeJoinTimeoutMs).then(
+            () => true,
+            () => false
+          );
+          return settled;
+        },
+      });
+      void pendingTick.then(
+        () => handle.discharge(),
+        () => handle.discharge()
+      );
+      console.warn(
+        "shutdown: an access-retry attempt is still running (cancelled, but its in-flight " +
+          "REST/git/runtime work cannot be recalled). Holding the single-instance lock until it " +
+          "settles; if this process exits first, the next start reclaims the lock as stale."
+      );
+    }
     for (const [threadId, session] of this.sessions) {
       // Rebind can be suspended in its prepare phase while shutdown starts.
       // Mark first so it cannot install a replacement after this loop clears
@@ -5676,39 +5738,6 @@ export class DiscordCopilotApp {
     }
     await this.copilot.stop().catch(() => {});
     await clearStartupReady().catch(() => {});
-    // The single-instance lock is the LAST thing released, and only once no
-    // attempt of ours can still be doing external work.
-    //
-    // The cancellation epoch stops this app from mutating anything further, but
-    // it cannot un-issue a REST call, a `git worktree add` or an
-    // `SessionActor.create` that has already been handed to the runtime. Those
-    // finish on their own schedule, against the same state directory and the
-    // same checkouts. Releasing the lock while one is in flight invites a
-    // successor instance to start reconciling the very records and worktrees
-    // this process is still touching — a cross-process race no in-process fence
-    // can cover.
-    //
-    // So a shutdown that could not join its retry attempt does not release the
-    // lock here; it releases it when that attempt finally settles. If it never
-    // settles, the lock file simply stays until this process exits, and the
-    // successor reclaims it then: `acquireSingleInstanceLock` treats a lock
-    // whose holder pid is no longer alive as stale, and `releaseIfOwner` refuses
-    // to delete a lock that a successor has already taken over. Holding it is
-    // therefore honest — this pid really is still working — and self-healing.
-    if (quiesced || !pendingTick) {
-      await this.lock.release().catch(() => {});
-      return;
-    }
-    console.warn(
-      "shutdown: an access-retry attempt is still running (cancelled, but its in-flight " +
-        `REST/git/runtime work cannot be recalled). Holding the single-instance lock at ` +
-        `${this.lock.path} until it settles; if this process exits first, the next start ` +
-        `reclaims the lock as stale.`
-    );
-    void pendingTick.then(
-      () => void this.lock.release().catch(() => {}),
-      () => void this.lock.release().catch(() => {})
-    );
   }
 }
 

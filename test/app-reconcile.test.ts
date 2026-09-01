@@ -36,6 +36,7 @@ import { SessionActor, type SessionActorOpts } from "../src/copilot/session-acto
 import { SessionStore, type SessionBinding } from "../src/core/session-store.js";
 import { ChannelRegistry } from "../src/core/channel-registry.js";
 import type { SecureOpenBackend } from "../src/core/secure-open.js";
+import type { InstanceLock } from "../src/core/single-instance.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { tmpdir } from "node:os";
@@ -210,6 +211,13 @@ function localLeasesOf(app: DiscordCopilotApp): Map<string, string> {
  *  unconfirmed; the strong reference is what holds the Windows root. */
 function unconfirmedResumesOf(app: DiscordCopilotApp): Map<string, unknown> {
   return (app as unknown as { unconfirmedResumes: Map<string, unknown> }).unconfirmedResumes;
+}
+/** Give the app a lock the test can watch. The lock now lives inside the
+ *  lifecycle coordinator — the only thing allowed to release it — so a test
+ *  observes releases by handing that coordinator an observable lock rather than
+ *  by reaching for a field on the app. */
+function useObservableLock(app: DiscordCopilotApp, lock: InstanceLock): void {
+  (app as unknown as { useOwnershipForTest(l: InstanceLock): void }).useOwnershipForTest(lock);
 }
 function reconcile(
   app: DiscordCopilotApp,
@@ -3005,12 +3013,12 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
         new ChannelRegistry("c1", "g1", registryFile)
       );
       let lockReleased = false;
-      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+      useObservableLock(app, {
         path: "(test)",
         async release(): Promise<void> {
           lockReleased = true;
         },
-      };
+      });
 
       let access = false;
       let deleted = false;
@@ -3092,12 +3100,12 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
         new ChannelRegistry("c1", "g1", registryFile)
       );
       let lockReleased = false;
-      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+      useObservableLock(app, {
         path: "(test)",
         async release(): Promise<void> {
           lockReleased = true;
         },
-      };
+      });
       let access = false;
       setChannelFetch(app, async () => {
         if (!access) throw { code: 50001 };
@@ -3165,12 +3173,12 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
         new ChannelRegistry("c1", "g1", registryFile)
       );
       let lockReleased = false;
-      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+      useObservableLock(app, {
         path: "(test)",
         async release(): Promise<void> {
           lockReleased = true;
         },
-      };
+      });
       let access = false;
       setChannelFetch(app, async () => {
         if (!access) throw { code: 50001 };
@@ -3221,7 +3229,7 @@ describe("shutdown ownership: single-flight, no forced exit, no leaked capabilit
       );
       let releases = 0;
       let releasing: (() => void) | undefined;
-      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+      useObservableLock(app, {
         path: "(test)",
         async release(): Promise<void> {
           releases++;
@@ -3230,7 +3238,7 @@ describe("shutdown ownership: single-flight, no forced exit, no leaked capabilit
             releasing = r;
           });
         },
-      };
+      });
 
       const first = app.stop();
       const second = app.stop();
@@ -3265,12 +3273,12 @@ describe("shutdown ownership: single-flight, no forced exit, no leaked capabilit
         new ChannelRegistry("c1", "g1", registryFile)
       );
       let releases = 0;
-      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+      useObservableLock(app, {
         path: "(test)",
         async release(): Promise<void> {
           releases++;
         },
-      };
+      });
       process.exitCode = undefined;
 
       const onSignal = (app as unknown as {
@@ -3305,12 +3313,12 @@ describe("shutdown ownership: single-flight, no forced exit, no leaked capabilit
         store,
         new ChannelRegistry("c1", "g1", registryFile)
       );
-      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+      useObservableLock(app, {
         path: "(test)",
         release: async () => {
           throw new Error("lock file vanished");
         },
-      };
+      });
       // `lock.release()` is already `.catch()`ed inside stop(); force the failure
       // through a path that is not, so the signal handler's error branch is real.
       (app as unknown as { clearAccessRetryTimer(): void }).clearAccessRetryTimer = () => {

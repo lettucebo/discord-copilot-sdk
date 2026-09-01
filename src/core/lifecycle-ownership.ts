@@ -101,8 +101,13 @@ export interface LifecycleOwnership {
    * `false` when shutdown has already begun — in which case the cleanup is taken
    * on as an obligation and attempted, and the caller must abort construction
    * rather than hand over a resource nobody will tear down.
+   *
+   * The teardown receives a `TeardownScope` because tearing down is exactly when
+   * a process discovers what it still owes: a runtime it could not confirm
+   * stopped is found HERE, and has to be recorded as an obligation rather than
+   * logged and forgotten.
    */
-  arm(teardown: () => Promise<void>): boolean;
+  arm(teardown: (scope: TeardownScope) => Promise<void>): boolean;
   /**
    * Run `body` as the owner of `threadId`. The scope is published SYNCHRONOUSLY,
    * before `body` is called, so a teardown that starts a moment later can see it.
@@ -186,7 +191,7 @@ export interface OwnershipInspector {
 
 class Ownership implements LifecycleOwnership {
   private state: "running" | "shutting-down" = "running";
-  private armed?: () => Promise<void>;
+  private armed?: (scope: TeardownScope) => Promise<void>;
   private readonly exclusive = new Map<string, Set<ExclusiveEntry>>();
   private readonly teardownClaims = new Map<string, number>();
   private readonly obligations = new Map<string, ObligationEntry>();
@@ -212,7 +217,7 @@ class Ownership implements LifecycleOwnership {
 
   // ------------------------------------------------------------------ arm --
 
-  arm(teardown: () => Promise<void>): boolean {
+  arm(teardown: (scope: TeardownScope) => Promise<void>): boolean {
     if (this.state === "running") {
       this.armed = teardown;
       return true;
@@ -224,12 +229,20 @@ class Ownership implements LifecycleOwnership {
     const handle = this.retain(key, {
       describe: () => "a resource armed after shutdown began",
       attempt: async () => {
-        await teardown();
+        await teardown(this.teardownScope());
         return true;
       },
     });
     void handle.attempt();
     return false;
+  }
+
+  private teardownScope(): TeardownScope {
+    return {
+      joinExclusive: (id) => this.joinExclusive(id),
+      retain: (key, obligation) => this.retain(key, obligation),
+      obligation: (key) => this.obligations.get(key)?.handle,
+    };
   }
 
   // -------------------------------------------------------- exclusive work --
@@ -392,15 +405,23 @@ class Ownership implements LifecycleOwnership {
     }
     const teardown = this.armed;
     this.armed = undefined;
+    let teardownError: unknown;
     if (teardown) {
       try {
-        await teardown();
+        await teardown(this.teardownScope());
       } catch (err) {
+        // Logged, and the release conclusion is still drawn below — a teardown
+        // that failed half-way must not strand the lock decision. But it is
+        // RETHROWN afterwards: a caller that asked this process to stop is
+        // entitled to know it did not fully manage to, and the signal handler
+        // turns that into a non-zero exit rather than a quiet success.
+        teardownError = err;
         this.log(`ownership: armed teardown failed (${err instanceof Error ? err.message : String(err)})`);
       }
     }
     this.teardownComplete = true;
     await this.evaluate();
+    if (teardownError !== undefined) throw teardownError;
   }
 
   /** Called after EVERY transition. No countdown, no snapshot: the question is
