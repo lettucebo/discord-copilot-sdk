@@ -442,3 +442,75 @@ describe("lifecycle ownership — the release conclusion", () => {
     expect(src).toMatch(/setTimeout\(fn, ms\);\s*(?:\/\/[^\n]*\n\s*)*[\s\S]{0,400}?unref\?\.\(\)/);
   });
 });
+
+describe("an attempt that discharges its own handle", () => {
+  /** The real shape this comes from: a detached rebind incarnation whose
+   *  RUNTIME is confirmed stopped — which is what ends its claim on the process
+   *  lock — while its worktree was kept because it was dirty. The app's
+   *  teardown identity-discharges the handle on `confirmed`, and its bounded
+   *  attempt then reports `confirmed && cleaned`, i.e. `false`. */
+  function selfDischarging(): {
+    obligation: CleanupObligation;
+    bind(discharge: () => void): void;
+  } {
+    let discharge: () => void = () => {};
+    return {
+      obligation: {
+        describe: () => "a detached incarnation whose tree was kept dirty",
+        attempt: async () => {
+          discharge();
+          return false; // the cleanup did not fully complete…
+        },
+      },
+      bind: (d) => {
+        discharge = d;
+      },
+    };
+  }
+
+  it("reports the SET, not the body's return value", async () => {
+    const { ownership, inspect } = build();
+    const self = selfDischarging();
+
+    await ownership.runTeardown("t1", async (scope) => {
+      const handle = scope.retain("k", self.obligation);
+      self.bind(() => handle.discharge());
+      // …but the obligation is gone, so nothing is owed and `attempt` must not
+      // claim otherwise. A caller that gates on this — `/end`'s barrier check —
+      // would otherwise refuse for a runtime already proved stopped.
+      await expect(handle.attempt()).resolves.toBe(true);
+      expect(handle.retained).toBe(false);
+    });
+
+    expect(inspect.obligationKeys()).toEqual([]);
+  });
+
+  it("logs no false retention at shutdown, and releases the lock", async () => {
+    const { ownership, inspect, releases, messages } = build();
+    const self = selfDischarging();
+
+    await ownership.runTeardown("t1", async (scope) => {
+      const handle = scope.retain("k", self.obligation);
+      self.bind(() => handle.discharge());
+    });
+    await ownership.shutdown();
+
+    expect(messages.filter((m) => /could not be discharged/.test(m))).toEqual([]);
+    expect(inspect.obligationKeys()).toEqual([]);
+    expect(releases()).toBe(1);
+  });
+
+  it("still logs, and still holds, when the obligation is genuinely retained", async () => {
+    // The other half: a body that returns false WITHOUT discharging is exactly
+    // the case the message is for.
+    const { ownership, releases, messages } = build();
+
+    await ownership.runTeardown("t1", async (scope) => {
+      scope.retain("k", obligation("a runtime nobody could confirm", async () => false));
+    });
+    await ownership.shutdown().catch(() => {});
+
+    expect(messages.some((m) => /could not be discharged; lock retained/.test(m))).toBe(true);
+    expect(releases()).toBe(0);
+  });
+});

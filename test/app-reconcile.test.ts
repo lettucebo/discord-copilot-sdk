@@ -4437,10 +4437,13 @@ describe("/end answers exactly once, through the real reclaim path", () => {
           app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
         ).endStaleRecord(interaction, threadId);
 
-        // Deferred, answered exactly once, and answered by editing: a `reply`
+        // Deferred, answered exactly once, and answered by EDITING: a `reply`
         // here would have thrown before the branch's own work completed.
+        // `replied` is true after an edit (as in discord.js), so the honest
+        // signal is that `reply()` was never the method used.
         expect(interaction.deferred).toBe(true);
-        expect(interaction.replied).toBe(false);
+        expect(interaction.replyCalls).toBe(0);
+        expect(interaction.editCalls).toBe(1);
         expect(interaction.answers).toHaveLength(1);
         expect(interaction.answers[0]).toMatch(branch.expected);
       } finally {
@@ -4472,7 +4475,8 @@ describe("/end answers exactly once, through the real reclaim path", () => {
       ).endStaleRecord(interaction, "t-shut");
 
       expect(interaction.deferred).toBe(false);
-      expect(interaction.replied).toBe(true);
+      expect(interaction.replyCalls).toBe(1);
+      expect(interaction.editCalls).toBe(0);
       expect(interaction.answers[0]).toMatch(/關閉中/);
     } finally {
       rmSync(f, { force: true });

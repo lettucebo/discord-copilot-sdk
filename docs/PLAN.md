@@ -1106,6 +1106,8 @@ teardown claims、obligations **同時為空**才釋放，且只釋放一次。
 | `/end` 在 defer **之後**的每一個分支都必須用 `editReply` 回答（表格驅動）；唯一仍用 `reply` 的是 claim 被拒的關閉中分支 | `test/app-reconcile.test.ts` |
 | `CopilotClient.stop()` 是 `Promise<Error[]>`：**fulfil 非空陣列＝失敗**。兩個 armed teardown 都必須走同一個 `stopCopilotClient()`，回報錯誤時 lock 不得釋放；空陣列才算乾淨 | `test/sdk-env.test.ts`、`test/app-reconcile.test.ts`、`test/app-start-ownership.test.ts` |
 | 有界 disconnect 逾時後，底層 single-flight promise **晚點成功**仍必須 identity-discharge 該 obligation 並讓 lock 釋放；晚點**失敗**則什麼都不 discharge | `test/app-reconcile.test.ts` |
+| obligation attempt 的回傳值必須反映**集合狀態**而非 body 的回傳值：body 自行 identity-discharge（runtime 已確認、只是 worktree 髒而保留）後回 false，shutdown 不得謊報「lock retained」，lock 要真的釋放 | `test/lifecycle-ownership.test.ts`、`test/app-rebind.test.ts` |
+| `beginRebind` 的三種 acknowledgement 狀態各只有一種合法方法：未回應→`reply`、已 defer→`editReply`、`/repo clone` 已 defer+edit→`followUp` | `test/app-rebind.test.ts` |
 
 ### 19.7 抽取結果與仍未做的事
 

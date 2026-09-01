@@ -181,11 +181,13 @@ exported for exactly this reason. Fakes mirror probed real-runtime behaviour, qu
 `FakeSession.abort()` emits `session.idle` only when a turn was in flight. Subprocess-heavy suites
 raise the limit explicitly, e.g. `describe(..., { timeout: 60_000 }, …)` in `app-reclaim`,
 `setup-integration` and `worktree-git`. **Slash-command tests must use
-`test/support/strict-interaction.ts`**, never a hand-rolled interaction object: it throws
-`InteractionAlreadyReplied`/`InteractionNotReplied` exactly where discord.js does, and its
-acknowledgement methods are deliberately not overridable. A permissive local fake is how a
-`reply()` after `deferReply()` stayed green in the suite while aborting `/end` in production
-before it reclaimed anything.
+`test/support/strict-interaction.ts`**, never a hand-rolled interaction object: it models the
+discord.js acknowledgement state machine (including `editReply` setting `replied`, and
+`followUp` requiring a prior acknowledgement) and its acknowledgement methods are deliberately
+not overridable. A permissive local fake is how a `reply()` after `deferReply()` stayed green in
+the suite while aborting `/end` in production before it reclaimed anything. Assert on
+`replyCalls`/`editCalls`/`followUpCalls` rather than the flags — after an edit, `replied` is
+legitimately true.
 
 **Shipped scripts are covered by tests, and encodings matter.** `test/shipped-scripts.test.ts`
 asserts every user-facing `.ps1` starts with a UTF-8 BOM (Windows PowerShell 5.1 otherwise

@@ -60,7 +60,16 @@ export interface ObligationHandle {
   readonly key: string;
   /** Still the live registration for its key? */
   readonly retained: boolean;
-  /** Bounded attempt; `true` once discharged (and removed). */
+  /**
+   * ONE bounded attempt. `true` means it is genuinely no longer owed and the
+   * payload may be dropped; `false` (or a rejection, or a hang) means it is
+   * still owed, and it keeps gating the release.
+   *
+   * Note the asymmetry with `CleanupObligation.attempt()`: a body may discharge
+   * its own handle — having proved the part that gates the LOCK — and still
+   * report `false` because some other part of its cleanup did not complete.
+   * What comes back here is whether the obligation is still registered.
+   */
   attempt(): Promise<boolean>;
   /** Drop it without attempting — for a caller that has already proved it gone. */
   discharge(): void;
@@ -415,7 +424,16 @@ class Ownership implements LifecycleOwnership {
         this.obligations.delete(entry.key);
         this.onTransition();
       }
-      return ok;
+      // The answer is the SET, not what the body returned — the same question
+      // the guard at the top of this method asks. A body may legitimately
+      // identity-discharge its own handle and still report `false`: a detached
+      // rebind incarnation whose RUNTIME is confirmed stopped no longer gates
+      // the process lock, even though its dirty worktree was kept and its
+      // cleanup therefore did not fully complete. Returning the body's `false`
+      // there made shutdown log "could not be discharged; lock retained" about
+      // an obligation that was gone, and made `/end`'s barrier check refuse for
+      // a runtime already proved stopped.
+      return this.obligations.get(entry.key) !== entry;
     })();
     entry.attempting = run;
     try {

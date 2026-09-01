@@ -20,7 +20,12 @@ import type { SecureOpenBackend } from "../src/core/secure-open.js";
 import { worktreePath } from "../src/core/worktree.js";
 import { worktreeRoot } from "../src/core/paths.js";
 import type { InstanceLock } from "../src/core/single-instance.js";
-import { strictInteraction, asCommandInteraction } from "./support/strict-interaction.js";
+import {
+  strictInteraction,
+  asCommandInteraction,
+  type StrictInteraction,
+  type StrictInteractionFields,
+} from "./support/strict-interaction.js";
 
 const run = promisify(execFile);
 
@@ -250,6 +255,21 @@ const applyRebind = (app: DiscordCopilotApp, target: { repoPath: string; devMode
       applyRebind(t: string, x: { repoPath: string; devMode: DevMode }): Promise<string>;
     }
   ).applyRebind("t1", target);
+const beginRebind = (
+  app: DiscordCopilotApp,
+  interaction: StrictInteraction & StrictInteractionFields,
+  want: { repoPath?: string; devMode?: DevMode },
+  opts: { alreadyReplied?: boolean } = {}
+): Promise<void> =>
+  (
+    app as unknown as {
+      beginRebind(
+        i: ChatInputCommandInteraction,
+        w: { repoPath?: string; devMode?: DevMode },
+        o: { alreadyReplied?: boolean }
+      ): Promise<void>;
+    }
+  ).beginRebind(asCommandInteraction(interaction), want, opts);
 const blocker = (
   app: DiscordCopilotApp,
   session: Session,
@@ -304,6 +324,18 @@ function inspectOwnership(app: DiscordCopilotApp): Inspector {
  *  to count releases is to hand that coordinator an observable lock. */
 function useObservableLock(app: DiscordCopilotApp, lock: InstanceLock): void {
   (app as unknown as { useOwnershipForTest(l: InstanceLock): void }).useOwnershipForTest(lock);
+}
+/** …and its log, for the shutdown messages that are supposed to be true. */
+function useObservableOwnership(
+  app: DiscordCopilotApp,
+  lock: InstanceLock,
+  log: (m: string) => void
+): void {
+  (
+    app as unknown as {
+      useOwnershipForTest(l: InstanceLock, o: { log(m: string): void }): void;
+    }
+  ).useOwnershipForTest(lock, { log });
 }
 const staleRebindKey = (b: { threadId: string; sessionId: string; generation: number }): string =>
   `stale-rebind:${b.threadId}:${b.sessionId}:${b.generation}`;
@@ -1849,5 +1881,111 @@ describe("applyRebind — the process lock", { timeout: 60_000 }, () => {
     await vi.waitFor(() => expect(releases).toBe(1));
 
     await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
+  });
+
+  it("says nothing about a retained lock when the runtime confirmed and only the tree was kept", async () => {
+    // The runtime stopping is what ends this incarnation's claim on the PROCESS
+    // lock; a worktree kept because it was dirty is durably recorded and is the
+    // operator's to reclaim. The app therefore discharges the obligation on
+    // `confirmed` while its bounded attempt still reports `confirmed && cleaned`
+    // — i.e. false. Reading that `false` as "still owed" made shutdown announce
+    // a retention that had not happened, about an obligation already gone.
+    const wtRoot = `${path.join(os.homedir(), ".discord-copilot-sdk")}-worktrees`;
+    const oldWt = path.join(wtRoot, `rebind-dirty-${Date.now()}`, "t1");
+    const branch = "copilot/t-t1";
+    await addWorktree(repoA, oldWt, branch);
+    try {
+      const { app, store, actor } = harness({ devMode: "worktree" });
+      const messages: string[] = [];
+      let releases = 0;
+      useObservableOwnership(
+        app,
+        {
+          path: "(test)",
+          release: async () => {
+            releases++;
+          },
+        },
+        (m) => messages.push(m)
+      );
+      const oldRecord = store.get("t1")!;
+      expect(store.restore({ ...oldRecord, workDir: oldWt, branch, devMode: "worktree" })).toBe(true);
+      const s = sessions(app).get("t1")!;
+      s.workDir = oldWt;
+      s.branch = branch;
+      // The rebind cannot confirm the old runtime, so it is retained and owed.
+      actor.disconnectFails = true;
+      await expect(applyRebind(app, { repoPath: repoB, devMode: "local" })).resolves.toMatch(
+        /無法確認舊的 runtime/
+      );
+      assertEveryRetainedRuntimeIsOwed(app);
+
+      // …and by shutdown the runtime answers, but the tree has work in it.
+      actor.disconnectFails = false;
+      fs.writeFileSync(path.join(oldWt, "unsaved.txt"), "work in progress");
+
+      await app.stop();
+
+      expect(messages.filter((m) => /could not be discharged/.test(m))).toEqual([]);
+      expect(fs.existsSync(oldWt)).toBe(true); // kept, exactly as promised
+      expect(releases).toBe(1); // …and the process lock genuinely goes
+    } finally {
+      fs.rmSync(path.dirname(oldWt), { recursive: true, force: true });
+    }
+  });
+});
+
+describe("beginRebind answers through whichever door is still open", () => {
+  /** `/repo` can reach `beginRebind` in three acknowledgement states, and each
+   *  has exactly one legal method. Getting it wrong throws
+   *  `InteractionAlreadyReplied`/`InteractionNotReplied` in production and used
+   *  to be invisible in tests. The no-session branch answers immediately, so it
+   *  exercises the door without any git work. */
+  const noSession = (app: DiscordCopilotApp): void => {
+    sessions(app).delete("t1");
+  };
+
+  it("replies when nothing has acknowledged yet", async () => {
+    const { app } = harness();
+    noSession(app);
+    const interaction = strictInteraction();
+
+    await beginRebind(app, interaction, { devMode: "worktree" });
+
+    expect(interaction.replyCalls).toBe(1);
+    expect(interaction.editCalls).toBe(0);
+    expect(interaction.followUpCalls).toBe(0);
+    expect(interaction.answers[0]).toMatch(/沒有進行中的 session/);
+  });
+
+  it("edits when the interaction was already deferred", async () => {
+    const { app } = harness();
+    noSession(app);
+    const interaction = strictInteraction();
+    await interaction.deferReply();
+
+    await beginRebind(app, interaction, { devMode: "worktree" });
+
+    expect(interaction.replyCalls).toBe(0);
+    expect(interaction.editCalls).toBe(1);
+    expect(interaction.followUpCalls).toBe(0);
+  });
+
+  it("follows up when /repo clone has already deferred AND edited", async () => {
+    // This is the `alreadyReplied` path. The interaction is fully answered, so
+    // `reply` and a second `editReply` would both be wrong: a follow-up is the
+    // only way to add the rebind confirmation to the same interaction.
+    const { app } = harness();
+    noSession(app);
+    const interaction = strictInteraction();
+    await interaction.deferReply();
+    await interaction.editReply({ content: "cloned" });
+
+    await beginRebind(app, interaction, { devMode: "worktree" }, { alreadyReplied: true });
+
+    expect(interaction.replyCalls).toBe(0);
+    expect(interaction.editCalls).toBe(1); // just the clone's own answer
+    expect(interaction.followUpCalls).toBe(1);
+    expect(interaction.answers[1]).toMatch(/沒有進行中的 session/);
   });
 });
