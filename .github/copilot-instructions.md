@@ -119,8 +119,18 @@ flowchart LR
 `import { X } from "../src/core/broker.js"`) and `.mjs` when a test imports an installer lib.
 `strict` and `noUncheckedIndexedAccess` are on.
 
-**Fail-closed is the house rule.** For a newly presented approval card: unsupported permission
-kinds deny; timeouts and aborts resolve to deny/cancel; `ask_user` throws rather than fabricating
+**Every MUTATING inbound operation is owned work.** The phase gate at the top of `onInteraction`
+is synchronous — it only says shutdown had not begun when the event arrived — so each mutating
+handler runs inside `ownership.runExclusive(inboundOperationKey(kind, id), …)` at the dispatch
+seam and takes a **required** `OwnedScope`, checked with `scope.lostReason()` after its awaits.
+The key is per OPERATION (interaction/message id), never per thread: a thread key would serialize
+commands that run concurrently today and would be declined by an `/end` teardown claim.
+`/end` and rebind are deliberately NOT wrapped — they are teardowns, already claim their thread
+through `runTeardown`, and an exclusive scope around them would deadlock their own
+`joinExclusive`. Read-only commands (`/sessions`, `/diff`, `/todos`, `/usage`, autocomplete) take
+no scope, because there is nothing for the lock to wait for.
+
+**Fail-closed is the house rule.** For a newly presented approval card: unsupported permissionkinds deny; timeouts and aborts resolve to deny/cancel; `ask_user` throws rather than fabricating
 an answer; a summary that is too long or contains bidi/control characters is auto-denied rather
 than shown partially; and the approval reaches the SDK only *after* Discord acknowledges the click
 (`resolveButtonAck`) and only when the click came from the owning thread (`decisionBindsToChannel`

@@ -388,6 +388,28 @@ const runtimeObligationKey = (threadId: string): string => `runtime:${threadId}`
  *  exclusive scope, it gates the release structurally rather than by checking. */
 const PROCESS_STARTUP_KEY = "<process-startup>";
 
+/**
+ * Key for ONE inbound operation.
+ *
+ * Deliberately NOT the thread id. `runExclusive` is used here for OWNERSHIP,
+ * not mutual exclusion: two commands in one thread are independent operations
+ * today, so keying them by thread would silently serialize them, and would make
+ * an `/end` teardown claim decline unrelated commands in the same thread. A
+ * Discord interaction or message id is unique per operation, so the concurrency
+ * semantics are exactly what they were — the difference is only that the
+ * single-instance lock now waits for the operation to settle or roll back.
+ *
+ * `/end` and rebind are NOT wrapped: they are teardowns and already run under
+ * `runTeardown`, which claims the thread. Wrapping them here as well would nest
+ * an exclusive scope inside their own claim and deadlock the join.
+ */
+const inboundOperationKey = (kind: string, id: string): string => `inbound:${kind}:${id}`;
+
+/** What a declined inbound operation says. Shutdown had already begun before
+ *  the handler ran, so nothing was done and nothing was half-done. */
+const INBOUND_DECLINED =
+  "⚠️ bot 正在關閉中，這次沒有執行。請等它重新啟動後再試。";
+
 /** Where a detached rebind incarnation is recorded. Keyed by its DURABLE
  *  identity, not by thread: one thread can legitimately have two of them, and
  *  first-wins must not drop the older unproven one. */
@@ -1142,7 +1164,7 @@ export class DiscordCopilotApp {
    *  than leaving a logged-in bot with no usable commands. */
   private async login(): Promise<void> {
     this.discord.on(Events.InteractionCreate, (i) => void this.onInteraction(i));
-    this.discord.on(Events.MessageCreate, (m) => void this.onMessage(m));
+    this.discord.on(Events.MessageCreate, (m) => void this.runOwnedMessage(m));
     this.installSignalHandlers();
     await new Promise<void>((resolve, reject) => {
       this.discord.once(Events.ClientReady, (c) => {
@@ -1476,6 +1498,40 @@ export class DiscordCopilotApp {
 
   // ---- input surface: interactions (slash + buttons) --------------------
 
+  /**
+   * Run one MUTATING inbound operation as owned work.
+   *
+   * The phase gate is a synchronous check at the top of `onInteraction`; it says
+   * only that shutdown had not begun when the event arrived. Everything after it
+   * is awaits — a channel fetch, a `git worktree add`, an SDK create, a store
+   * write — and a signal landing in any of those gaps used to let the
+   * coordinator conclude that nothing was in flight and release the
+   * single-instance lock while a `/new` was still creating a worktree.
+   *
+   * Holding a scope makes the release wait for this operation to settle or roll
+   * back, and gives the handler a `lostReason()` to check after each await so it
+   * stops rather than finishing into a process that is going away. A decline is
+   * synchronous and happens before the body's first instruction, so the
+   * interaction is definitely unacknowledged and `reply()` is the right answer.
+   *
+   * Read-only handlers (`/sessions`, `/diff`, `/todos`, `/usage`, autocomplete)
+   * deliberately do NOT go through this: they mutate nothing, so there is
+   * nothing for the lock to wait for.
+   */
+  private async runOwnedCommand(
+    interaction: ChatInputCommandInteraction | ButtonInteraction,
+    body: (scope: OwnedScope) => Promise<void>
+  ): Promise<void> {
+    const kind = interaction.isButton() ? "button" : "command";
+    const outcome = await this.ownership.runExclusive(
+      inboundOperationKey(kind, interaction.id),
+      body
+    );
+    if (!outcome.ran) {
+      await interaction.reply(ephemeralReply(INBOUND_DECLINED)).catch(() => {});
+    }
+  }
+
   private async onInteraction(interaction: Interaction): Promise<void> {
     try {
       // Autocomplete is handled BEFORE the phase gate's repliable path: an
@@ -1523,35 +1579,42 @@ export class DiscordCopilotApp {
         return;
       }
       if (interaction.isButton()) {
-        await this.onButton(interaction);
+        await this.runOwnedCommand(interaction, (scope) => this.onButton(interaction, scope));
         return;
       }
       if (interaction.isChatInputCommand()) {
         const c = interaction.commandName;
-        if (c === "new") await this.cmdNew(interaction);
-        else if (c === "stop") await this.cmdStop(interaction);
-        else if (c === "model" || c === "effort" || c === "context") await this.cmdReconfigure(interaction);
+        const owned = (body: (scope: OwnedScope) => Promise<void>): Promise<void> =>
+          this.runOwnedCommand(interaction, body);
+        // MUTATING commands run as owned work; read-only ones do not. `/end` is
+        // absent from the owned list on purpose: it is a teardown and claims its
+        // thread through `runTeardown`, and an exclusive scope around it would
+        // deadlock against its own join.
+        if (c === "new") await owned((s) => this.cmdNew(interaction, s));
+        else if (c === "stop") await owned((s) => this.cmdStop(interaction, s));
+        else if (c === "model" || c === "effort" || c === "context")
+          await owned((s) => this.cmdReconfigure(interaction, s));
         else if (c === "usage") await this.cmdUsage(interaction);
-        else if (c === "approvals") await this.cmdApprovals(interaction);
+        else if (c === "approvals") await owned((s) => this.cmdApprovals(interaction, s));
         else if (c === "diff") await this.cmdDiff(interaction);
-        else if (c === "file") await this.cmdFile(interaction);
+        else if (c === "file") await owned((s) => this.cmdFile(interaction, s));
         else if (c === "todos") await this.cmdTodos(interaction);
-        else if (c === "yolo") await this.cmdYolo(interaction);
-        else if (c === "rename") await this.cmdRename(interaction);
-        else if (c === "queue") await this.cmdQueue(interaction);
+        else if (c === "yolo") await owned((s) => this.cmdYolo(interaction, s));
+        else if (c === "rename") await owned((s) => this.cmdRename(interaction, s));
+        else if (c === "queue") await owned((s) => this.cmdQueue(interaction, s));
         else if (c === "end") await this.cmdEnd(interaction);
         else if (c === "sessions") await this.cmdSessions(interaction);
-        else if (c === "repo") await this.cmdRepo(interaction);
+        else if (c === "repo") await owned((s) => this.cmdRepo(interaction, s));
         // `/channel` is the ONLY command gated on `isOwner` instead of
         // `isAuthorized` — see cmdChannel.
-        else if (c === "channel") await this.cmdChannel(interaction);
+        else if (c === "channel") await owned((s) => this.cmdChannel(interaction, s));
       }
     } catch (err) {
       console.error("interaction error:", err);
     }
   }
 
-  private async onButton(interaction: ButtonInteraction): Promise<void> {
+  private async onButton(interaction: ButtonInteraction, scope: OwnedScope): Promise<void> {
     const perm = decodePermissionId(interaction.customId);
     const choice = perm ? undefined : decodeChoiceId(interaction.customId);
     const plan = perm || choice ? undefined : decodePlanId(interaction.customId);
@@ -1602,6 +1665,14 @@ export class DiscordCopilotApp {
       await resolveButtonAck(
         () => interaction.update({ components: [] }),
         (d) => {
+          // The ack is a network round trip and shutdown can land inside it.
+          // Delivering the operator's Allow then would hand the SDK a shell
+          // command to start while teardown is walking the sessions — so the
+          // same safe default an ack failure produces applies here.
+          if (scope.lostReason()) {
+            this.transport.deliverDecision(perm.nonce, "deny", uid);
+            return;
+          }
           const widens = d === "session" || d === "always";
           const revoked = this.approvals.revocationEpoch() !== epochAtClick;
           if (widens && revoked) {
@@ -1627,19 +1698,23 @@ export class DiscordCopilotApp {
     } catch {
       acked = false;
     }
+    // Losing ownership across the ack has the same answer as a failed ack: the
+    // SAFE default. A choice is left pending and times out to it; a plan is
+    // rejected; a rebind is cancelled. None of them may start new work here.
+    const settleable = acked && !scope.lostReason();
     if (choice) {
       // ack failure ⇒ leave the ask pending; it times out to the safe default.
-      if (acked) this.transport.deliverChoice(choice.nonce, choice.index, uid);
+      if (settleable) this.transport.deliverChoice(choice.nonce, choice.index, uid);
     } else if (plan) {
       // ack failure ⇒ safe default is reject.
-      this.transport.deliverPlan(plan.nonce, acked ? plan.action : "reject", uid);
+      this.transport.deliverPlan(plan.nonce, settleable ? plan.action : "reject", uid);
     } else if (repo) {
       // Same ack-before-act rule as every other card: an unacknowledged click
       // must not discard a conversation. Settling on the OWNING session's broker
       // (`decisionBindsToChannel` above already proved the click came from it)
       // keeps the exactly-once and generation guarantees.
       const owner = this.sessions.get(interaction.channelId);
-      owner?.broker.settle<RebindAction>(repo.nonce, acked ? repo.action : "cancel");
+      owner?.broker.settle<RebindAction>(repo.nonce, settleable ? repo.action : "cancel");
     }
   }
 
@@ -1655,7 +1730,7 @@ export class DiscordCopilotApp {
     return undefined;
   }
 
-  private async cmdNew(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async cmdNew(interaction: ChatInputCommandInteraction, scope: OwnedScope): Promise<void> {
     if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
       await this.refuseUnauthorized(interaction);
       return;
@@ -1721,7 +1796,18 @@ export class DiscordCopilotApp {
       // `/new` here, then falsely tell the operator THIS channel was disabled.
       // The authorization question is only whether THIS parent is enabled now.
       const stillEnabled = (): boolean => this.channels.has(parentChannelId);
+      // The same question about the PROCESS rather than the channel, asked at
+      // the same points. `/new` builds a Discord thread, a git worktree, a root
+      // capability, an SDK session and a durable record, and a signal can land
+      // in any of those gaps: without this it would finish building all of it
+      // into a process that is going away, leaving a thread, a checkout and a
+      // `creating` row nobody is left to reconcile.
+      const lost = (): string | undefined => scope.lostReason();
       const parentResult = await fetchChannelSafe(this.discord, parentChannelId);
+      if (lost()) {
+        await interaction.editReply(INBOUND_DECLINED);
+        return;
+      }
       if (parentResult.kind !== "ok") {
         const reason =
           parentResult.kind === "gone"
@@ -1775,6 +1861,12 @@ export class DiscordCopilotApp {
       const dropThread = async (): Promise<void> => {
         await (thread as unknown as { delete?: () => Promise<unknown> }).delete?.().catch(() => {});
       };
+      // The thread exists now, so from here losing ownership must undo it.
+      if (lost()) {
+        await dropThread();
+        await interaction.editReply(INBOUND_DECLINED);
+        return;
+      }
       // Reserve-before-create (P2): durably record a `creating` row with a
       // caller-assigned session id BEFORE calling createSession, so a crash
       // between the two leaves an identifiable id on disk rather than a live
@@ -1817,6 +1909,13 @@ export class DiscordCopilotApp {
         await dropThread();
         await interaction.editReply(msg);
       };
+      // A checkout on disk is the most expensive thing this command creates and
+      // the one a shutdown most easily orphans: nothing else can reach it, since
+      // `/end` only works on a LIVE session. `abort` is the existing rollback.
+      if (lost()) {
+        await abort(INBOUND_DECLINED);
+        return;
+      }
 
       // On Windows capture first, then prove the handle-bound validation path.
       // POSIX starts a normal session without a root capability because the SDK
@@ -1853,6 +1952,15 @@ export class DiscordCopilotApp {
       if (!stillEnabled()) {
         await trustedRoot?.close().catch(() => {});
         await abort(`⚠️ <#${parentChannelId}> 在這期間被停用了，已回復（討論串與 worktree 都已移除）。`);
+        return;
+      }
+      // …and the same question about the process, at the same point and with the
+      // same rollback. The capture is a real OS handle on Windows; dropping the
+      // reference without closing it would keep the root fenced for the rest of
+      // the process's life.
+      if (lost()) {
+        await trustedRoot?.close().catch(() => {});
+        await abort(INBOUND_DECLINED);
         return;
       }
 
@@ -1912,6 +2020,38 @@ export class DiscordCopilotApp {
         await interaction.editReply(
           `⚠️ 建立 session 失敗（${err instanceof Error ? err.message : String(err)}）。請重試 /new。`
         );
+        return;
+      }
+      // Ownership can be lost between the reservation and the runtime, so ask
+      // once more before promoting anything to `active`. The runtime EXISTS by
+      // now, so this cannot simply return: an unconfirmable disconnect must
+      // become an obligation, exactly as it does everywhere else, or the lock
+      // would be released over a checkout an SDK session may still be in.
+      if (lost()) {
+        let disconnected = false;
+        try {
+          await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS);
+          disconnected = true;
+        } catch {
+          disconnected = false;
+        }
+        if (disconnected) {
+          // Nothing durable was promoted, the runtime is proved gone, and the
+          // reservation stays `creating` — fail-closed, reconciled on the next
+          // boot. Keep the worktree with it for the same reason the create
+          // failure above does: the row is the operator's only evidence.
+          await dropThread();
+          await interaction.editReply(INBOUND_DECLINED);
+        } else {
+          const handle = scope.retain(runtimeObligationKey(thread.id), {
+            describe: () => `a half-created session runtime for ${thread.id} over ${workDir}`,
+            attempt: () => confirmStopped(actor.disconnect(), TEARDOWN_TIMEOUT_MS, () => handle),
+          });
+          void handle;
+          await interaction.editReply(
+            "⚠️ bot 正在關閉中，而且無法確認剛建立的 runtime 已關閉。記錄與 worktree 都已保留——請重啟 bot。"
+          );
+        }
         return;
       }
       // Promote creating→active. A failed commit means the record isn't durable,
@@ -2517,7 +2657,7 @@ export class DiscordCopilotApp {
    * the very channel the operator is standing in — hence the `channel:` option,
    * which also lets a DELETED channel be removed by id.
    */
-  private async cmdChannel(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async cmdChannel(interaction: ChatInputCommandInteraction, scope: OwnedScope): Promise<void> {
     if (!isOwner(ctxOf(interaction), this.policyNow())) {
       await interaction.reply({ content: "Not authorized.", ...EPHEMERAL });
       return;
@@ -2539,8 +2679,8 @@ export class DiscordCopilotApp {
       return;
     }
     const target = explicit ?? interaction.channelId;
-    if (sub === "enable") await this.channelEnable(interaction, target);
-    else if (sub === "disable") await this.channelDisable(interaction, target);
+    if (sub === "enable") await this.channelEnable(interaction, target, scope);
+    else if (sub === "disable") await this.channelDisable(interaction, target, scope);
   }
 
   private async channelList(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -2615,7 +2755,8 @@ export class DiscordCopilotApp {
    */
   private async channelEnable(
     interaction: ChatInputCommandInteraction,
-    target: string
+    target: string,
+    scope: OwnedScope
   ): Promise<void> {
     await interaction.deferReply({ ...EPHEMERAL });
     if (this.channels.has(target)) {
@@ -2640,6 +2781,14 @@ export class DiscordCopilotApp {
     // for a DIFFERENT target is irrelevant. The former is reported by
     // `ChannelRegistry.enable()` as success, and the latter must not make this
     // operator retry a request whose target is still disabled.
+    // IMMEDIATELY before the durable write, not on a snapshot taken above it:
+    // the permission audit and two ditReply round trips sit between, and a
+    // registry written by a process that is going away would widen the
+    // authorized set with nobody left to answer in it.
+    if (scope.lostReason()) {
+      await interaction.editReply(INBOUND_DECLINED).catch(() => {});
+      return;
+    }
     const ok = this.channels.enable(target, interaction.user.id);
     await interaction
       .editReply(
@@ -2663,7 +2812,8 @@ export class DiscordCopilotApp {
    */
   private async channelDisable(
     interaction: ChatInputCommandInteraction,
-    target: string
+    target: string,
+    scope: OwnedScope
   ): Promise<void> {
     if (!this.channels.has(target)) {
       await interaction.reply({
@@ -2684,6 +2834,12 @@ export class DiscordCopilotApp {
           (held.length > 10 ? `\n…另有 ${held.length - 10} 個（用 \`/sessions\` 查看）。` : ""),
         ...EPHEMERAL,
       });
+      return;
+    }
+    // Same, for the narrowing direction. channelHolders walked the live map
+    // and the store above; a shutdown since then means this answer is stale.
+    if (scope.lostReason()) {
+      await interaction.reply(ephemeralReply(INBOUND_DECLINED)).catch(() => {});
       return;
     }
     const ok = this.channels.disable(target);
@@ -2796,7 +2952,7 @@ export class DiscordCopilotApp {
     await respond(names.map((n) => ({ name: n.slice(0, 100), value: n.slice(0, 100) })));
   }
 
-  private async cmdRepo(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async cmdRepo(interaction: ChatInputCommandInteraction, scope: OwnedScope): Promise<void> {
     if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
       await this.refuseUnauthorized(interaction);
       return;
@@ -2851,7 +3007,7 @@ export class DiscordCopilotApp {
       return;
     }
     if (sub === "clone" || sub === "new") {
-      await this.cmdProvision(interaction, sub);
+      await this.cmdProvision(interaction, sub, scope);
       return;
     }
     // sub === "dev"
@@ -2871,7 +3027,8 @@ export class DiscordCopilotApp {
    */
   private async cmdProvision(
     interaction: ChatInputCommandInteraction,
-    kind: "clone" | "new"
+    kind: "clone" | "new",
+    scope: OwnedScope
   ): Promise<void> {
     const threadId = interaction.channelId;
     if (this.provisioning.has(threadId)) {
@@ -2898,6 +3055,15 @@ export class DiscordCopilotApp {
         );
       }
       const made = `✅ 已建立 \`${result.name}\`\n📂 \`${result.path}\``;
+      // A clone can take MINUTES. The repo on disk is harmless and stays, but
+      // entering a rebind now would build an SDK session and a worktree into a
+      // process that is going away — and `beginRebind`'s own `runTeardown` would
+      // decline anyway, leaving the operator a confirmation card that does
+      // nothing when clicked.
+      if (scope.lostReason()) {
+        await interaction.editReply({ content: `${made}\n${INBOUND_DECLINED}`, ...NO_MENTIONS });
+        return;
+      }
       // Bind it if this thread has a session; otherwise the repo simply exists
       // and `/new repo:<name>` can pick it up.
       if (!this.sessions.has(threadId)) {
@@ -5081,7 +5247,7 @@ export class DiscordCopilotApp {
     return "valid";
   }
 
-  private async cmdStop(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async cmdStop(interaction: ChatInputCommandInteraction, scope: OwnedScope): Promise<void> {
     if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
       await this.refuseUnauthorized(interaction);
       return;
@@ -5108,6 +5274,13 @@ export class DiscordCopilotApp {
     const dropped = session.queue.length;
     session.queue = [];
     const ok = await this.stopSession(session);
+    // `stopSession` is a JSON-RPC round trip. Shutdown may have begun inside it,
+    // and shutdown aborts every session anyway — but the answer must not claim
+    // a turn was stopped for a session this process no longer owns.
+    if (scope.lostReason()) {
+      await interaction.editReply({ content: INBOUND_DECLINED }).catch(() => {});
+      return;
+    }
     const tail = dropped ? ` 已同時丟棄佇列中的 ${dropped} 則。` : "";
     await interaction.editReply({
       content:
@@ -5125,7 +5298,7 @@ export class DiscordCopilotApp {
   }
 
   /** /model, /effort, /context — reconfigure the current thread's session. */
-  private async cmdReconfigure(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async cmdReconfigure(interaction: ChatInputCommandInteraction, scope: OwnedScope): Promise<void> {
     if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
       await this.refuseUnauthorized(interaction);
       return;
@@ -5165,6 +5338,14 @@ export class DiscordCopilotApp {
       change.context = interaction.options.getString("tier", true) as "default" | "long_context";
     }
     await interaction.deferReply({ ...EPHEMERAL });
+    // The deferral is a round trip, and `reconfigure` below is an RPC that
+    // changes the runtime's model/effort. Neither is worth doing into a process
+    // that is going away, and the answer must not claim a change that will be
+    // torn down a moment later.
+    if (scope.lostReason()) {
+      await interaction.editReply(INBOUND_DECLINED).catch(() => {});
+      return;
+    }
     try {
       await session.actor.reconfigure(change);
       const c = session.actor.config();
@@ -5215,7 +5396,7 @@ export class DiscordCopilotApp {
    *  turning YOLO **on** happens only AFTER Discord has acknowledged the reply,
    *  so a failed reply can never leave the session silently unguarded. Turning
    *  it **off** happens FIRST, because a failure there must still be safe. */
-  private async cmdYolo(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async cmdYolo(interaction: ChatInputCommandInteraction, scope: OwnedScope): Promise<void> {
     if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
       await this.refuseUnauthorized(interaction);
       return;
@@ -5247,6 +5428,13 @@ export class DiscordCopilotApp {
       // Only announce when the enable actually took effect (a concurrent
       // `/yolo off` may have superseded it).
       if (enabled) {
+        // The ack was a round trip. Enabling YOLO removes the last card gate on
+        // this session's permissions, so a shutdown in that window must undo it
+        // rather than leave the session wide open while teardown runs.
+        if (scope.lostReason()) {
+          session.actor.setYolo(false);
+          return;
+        }
         await this.transport
           .notice(
             interaction.channelId,
@@ -5259,7 +5447,7 @@ export class DiscordCopilotApp {
     });
   }
 
-  private async cmdApprovals(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async cmdApprovals(interaction: ChatInputCommandInteraction, scope: OwnedScope): Promise<void> {
     if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
       await this.refuseUnauthorized(interaction);
       return;
@@ -5268,16 +5456,24 @@ export class DiscordCopilotApp {
     // Act on every LIVE session, not just this channel — /approvals is usable
     // from the parent channel, where scoping to the channel silently skipped the
     // in-memory rules while still claiming they were revoked.
-    const scope = approvalScopeKeys(this.sessions.keys());
-    const sessionRules = [...new Set(scope.flatMap((k) => this.approvals.sessionApprovals(k)))];
+    const approvalKeys = approvalScopeKeys(this.sessions.keys());
+    const sessionRules = [...new Set(approvalKeys.flatMap((k) => this.approvals.sessionApprovals(k)))];
     // Show the CURRENT thread's repo rules when there is one, else everything.
     const here = this.sessions.get(interaction.channelId);
     const hereKey = here ? await this.displayApprovalKeyFor(here.repoPath) : undefined;
+    // `displayApprovalKeyFor` canonicalises a path on disk. Clearing approvals
+    // below writes `approvals.json`, and a durable revocation written by a
+    // process that is going away would be reported as done here while the reply
+    // never reaches the operator.
+    if (scope.lostReason()) {
+      await interaction.reply(ephemeralReply(INBOUND_DECLINED)).catch(() => {});
+      return;
+    }
     const repoRules = hereKey
       ? this.approvals.repoApprovals(hereKey)
       : [...new Set(this.approvals.repoKeys().flatMap((k) => this.approvals.repoApprovals(k)))];
     if (clear) {
-      for (const key of scope) this.approvals.clearSession(key);
+      for (const key of approvalKeys) this.approvals.clearSession(key);
       // ALL repos, not just the live ones. A rule survives in three places a
       // live-session sweep would miss: a `retry-pending` record that will resume
       // on the next boot, a blocked record that may yet be rebound, and a
@@ -5361,7 +5557,7 @@ export class DiscordCopilotApp {
     }
   }
 
-  private async cmdFile(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async cmdFile(interaction: ChatInputCommandInteraction, scope: OwnedScope): Promise<void> {
     if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
       await this.refuseUnauthorized(interaction);
       return;
@@ -5377,8 +5573,15 @@ export class DiscordCopilotApp {
       await interaction.editReply({ content: this.fileRefusalMessage("unavailable") });
       return;
     }
+    // The existing cancellation predicate, widened by one question. It is
+    // consulted after every await here AND handed to `transport.sendFile`, which
+    // re-asks it around the upload itself — so a shutdown mid-send retracts the
+    // attachment through the same path a rebind or `/end` does, rather than
+    // uploading into a thread this process is about to stop owning.
     const canSend = (): boolean =>
-      this.sessions.get(threadId) === session && session.actor.canDeliverFiles();
+      scope.lostReason() === undefined &&
+      this.sessions.get(threadId) === session &&
+      session.actor.canDeliverFiles();
     const requestedPath = interaction.options.getString("path", true);
     let resolved: Awaited<ReturnType<SessionActor["resolveFileForDelivery"]>>;
     try {
@@ -5461,7 +5664,7 @@ export class DiscordCopilotApp {
   }
 
   /** /rename — retitle the current session thread. */
-  private async cmdRename(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async cmdRename(interaction: ChatInputCommandInteraction, scope: OwnedScope): Promise<void> {
     if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
       await this.refuseUnauthorized(interaction);
       return;
@@ -5480,6 +5683,13 @@ export class DiscordCopilotApp {
     // noticeably longer than the 3s interaction token allows.
     await interaction.deferReply({ ...EPHEMERAL });
     const ok = await this.retitleThread(interaction.channelId, title);
+    // Discord already has the new name; the in-memory title fence below is the
+    // only part left, and setting it for a session that is being torn down would
+    // just be a write into a map that is about to be cleared.
+    if (scope.lostReason()) {
+      await interaction.editReply({ content: INBOUND_DECLINED }).catch(() => {});
+      return;
+    }
     // An explicit rename also counts as "titled" either way, so a later first
     // message can't silently overwrite what the operator just chose — and the
     // epoch bump invalidates a titler that is ALREADY in flight, which would
@@ -5502,7 +5712,7 @@ export class DiscordCopilotApp {
    * Volatile by design, like YOLO: a restart drops the queue rather than
    * resurrecting work the operator has long forgotten about.
    */
-  private async cmdQueue(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async cmdQueue(interaction: ChatInputCommandInteraction, scope: OwnedScope): Promise<void> {
     if (!isAuthorized(ctxOf(interaction), this.policyNow())) {
       await this.refuseUnauthorized(interaction);
       return;
@@ -5540,6 +5750,14 @@ export class DiscordCopilotApp {
       // Nothing to wait for — reply first (the interaction token is short), then
       // start it. drainQueue is the single place a queued item is consumed.
       await reply("▶️ 目前沒有在執行，直接開始這一則。");
+      // The reply is a round trip, and `drainQueue` starts a real SDK turn.
+      // Starting one now would be new agent work in a process that is going
+      // away; the queue is volatile by design, so dropping it is the honest
+      // outcome rather than leaving a turn nobody will see finish.
+      if (scope.lostReason()) {
+        session.queue = session.queue.filter((q) => q !== text);
+        return;
+      }
       void this.drainQueue(interaction.channelId).catch(() => {});
       return;
     }
@@ -5548,7 +5766,28 @@ export class DiscordCopilotApp {
 
   // ---- input surface: thread messages -----------------------------------
 
-  private async onMessage(message: Message): Promise<void> {
+  /**
+   * Run one inbound message as owned work.
+   *
+   * A message is the heaviest inbound operation there is: it downloads
+   * attachments, retitles the thread and runs a full SDK turn. All of that is
+   * awaits, and a signal in any gap used to let the coordinator conclude nothing
+   * was in flight. No decline notice: a message that arrives as the bot is
+   * stopping gets the same silence a message arriving one instant later does,
+   * and posting into a thread during teardown is exactly what shutdown is
+   * trying to stop.
+   */
+  private async runOwnedMessage(message: Message): Promise<void> {
+    const outcome = await this.ownership.runExclusive(
+      inboundOperationKey("message", message.id),
+      (scope) => this.onMessage(message, scope)
+    );
+    if (!outcome.ran) {
+      console.warn(`message ${message.id} was not handled — ${outcome.reason}`);
+    }
+  }
+
+  private async onMessage(message: Message, scope: OwnedScope): Promise<void> {
     if (message.author.bot) return;
     const session = this.sessions.get(message.channelId);
     if (!session) {
@@ -5588,6 +5827,15 @@ export class DiscordCopilotApp {
     }
     // Name the thread after its first real prompt, exactly once.
     this.startTitling(message.channelId, session, text);
+    // The last gate before real agent work. `tryConsumeFreeform` and the notices
+    // above are awaits, and starting an SDK turn (which downloads attachments
+    // first) into a process that is going away leaves a runtime mid-turn for
+    // shutdown to abort — the operator sees a prompt accepted and then nothing.
+    // The last gate before real agent work: starting an SDK turn (which
+    // downloads attachments first) into a process that is going away leaves a
+    // runtime mid-turn for shutdown to abort, and the operator sees a prompt
+    // accepted and then nothing.
+    if (scope.lostReason()) return;
     // Reserve the turn (via the running guard in runTurn) BEFORE any network I/O,
     // so image downloads serialize with message arrival and two quick image
     // messages can't reorder. The download happens inside runTurn.

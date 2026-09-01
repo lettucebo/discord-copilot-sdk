@@ -15,6 +15,8 @@ import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { removeWorktreeIfClean, worktreeBranch, worktreePath } from "../src/core/worktree.js";
 import { worktreeRoot } from "../src/core/paths.js";
 import type { SecureOpenBackend } from "../src/core/secure-open.js";
+import type { OwnedScope } from "../src/core/lifecycle-ownership.js";
+import { inOwnedScope } from "./support/owned-scope.js";
 
 const OWNER = "10000";
 const GUILD = "20000";
@@ -140,11 +142,16 @@ function config(reposRoot: string): Config {
 }
 
 function cmdNew(app: DiscordCopilotApp, interaction: ChatInputCommandInteraction): Promise<void> {
-  return (
-    app as unknown as {
-      cmdNew(i: ChatInputCommandInteraction): Promise<void>;
-    }
-  ).cmdNew(interaction);
+  // Through a REAL scope from the app's own coordinator: the handler now
+  // requires one, and a fabricated "never lost" scope would make every
+  // shutdown-race assertion in this area vacuous.
+  return inOwnedScope(app, (scope) =>
+    (
+      app as unknown as {
+        cmdNew(i: ChatInputCommandInteraction, s: OwnedScope): Promise<void>;
+      }
+    ).cmdNew(interaction, scope)
+  );
 }
 
 type DiscordForTest = {

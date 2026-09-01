@@ -1108,6 +1108,11 @@ teardown claims、obligations **同時為空**才釋放，且只釋放一次。
 | 有界 disconnect 逾時後，底層 single-flight promise **晚點成功**仍必須 identity-discharge 該 obligation 並讓 lock 釋放；晚點**失敗**則什麼都不 discharge | `test/app-reconcile.test.ts` |
 | obligation attempt 的回傳值必須反映**集合狀態**而非 body 的回傳值：body 自行 identity-discharge（runtime 已確認、只是 worktree 髒而保留）後回 false，shutdown 不得謊報「lock retained」，lock 要真的釋放 | `test/lifecycle-ownership.test.ts`、`test/app-rebind.test.ts` |
 | `beginRebind` 的三種 acknowledgement 狀態各只有一種合法方法：未回應→`reply`、已 defer→`editReply`、`/repo clone` 已 defer+edit→`followUp` | `test/app-rebind.test.ts` |
+| **每個會改變狀態的 inbound 操作都是 owned work**：`/new` 在 worktree 已存在時遇到 shutdown 必須整筆回滾（worktree 移除、討論串刪除、無 record、無 session），且 lock 要等回滾完成才釋放 | `test/app-inbound-ownership.test.ts` |
+| `/channel enable` 在 durable 寫入前遇到 shutdown ⇒ registry（記憶體與磁碟）都不得改變 | `test/app-inbound-ownership.test.ts` |
+| button 的 ack 期間遇到 shutdown ⇒ 交付**安全預設值**（deny／reject／cancel），不得交付操作者按下的擴權選項 | `test/app-inbound-ownership.test.ts` |
+| thread 訊息在啟動 SDK turn 之前遇到 shutdown ⇒ 不得開始新的 turn | `test/app-inbound-ownership.test.ts` |
+| 唯讀指令不需要 scope，且 coordinator 不得因此持有任何 exclusive；`/end`／rebind 不被包成 exclusive，與並行的 owned 操作不得死結 | `test/app-inbound-ownership.test.ts` |
 
 ### 19.7 抽取結果與仍未做的事
 
