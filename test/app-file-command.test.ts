@@ -8,7 +8,10 @@ import { DiscordCopilotApp, type Session } from "../src/app.js";
 import type { SessionActor } from "../src/copilot/session-actor.js";
 import type { Config } from "../src/config.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
-import { ChannelRegistry } from "../src/core/channel-registry.js";
+import {
+  appTestDependencies,
+  type AppTestDependencyOverrides,
+} from "./support/app-test-dependencies.js";
 import {
   MAX_DISCORD_UPLOAD_BYTES,
   type OutboundFile,
@@ -216,6 +219,11 @@ let root: string;
 let reposRoot: string;
 let storeFile: string;
 
+/** The dependency object `createForTest` requires, sourced from this suite's
+ *  per-test temporary root instead of the home directory of whoever runs it. */
+const appDependencies = (over: AppTestDependencyOverrides): ReturnType<typeof appTestDependencies> =>
+  appTestDependencies({ directory: root, parentChannelId: PARENT, guildId: GUILD }, over);
+
 beforeEach(() => {
   root = mkdtempSync(path.join(os.tmpdir(), "dcs-app-file-"));
   reposRoot = path.join(root, "repos");
@@ -235,8 +243,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       new FakeTransport(),
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const spy = vi
       .spyOn(app as unknown as { cmdFile(interaction: ChatInputCommandInteraction): Promise<void> }, "cmdFile")
@@ -253,8 +260,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       new FakeTransport(),
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const interaction = slash({ userId: "99999" });
 
@@ -271,8 +277,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       new FakeTransport(),
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const interaction = slash({ channelId: "55555", parentId: "66666", commandName: "channel" });
 
@@ -289,8 +294,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       new FakeTransport(),
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const interaction = slash({ channelId: "55555", parentId: "66666", commandName: "file" });
     const handler = vi
@@ -310,8 +314,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       new FakeTransport(),
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const interaction = slash();
     const handler = vi
@@ -331,8 +334,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
 
     await invokeInteraction(app, slash({ userId: OTHER }));
@@ -347,8 +349,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const interaction = slash();
 
@@ -366,8 +367,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const workDir = path.join(reposRoot, "repo");
     const outsideRoot = path.join(root, "outside");
@@ -393,8 +393,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const workDir = path.join(reposRoot, "repo");
     mkdirSync(path.join(workDir, "artifacts"), { recursive: true });
@@ -438,8 +437,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const workDir = path.join(reposRoot, "repo");
     const filePath = path.join(workDir, "report.txt");
@@ -490,8 +488,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const workDir = path.join(reposRoot, "repo");
     const filePath = path.join(workDir, "report.txt");
@@ -537,8 +534,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const workDir = path.join(reposRoot, "repo");
     const filePath = path.join(workDir, "report.txt");
@@ -587,8 +583,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const workDir = path.join(reposRoot, "repo");
     const filePath = path.join(workDir, "report.txt");
@@ -637,8 +632,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const workDir = path.join(reposRoot, "repo");
     mkdirSync(workDir, { recursive: true });
@@ -674,8 +668,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const workDir = path.join(reposRoot, "repo");
     mkdirSync(workDir, { recursive: true });
@@ -710,8 +703,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json"))
+      appDependencies({ store: new SessionStore(storeFile) })
     );
     const workDir = path.join(reposRoot, "repo");
     mkdirSync(workDir, { recursive: true });
@@ -746,9 +738,7 @@ describe("/file", () => {
       reposRoot,
       {} as CopilotClient,
       transport,
-      new SessionStore(storeFile),
-      new ChannelRegistry(PARENT, GUILD, path.join(root, "channels.json")),
-      { fileDeliveryPlatform: "linux" }
+      appDependencies({ store: new SessionStore(storeFile), fileDeliveryPlatform: "linux" })
     );
     const workDir = path.join(reposRoot, "repo");
     const filePath = path.join(workDir, "report.txt");

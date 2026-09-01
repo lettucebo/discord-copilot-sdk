@@ -603,6 +603,30 @@ export function yoloOnWarning(repoSkillsLoaded: boolean, fileDeliveryAvailable: 
 }
 
 /**
+ * Every collaborator `createForTest` would otherwise DEFAULT to a real
+ * home-backed one.
+ *
+ * These fields are required, and deliberately so. The defaults they replace all
+ * resolve through `os.homedir()`. A test that forgot one used to read — and in
+ * several cases create — the state of whoever ran the
+ * suite. Vitest now redirects `HOME`/`USERPROFILE` for the whole run, but that
+ * is one process-wide setting away from being removed or broken, and it fails
+ * open: nothing about it makes the omission visible. Making these required makes
+ * the omission a COMPILE error instead, which is the only form of the rule that
+ * cannot silently regress. Do not give any of them a default here.
+ */
+export interface DiscordCopilotAppTestDependencies {
+  /** Durable thread↔session records. Real default: `~/.discord-copilot-sdk`. */
+  store: SessionStore;
+  /** Enabled-channel registry. Real default: `~/.discord-copilot-sdk`. */
+  channels: ChannelRegistry;
+  /** Approval memory. Real default: `~/.discord-copilot-sdk/approvals.json`. */
+  approvals: ApprovalPolicy;
+  /** Not home-backed: the platform whose file-delivery rules apply. */
+  fileDeliveryPlatform?: NodeJS.Platform;
+}
+
+/**
  * App state-machine tests intentionally use synthetic workdirs. Their actors
  * need an opaque root capability to reach SDK wiring, but must never gain file
  * resolution: a candidate open is always rejected and no OS handle is held.
@@ -653,8 +677,12 @@ export class DiscordCopilotApp {
   private readonly allowedUserIds: ReadonlySet<string>;
   /** Durable set of channels the bot acts in (seed + `/channel enable`). */
   private readonly channels: ChannelRegistry;
-  /** Shared approval memory (session + persisted repo rules) across sessions. */
-  private readonly approvals = new ApprovalPolicy();
+  /** Shared approval memory (session + persisted repo rules) across sessions.
+   *  Assigned in the constructor rather than initialized here: the real default
+   *  loads (and creates the directory of) `~/.discord-copilot-sdk/approvals.json`
+   *  as a side effect of merely EXISTING, which is exactly what a test that only
+   *  builds an app must not do. */
+  private readonly approvals: ApprovalPolicy;
   private modelIds: string[] = [];
   private readonly modelEfforts = new Map<string, string[]>();
   private shuttingDown = false;
@@ -780,8 +808,7 @@ export class DiscordCopilotApp {
     private readonly copilot: CopilotClient,
     private ownership: LifecycleOwnership,
     transportOverride?: Transport,
-    storeOverride?: SessionStore,
-    channelsOverride?: ChannelRegistry
+    testDependencies?: DiscordCopilotAppTestDependencies
   ) {
     this.discord = new Client({
       intents: [
@@ -791,14 +818,15 @@ export class DiscordCopilotApp {
       ],
     });
     this.transport = transportOverride ?? new DiscordTransport(this.discord);
-    this.store = storeOverride ?? new SessionStore(sessionStorePath());
+    this.store = testDependencies?.store ?? new SessionStore(sessionStorePath());
     this.channels =
-      channelsOverride ??
+      testDependencies?.channels ??
       new ChannelRegistry(
         this.config.DISCORD_PARENT_CHANNEL_ID,
         this.config.DISCORD_GUILD_ID,
         channelRegistryPath()
       );
+    this.approvals = testDependencies?.approvals ?? new ApprovalPolicy();
     this.allowedUserIds = new Set(this.config.DISCORD_ALLOWED_USER_IDS);
   }
 
@@ -935,25 +963,27 @@ export class DiscordCopilotApp {
     await interaction.reply({ content, ...EPHEMERAL });
   }
 
-  /** Test-only seam: construct the app with an injected transport + store (and
-   *  fake copilot/lock), skipping the lock/SDK/login startup, so unit tests can
-   *  drive the real runTurn/stop/reconcile wiring without a live Discord
-   *  connection. Not used in production (start() is the only production entry).
+  /** Test-only seam: construct the app with an injected transport and an
+   *  explicit set of home-backed dependencies (and fake copilot/lock), skipping
+   *  the lock/SDK/login startup, so unit tests can drive the real
+   *  runTurn/stop/reconcile wiring without a live Discord connection. Not used in
+   *  production (start() is the only production entry).
    *
    *  `reposRoot` is set directly rather than resolved: the filesystem checks in
    *  `resolveReposRoot` are covered by their own tests, and requiring a real
    *  directory here would make every app-level test build one.
    *
-   *  `channels` MUST be injectable: without it every app-level test would load
-   *  the real `~/.discord-copilot-sdk` registry of whoever runs the suite. */
+   *  `dependencies` is REQUIRED and has no defaults — see
+   *  `DiscordCopilotAppTestDependencies`. Every one of its fields replaces a
+   *  default that resolves through the home directory of whoever runs the suite,
+   *  and an optional parameter is a fallback that reaches exactly that state the
+   *  day a test forgets one. */
   static createForTest(
     config: Config,
     reposRoot: string,
     copilot: CopilotClient,
     transport: Transport,
-    store?: SessionStore,
-    channels?: ChannelRegistry,
-    options: { fileDeliveryPlatform?: NodeJS.Platform } = {}
+    dependencies: DiscordCopilotAppTestDependencies
   ): DiscordCopilotApp {
     const noopLock: InstanceLock = { path: "(test)", release: async () => {} };
     const built = createLifecycleOwnershipForTest(noopLock);
@@ -962,11 +992,12 @@ export class DiscordCopilotApp {
       copilot,
       built.ownership,
       transport,
-      store,
-      channels
+      dependencies
     );
     app.reposRoot = reposRoot;
-    app.actorCreateDependencies = createForTestActorDependencies(options.fileDeliveryPlatform ?? "win32");
+    app.actorCreateDependencies = createForTestActorDependencies(
+      dependencies.fileDeliveryPlatform ?? "win32"
+    );
     app.approvalKeyForTest = async (validationPath) => validationPath;
     app.ownershipInspector = built.inspect;
     app.ownershipLockForTest = noopLock;

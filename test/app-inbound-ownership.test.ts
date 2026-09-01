@@ -18,6 +18,10 @@ import { tryOwnedScope } from "./support/owned-scope.js";
 import { strictInteraction, asCommandInteraction } from "./support/strict-interaction.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { encodePermissionId } from "../src/platforms/discord/custom-id.js";
+import {
+  appTestDependencies,
+  type AppTestDependencyOverrides,
+} from "./support/app-test-dependencies.js";
 
 /**
  * Ownership of MUTATING inbound operations.
@@ -42,6 +46,11 @@ const SEED = "30000";
 const FIXTURES = join(process.cwd(), ".test-fixtures-inbound-ownership");
 const NEW_THREAD_ID = `inbound-new-${process.pid}`;
 const run = promisify(execFile);
+
+/** The dependency object `createForTest` requires, sourced from this suite's
+ *  fixture directory instead of the home directory of whoever runs it. */
+const appDependencies = (over: AppTestDependencyOverrides): ReturnType<typeof appTestDependencies> =>
+  appTestDependencies({ directory: FIXTURES, parentChannelId: SEED, guildId: GUILD }, over);
 
 let cleanupRepo: string | undefined;
 let cleanupWorktree: string | undefined;
@@ -129,8 +138,7 @@ function appWith(
     reposRoot,
     fakeCopilot(),
     transport,
-    store,
-    registry
+    appDependencies({ store, channels: registry })
   );
   const events: string[] = [];
   let releases = 0;

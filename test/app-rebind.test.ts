@@ -26,6 +26,10 @@ import {
   type StrictInteraction,
   type StrictInteractionFields,
 } from "./support/strict-interaction.js";
+import {
+  appTestDependencies,
+  type AppTestDependencyOverrides,
+} from "./support/app-test-dependencies.js";
 
 const run = promisify(execFile);
 
@@ -170,6 +174,11 @@ function testChannels(): ChannelRegistry {
   return new ChannelRegistry("c1", "g1", path.join(tmp, "channels.json"));
 }
 
+/** The dependency object `createForTest` requires, sourced from this suite's
+ *  per-test temporary root instead of the home directory of whoever runs it. */
+const appDependencies = (over: AppTestDependencyOverrides): ReturnType<typeof appTestDependencies> =>
+  appTestDependencies({ directory: tmp, parentChannelId: "c1", guildId: "g1" }, over);
+
 function harness(
   over: {
     devMode?: DevMode;
@@ -187,8 +196,7 @@ function harness(
     reposRoot,
     fakeCopilot(over),
     transport,
-    store,
-    over.channels ?? testChannels()
+    appDependencies({ store, channels: over.channels ?? testChannels() })
   );
   const actor = new FakeActor();
   const devMode = over.devMode ?? "local";
@@ -509,8 +517,7 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       reposRoot,
       fakeCopilot({ createFails: true }),
       transport,
-      store,
-      testChannels()
+      appDependencies({ store, channels: testChannels() })
     );
     const actor = new FakeActor();
     const session: Session = {

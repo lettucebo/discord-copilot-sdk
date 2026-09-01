@@ -2,9 +2,14 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { DiscordCopilotApp, type Session } from "../src/app.js";
+import { SessionStore } from "../src/core/session-store.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
+import { appTestDependencies } from "./support/app-test-dependencies.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /**
  * App-level regression for the /stop-during-download blocker (RubberDuck P5):
@@ -77,8 +82,12 @@ class FakeTransport implements Transport {
 
 let server: Server;
 let base: string;
+/** Suite-scoped fixture directory: the store, channel registry and approval
+ *  file `createForTest` now requires all live here, never in a real home. */
+let fixtures: string;
 
 beforeAll(async () => {
+  fixtures = mkdtempSync(join(tmpdir(), "dcs-stop-flow-"));
   server = createServer((req, res) => {
     if (req.url === "/png") {
       res.writeHead(200, { "content-type": "image/png", "content-length": String(PNG_1x1.length) });
@@ -94,6 +103,7 @@ beforeAll(async () => {
 afterAll(async () => {
   server.closeAllConnections?.();
   await new Promise<void>((r) => server.close(() => r()));
+  rmSync(fixtures, { recursive: true, force: true });
 });
 
 const cfg = {
@@ -119,7 +129,16 @@ function imageMessage(url: string): unknown {
 
 function buildAppWithSession(): { app: DiscordCopilotApp; actor: FakeActor; transport: FakeTransport; session: Session } {
   const transport = new FakeTransport();
-  const app = DiscordCopilotApp.createForTest(cfg, "C:\\Repos", fakeCopilot, transport);
+  const app = DiscordCopilotApp.createForTest(
+    cfg,
+    "C:\\Repos",
+    fakeCopilot,
+    transport,
+    appTestDependencies(
+      { directory: fixtures, parentChannelId: "c1", guildId: "g1" },
+      { store: new SessionStore(join(fixtures, "sessions.json")) }
+    )
+  );
   const actor = new FakeActor();
   // Typed on purpose: a `Record<string, unknown>` fixture silently drifts from
   // the real Session shape and fails at runtime instead of at typecheck.
