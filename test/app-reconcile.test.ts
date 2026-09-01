@@ -1238,15 +1238,15 @@ describe("startup announcement length budget", () => {
   }
   it("budgets the composed notice before transport truncation, and says how many it left out", async () => {
     // A fixed count cap does not bound a message built from 19-digit snowflakes
-    // and absolute paths: 15 realistic entries measure ~2250 chars, so the last
-    // ids AND the instruction line were silently dropped — in a message whose
-    // entire job is to name ids.
+    // and absolute paths: the 15 realistic entries per parent below exceed the
+    // budget, so the last ids AND the instruction line would be silently
+    // dropped — in a message whose entire job is to name ids.
     const f = tmpFile();
     const registryFile = `${f}.channels.json`;
     try {
       const store = new SessionStore(f);
       for (const parentChannelId of ["c1", "c2"]) {
-        for (let i = 0; i < 40; i++) {
+        for (let i = 0; i < 15; i++) {
           const id = `${parentChannelId}-153200000000000${String(i).padStart(4, "0")}`;
           store.reserve(
             bind({
@@ -1256,7 +1256,7 @@ describe("startup announcement length budget", () => {
               branch: `copilot/t-${id}`,
             })
           );
-          store.commit(id);
+          // Formatting-only fixture: the intermediate active state is irrelevant.
           store.setState(id, "blocked", "thread-gone");
         }
       }
