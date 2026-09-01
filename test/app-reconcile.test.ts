@@ -3041,7 +3041,10 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
       await vi.waitFor(() => expect(fetchCalls.length).toBeGreaterThan(fetchesBefore));
 
       await app.stop();
-      expect(lockReleased).toBe(true); // ownership of the state dir is surrendered
+      // The attempt did not quiesce, so the lock is deliberately STILL HELD:
+      // its in-flight REST/git/runtime work cannot be recalled, and a successor
+      // instance must not start reconciling the same records and checkouts.
+      expect(lockReleased).toBe(false);
 
       const bytesAfterStop = readFileSync(f, "utf8");
       const recordAfterStop = JSON.stringify(store.get("t-late"));
@@ -3062,6 +3065,138 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
       expect(transport.notices.length).toBe(noticesAfterStop);
       expect(store.get("t-late")?.state).toBe("active"); // still resumable next boot
       expect(store.get("t-late")?.reason).toBe("thread-no-access");
+      expect(sessionsOf(app).size).toBe(0);
+      // And only now, once nothing of ours can still be working, is ownership
+      // of the state directory handed over.
+      await vi.waitFor(() => expect(lockReleased).toBe(true));
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("holds the lock through a rebuild that stop() could not join, then releases it", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const wt = wtBind("t-gitlate", { sessionId: "sess-gitlate" });
+      store.reserve(wt);
+      store.commit("t-gitlate");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let lockReleased = false;
+      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+        path: "(test)",
+        async release(): Promise<void> {
+          lockReleased = true;
+        },
+      };
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      (app as unknown as { accessResumeJoinTimeoutMs: number }).accessResumeJoinTimeoutMs = 10;
+      access = true;
+
+      // `git worktree add` is already running. An epoch cannot recall it, and it
+      // will finish writing to disk on its own schedule.
+      let entered: () => void = () => {};
+      const inRebuild = new Promise<void>((r) => {
+        entered = r;
+      });
+      let releaseRebuild: () => void = () => {};
+      const held = new Promise<void>((r) => {
+        releaseRebuild = r;
+      });
+      worktreeHooks.add = async (_repo, dir) => {
+        entered();
+        await held;
+        mkdirSync(dir, { recursive: true });
+      };
+      worktreeHooks.remove = async (_repo, dir) => {
+        rmSync(dir, { recursive: true, force: true });
+        return "removed";
+      };
+      rmSync(wt.workDir, { recursive: true, force: true });
+
+      const tick = beginRetry(app, jobs);
+      await inRebuild;
+      await app.stop();
+      expect(lockReleased).toBe(false); // git is still writing under our root
+
+      releaseRebuild();
+      await tick;
+
+      expect(store.get("t-gitlate")?.state).toBe("active");
+      expect(store.get("t-gitlate")?.reason).toBe("thread-no-access");
+      expect(sessionsOf(app).size).toBe(0);
+      await vi.waitFor(() => expect(lockReleased).toBe(true));
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("never releases the lock while an attempt never settles at all", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-never", sessionId: "sess-never" }));
+      store.commit("t-never");
+      const transport = new FakeTransport();
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        transport,
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let lockReleased = false;
+      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+        path: "(test)",
+        async release(): Promise<void> {
+          lockReleased = true;
+        },
+      };
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        await new Promise<void>(() => {}); // never comes back
+        return visibleThread;
+      });
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      (app as unknown as { accessResumeJoinTimeoutMs: number }).accessResumeJoinTimeoutMs = 10;
+      access = true;
+
+      const fetchesBefore = fetchCalls.length;
+      beginRetry(app, jobs);
+      await vi.waitFor(() => expect(fetchCalls.length).toBeGreaterThan(fetchesBefore));
+
+      const bytes = readFileSync(f, "utf8");
+      await app.stop();
+      expect(lockReleased).toBe(false);
+
+      // Give it every chance to release late. It must not: the PID lock stays
+      // for the life of this process, and a successor reclaims it as stale
+      // once this pid is gone (see `acquireSingleInstanceLock`).
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 5));
+      expect(lockReleased).toBe(false);
+      expect(readFileSync(f, "utf8")).toBe(bytes);
       expect(sessionsOf(app).size).toBe(0);
     } finally {
       rmSync(f, { force: true });

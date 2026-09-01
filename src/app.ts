@@ -3949,24 +3949,10 @@ export class DiscordCopilotApp {
       if (this.endClaims.has(candidate.threadId)) continue;
       const rec = this.store.get(candidate.threadId);
       if (!rec || !this.isAccessRetryCandidate(rec)) continue;
-      // A previous attempt on this thread left a runtime we could not prove
-      // stopped. Resuming again would create a SECOND runtime for the same
-      // session and worktree, and its discard would overwrite the strong
-      // reference that is the first one's only fence. Retry the barrier first;
-      // only a CONFIRMED teardown earns another attempt.
-      if (this.unconfirmedResumes.has(rec.threadId)) {
-        if (!(await this.retryUnconfirmedResume(rec.threadId))) {
-          console.warn(
-            `access-retry: ${rec.threadId} still has an unconfirmed runtime from an earlier attempt; ` +
-              `not resuming it again this wake-up.`
-          );
-          continue;
-        }
-      }
-      // Published BEFORE the first await, and settled only after any discard and
-      // barrier registration below have finished. `/end` awaits THIS, so it can
-      // never observe "no barrier yet" merely because its own bound expired
-      // while the discard was still running.
+      // Published BEFORE the attempt's FIRST await — which is the barrier retry
+      // below, not the classification. A caller that joins this thread has to
+      // cover every await this attempt makes, including the SDK disconnect the
+      // barrier retry issues.
       let settle: () => void = () => {};
       this.accessResumeSettled.set(
         rec.threadId,
@@ -3974,10 +3960,10 @@ export class DiscordCopilotApp {
           settle = resolve;
         })
       );
-      // Captured per attempt, checked after every await inside it. `phase` and
-      // `shuttingDown` are only read BEFORE the awaits below; this is what makes
-      // a late-resolving classification unable to act on behalf of a process
-      // that has since released its lock.
+      // Captured here for the same reason: `phase` and `shuttingDown` are only
+      // read BEFORE these awaits, and this is what makes a late-resolving
+      // classification unable to act on behalf of a process that has since given
+      // up ownership of its state.
       const epoch = this.accessRetryEpoch;
       const cancelled = (): string | undefined => {
         if (this.accessRetryEpoch !== epoch) return "this process gave up ownership of its state";
@@ -3985,6 +3971,29 @@ export class DiscordCopilotApp {
         return undefined;
       };
       try {
+        // A previous attempt on this thread left a runtime we could not prove
+        // stopped. Resuming again would create a SECOND runtime for the same
+        // session and worktree, and its discard would overwrite the strong
+        // reference that is the first one's only fence. Retry the barrier first;
+        // only a CONFIRMED teardown earns another attempt.
+        if (this.unconfirmedResumes.has(rec.threadId)) {
+          if (!(await this.retryUnconfirmedResume(rec.threadId))) {
+            console.warn(
+              `access-retry: ${rec.threadId} still has an unconfirmed runtime from an earlier attempt; ` +
+                `not resuming it again this wake-up.`
+            );
+            continue;
+          }
+        }
+        // Do not START new external work after cancellation. The token below
+        // would refuse to act on its result anyway; issuing a forced REST fetch,
+        // a git rebuild and a runtime resume that nobody may use is pure cost —
+        // and cost that keeps the single-instance lock held (see `stop()`).
+        const stale = cancelled();
+        if (stale) {
+          console.warn(`access-retry: not starting work for ${rec.threadId} — ${stale}`);
+          continue;
+        }
         // The SAME reconcile path startup uses: it re-validates the binding and
         // re-classifies the thread, and only a `valid` classification resumes.
         // A record that has meanwhile become genuinely terminal under those
@@ -4383,6 +4392,16 @@ export class DiscordCopilotApp {
     // mutable; Git proves the retained handle's validation path, while the same
     // capability and its final display path transfer to the resumed actor.
     // POSIX resumes normally without file-delivery machinery.
+    //
+    // Checked before STARTING it, not only before acting on its result: a root
+    // capture opens a real handle and the resume behind it is a runtime RPC.
+    // Neither can be recalled once issued, and both keep the single-instance
+    // lock held through shutdown (see `stop()`).
+    const beforeCapture = this.resumeOwnershipLost(rec, opts);
+    if (beforeCapture) {
+      console.warn(`resume: not capturing a root for ${rec.threadId} — ${beforeCapture}`);
+      return;
+    }
     let captured;
     try {
       captured = await this.captureValidatedRoot({
@@ -4422,6 +4441,12 @@ export class DiscordCopilotApp {
     const approvalKey = captured.approvalKey;
     const broker = new PendingInteractionBroker();
     let actor: SessionActor;
+    // Last gate before the longest, least recallable await in this method.
+    const beforeCreate = this.resumeOwnershipLost(rec, opts);
+    if (beforeCreate) {
+      console.warn(`resume: not creating a session for ${rec.threadId} — ${beforeCreate}`);
+      return;
+    }
     try {
       actor = await SessionActor.create(this.copilot, {
         sessionKey: rec.threadId,
@@ -5541,23 +5566,15 @@ export class DiscordCopilotApp {
     // lease or post a message once the lock below is released.
     this.accessRetryEpoch++;
     // Then JOIN it. Disarming only prevents the NEXT tick; one already inside
-    // git or the runtime can still be mid-transition, and letting `stop()`
-    // resolve first would mean the store could be written after the process
-    // declared itself torn down. Bounded, so a wedged runtime cannot make
-    // shutdown hang — the token, not this bound, is what makes that safe.
-    const quiesced = await withTimeout(
-      this.accessRetryTickPromise ?? Promise.resolve(),
-      this.accessResumeJoinTimeoutMs
-    ).then(
-      () => true,
-      () => false
-    );
-    if (!quiesced) {
-      console.warn(
-        "shutdown: an access-retry attempt was still running; it has been cancelled and will " +
-          "make no further durable change, but this process is exiting without having joined it."
-      );
-    }
+    // git or the runtime can still be mid-transition. Bounded, so a wedged
+    // runtime cannot make shutdown hang.
+    const pendingTick = this.accessRetryTickPromise;
+    const quiesced = pendingTick
+      ? await withTimeout(pendingTick, this.accessResumeJoinTimeoutMs).then(
+          () => true,
+          () => false
+        )
+      : true;
     for (const [threadId, session] of this.sessions) {
       // Rebind can be suspended in its prepare phase while shutdown starts.
       // Mark first so it cannot install a replacement after this loop clears
@@ -5596,7 +5613,39 @@ export class DiscordCopilotApp {
     }
     await this.copilot.stop().catch(() => {});
     await clearStartupReady().catch(() => {});
-    await this.lock.release().catch(() => {});
+    // The single-instance lock is the LAST thing released, and only once no
+    // attempt of ours can still be doing external work.
+    //
+    // The cancellation epoch stops this app from mutating anything further, but
+    // it cannot un-issue a REST call, a `git worktree add` or an
+    // `SessionActor.create` that has already been handed to the runtime. Those
+    // finish on their own schedule, against the same state directory and the
+    // same checkouts. Releasing the lock while one is in flight invites a
+    // successor instance to start reconciling the very records and worktrees
+    // this process is still touching — a cross-process race no in-process fence
+    // can cover.
+    //
+    // So a shutdown that could not join its retry attempt does not release the
+    // lock here; it releases it when that attempt finally settles. If it never
+    // settles, the lock file simply stays until this process exits, and the
+    // successor reclaims it then: `acquireSingleInstanceLock` treats a lock
+    // whose holder pid is no longer alive as stale, and `releaseIfOwner` refuses
+    // to delete a lock that a successor has already taken over. Holding it is
+    // therefore honest — this pid really is still working — and self-healing.
+    if (quiesced || !pendingTick) {
+      await this.lock.release().catch(() => {});
+      return;
+    }
+    console.warn(
+      "shutdown: an access-retry attempt is still running (cancelled, but its in-flight " +
+        `REST/git/runtime work cannot be recalled). Holding the single-instance lock at ` +
+        `${this.lock.path} until it settles; if this process exits first, the next start ` +
+        `reclaims the lock as stale.`
+    );
+    void pendingTick.then(
+      () => void this.lock.release().catch(() => {}),
+      () => void this.lock.release().catch(() => {})
+    );
   }
 }
 

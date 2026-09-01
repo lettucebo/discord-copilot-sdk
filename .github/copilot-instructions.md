@@ -261,4 +261,9 @@ second one resumed on top of it. Every retry attempt also carries a cancellation
 bumped by `stop()`) that is re-checked after each await and before **every** durable transition and
 external side effect, because `stop()`'s join is bounded: an attempt may outlive it, and by then the
 single-instance lock is released and a replacement process may own the same store. Startup passes no
-token and its semantics are unchanged.
+token and its semantics are unchanged. A cancellation token cannot recall external work that was
+already issued, so `stop()` additionally does **not** release the single-instance lock when its
+bounded join did not quiesce: the release is deferred until that attempt settles, and if it never
+does, the PID lock stays until the process exits and the successor reclaims it as stale
+(`src/core/single-instance.ts`). Holding it is what makes an already-issued REST/git/runtime call
+cross-process safe.

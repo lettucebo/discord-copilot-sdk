@@ -1016,9 +1016,20 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   此時一個延遲回來的 classify 若回報 `gone`，舊版就會在「本 process 已交出狀態所有權（下一個 instance
   可能已經接手同一個 store）」之後，寫入 blocked、釋放 repo lease、還往 Discord 貼訊息。
 - **每個 retry attempt 都帶一個取消 token（epoch）**，在**每一個 await 之後、任何持久轉換或外部副作用
-  之前**檢查：`reconcileRecord` 在 classify await 之後檢查一次（涵蓋 `block`／`skip`／`orphan` 全部分支），
-  `resumeRecord` 則在重建 worktree 失敗、trusted-root 擷取失敗、binding 拒絕、`SessionActor.create`
-  失敗，以及註冊前的 fence 各檢查一次。startup 不傳 token（`opts.cancelled` 為 undefined），語意完全不變。
+  之前**檢查，並且在**啟動**昂貴外部工作之前也檢查（root capture、`SessionActor.create`、以及整個
+  attempt 的入口）：`reconcileRecord` 在 classify await 之後檢查一次（涵蓋 `block`／`skip`／`orphan`
+  全部分支），`resumeRecord` 則在重建 worktree 失敗、trusted-root 擷取（前後）、binding 拒絕、
+  `SessionActor.create`（前後），以及註冊前的 fence 各檢查一次。settlement promise 與 epoch 都在
+  **barrier retry 之前**就發布／捕捉，因為那個 retry 本身就是這次 attempt 的第一個 await。
+  startup 不傳 token（`opts.cancelled` 為 undefined），語意完全不變。
+- **token 擋不住「已經發出去」的外部工作，所以 lock 才是最後一道**：epoch 可以讓本 app 不再寫任何東西，
+  但它無法收回一個已經送出的 REST 呼叫、一個正在跑的 `git worktree add`、或一個已經交給 runtime 的
+  `SessionActor.create`。那些工作會照自己的節奏完成，作用在**同一個 state 目錄與同一批 checkout** 上。
+  因此：**`stop()` 若在有界等待內沒能 join 到 tick，就不在正常結束處釋放 single-instance lock**，改成
+  掛在該 tick 的 settle 上延後釋放；若它永遠不 settle，PID lock 就一直留到 process 結束——
+  `acquireSingleInstanceLock` 會把「holder pid 已不存在」的 lock 視為 stale 並回收，`releaseIfOwner`
+  也拒絕刪掉已被後繼者接管的 lock（見 `src/core/single-instance.ts`）。所以「繼續持有」既誠實
+  （這個 pid 真的還在做事），也能自我痊癒。epoch 則退居為 defense-in-depth，負責擋住 app 層的遲到寫入。
 - **無法確認關閉的被丟棄 runtime 會被保留成 barrier**：`discardResumedActor()` 若 `disconnect()` 失敗，
   該 actor 會被**強引用**留在 `unconfirmedResumes`（Windows 上這個引用就是 root capability 的生命線，
   掉了就等於允許把可能還活著的 runtime 的工作目錄改名/刪掉）。刻意**不**走 stale-rebind companion row：
@@ -1057,6 +1068,10 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   的 disconnect 是**永遠不 settle** 的 hang，single-flight 讓它在本 process 內根本無法被確認）。這是
   刻意的：無法證明已停止的 runtime 不該被當成已停止，記錄與 worktree 一起保留，重啟才是清乾淨的路。
   期間該討論串**不會**被重複 resume（見 §19.3），也不會被終態化。
+- 同理，`stop()` 沒 join 到的 attempt 會讓 single-instance lock 一直被持有到它 settle 或 process 結束。
+  代價是：在這種情況下**立刻**重啟 bot 會因為「另一個 instance 還活著」而被拒（那是實話）；等這個
+  process 真的結束之後，後繼者就能把 stale PID lock 回收。用「可能要多等一下才能重啟」換掉「兩個
+  process 同時對同一批 record 與 checkout 動手」，是刻意的取捨。
 - 重試路徑的 transient resume 失敗只會貼一次通知（每個 process、每個討論串）。第二次之後只有 log；
   狀態仍看得到（`/sessions`），成功復原時也會貼復原通知。
 - 一筆記錄的終態轉換寫入失敗時，retry loop 只能記錄（`console.error`）並讓它維持 `active`；沒有「讓啟動失敗」
@@ -1093,7 +1108,9 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | 兩個丟棄競爭同一個 thread 時，barrier 必須保留**第一個**（較新的 actor 乾淨退出不代表較舊的安全） | `test/app-reconcile.test.ts` |
 | in-thread 的 `/end`（不加 `thread:`）也必須認領該討論串，並在結束後完全釋放 | `test/app-reconcile.test.ts` |
 | `onReady` 必須在 `phase = "ready"` 之後**立刻**啟動 retry loop，且全檔只有一處啟動點（source 契約，如同本 repo 既有的 shipped-script／docs 契約測試） | `test/app-reconcile.test.ts` |
-| `stop()` 的有界 join 逾時、lock 已釋放之後，延遲回來的 classify（即使是 `gone` 這種終態）**不得**有任何持久寫入、lease 變更或 Discord 副作用——store 檔案 byte-for-byte 不變 | `test/app-reconcile.test.ts` |
+| `stop()` 的有界 join 逾時後，延遲回來的 classify（即使是 `gone` 這種終態）**不得**有任何持久寫入、lease 變更或 Discord 副作用——store 檔案 byte-for-byte 不變；而且 lock **不得**在那之前被釋放，要等該 attempt settle 才釋放 | `test/app-reconcile.test.ts` |
+| 同上，但卡在 `addWorktree`（已發出的 git 工作）：lock 保留到重建結束才釋放 | `test/app-reconcile.test.ts` |
+| attempt **永遠不 settle** 時，lock 在整個 process 生命期內都不得釋放（靠後繼者回收 stale PID lock） | `test/app-reconcile.test.ts` |
 
 ### 19.7 後續工作（尚未做）
 
