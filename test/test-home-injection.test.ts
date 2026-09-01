@@ -315,8 +315,36 @@ describe("createForTest uses what it was injected, and nothing from a real home"
     expect(snapshot(sentinel.home)).toEqual(before);
   });
 
-  it("keeps an actor's audit sink and skills home out of the sentinel home", async () => {
-    sentinel = poisonedHome();
+  it("hands the injected audit sink and skills home to EVERY actor creation path", () => {
+    // A value assertion can only speak for the path a test happened to drive.
+    // The defect this guards against is structural: a fourth creation site that
+    // builds its own options object keeps the real, home-backed defaults while
+    // every existing test stays green. So assert on the source — each
+    // `SessionActor.create` call in the orchestrator must spread the ONE method
+    // that carries the injected sink and skills home.
+    const source = fs.readFileSync(new URL("../src/app.ts", import.meta.url), "utf8");
+    const needle = "SessionActor.create(this.copilot, {";
+    const spreads: boolean[] = [];
+    for (let at = source.indexOf(needle); at !== -1; at = source.indexOf(needle, at + 1)) {
+      const open = source.indexOf("{", at + needle.length - 1);
+      let depth = 0;
+      let end = open;
+      for (; end < source.length; end++) {
+        const ch = source[end];
+        if (ch === "{") depth++;
+        else if (ch === "}") {
+          depth--;
+          if (depth === 0) break;
+        }
+      }
+      spreads.push(source.slice(open, end).includes("...this.actorSourceOptions()"));
+    }
+
+    expect(spreads.length).toBeGreaterThanOrEqual(3); // /new, /repo rebind, resume
+    expect(spreads.every(Boolean)).toBe(true);
+  });
+
+  it("keeps an actor's audit sink and skills home out of the sentinel home", async () => {    sentinel = poisonedHome();
     const before = snapshot(sentinel.home);
 
     const auditLog = new RecordingAuditLog();

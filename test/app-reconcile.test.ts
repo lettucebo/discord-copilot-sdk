@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterAll, afterEach } from "vitest";
 import { DiscordCopilotApp } from "../src/app.js";
 
 /** Counts every real worktree recreation, and lets one test suspend INSIDE it.
@@ -125,6 +125,12 @@ afterEach(() => {
   delete worktreeHooks.add;
   delete worktreeHooks.remove;
   for (const d of wtDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+});
+
+afterAll(() => {
+  // The fixture root is created once for the file, so it is this file's to
+  // remove; leaving it behind leaks one temp directory per run.
+  rmSync(FIXTURES, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });
 
 const cfg = {
