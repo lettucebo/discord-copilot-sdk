@@ -73,6 +73,7 @@ import {
   formatTodos,
 } from "./copilot/session-actor.js";
 import { ApprovalPolicy } from "./core/approval-policy.js";
+import type { AuditSink } from "./core/audit-log.js";
 import { DiscordTransport, NO_MENTIONS } from "./platforms/discord/discord-transport.js";
 import {
   botCanViewChannel,
@@ -603,6 +604,44 @@ export function yoloOnWarning(repoSkillsLoaded: boolean, fileDeliveryAvailable: 
 }
 
 /**
+ * Every collaborator `createForTest` would otherwise DEFAULT to a real
+ * home-backed one.
+ *
+ * These fields are required, and deliberately so. The defaults they replace all
+ * resolve through `os.homedir()`. A test that forgot one used to read — and in
+ * several cases create — the state of whoever ran the
+ * suite. Vitest now redirects `HOME`/`USERPROFILE` for the whole run, but that
+ * is one process-wide setting away from being removed or broken, and it fails
+ * open: nothing about it makes the omission visible. Making these required makes
+ * the omission a COMPILE error instead, which is the only form of the rule that
+ * cannot silently regress. Do not give any of them a default here.
+ */
+export interface DiscordCopilotAppTestDependencies {
+  /** Durable thread↔session records. Real default: `~/.discord-copilot-sdk`. */
+  store: SessionStore;
+  /** Enabled-channel registry. Real default: `~/.discord-copilot-sdk`. */
+  channels: ChannelRegistry;
+  /** Approval memory. Real default: `~/.discord-copilot-sdk/approvals.json`. */
+  approvals: ApprovalPolicy;
+  /** Audit sink handed to EVERY actor this app creates. Real default:
+   *  `~/.discord-copilot-sdk/<instance>.audit.jsonl`. */
+  actorAuditLog: AuditSink;
+  /** Skills home handed to every actor. Real default: the `~/.copilot/skills`
+   *  of whoever runs the suite. */
+  actorSkillsHomeDirectory: string;
+  /** Where this app believes per-session worktrees live. A path, or a provider
+   *  for a suite whose root is only known later. Real default:
+   *  `~/.discord-copilot-sdk-worktrees`, which this app both SCANS for strays
+   *  and creates session checkouts under. */
+  worktreeRoot: string | (() => string);
+  /** Teardown's readiness-marker cleanup. Real default: `clearStartupReady()`,
+   *  which resolves — and creates — `~/.discord-copilot-sdk/startup-ready`. */
+  clearStartupReady: () => Promise<void>;
+  /** Not home-backed: the platform whose file-delivery rules apply. */
+  fileDeliveryPlatform?: NodeJS.Platform;
+}
+
+/**
  * App state-machine tests intentionally use synthetic workdirs. Their actors
  * need an opaque root capability to reach SDK wiring, but must never gain file
  * resolution: a candidate open is always rejected and no OS handle is held.
@@ -653,8 +692,30 @@ export class DiscordCopilotApp {
   private readonly allowedUserIds: ReadonlySet<string>;
   /** Durable set of channels the bot acts in (seed + `/channel enable`). */
   private readonly channels: ChannelRegistry;
-  /** Shared approval memory (session + persisted repo rules) across sessions. */
-  private readonly approvals = new ApprovalPolicy();
+  /** Shared approval memory (session + persisted repo rules) across sessions.
+   *  Assigned in the constructor rather than initialized here: the real default
+   *  loads (and creates the directory of) `~/.discord-copilot-sdk/approvals.json`
+   *  as a side effect of merely EXISTING, which is exactly what a test that only
+   *  builds an app must not do. */
+  private readonly approvals: ApprovalPolicy;
+  /** Where this app believes per-session worktrees live. Production resolves the
+   *  real `worktreeRoot()` on every call — it is a pure path helper, and reading
+   *  it once would freeze a value the uninstaller and the validators derive
+   *  independently. A test injects a suite-scoped root, so a stray-worktree scan
+   *  never reads (and a session checkout never lands in) a real home. */
+  private readonly worktreeRootOf: () => string;
+  /** Teardown's readiness-marker cleanup. Production is `clearStartupReady`,
+   *  which resolves — and creates — a directory under the state directory, so a
+   *  test that merely drives `stop()` used to leave one behind. */
+  private readonly clearStartupReadyOnTeardown: () => Promise<void>;
+  /** Home-backed collaborators EVERY actor this app creates must be handed.
+   *  Undefined in production, where the actor applies its own real defaults;
+   *  `createForTest` always sets it, so no creation path can quietly fall back
+   *  to the audit log or skills home of whoever runs the suite. */
+  private readonly actorHomeDependencies?: Pick<
+    SessionActorOpts,
+    "auditLog" | "skillsHomeDirectory"
+  >;
   private modelIds: string[] = [];
   private readonly modelEfforts = new Map<string, string[]>();
   private shuttingDown = false;
@@ -780,8 +841,7 @@ export class DiscordCopilotApp {
     private readonly copilot: CopilotClient,
     private ownership: LifecycleOwnership,
     transportOverride?: Transport,
-    storeOverride?: SessionStore,
-    channelsOverride?: ChannelRegistry
+    testDependencies?: DiscordCopilotAppTestDependencies
   ) {
     this.discord = new Client({
       intents: [
@@ -791,14 +851,29 @@ export class DiscordCopilotApp {
       ],
     });
     this.transport = transportOverride ?? new DiscordTransport(this.discord);
-    this.store = storeOverride ?? new SessionStore(sessionStorePath());
+    this.store = testDependencies?.store ?? new SessionStore(sessionStorePath());
     this.channels =
-      channelsOverride ??
+      testDependencies?.channels ??
       new ChannelRegistry(
         this.config.DISCORD_PARENT_CHANNEL_ID,
         this.config.DISCORD_GUILD_ID,
         channelRegistryPath()
       );
+    this.approvals = testDependencies?.approvals ?? new ApprovalPolicy();
+    const injectedWorktreeRoot = testDependencies?.worktreeRoot;
+    this.worktreeRootOf =
+      injectedWorktreeRoot === undefined
+        ? worktreeRoot
+        : typeof injectedWorktreeRoot === "function"
+          ? injectedWorktreeRoot
+          : (): string => injectedWorktreeRoot;
+    this.clearStartupReadyOnTeardown = testDependencies?.clearStartupReady ?? clearStartupReady;
+    if (testDependencies) {
+      this.actorHomeDependencies = {
+        auditLog: testDependencies.actorAuditLog,
+        skillsHomeDirectory: testDependencies.actorSkillsHomeDirectory,
+      };
+    }
     this.allowedUserIds = new Set(this.config.DISCORD_ALLOWED_USER_IDS);
   }
 
@@ -818,13 +893,23 @@ export class DiscordCopilotApp {
     };
   }
 
-  /** Keep every SessionActor creation path on the same skill-source policy.
-   *  Duplicating these conversions at /new, /repo rebind and resume would let a
-   *  restart silently load a different trust boundary than a fresh session. */
-  private skillSourceOptions(): { enableRepoSkills: boolean; enableUserSkills: boolean } {
+  /** Keep every SessionActor creation path on the same skill-source policy AND
+   *  the same audit/skills home.
+   *
+   *  These are deliberately ONE method. Duplicating the skill conversions at
+   *  /new, /repo rebind and resume would let a restart silently load a different
+   *  trust boundary than a fresh session, and a per-path audit/skills spread is
+   *  how one of three creation sites would keep the real home-backed defaults
+   *  after `createForTest` injected test ones. Every path spreads this; adding a
+   *  fourth path that forgets it is the failure this shape prevents. */
+  private actorSourceOptions(): Pick<
+    SessionActorOpts,
+    "enableRepoSkills" | "enableUserSkills" | "auditLog" | "skillsHomeDirectory"
+  > {
     return {
       enableRepoSkills: this.config.ENABLE_REPO_SKILLS === "true",
       enableUserSkills: this.config.ENABLE_USER_SKILLS === "true",
+      ...(this.actorHomeDependencies ?? {}),
     };
   }
 
@@ -881,7 +966,7 @@ export class DiscordCopilotApp {
     try {
       verdict = await this.bindingCheck(validationBinding, {
         reposRoot: this.reposRoot,
-        worktreeRoot: worktreeRoot(),
+        worktreeRoot: this.worktreeRootOf(),
       });
     } catch (error) {
       await trustedRoot?.close().catch(() => {});
@@ -935,25 +1020,27 @@ export class DiscordCopilotApp {
     await interaction.reply({ content, ...EPHEMERAL });
   }
 
-  /** Test-only seam: construct the app with an injected transport + store (and
-   *  fake copilot/lock), skipping the lock/SDK/login startup, so unit tests can
-   *  drive the real runTurn/stop/reconcile wiring without a live Discord
-   *  connection. Not used in production (start() is the only production entry).
+  /** Test-only seam: construct the app with an injected transport and an
+   *  explicit set of home-backed dependencies (and fake copilot/lock), skipping
+   *  the lock/SDK/login startup, so unit tests can drive the real
+   *  runTurn/stop/reconcile wiring without a live Discord connection. Not used in
+   *  production (start() is the only production entry).
    *
    *  `reposRoot` is set directly rather than resolved: the filesystem checks in
    *  `resolveReposRoot` are covered by their own tests, and requiring a real
    *  directory here would make every app-level test build one.
    *
-   *  `channels` MUST be injectable: without it every app-level test would load
-   *  the real `~/.discord-copilot-sdk` registry of whoever runs the suite. */
+   *  `dependencies` is REQUIRED and has no defaults — see
+   *  `DiscordCopilotAppTestDependencies`. Every one of its fields replaces a
+   *  default that resolves through the home directory of whoever runs the suite,
+   *  and an optional parameter is a fallback that reaches exactly that state the
+   *  day a test forgets one. */
   static createForTest(
     config: Config,
     reposRoot: string,
     copilot: CopilotClient,
     transport: Transport,
-    store?: SessionStore,
-    channels?: ChannelRegistry,
-    options: { fileDeliveryPlatform?: NodeJS.Platform } = {}
+    dependencies: DiscordCopilotAppTestDependencies
   ): DiscordCopilotApp {
     const noopLock: InstanceLock = { path: "(test)", release: async () => {} };
     const built = createLifecycleOwnershipForTest(noopLock);
@@ -962,11 +1049,12 @@ export class DiscordCopilotApp {
       copilot,
       built.ownership,
       transport,
-      store,
-      channels
+      dependencies
     );
     app.reposRoot = reposRoot;
-    app.actorCreateDependencies = createForTestActorDependencies(options.fileDeliveryPlatform ?? "win32");
+    app.actorCreateDependencies = createForTestActorDependencies(
+      dependencies.fileDeliveryPlatform ?? "win32"
+    );
     app.approvalKeyForTest = async (validationPath) => validationPath;
     app.ownershipInspector = built.inspect;
     app.ownershipLockForTest = noopLock;
@@ -1115,7 +1203,7 @@ export class DiscordCopilotApp {
   private assertChannelRegistryUsable(): void {
     if (!this.channels.isCorrupt()) return;
     throw new Error(
-      `channel registry at ${channelRegistryPath()} cannot be trusted: ${this.channels.corruptReason()}. ` +
+      `channel registry at ${this.channels.path()} cannot be trusted: ${this.channels.corruptReason()}. ` +
         `Refusing to start rather than silently falling back to ${this.config.DISCORD_PARENT_CHANNEL_ID} alone, ` +
         `which would permanently block every session under another channel. ` +
         `Inspect or delete the file (channels can be re-added with /channel enable) and restart.`
@@ -1892,7 +1980,7 @@ export class DiscordCopilotApp {
       // operator's own checkout.
       const devMode: DevMode = "worktree";
       const branch = worktreeBranch(thread.id);
-      const requestedWorkDir = worktreePath(worktreeRoot(), repoPath, thread.id);
+      const requestedWorkDir = worktreePath(this.worktreeRootOf(), repoPath, thread.id);
       let worktreeCreated = false;
       await pruneWorktrees(repoPath);
       try {
@@ -2008,7 +2096,7 @@ export class DiscordCopilotApp {
           generation,
           createSessionId: sessionId,
           ...this.fileDeliveryQuotaOptions(thread.id, fileDeliveryBytes, sessionId, generation),
-          ...this.skillSourceOptions(),
+          ...this.actorSourceOptions(),
         });
       } catch (err) {
         // Create failed. The RPC may or may not have created the assigned id, so
@@ -3678,7 +3766,7 @@ export class DiscordCopilotApp {
     const branch = target.devMode === "worktree" ? worktreeBranch(threadId) : undefined;
     const requestedWorkDir =
       target.devMode === "worktree"
-        ? worktreePath(worktreeRoot(), target.repoPath, threadId)
+        ? worktreePath(this.worktreeRootOf(), target.repoPath, threadId)
         : target.repoPath;
 
     let createdWorktree = false;
@@ -3988,7 +4076,7 @@ export class DiscordCopilotApp {
         generation,
         createSessionId: sessionId,
         ...this.fileDeliveryQuotaOptions(threadId, fileDeliveryBytes, sessionId, generation),
-        ...this.skillSourceOptions(),
+        ...this.actorSourceOptions(),
       });
       replacementActor = actor;
       trustedRoot = undefined; // ownership transferred to the returned actor
@@ -4340,7 +4428,7 @@ export class DiscordCopilotApp {
       // about ANY session, so per-record handling would be guesswork.
       planReconcile({ corrupt: true });
       throw new Error(
-        `session store at ${sessionStorePath()} is corrupt; refusing to start. Inspect/remove it and restart.`
+        `session store at ${this.store.path()} is corrupt; refusing to start. Inspect/remove it and restart.`
       );
     }
     // Reserve every local-mode repo BEFORE the first resume attempt.
@@ -4368,7 +4456,7 @@ export class DiscordCopilotApp {
         // transition.
         if (!this.store.setState(rec.threadId, "blocked", "local-conflict")) {
           throw new FatalReconcileError(
-            `reconcile: could not persist local-conflict for ${rec.threadId} at ${sessionStorePath()}`
+            `reconcile: could not persist local-conflict for ${rec.threadId} at ${this.store.path()}`
           );
         }
       }
@@ -4706,7 +4794,7 @@ export class DiscordCopilotApp {
    * the same one on Linux, and a stray tree would go unreported.
    */
   private strayWorktreeDirs(known: ReadonlySet<string>): string[] {
-    const root = worktreeRoot();
+    const root = this.worktreeRootOf();
     const out: string[] = [];
     let top: Dirent[];
     try {
@@ -4768,7 +4856,7 @@ export class DiscordCopilotApp {
         // A required terminal transition: if it can't be persisted, that's a disk
         // problem — fail startup rather than run with a non-durable state.
         if (!this.store.setState(rec.threadId, "orphaned", "interrupted-create")) {
-          throw new FatalReconcileError(`reconcile: could not persist orphaned state at ${sessionStorePath()}`);
+          throw new FatalReconcileError(`reconcile: could not persist orphaned state at ${this.store.path()}`);
         }
         return;
       case "skip": {
@@ -4784,7 +4872,7 @@ export class DiscordCopilotApp {
         if (retry) return;
         if (!this.store.setState(rec.threadId, "active", action.reason)) {
           throw new FatalReconcileError(
-            `reconcile: could not persist retry reason for ${rec.threadId} at ${sessionStorePath()}`
+            `reconcile: could not persist retry reason for ${rec.threadId} at ${this.store.path()}`
           );
         }
         console.warn(
@@ -4819,7 +4907,7 @@ export class DiscordCopilotApp {
         // the lease either, so `/repo dev local` would report a phantom holder
         // with a deleted thread, permanently.
         if (!this.store.setState(rec.threadId, "blocked", action.reason)) {
-          throw new FatalReconcileError(`reconcile: could not persist blocked state at ${sessionStorePath()}`);
+          throw new FatalReconcileError(`reconcile: could not persist blocked state at ${this.store.path()}`);
         }
         this.releaseLocalLease(rec.threadId);
         await this.transport
@@ -4985,7 +5073,7 @@ export class DiscordCopilotApp {
         generation: rec.generation,
         resumeSessionId: rec.sessionId,
         ...this.fileDeliveryQuotaOptions(rec.threadId, rec.fileDeliveryBytes, rec.sessionId, rec.generation),
-        ...this.skillSourceOptions(),
+        ...this.actorSourceOptions(),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -5040,7 +5128,7 @@ export class DiscordCopilotApp {
     // (or the next boot) simply tries again.
     if (!this.store.commit(rec.threadId)) {
       console.error(
-        `reconcile: could not persist the recovered state for ${rec.threadId} at ${sessionStorePath()}; ` +
+        `reconcile: could not persist the recovered state for ${rec.threadId} at ${this.store.path()}; ` +
           `discarding the resumed session and leaving the record for a later retry.`
       );
       await this.discardResumedActor(rec, actor, "the recovered state could not be written to disk", opts);
@@ -5283,7 +5371,7 @@ export class DiscordCopilotApp {
     const workDirOk =
       rec.devMode === "local"
         ? pathRelation(wd, rec.repoPath) === "same"
-        : isStrictlyInside(wd, worktreeRoot());
+        : isStrictlyInside(wd, this.worktreeRootOf());
     return (
       isStrictlyInside(rec.repoPath, this.reposRoot) &&
       workDirOk &&
@@ -6300,7 +6388,7 @@ export class DiscordCopilotApp {
     await stopCopilotClient(this.copilot).catch((err: unknown) => {
       clientStopFailure = err;
     });
-    await clearStartupReady().catch(() => {});
+    await this.clearStartupReadyOnTeardown().catch(() => {});
     if (clientStopFailure !== undefined) throw clientStopFailure;
   }
 }

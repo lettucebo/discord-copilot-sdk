@@ -10,6 +10,10 @@ import { addWorktree } from "../src/core/worktree.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import type { ChatInputCommandInteraction } from "discord.js";
+import {
+  appTestDependencies,
+  type AppTestDependencyOverrides,
+} from "./support/app-test-dependencies.js";
 
 const exec = promisify(execFile);
 const git = (cwd: string, ...args: string[]): Promise<{ stdout: string }> => exec("git", args, { cwd });
@@ -46,6 +50,14 @@ class NullTransport implements Transport {
 let repo: string;
 let storeFile: string;
 let worktreeDir: string;
+/** Deliberately OUTSIDE `repo`: registry/approval fixtures written into a git
+ *  working tree would make the repo dirty and change what these tests observe. */
+let fixtures: string;
+
+/** The dependency object `createForTest` requires, sourced from this suite's
+ *  per-test fixture directory instead of the home directory of whoever runs it. */
+const appDependencies = (over: AppTestDependencyOverrides): ReturnType<typeof appTestDependencies> =>
+  appTestDependencies({ directory: fixtures, parentChannelId: "c1", guildId: "g1" }, over);
 
 const cfgFor = (r: string): Parameters<typeof DiscordCopilotApp.createForTest>[0] =>
   ({
@@ -62,6 +74,7 @@ const fakeCopilot = (): CopilotClient => ({}) as unknown as CopilotClient;
 
 beforeEach(async () => {
   repo = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dcs-reclaim-"));
+  fixtures = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dcs-reclaim-fixtures-"));
   storeFile = path.join(repo, "..", `${path.basename(repo)}-store.json`);
   await git(repo, "init", "-q", "-b", "main");
   await git(repo, "config", "user.email", "t@t.t");
@@ -76,6 +89,7 @@ afterEach(async () => {
   // removing the repo alone leaks a full checkout into the temp dir on every run.
   if (worktreeDir) await fs.promises.rm(worktreeDir, { recursive: true, force: true }).catch(() => {});
   await fs.promises.rm(repo, { recursive: true, force: true }).catch(() => {});
+  await fs.promises.rm(fixtures, { recursive: true, force: true }).catch(() => {});
   await fs.promises.rm(storeFile, { force: true }).catch(() => {});
 });
 
@@ -104,7 +118,7 @@ async function seed(): Promise<{ app: DiscordCopilotApp; store: SessionStore; di
     path.dirname(repo),
     fakeCopilot(),
     new NullTransport(),
-    store
+    appDependencies({ store })
   );
   return { app, store, dir, branch };
 }
@@ -200,7 +214,13 @@ describe("reclaim — the record and its worktree retire together", { timeout: 6
       devMode: "local",
     });
     store.commit("t2");
-    const app = DiscordCopilotApp.createForTest(cfgFor(repo), path.dirname(repo), fakeCopilot(), new NullTransport(), store);
+    const app = DiscordCopilotApp.createForTest(
+      cfgFor(repo),
+      path.dirname(repo),
+      fakeCopilot(),
+      new NullTransport(),
+      appDependencies({ store })
+    );
     const out = await reclaim(app, "t2", repo, repo, undefined);
     expect(out.ok).toBe(true);
     expect(store.get("t2")).toBeUndefined();
@@ -226,7 +246,7 @@ describe("reclaim — the record and its worktree retire together", { timeout: 6
       path.dirname(repo),
       fakeCopilot(),
       new NullTransport(),
-      store
+      appDependencies({ store })
     );
     const replies: unknown[] = [];
     const edits: unknown[] = [];

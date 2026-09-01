@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterAll, afterEach } from "vitest";
 import { DiscordCopilotApp } from "../src/app.js";
 
 /** Counts every real worktree recreation, and lets one test suspend INSIDE it.
@@ -40,9 +40,8 @@ import type { InstanceLock } from "../src/core/single-instance.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { tmpdir } from "node:os";
-import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import {
   createLifecycleOwnership,
   type LifecycleOwnership,
@@ -52,6 +51,10 @@ import {
   asCommandInteraction,
   type StrictInteraction,
 } from "./support/strict-interaction.js";
+import {
+  appTestDependencies,
+  type AppTestDependencyOverrides,
+} from "./support/app-test-dependencies.js";
 
 const isolatedHome = (() => {
   const value = process.env["DISCORD_COPILOT_SDK_VITEST_HOME"];
@@ -61,9 +64,28 @@ const isolatedHome = (() => {
 
 const REPOS_ROOT = join(tmpdir(), "dcs-fixture-repos");
 const REPO = join(REPOS_ROOT, "repo");
-/** Where `bindingOk` requires a worktree-mode workDir to live. */
-const WT_ROOT = `${stateDir()}-worktrees`;
+
+/** Suite-scoped home for every fixture the app would otherwise default to a
+ *  home-backed path for. Created once, because `createForTest` now REQUIRES
+ *  those dependencies and a registry has to be written somewhere real. */
+const FIXTURES = mkdtempSync(join(tmpdir(), "dcs-reconcile-fixtures-"));
+/** The worktree root this suite INJECTS, and where a worktree-mode fixture
+ *  workDir must live. Deliberately not derived from `stateDir()`: these tests
+ *  used to spell the real state directory's sibling and then assert against the
+ *  app reading that same real path. */
+const WT_ROOT = join(FIXTURES, "worktrees");
 const tmpFile = (): string => join(tmpdir(), `dp-reconcile-${Math.random()}.json`);
+
+/** The dependency object `createForTest` requires, sourced from this suite's
+ *  fixture directory instead of the home directory of whoever runs it. Each app
+ *  gets its own registry/approval files: several tests build two apps and a
+ *  shared registry file would couple them. */
+let appCount = 0;
+const appDependencies = (over: AppTestDependencyOverrides): ReturnType<typeof appTestDependencies> =>
+  appTestDependencies(
+    { directory: FIXTURES, parentChannelId: "c1", guildId: "g1", label: String(appCount++) },
+    over
+  );
 
 const bind = (over: Partial<SessionBinding> = {}): SessionBinding => {
   const merged = {
@@ -103,6 +125,12 @@ afterEach(() => {
   delete worktreeHooks.add;
   delete worktreeHooks.remove;
   for (const d of wtDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+});
+
+afterAll(() => {
+  // The fixture root is created once for the file, so it is this file's to
+  // remove; leaving it behind leaks one temp directory per run.
+  rmSync(FIXTURES, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });
 
 const cfg = {
@@ -203,8 +231,7 @@ function productionStyleApp(
       client: CopilotClient,
       ownership: LifecycleOwnership,
       transportOverride: Transport,
-      storeOverride: SessionStore,
-      channelsOverride: ChannelRegistry
+      dependencies: Parameters<typeof DiscordCopilotApp.createForTest>[4]
     ): DiscordCopilotApp;
   };
   const app = new AppConstructor(
@@ -212,8 +239,14 @@ function productionStyleApp(
     copilot,
     createLifecycleOwnership({ path: "(production-style-test)", release: async () => {} }),
     transport,
-    store,
-    new ChannelRegistry("c1", "g1", join(isolatedHome, "production-style-channels.json"))
+    // The dependency object still carries only state-holding collaborators. The
+    // fake trusted-root backend is installed by `createForTest` ALONE, so this
+    // app reaches the real `captureTrustedRoot` exactly as production does —
+    // which is the whole point of building it through the constructor.
+    appDependencies({
+      store,
+      channels: new ChannelRegistry("c1", "g1", join(isolatedHome, "production-style-channels.json")),
+    })
   );
   (app as unknown as { reposRoot: string }).reposRoot = REPOS_ROOT;
   return app;
@@ -307,7 +340,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const store = new SessionStore(f);
       store.reserve(bind({ repoPath: missingWorkDir, workDir: missingWorkDir }));
       store.commit("t1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
 
       await reconcile(app, async () => "valid");
 
@@ -350,7 +383,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const store = new SessionStore(f);
       store.reserve(bind());
       store.commit("t1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       const internals = app as unknown as {
         actorCreateDependencies?: {
           secureOpen?: { backend?: SecureOpenBackend; pathMode?: "win32" | "posix" };
@@ -430,7 +463,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const store = new SessionStore(f);
       store.reserve(bind()); store.commit("t1");
       const transport = new FakeTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, appDependencies({ store }));
       let classifiedParent: string | undefined;
       await reconcile(app, async (_threadId, expectedParentChannelId) => {
         classifiedParent = expectedParentChannelId;
@@ -457,7 +490,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const store = new SessionStore(f);
       store.reserve(bind({ fileDeliveryBytes: 17 }));
       store.commit("t1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
 
       await reconcile(app, async () => "valid");
 
@@ -484,7 +517,13 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       const store = new SessionStore(f);
       store.reserve(bind()); store.commit("t1");
       const transport = new FakeTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot({ resumeError: "session not found" }), transport, store);
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot({ resumeError: "session not found" }),
+        transport,
+        appDependencies({ store })
+      );
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(false);
       expect(store.get("t1")?.state).toBe("orphaned");
@@ -504,9 +543,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        undefined,
-        { fileDeliveryPlatform: "linux" }
+        appDependencies({ store, channels: undefined, fileDeliveryPlatform: "linux" })
       );
       const persist = vi.spyOn(store, "setState").mockReturnValue(false);
 
@@ -539,9 +576,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
         REPOS_ROOT,
         fakeCopilot({ resumeError: "session not found" }),
         new FakeTransport(),
-        store,
-        undefined,
-        { fileDeliveryPlatform: "linux" }
+        appDependencies({ store, channels: undefined, fileDeliveryPlatform: "linux" })
       );
       const persist = vi.spyOn(store, "setState").mockReturnValue(false);
 
@@ -569,7 +604,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
         REPOS_ROOT,
         fakeCopilot({ resumeError: "getaddrinfo ENOTFOUND api.githubcopilot.com" }),
         transport,
-        store
+        appDependencies({ store })
       );
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(false); // not resumed this boot
@@ -592,7 +627,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
           return fakeSession;
         },
       } as unknown as CopilotClient;
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, client, new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, client, new FakeTransport(), appDependencies({ store }));
       await reconcile(app, async () => "gone");
       expect(store.get("t1")?.state).toBe("blocked");
       expect(store.get("t1")?.reason).toBe("thread-gone");
@@ -608,7 +643,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     try {
       const store = new SessionStore(f);
       store.reserve(bind({ repoPath: join(tmpdir(), "dcs-fixture-OTHER-root", "repo") })); store.commit("t1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       let classifyCalls = 0;
       await reconcile(app, async () => {
         classifyCalls++;
@@ -628,7 +663,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     try {
       const store = new SessionStore(f);
       store.reserve(bind({ parentChannelId: "c2" })); store.commit("t1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       let classifyCalls = 0;
       await reconcile(app, async () => {
         classifyCalls++;
@@ -647,7 +682,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     try {
       const store = new SessionStore(f);
       store.reserve(bind()); store.commit("t1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       await reconcile(app, async () => "transient");
       expect(store.get("t1")?.state).toBe("active"); // preserved for a later retry
       expect(sessionsOf(app).has("t1")).toBe(false);
@@ -661,7 +696,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     try {
       const store = new SessionStore(f);
       store.reserve(bind()); // creating
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       await reconcile(app, async () => "valid");
       expect(store.get("t1")?.state).toBe("orphaned");
       expect(sessionsOf(app).has("t1")).toBe(false);
@@ -682,7 +717,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       // stale row could not persist. It is not a resumable conversation.
       expect(store.reserve(bind({ sessionId: "fallback-target", generation: 2 }))).toBe(true);
 
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       await reconcile(app, async () => "valid");
 
       expect(store.get("t1")).toMatchObject({
@@ -703,7 +738,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
     const f = tmpFile();
     try {
       const store = new SessionStore(f);
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).size).toBe(0);
     } finally {
@@ -724,8 +759,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        channels
+        appDependencies({ store, channels })
       );
       let classifiedParent: string | undefined;
       await reconcile(app, async (_threadId, expectedParentChannelId) => {
@@ -755,8 +789,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        channels
+        appDependencies({ store, channels })
       );
       let classifyCalls = 0;
       await expect(
@@ -784,8 +817,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        new SessionStore(f),
-        channels
+        appDependencies({ store: new SessionStore(f), channels })
       );
       (app as unknown as {
         discord: { channels: { fetch(id: string): Promise<unknown> } };
@@ -820,8 +852,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        new SessionStore(f),
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store: new SessionStore(f), channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       (app as unknown as {
         discord: { channels: { fetch(id: string): Promise<unknown> } };
@@ -849,8 +880,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        new SessionStore(f),
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store: new SessionStore(f), channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       (app as unknown as {
         discord: { channels: { fetch(id: string): Promise<unknown> } };
@@ -881,7 +911,7 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
       writeFileSync(f, "{ not valid json", "utf8");
       const store = new SessionStore(f);
       expect(store.isCorrupt()).toBe(true);
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       await expect(reconcile(app, async () => "valid")).rejects.toThrow(/corrupt/i);
     } finally {
       rmSync(f, { force: true });
@@ -898,7 +928,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
         store.reserve(wtBind(id, { generation: 1 }));
         store.commit(id);
       }
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       await reconcile(app, async () => "valid");
       expect([...sessionsOf(app).keys()].sort()).toEqual(["t1", "t2", "t3"]);
     } finally {
@@ -917,7 +947,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
         store.commit(id);
       }
       const copilot = fakeCopilot({ resumeError: (id) => (id === "s-bad" ? "boom" : undefined) });
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, copilot, new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, copilot, new FakeTransport(), appDependencies({ store }));
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(true);
       expect(sessionsOf(app).has("t3")).toBe(true);
@@ -933,7 +963,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
     // one thread's conversation against another thread's files. The workDir must
     // be one `bindingOk` accepts, i.e. under the real worktree root.
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, `test-${Math.random().toString(36).slice(2)}`);
+    const wt = join(WT_ROOT, `test-${Math.random().toString(36).slice(2)}`);
     mkdirSync(wt, { recursive: true });
     try {
       resumeCalls.length = 0;
@@ -942,7 +972,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
       store.commit("t1");
       store.reserve(bind({ threadId: "t2", sessionId: "s-2", workDir: REPO }));
       store.commit("t2");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       await reconcile(app, async () => "valid");
       const byId = Object.fromEntries(resumeCalls.map((c) => [c.id, c.cfg["workingDirectory"]]));
       expect(byId["s-1"]).toBe(wt);
@@ -955,7 +985,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
 
   it("passes disabled skill sources into a resumed actor even when its worktree has a skill", async () => {
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, `skill-source-${Math.random().toString(36).slice(2)}`);
+    const wt = join(WT_ROOT, `skill-source-${Math.random().toString(36).slice(2)}`);
     try {
       const skillDir = join(wt, ".github", "skills", "probe");
       mkdirSync(skillDir, { recursive: true });
@@ -964,7 +994,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
       const store = new SessionStore(f);
       store.reserve(bind({ sessionId: "s-skill", workDir: wt, branch: "copilot/t-skill" }));
       store.commit("t1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
 
       await reconcile(app, async () => "valid");
 
@@ -991,7 +1021,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
       store.commit("first");
       store.reserve(bind({ threadId: "second", sessionId: "s-second" }));
       store.commit("second");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("first")).toBe(true);
       expect(sessionsOf(app).has("second")).toBe(false);
@@ -1010,7 +1040,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
       store.commit("a");
       store.reserve(wtBind("b"));
       store.commit("b");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("a")).toBe(true);
       expect(sessionsOf(app).has("b")).toBe(true);
@@ -1027,7 +1057,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
       const store = new SessionStore(f);
       store.reserve(bind({ threadId: "t1", sessionId: "s-1", workDir: join(tmpdir(), "dcs-fixture-somewhere-else") }));
       store.commit("t1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), new FakeTransport(), appDependencies({ store }));
       await reconcile(app, async () => "valid");
       expect(sessionsOf(app).has("t1")).toBe(false);
       expect(store.get("t1")?.state).toBe("blocked");
@@ -1053,13 +1083,13 @@ describe("startup announcement for records whose thread is gone", () => {
 
   it("posts ONE parent-channel line naming the thread id and its worktree", async () => {
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, "dead"); // where bindingOk requires it to be
+    const wt = join(WT_ROOT, "dead"); // where bindingOk requires it to be
     try {
       const store = new SessionStore(f);
       store.reserve(bind({ threadId: "dead", workDir: wt, branch: "copilot/t-dead" }));
       store.commit("dead");
       const transport = new KeyedTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, appDependencies({ store }));
       await reconcile(app, async () => "gone");
 
       const parent = transport.sent.filter((m) => m.key === "c1");
@@ -1074,7 +1104,7 @@ describe("startup announcement for records whose thread is gone", () => {
 
   it("announces a terminal stale rebind pointer instead of reporting its worktree as unowned", async () => {
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, "stale-old");
+    const wt = join(WT_ROOT, "stale-old");
     try {
       const store = new SessionStore(f);
       store.reserve(
@@ -1092,7 +1122,7 @@ describe("startup announcement for records whose thread is gone", () => {
       expect(store.remove("stale")).toBe(true);
 
       const transport = new KeyedTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, appDependencies({ store }));
       await reconcile(app, async () => "valid");
 
       const parent = transport.sent.filter((m) => m.key === "c1");
@@ -1112,7 +1142,7 @@ describe("startup announcement for records whose thread is gone", () => {
       const store = new SessionStore(f);
       store.reserve(bind()); store.commit("t1");
       const transport = new KeyedTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, appDependencies({ store }));
       await reconcile(app, async () => "valid");
       expect(transport.sent.filter((m) => m.key === "c1")).toHaveLength(0);
     } finally {
@@ -1129,14 +1159,14 @@ describe("startup announcement for records whose thread is gone", () => {
         ["seed-record", "c1"],
         ["secondary-record", "c2"],
       ] as const) {
-        store.reserve(bind({ threadId, parentChannelId, workDir: join(`${stateDir()}-worktrees`, threadId) }));
+        store.reserve(bind({ threadId, parentChannelId, workDir: join(WT_ROOT, threadId) }));
         store.commit(threadId);
         store.setState(threadId, "blocked", "thread-gone");
       }
       const channels = new ChannelRegistry("c1", "g1", registryFile);
       expect(channels.enable("c2", "u1")).toBe(true);
       const transport = new KeyedTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store, channels);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, appDependencies({ store, channels }));
 
       await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
 
@@ -1165,7 +1195,7 @@ describe("startup announcement for records whose thread is gone", () => {
       expect(channels.enable("c2", "u1")).toBe(true);
       const transport = new KeyedTransport();
       transport.rejectedKeys.add("c2");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store, channels);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, appDependencies({ store, channels }));
 
       await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
 
@@ -1192,8 +1222,7 @@ describe("startup announcement for records whose thread is gone", () => {
         REPOS_ROOT,
         fakeCopilot(),
         transport,
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
 
       await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
@@ -1220,8 +1249,7 @@ describe("startup announcement for records whose thread is gone", () => {
         REPOS_ROOT,
         fakeCopilot(),
         transport,
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
 
       await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
@@ -1249,7 +1277,7 @@ describe("startup announcement for records whose thread is gone", () => {
       const transport = new KeyedTransport();
       transport.rejectedKeys.add("c2");
       transport.rejectedKeys.add("c1");
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store, channels);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, appDependencies({ store, channels }));
 
       await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
 
@@ -1263,12 +1291,18 @@ describe("startup announcement for records whose thread is gone", () => {
 
   it("reports unowned stray worktrees to the seed channel", async () => {
     const f = tmpFile();
-    const stray = join(`${stateDir()}-worktrees`, "unowned");
+    const stray = join(WT_ROOT, "unowned");
     try {
       mkdirSync(stray, { recursive: true });
       writeFileSync(join(stray, ".git"), "gitdir: nowhere", "utf8");
       const transport = new KeyedTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, new SessionStore(f));
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        transport,
+        appDependencies({ store: new SessionStore(f) })
+      );
 
       await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
 
@@ -1298,13 +1332,13 @@ describe("a record retired by reclaim stays announceable", () => {
 
   it("keeps the thread-* diagnosis when the worktree is kept", async () => {
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, "kept");
+    const wt = join(WT_ROOT, "kept");
     try {
       const store = new SessionStore(f);
       store.reserve(bind({ threadId: "kept", workDir: wt, branch: "copilot/t-kept" }));
       store.commit("kept");
       const transport = new KeyedTransport2();
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, appDependencies({ store }));
       await reconcile(app, async () => "gone");
       expect(store.get("kept")?.reason).toBe("thread-gone");
 
@@ -1327,13 +1361,13 @@ describe("a record retired by reclaim stays announceable", () => {
 
   it("announces a record retired from a live session too (it still holds disk)", async () => {
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, "live-end");
+    const wt = join(WT_ROOT, "live-end");
     try {
       const store = new SessionStore(f);
       store.reserve(bind({ threadId: "live-end", workDir: wt, branch: "copilot/t-live-end" }));
       store.commit("live-end"); // active, no reason
       const transport = new KeyedTransport2();
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, appDependencies({ store }));
       (app as unknown as { retire(id: string): boolean }).retire("live-end");
       expect(store.get("live-end")?.reason).toBe("worktree-kept");
 
@@ -1369,7 +1403,7 @@ describe("startup announcement length budget", () => {
             bind({
               threadId: id,
               parentChannelId,
-              workDir: join(`${stateDir()}-worktrees`, id),
+              workDir: join(WT_ROOT, id),
               branch: `copilot/t-${id}`,
             })
           );
@@ -1380,7 +1414,7 @@ describe("startup announcement length budget", () => {
       const transport = new Cap();
       const channels = new ChannelRegistry("c1", "g1", registryFile);
       expect(channels.enable("c2", "u1")).toBe(true);
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store, channels);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, appDependencies({ store, channels }));
       await (app as unknown as { announceUnreachableRecords(): Promise<void> }).announceUnreachableRecords();
       expect(transport.sent).toHaveLength(2);
       for (const msg of transport.sent) {
@@ -1565,8 +1599,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         transport,
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -1622,8 +1655,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let hidden = true;
       setChannelFetch(app, async () =>
@@ -1663,8 +1695,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         transport,
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       setChannelFetch(app, async () => {
         throw { code: 50001 };
@@ -1707,8 +1738,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let deleted = false;
       setChannelFetch(app, async () => {
@@ -1747,8 +1777,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         gated.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -1797,8 +1826,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         gated.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -1851,8 +1879,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         gated.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -1899,8 +1926,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        new SessionStore(f),
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store: new SessionStore(f), channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       (app as unknown as { phase: string }).phase = "ready";
       (app as unknown as { startAccessRetryLoop(): void }).startAccessRetryLoop();
@@ -1927,8 +1953,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         transport,
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let mode: "no-access" | "transient" | "ok" = "no-access";
       setChannelFetch(app, async () => {
@@ -1981,8 +2006,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         fakeCopilot(),
         transport,
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let status = "no-access";
       await reconcile(app, async () => status);
@@ -2025,8 +2049,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         gated.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       let holdClassify: Promise<void> | undefined;
@@ -2089,8 +2112,7 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         REPOS_ROOT,
         gated.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       let holdClassify: Promise<void> | undefined;
@@ -2145,7 +2167,7 @@ describe("startup skip notices promise only what will actually happen", () => {
       store.reserve(bind({ threadId, sessionId: `s-${threadId}` }));
       store.commit(threadId);
       const transport = new FakeTransport();
-      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, store);
+      const app = DiscordCopilotApp.createForTest(cfg, REPOS_ROOT, fakeCopilot(), transport, appDependencies({ store }));
       await reconcile(app, async () => status);
       expect(store.get(threadId)?.state).toBe("active");
       expect(transport.notices).toHaveLength(1);
@@ -2194,8 +2216,7 @@ describe("access retry must not trust the channel cache", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       // discord.js answers `channels.fetch(id)` from cache when it holds a
       // non-partial object. Losing access leaves an OBFUSCATED stub cached, and
@@ -2247,8 +2268,7 @@ describe("access retry must not trust the channel cache", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       setChannelFetch(app, async () => visibleThread);
       const before = fetchCalls.length;
@@ -2302,8 +2322,7 @@ describe("access retry vs an explicit teardown that started FIRST", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async (_id, options) => {
@@ -2356,8 +2375,7 @@ describe("access retry vs an explicit teardown that started FIRST", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -2410,8 +2428,7 @@ describe("access retry vs an explicit teardown that started FIRST", () => {
         REPOS_ROOT,
         gated.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -2463,8 +2480,7 @@ describe("access retry vs an explicit teardown that started FIRST", () => {
         REPOS_ROOT,
         fakeCopilot({ resumeError: "getaddrinfo ENOTFOUND api.githubcopilot.com" }),
         transport,
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -2518,8 +2534,7 @@ describe("access retry — settlement, durability and teardown retries", () => {
         REPOS_ROOT,
         gated.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -2576,8 +2591,7 @@ describe("access retry — settlement, durability and teardown retries", () => {
         REPOS_ROOT,
         fakeCopilot(),
         transport,
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -2633,8 +2647,7 @@ describe("access retry — settlement, durability and teardown retries", () => {
         REPOS_ROOT,
         gated.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -2705,8 +2718,7 @@ describe("access retry — settlement, durability and teardown retries", () => {
         REPOS_ROOT,
         gated.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -2750,8 +2762,7 @@ describe("access retry — settlement, durability and teardown retries", () => {
         REPOS_ROOT,
         gated.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -2796,8 +2807,7 @@ describe("access retry — settlement, durability and teardown retries", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let fetched = 0;
       setChannelFetch(app, async () => {
@@ -2901,8 +2911,7 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
         REPOS_ROOT,
         copilot.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -2981,8 +2990,7 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       shrinkTeardown(app);
       const rec = store.get("t-keepfirst");
@@ -3053,8 +3061,7 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       const claims = { get: (id: string) => (inspectOwnership(app).teardownClaims().includes(id) ? 1 : 0), has: (id: string) => inspectOwnership(app).teardownClaims().includes(id) };
       const seen: Array<number | undefined> = [];
@@ -3114,8 +3121,7 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
         REPOS_ROOT,
         fakeCopilot(),
         transport,
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let lockReleased = false;
       useObservableLock(app, {
@@ -3201,8 +3207,7 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let lockReleased = false;
       useObservableLock(app, {
@@ -3274,8 +3279,7 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
         REPOS_ROOT,
         fakeCopilot(),
         transport,
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let lockReleased = false;
       useObservableLock(app, {
@@ -3329,8 +3333,7 @@ describe("shutdown ownership: single-flight, no forced exit, no leaked capabilit
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let releases = 0;
       let releasing: (() => void) | undefined;
@@ -3374,8 +3377,7 @@ describe("shutdown ownership: single-flight, no forced exit, no leaked capabilit
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let releases = 0;
       useObservableLock(app, {
@@ -3415,8 +3417,7 @@ describe("shutdown ownership: single-flight, no forced exit, no leaked capabilit
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       useObservableLock(app, {
         path: "(test)",
@@ -3472,8 +3473,7 @@ describe("shutdown ownership: single-flight, no forced exit, no leaked capabilit
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let closes = 0;
       const trustedRoot = {
@@ -3515,8 +3515,7 @@ describe("shutdown ownership: single-flight, no forced exit, no leaked capabilit
         REPOS_ROOT,
         fakeCopilot({ resumeError: "getaddrinfo ENOTFOUND api.githubcopilot.com" }),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let closes = 0;
       const trustedRoot = {
@@ -3576,8 +3575,7 @@ describe("the phase gate closes before the teardown, not after it", () => {
         REPOS_ROOT,
         copilot,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       (app as unknown as { phase: string }).phase = "ready";
 
@@ -3650,8 +3648,7 @@ describe("a rebind is a teardown claim on its thread", () => {
       REPOS_ROOT,
       fakeCopilot(),
       new FakeTransport(),
-      store,
-      new ChannelRegistry("c1", "g1", registryFile)
+      appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
     );
   }
 
@@ -3820,8 +3817,7 @@ describe("nothing this process started may be dropped unnoticed at shutdown", ()
       REPOS_ROOT,
       fakeCopilot(),
       new FakeTransport(),
-      store,
-      new ChannelRegistry("c1", "g1", registryFile)
+      appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
     );
     let released = 0;
     useObservableLock(app, {
@@ -3917,8 +3913,7 @@ describe("late findings: declines, defers and superseded runtimes", () => {
         REPOS_ROOT,
         gated.client,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let access = false;
       setChannelFetch(app, async () => {
@@ -3974,8 +3969,7 @@ describe("late findings: declines, defers and superseded runtimes", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       await app.stop();
 
@@ -4011,8 +4005,7 @@ describe("late findings: declines, defers and superseded runtimes", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       const seen: Array<string | undefined> = [];
       let release: () => void = () => {};
@@ -4060,8 +4053,7 @@ describe("startup is owned work, and its resumes are owned per thread", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let released = 0;
       useObservableLock(app, {
@@ -4148,8 +4140,7 @@ describe("startup is owned work, and its resumes are owned per thread", () => {
         REPOS_ROOT,
         copilot,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       useOwnershipBounds(app, { obligationTimeoutMs: 20 });
       (app as unknown as { resumeTeardownTimeoutMs: number }).resumeTeardownTimeoutMs = 20;
@@ -4220,8 +4211,7 @@ describe("a rebind that loses ownership mid-transaction installs nothing", () =>
       REPOS_ROOT,
       fakeCopilot(),
       new FakeTransport(),
-      store,
-      new ChannelRegistry("c1", "g1", registryFile)
+      appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
     );
     sessionsOf(app).set("t-rbx", {
       actor: { disconnect: async () => {} },
@@ -4348,8 +4338,7 @@ describe("/end answers exactly once, through the real reclaim path", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       const interaction = strictInteraction();
 
@@ -4381,8 +4370,7 @@ describe("/end answers exactly once, through the real reclaim path", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       const interaction = strictInteraction();
 
@@ -4461,8 +4449,7 @@ describe("/end answers exactly once, through the real reclaim path", () => {
           REPOS_ROOT,
           fakeCopilot(),
           new FakeTransport(),
-          store,
-          new ChannelRegistry("c1", "g1", registryFile)
+          appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
         );
         branch.arrange(store, app, threadId);
         const interaction = strictInteraction({ channelId: threadId });
@@ -4498,8 +4485,7 @@ describe("/end answers exactly once, through the real reclaim path", () => {
         REPOS_ROOT,
         fakeCopilot(),
         new FakeTransport(),
-        new SessionStore(f),
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store: new SessionStore(f), channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       await app.stop();
       const interaction: StrictInteraction = strictInteraction({ channelId: "t-shut" });
@@ -4539,8 +4525,7 @@ describe("teardown failures the SDK REPORTS rather than throws", () => {
         REPOS_ROOT,
         copilot,
         new FakeTransport(),
-        new SessionStore(f),
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store: new SessionStore(f), channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let releases = 0;
       useObservableLock(app, {
@@ -4572,8 +4557,7 @@ describe("teardown failures the SDK REPORTS rather than throws", () => {
         REPOS_ROOT,
         copilot,
         new FakeTransport(),
-        new SessionStore(f),
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store: new SessionStore(f), channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let releases = 0;
       useObservableLock(app, {
@@ -4633,8 +4617,7 @@ describe("a runtime that confirms LATE still discharges what it was owed", () =>
         REPOS_ROOT,
         copilot,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let releases = 0;
       useObservableLock(app, {
@@ -4700,8 +4683,7 @@ describe("a runtime that confirms LATE still discharges what it was owed", () =>
         REPOS_ROOT,
         copilot,
         new FakeTransport(),
-        store,
-        new ChannelRegistry("c1", "g1", registryFile)
+        appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       let releases = 0;
       useObservableLock(app, {

@@ -213,6 +213,18 @@ the suite while aborting `/end` in production before it reclaimed anything. Asse
 `replyCalls`/`editCalls`/`followUpCalls` rather than the flags — after an edit, `replied` is
 legitimately true.
 
+**Test construction may not reach a real home.** `DiscordCopilotApp.createForTest` and
+`SessionActor.createForTest` take a **required** dependency object covering every collaborator
+whose production default resolves through `os.homedir()` — session store, channel registry,
+`ApprovalPolicy`, the actor's `AuditSink` and skills home, the worktree root, and teardown's
+`clearStartupReady`. Omitting one is a compile error, deliberately: Vitest's run-wide
+`HOME`/`USERPROFILE` redirect (`test/global-home.ts`) stays as defence in depth, but it fails
+open and cannot make an omission visible. Build the object with
+`test/support/app-test-dependencies.ts` from a suite-scoped directory; never add an optional
+fallback that can resolve to a home path, and never give `dependencies` a default value.
+`test/test-home-injection.test.ts` is the runtime half — it poisons a sentinel home and proves
+the app acts on none of it (see `docs/PLAN.md` §15.7).
+
 **Shipped scripts are covered by tests, and encodings matter.** `test/shipped-scripts.test.ts`
 asserts every user-facing `.ps1` starts with a UTF-8 BOM (Windows PowerShell 5.1 otherwise
 mis-parses the Chinese strings), every `.sh` has a shebang, and every `.sh` is committed `100755`.

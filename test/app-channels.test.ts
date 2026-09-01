@@ -17,6 +17,10 @@ import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { isAuthorized, type AuthPolicy } from "../src/platforms/discord/auth.js";
 import type { OwnedScope } from "../src/core/lifecycle-ownership.js";
 import { inOwnedScope } from "./support/owned-scope.js";
+import {
+  appTestDependencies,
+  type AppTestDependencyOverrides,
+} from "./support/app-test-dependencies.js";
 
 const OWNER = "10000";
 const GUILD = "20000";
@@ -24,6 +28,11 @@ const SEED = "30000";
 const SECONDARY = "40000";
 const VISIBLE_DISABLED = "50000";
 const FIXTURES = join(process.cwd(), ".test-fixtures-app-channels");
+
+/** The dependency object `createForTest` requires, sourced from this suite's
+ *  fixture directory instead of the home directory of whoever runs it. */
+const appDependencies = (over: AppTestDependencyOverrides): ReturnType<typeof appTestDependencies> =>
+  appTestDependencies({ directory: FIXTURES, parentChannelId: SEED, guildId: GUILD }, over);
 
 class FakeTransport implements Transport {
   async render(): Promise<void> {}
@@ -163,8 +172,7 @@ function harness(registryFile = join(FIXTURES, "channels.json")): Harness {
     reposRoot,
     {} as unknown as CopilotClient,
     new FakeTransport(),
-    store,
-    registry
+    appDependencies({ store, channels: registry })
   );
   return { app, registry, store };
 }
@@ -310,9 +318,7 @@ describe("/channel", () => {
       reposRoot,
       {} as unknown as CopilotClient,
       new FakeTransport(),
-      new SessionStore(join(FIXTURES, "sessions-nonwin-permissions.json")),
-      registry,
-      { fileDeliveryPlatform: "linux" }
+      appDependencies({ store: new SessionStore(join(FIXTURES, "sessions-nonwin-permissions.json")), channels: registry, fileDeliveryPlatform: "linux" })
     );
     const interaction = slash({ channelId: SECONDARY, subcommand: "enable" });
     patchChannelFetch(app, async () => ({
@@ -523,8 +529,7 @@ describe("/channel", () => {
       reposRoot,
       {} as unknown as CopilotClient,
       new NoticeTransport(),
-      new SessionStore(join(FIXTURES, "sessions-yolo.json")),
-      new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels-yolo.json"))
+      appDependencies({ store: new SessionStore(join(FIXTURES, "sessions-yolo.json")), channels: new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels-yolo.json")) })
     );
 
     const state = { on: false, epoch: 0 };
@@ -611,9 +616,7 @@ describe("/channel", () => {
       reposRoot,
       {} as unknown as CopilotClient,
       new NoticeTransport(),
-      new SessionStore(join(FIXTURES, "sessions-yolo-nonwin.json")),
-      new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels-yolo-nonwin.json")),
-      { fileDeliveryPlatform: "linux" }
+      appDependencies({ store: new SessionStore(join(FIXTURES, "sessions-yolo-nonwin.json")), channels: new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels-yolo-nonwin.json")), fileDeliveryPlatform: "linux" })
     );
 
     const state = { on: false, epoch: 0 };

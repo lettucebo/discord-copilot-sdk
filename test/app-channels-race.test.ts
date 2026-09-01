@@ -13,10 +13,13 @@ import { ChannelRegistry } from "../src/core/channel-registry.js";
 import { SessionStore } from "../src/core/session-store.js";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { removeWorktreeIfClean, worktreeBranch, worktreePath } from "../src/core/worktree.js";
-import { worktreeRoot } from "../src/core/paths.js";
 import type { SecureOpenBackend } from "../src/core/secure-open.js";
 import type { OwnedScope } from "../src/core/lifecycle-ownership.js";
 import { inOwnedScope } from "./support/owned-scope.js";
+import {
+  appTestDependencies,
+  type AppTestDependencyOverrides,
+} from "./support/app-test-dependencies.js";
 
 const OWNER = "10000";
 const GUILD = "20000";
@@ -29,6 +32,16 @@ const UNRELATED_RACE_THREAD_ID = `channel-race-unrelated-mutation-${process.pid}
 const QUOTA_THREAD_ID = `channel-race-file-quota-${process.pid}`;
 const APPROVAL_KEY_THREAD_ID = `channel-race-approval-key-${process.pid}`;
 const run = promisify(execFile);
+
+/** This suite's INJECTED worktree root, matching what `appDependencies` hands
+ *  the app. Deliberately not `paths.worktreeRoot()`: an expectation derived from
+ *  the real home would pass only because the app was reading that same home. */
+const worktreeRoot = (): string => join(FIXTURES, "worktrees");
+
+/** The dependency object `createForTest` requires, sourced from this suite's
+ *  fixture directory instead of the home directory of whoever runs it. */
+const appDependencies = (over: AppTestDependencyOverrides): ReturnType<typeof appTestDependencies> =>
+  appTestDependencies({ directory: FIXTURES, parentChannelId: SEED, guildId: GUILD }, over);
 
 let cleanupRepo: string | undefined;
 let cleanupWorktree: string | undefined;
@@ -235,8 +248,7 @@ describe("/new channel-registry epoch fence", { timeout: 60_000 }, () => {
       reposRoot,
       {} as unknown as CopilotClient,
       new FakeTransport(),
-      new SessionStore(join(FIXTURES, "sessions.json")),
-      registry
+      appDependencies({ store: new SessionStore(join(FIXTURES, "sessions.json")), channels: registry })
     );
     const createThread = vi.fn(async () => ({ id: "thread-1", delete: async () => {} }));
     patchChannelFetch(app, async () => {
@@ -267,8 +279,7 @@ describe("/new channel-registry epoch fence", { timeout: 60_000 }, () => {
       reposRoot,
       {} as unknown as CopilotClient,
       new FakeTransport(),
-      store,
-      registry
+      appDependencies({ store, channels: registry })
     );
     const branch = worktreeBranch(RACE_THREAD_ID);
     const expectedWorktree = worktreePath(worktreeRoot(), repoPath, RACE_THREAD_ID);
@@ -318,8 +329,7 @@ describe("/new channel-registry epoch fence", { timeout: 60_000 }, () => {
       reposRoot,
       {} as unknown as CopilotClient,
       new FakeTransport(),
-      store,
-      registry
+      appDependencies({ store, channels: registry })
     );
     const branch = worktreeBranch(UNRELATED_RACE_THREAD_ID);
     const expectedWorktree = worktreePath(worktreeRoot(), repoPath, UNRELATED_RACE_THREAD_ID);
@@ -373,8 +383,7 @@ describe("/new channel-registry epoch fence", { timeout: 60_000 }, () => {
       reposRoot,
       fakeCopilot(),
       new FakeTransport(),
-      store,
-      registry
+      appDependencies({ store, channels: registry })
     );
     const branch = worktreeBranch(QUOTA_THREAD_ID);
     const expectedWorktree = worktreePath(worktreeRoot(), repoPath, QUOTA_THREAD_ID);
@@ -425,8 +434,7 @@ describe("/new channel-registry epoch fence", { timeout: 60_000 }, () => {
       reposRoot,
       fakeCopilot(),
       new FakeTransport(),
-      new SessionStore(join(FIXTURES, "sessions.json")),
-      registry
+      appDependencies({ store: new SessionStore(join(FIXTURES, "sessions.json")), channels: registry })
     );
     const branch = worktreeBranch(APPROVAL_KEY_THREAD_ID);
     const expectedWorktree = worktreePath(worktreeRoot(), repoPath, APPROVAL_KEY_THREAD_ID);

@@ -1,5 +1,10 @@
 import { afterAll, afterEach, describe, it, expect, vi } from "vitest";
-import { SessionActor, formatTodos, type SessionActorCreateDependencies } from "../src/copilot/session-actor.js";
+import {
+  SessionActor,
+  formatTodos,
+  type SessionActorCreateDependencies,
+  type SessionActorCreateForTestDependencies,
+} from "../src/copilot/session-actor.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { ApprovalPolicy } from "../src/core/approval-policy.js";
 import type { AuditEntry, AuditSink } from "../src/core/audit-log.js";
@@ -260,10 +265,27 @@ function retainedRootDependencies(root: string): {
   return { dependencies: { secureOpen: { backend } }, close, openDirectory };
 }
 
+/** The two REQUIRED test dependencies, defaulted to fixtures that cannot reach a
+ *  real home: a sink that records in memory instead of appending to
+ *  `~/.discord-copilot-sdk/<instance>.audit.jsonl`, and a skills home that is not
+ *  the `~/.copilot/skills` of whoever runs this suite. `skillsHomeDirectory` has
+ *  exactly ONE source now — passing it in `opts` no longer compiles. */
+function actorDependencies(
+  auditLog: AuditSink,
+  over: SetupDependencies = {}
+): SessionActorCreateForTestDependencies {
+  return {
+    ...over,
+    auditLog,
+    skillsHomeDirectory:
+      over.skillsHomeDirectory ?? join(tmpdir(), `discord-copilot-sdk-no-skills-${Math.random()}`),
+  };
+}
+
 function createActor(
   client: CopilotClient,
   opts: Parameters<typeof SessionActor.createForTest>[1],
-  dependencies?: SessionActorCreateDependencies
+  dependencies: SessionActorCreateForTestDependencies
 ): Promise<SessionActor> {
   return SessionActor.createForTest(client, opts, dependencies).then((actor) => {
     liveActors.add(actor);
@@ -271,9 +293,15 @@ function createActor(
   });
 }
 
+/** The optional seams a test may add, plus the skills home. The audit sink is
+ *  deliberately absent: `setup` owns the `FakeAuditLog` it returns, and a second
+ *  source for it would let a test assert on a sink the actor never used. */
+type SetupDependencies = SessionActorCreateDependencies &
+  Partial<Pick<SessionActorCreateForTestDependencies, "skillsHomeDirectory">>;
+
 async function setup(
   extra: Record<string, unknown> = {},
-  dependencies?: SessionActorCreateDependencies
+  dependencies: SetupDependencies = {}
 ): Promise<Setup> {
   const session = new FakeSession();
   const transport = new FakeTransport();
@@ -310,18 +338,15 @@ async function setup(
     {
       sessionKey: "t",
       workingDirectory: defaultWorkingDirectory,
-      // Keep unit tests independent of the developer's actual ~/.copilot/skills.
-      skillsHomeDirectory: join(tmpdir(), `discord-copilot-sdk-no-skills-${Math.random()}`),
       broker,
       transport,
       policy,
-      auditLog,
       initialFileDeliveryBytes: persistedFileDeliveryBytes,
       fileDeliverySessionId: "fake-session-id",
       reserveFileDeliveryBytes,
       ...extra,
     },
-    dependencies
+    actorDependencies(auditLog, dependencies)
   );
   return { actor, session, transport, broker, policy, auditLog, config, resumeArgs: box.resumeArgs };
 }
@@ -493,12 +518,10 @@ describe("SessionActor config hardening", () => {
         writeFileSync(join(dir, "SKILL.md"), "---\nname: probe\n---\n");
       }
 
-      const s = await setup({
-        workingDirectory: root,
-        skillsHomeDirectory: home,
-        enableRepoSkills: true,
-        enableUserSkills: true,
-      });
+      const s = await setup(
+        { workingDirectory: root, enableRepoSkills: true, enableUserSkills: true },
+        { skillsHomeDirectory: home }
+      );
 
       expect(s.config["enableConfigDiscovery"]).toBe(false);
       expect(s.config["enableSkills"]).toBe(true);
@@ -513,12 +536,10 @@ describe("SessionActor config hardening", () => {
     const root = mkdtempSync(join(tmpdir(), "dcs-session-empty-skills-"));
     const home = join(root, "home");
     try {
-      const s = await setup({
-        workingDirectory: root,
-        skillsHomeDirectory: home,
-        enableRepoSkills: true,
-        enableUserSkills: true,
-      });
+      const s = await setup(
+        { workingDirectory: root, enableRepoSkills: true, enableUserSkills: true },
+        { skillsHomeDirectory: home }
+      );
 
       expect(s.config["enableConfigDiscovery"]).toBe(false);
       expect(s.config["enableSkills"]).toBe(false);
@@ -540,18 +561,14 @@ describe("SessionActor config hardening", () => {
         writeFileSync(join(dir, "SKILL.md"), "---\nname: probe\n---\n");
       }
 
-      const repo = await setup({
-        workingDirectory: root,
-        skillsHomeDirectory: home,
-        enableRepoSkills: true,
-        enableUserSkills: false,
-      });
-      const user = await setup({
-        workingDirectory: root,
-        skillsHomeDirectory: home,
-        enableRepoSkills: false,
-        enableUserSkills: true,
-      });
+      const repo = await setup(
+        { workingDirectory: root, enableRepoSkills: true, enableUserSkills: false },
+        { skillsHomeDirectory: home }
+      );
+      const user = await setup(
+        { workingDirectory: root, enableRepoSkills: false, enableUserSkills: true },
+        { skillsHomeDirectory: home }
+      );
 
       expect(repo.actor.hasRepoSkills()).toBe(true);
       expect(user.actor.hasRepoSkills()).toBe(false);
@@ -668,17 +685,20 @@ describe("SessionActor trusted roots", () => {
     } as unknown as CopilotClient;
 
     await expect(
-      SessionActor.createForTest(client, {
-        sessionKey: "t",
-        workingDirectory: join(tmpdir(), `dcs-missing-root-${Math.random()}`, "work"),
-        skillsHomeDirectory: join(tmpdir(), `dcs-no-skills-${Math.random()}`),
-        broker: new PendingInteractionBroker(),
-        transport: new FakeTransport(),
-        policy: new ApprovalPolicy(join(tmpdir(), `dcs-test-approvals-${Math.random()}.json`)),
-        initialFileDeliveryBytes: 0,
-        fileDeliverySessionId: "root-capture-test",
-        reserveFileDeliveryBytes: () => true,
-      })
+      SessionActor.createForTest(
+        client,
+        {
+          sessionKey: "t",
+          workingDirectory: join(tmpdir(), `dcs-missing-root-${Math.random()}`, "work"),
+          broker: new PendingInteractionBroker(),
+          transport: new FakeTransport(),
+          policy: new ApprovalPolicy(join(tmpdir(), `dcs-test-approvals-${Math.random()}.json`)),
+          initialFileDeliveryBytes: 0,
+          fileDeliverySessionId: "root-capture-test",
+          reserveFileDeliveryBytes: () => true,
+        },
+        actorDependencies(new FakeAuditLog())
+      )
     ).rejects.toThrow();
 
     expect(createSession).not.toHaveBeenCalled();
@@ -825,7 +845,6 @@ describe("SessionActor trusted roots", () => {
         {
           sessionKey: "t",
           workingDirectory: defaultWorkingDirectory,
-          skillsHomeDirectory: join(tmpdir(), `dcs-no-skills-${Math.random()}`),
           broker: new PendingInteractionBroker(),
           transport: new FakeTransport(),
           policy: new ApprovalPolicy(join(tmpdir(), `dcs-test-approvals-${Math.random()}.json`)),
@@ -833,7 +852,7 @@ describe("SessionActor trusted roots", () => {
           fileDeliverySessionId: "create-failure-test",
           reserveFileDeliveryBytes: () => true,
         },
-        retained.dependencies
+        actorDependencies(new FakeAuditLog(), retained.dependencies)
       )
     ).rejects.toThrow("SDK create failed");
 
@@ -888,7 +907,6 @@ describe("SessionActor trusted roots", () => {
             {
               sessionKey: "root-handoff",
               workingDirectory: defaultWorkingDirectory,
-              skillsHomeDirectory: join(tmpdir(), `discord-copilot-sdk-no-skills-${Math.random()}`),
               broker: new PendingInteractionBroker(),
               transport: new FakeTransport(),
               policy: new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`)),
@@ -897,7 +915,7 @@ describe("SessionActor trusted roots", () => {
               reserveFileDeliveryBytes: () => true,
               ...(mode === "resume" ? { resumeSessionId: "persisted-root-handoff" } : {}),
             },
-            { secureOpen: { backend } }
+            actorDependencies(new FakeAuditLog(), { secureOpen: { backend } })
           )
         ).rejects.toThrow(/trusted-root|root/i);
 
@@ -963,7 +981,6 @@ describe("SessionActor trusted roots", () => {
       {
         sessionKey: "root-cleanup-timeout",
         workingDirectory: defaultWorkingDirectory,
-        skillsHomeDirectory: join(tmpdir(), `discord-copilot-sdk-no-skills-${Math.random()}`),
         broker: new PendingInteractionBroker(),
         transport: new FakeTransport(),
         policy: new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`)),
@@ -971,7 +988,7 @@ describe("SessionActor trusted roots", () => {
         fileDeliverySessionId: "root-cleanup-timeout",
         reserveFileDeliveryBytes: () => true,
       },
-      { secureOpen: { backend }, postRpcCleanupTimeoutMs: 1 }
+      actorDependencies(new FakeAuditLog(), { secureOpen: { backend }, postRpcCleanupTimeoutMs: 1 })
     );
     const outcome = await Promise.race([
       creating.then(
@@ -2876,19 +2893,23 @@ describe("SessionActor resume/create-id seam (P2)", () => {
       createSession: async () => session,
       resumeSession: async () => session,
     } as unknown as CopilotClient;
-    const actor = await createActor(client, {
-      sessionKey: "t",
-      workingDirectory: defaultWorkingDirectory,
-      broker: new PendingInteractionBroker(),
-      transport: new FakeTransport(),
-      policy: new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`)),
-      initialFileDeliveryBytes: 0,
-      fileDeliverySessionId: "sess-123",
-      reserveFileDeliveryBytes: () => true,
-      resumeSessionId: "sess-123",
-      model: "gpt-5.4", // the startup default — must NOT win
-      contextTier: "default",
-    });
+    const actor = await createActor(
+      client,
+      {
+        sessionKey: "t",
+        workingDirectory: defaultWorkingDirectory,
+        broker: new PendingInteractionBroker(),
+        transport: new FakeTransport(),
+        policy: new ApprovalPolicy(join(tmpdir(), `discord-copilot-sdk-test-approvals-${Math.random()}.json`)),
+        initialFileDeliveryBytes: 0,
+        fileDeliverySessionId: "sess-123",
+        reserveFileDeliveryBytes: () => true,
+        resumeSessionId: "sess-123",
+        model: "gpt-5.4", // the startup default — must NOT win
+        contextTier: "default",
+      },
+      actorDependencies(new FakeAuditLog())
+    );
     expect(actor.config()).toEqual({ model: "claude-opus-4.8", effort: "max", context: "long_context" });
   });
 

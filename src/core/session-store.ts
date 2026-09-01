@@ -136,6 +136,16 @@ export class SessionStore {
     this.load();
   }
 
+  /** The file this store actually reads and writes.
+   *
+   * Operator-facing messages used to name `sessionStorePath()` instead, which is
+   * both a guess (it resolves the DEFAULT location, not this instance's) and a
+   * side effect: that helper calls `stateDir()`, which CREATES the real state
+   * directory — including for an app that was given a different store entirely. */
+  path(): string {
+    return this.file;
+  }
+
   /** Every persisted record, in insertion order. */
   all(): SessionRecord[] {
     return [...this.sessions.values()].map((r) => ({ ...r }));

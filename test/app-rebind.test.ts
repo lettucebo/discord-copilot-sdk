@@ -18,7 +18,6 @@ import type { SendFileResult, Transport } from "../src/core/transport.js";
 import type { DevMode } from "../src/core/binding.js";
 import type { SecureOpenBackend } from "../src/core/secure-open.js";
 import { worktreePath } from "../src/core/worktree.js";
-import { worktreeRoot } from "../src/core/paths.js";
 import type { InstanceLock } from "../src/core/single-instance.js";
 import {
   strictInteraction,
@@ -26,6 +25,10 @@ import {
   type StrictInteraction,
   type StrictInteractionFields,
 } from "./support/strict-interaction.js";
+import {
+  appTestDependencies,
+  type AppTestDependencyOverrides,
+} from "./support/app-test-dependencies.js";
 
 const run = promisify(execFile);
 
@@ -145,18 +148,24 @@ function fakeCopilot(opts: { createFails?: boolean } = {}): CopilotClient {
 }
 
 async function createActiveActor(workDir: string, transport: Transport): Promise<SessionActor> {
-  return SessionActor.createForTest(fakeCopilot(), {
-    sessionKey: "t1",
-    workingDirectory: workDir,
-    skillsHomeDirectory: path.join(tmp, "no-user-skills"),
-    broker: new PendingInteractionBroker(),
-    transport,
-    policy: new ApprovalPolicy(path.join(tmp, `approvals-${Math.random()}.json`)),
-    auditLog: { append: () => true },
-    initialFileDeliveryBytes: 0,
-    fileDeliverySessionId: "s1",
-    reserveFileDeliveryBytes: () => true,
-  });
+  return SessionActor.createForTest(
+    fakeCopilot(),
+    {
+      sessionKey: "t1",
+      workingDirectory: workDir,
+      broker: new PendingInteractionBroker(),
+      transport,
+      policy: new ApprovalPolicy(path.join(tmp, `approvals-${Math.random()}.json`)),
+      initialFileDeliveryBytes: 0,
+      fileDeliverySessionId: "s1",
+      reserveFileDeliveryBytes: () => true,
+    },
+    {
+      // Required: both default to the home of whoever runs this suite.
+      auditLog: { append: () => true },
+      skillsHomeDirectory: path.join(tmp, "no-user-skills"),
+    }
+  );
 }
 
 interface Harness {
@@ -166,9 +175,19 @@ interface Harness {
   actor: FakeActor;
 }
 
+/** This suite's INJECTED worktree root, matching what `appDependencies` hands
+ *  the app. Deliberately not `paths.worktreeRoot()`: an expectation derived from
+ *  the real home would pass only because the app was reading that same home. */
+const worktreeRoot = (): string => path.join(tmp, "worktrees");
+
 function testChannels(): ChannelRegistry {
   return new ChannelRegistry("c1", "g1", path.join(tmp, "channels.json"));
 }
+
+/** The dependency object `createForTest` requires, sourced from this suite's
+ *  per-test temporary root instead of the home directory of whoever runs it. */
+const appDependencies = (over: AppTestDependencyOverrides): ReturnType<typeof appTestDependencies> =>
+  appTestDependencies({ directory: tmp, parentChannelId: "c1", guildId: "g1" }, over);
 
 function harness(
   over: {
@@ -187,8 +206,7 @@ function harness(
     reposRoot,
     fakeCopilot(over),
     transport,
-    store,
-    over.channels ?? testChannels()
+    appDependencies({ store, channels: over.channels ?? testChannels() })
   );
   const actor = new FakeActor();
   const devMode = over.devMode ?? "local";
@@ -509,8 +527,7 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       reposRoot,
       fakeCopilot({ createFails: true }),
       transport,
-      store,
-      testChannels()
+      appDependencies({ store, channels: testChannels() })
     );
     const actor = new FakeActor();
     const session: Session = {
