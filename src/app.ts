@@ -3367,8 +3367,35 @@ export class DiscordCopilotApp {
     const session = this.sessions.get(threadId);
     if (!session) return "⚠️ 這個討論串已經沒有進行中的 session，未改綁。";
     if (this.endedSessions.has(session)) return "⚠️ 這個討論串已結束，改綁未執行。";
+    /**
+     * May this transaction still install what it is building?
+     *
+     * Every await below is already followed by a check of this predicate with
+     * the rollback that is correct for THAT phase — close the captured root,
+     * undo the worktree just created, restore or retain the durable
+     * reservation, move the local lease back, tear the replacement actor down
+     * through the retain machinery, leave the old session in the map. The gap
+     * was never a missing checkpoint; it was that this predicate could not see
+     * a shutdown.
+     *
+     * `/end` is visible through `endedSessions` and the map, but `stop()` sets
+     * its flags and then tears down asynchronously, so between those two moments
+     * the old session is still mapped and un-ended — long enough for this
+     * transaction to create an SDK session and a worktree, and to register them
+     * AFTER `teardownResources` has already walked the map. Asking the scope
+     * closes that window at every existing checkpoint at once, which is the only
+     * way to add shutdown-awareness without inventing rollback that does not
+     * already exist.
+     */
     const ownsOldSession = (): boolean =>
-      this.sessions.get(threadId) === session && !this.endedSessions.has(session);
+      this.sessions.get(threadId) === session &&
+      !this.endedSessions.has(session) &&
+      scope.lostReason() === undefined;
+    /** Lost to an explicit `/end` rather than to shutdown. The distinction
+     *  matters for the fallback plan below: `/end` deliberately gives up the old
+     *  record, while a shutdown expects the next boot to resume it. */
+    const endedByCommand = (): boolean =>
+      this.endedSessions.has(session) || this.sessions.get(threadId) !== session;
     const endedRebind = "⚠️ 這個討論串已結束，改綁已取消。";
     // Fence old attachments synchronously, before rebindBlocker or any git/SDK
     // await. A stale actor must not reserve or send against the replacement
@@ -3434,7 +3461,12 @@ export class DiscordCopilotApp {
       // The first commit-failure disconnect may have raced `/end` before its
       // fallback tracker was registered. Flip an existing plan synchronously;
       // a plan created below is removal-only as well.
-      this.markFallbackPrimaryEnded(threadId);
+      //
+      // Only for `/end`. A shutdown must NOT turn a restore into a removal: the
+      // owner never gave up the old record, and the next boot is expected to
+      // resume it. Overwriting `/end`'s outcome, or a shutdown's, with the
+      // other's is exactly what this distinction prevents.
+      if (endedByCommand()) this.markFallbackPrimaryEnded(threadId);
       const trackedReplacement =
         replacementActor === undefined ? undefined : this.staleRebindActors.get(replacementActor);
       if (trackedReplacement?.fallbackPrimary) {

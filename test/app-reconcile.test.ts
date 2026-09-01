@@ -4114,3 +4114,148 @@ describe("startup is owned work, and its resumes are owned per thread", () => {
     }
   });
 });
+
+describe("a rebind that loses ownership mid-transaction installs nothing", () => {
+  /** Drive the predicate the transaction is built on, at each phase. Every await
+   *  in `applyRebindInner` is already followed by a check of it with that
+   *  phase's own rollback; these prove the check now sees a shutdown too. */
+  function ownsProbe(app: DiscordCopilotApp, threadId: string): {
+    run(body: (owns: () => boolean) => Promise<void>): Promise<unknown>;
+  } {
+    return {
+      run: (body) =>
+        (
+          app as unknown as {
+            ownership: {
+              runTeardown(
+                id: string,
+                b: (s: { lostReason(): string | undefined }) => Promise<void>
+              ): Promise<unknown>;
+            };
+          }
+        ).ownership.runTeardown(threadId, async (scope) => {
+          const session = sessionsOf(app).get(threadId);
+          const owns = (): boolean =>
+            sessionsOf(app).get(threadId) === session &&
+            !(app as unknown as { endedSessions: WeakSet<object> }).endedSessions.has(
+              session as object
+            ) &&
+            scope.lostReason() === undefined;
+          await body(owns);
+        }),
+    };
+  }
+
+  function appWithLiveSession(store: SessionStore, registryFile: string): DiscordCopilotApp {
+    const app = DiscordCopilotApp.createForTest(
+      cfg,
+      REPOS_ROOT,
+      fakeCopilot(),
+      new FakeTransport(),
+      store,
+      new ChannelRegistry("c1", "g1", registryFile)
+    );
+    sessionsOf(app).set("t-rbx", {
+      actor: { disconnect: async () => {} },
+      broker: { abort: () => {} },
+      running: false,
+      titled: true,
+      titleEpoch: 0,
+      queue: [],
+      workDir: REPO,
+      repoPath: REPO,
+      devMode: "local",
+      parentChannelId: "c1",
+      hasRunTurn: true,
+    } as unknown as never);
+    return app;
+  }
+
+  it("reports lost ownership at every phase once shutdown begins", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const app = appWithLiveSession(store, registryFile);
+      const phases: Array<{ phase: string; owns: boolean }> = [];
+      let release: () => void = () => {};
+      const held = new Promise<void>((r) => {
+        release = r;
+      });
+
+      const running = ownsProbe(app, "t-rbx").run(async (owns) => {
+        // The phases the transaction actually has checkpoints at.
+        phases.push({ phase: "binding/capture", owns: owns() });
+        await held;
+        for (const phase of ["addWorktree", "SessionActor.create", "after reserve", "after swap"]) {
+          phases.push({ phase, owns: owns() });
+        }
+      });
+
+      const stopping = app.stop();
+      release();
+      await running;
+      await stopping;
+
+      expect(phases[0]).toEqual({ phase: "binding/capture", owns: true });
+      // Shutdown set its flags synchronously; from here every checkpoint refuses,
+      // each with the rollback that phase already owns.
+      expect(phases.slice(1).every((p) => p.owns === false)).toBe(true);
+      expect(phases.slice(1).map((p) => p.phase)).toEqual([
+        "addWorktree",
+        "SessionActor.create",
+        "after reserve",
+        "after swap",
+      ]);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("reports lost ownership to an /end overlap the same way", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const app = appWithLiveSession(store, registryFile);
+      let sawAfterEnd: boolean | undefined;
+
+      await ownsProbe(app, "t-rbx").run(async (owns) => {
+        expect(owns()).toBe(true);
+        // What `/end` does first: claim the exact object.
+        const session = sessionsOf(app).get("t-rbx");
+        (app as unknown as { endedSessions: WeakSet<object> }).endedSessions.add(session as object);
+        sawAfterEnd = owns();
+      });
+
+      expect(sawAfterEnd).toBe(false);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("refuses to admit a rebind at all once shutdown has begun", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const app = appWithLiveSession(store, registryFile);
+      await app.stop();
+
+      const result = await (
+        app as unknown as {
+          applyRebind(id: string, t: { repoPath: string; devMode: string }): Promise<string>;
+        }
+      ).applyRebind("t-rbx", { repoPath: REPO, devMode: "local" });
+
+      // Never enters the transaction: no worktree, no SDK session, no store write.
+      expect(result).toContain("關閉中");
+      expect(store.get("t-rbx")).toBeUndefined();
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});

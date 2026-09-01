@@ -1090,6 +1090,10 @@ teardown claims、obligations **同時為空**才釋放，且只釋放一次。
 | coordinator 本身：pre-shutdown settle 不釋放／健康 shutdown 只釋放一次且 sweep 在 armed teardown 之前／join 逾時延後釋放／sweep 之後才 retain 的 obligation 仍擋住／obligation 失敗與 hang／first-wins 身分／teardown claim 拒絕 admission 但 barrier 不拒絕／計數式重入 claim／late arm 變 obligation／last-arm-wins／armed teardown 有界（永不返回、晚返回、返回但失敗）／timer 必須 unref | `test/lifecycle-ownership.test.ts` |
 | `app.stop()` 一被呼叫就**同步**關上 phase gate：teardown 進行中不得接受任何指令，coordinator 也不得再 admit owned work | `test/app-reconcile.test.ts` |
 | rebind 進行中，該 thread 的 access retry 必須被拒絕（其他 thread 不受影響）；巢狀 `/end` 是計數 claim；teardown body reject 不得洩漏 claim | `test/app-reconcile.test.ts` |
+| shutdown 開始後不得再 admit 新的 rebind；已 admit 的 rebind 在**每一個既有 checkpoint**（binding/capture、addWorktree、`SessionActor.create`、reserve 之後 swap 之前、swap 之後）都必須回報失去擁有權，`/end` 重疊同理 | `test/app-reconcile.test.ts`、`test/app-rebind.test.ts`（39 個既有斷言不變） |
+| startup 全程為 owned scope：shutdown 落在 reconcile 中途時不得開 phase gate、不得有遲到寫入、lock 不得在 scope 結束前釋放 | `test/app-reconcile.test.ts` |
+| startup resume 的 `commit()` 失敗 + disconnect hang ⇒ 留下 obligation，且 retry loop 啟動後不得建立第二個 runtime | `test/app-reconcile.test.ts` |
+| 一般 live session 的 disconnect throw／hang ⇒ obligation 保留、lock 不釋放；`/end thread:` 必須先 defer 再做兩段有界等待 | `test/app-reconcile.test.ts` |
 | 無法確認停止的 detached rebind incarnation 必須擋住 lock 釋放，直到它被 discharge | `test/app-reconcile.test.ts` |
 | **真實** `DiscordCopilotApp.start()` 的每一種失敗都必須釋放 lock 恰好一次：`REPOS_ROOT` 不存在、`REPOS_ROOT` 涵蓋 trust store、SDK 版本不符（三者皆不得建立 Copilot client）、以及 runtime 啟動失敗（要 stop client 再 release） | `test/app-start-ownership.test.ts` |
 | `stop()` 必須 single-flight：三個並行呼叫只跑一次拆解，且拿到**同一個** promise | `test/app-reconcile.test.ts` |
