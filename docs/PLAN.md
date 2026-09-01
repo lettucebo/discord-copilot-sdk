@@ -7,7 +7,20 @@
 > 已納入 RubberDuck 兩輪（rd-plan、rd-plan2）。SDK 事實均型別驗證。
 
 ## 0. 已型別驗證的 SDK 事實
-- 套件 `@github/copilot-sdk`。**使用最新版 `1.0.7-preview.3`（npm `latest` tag，依使用者要求追蹤最新）** + lockfile + 啟動相容檢查（installed vs declared，declared 取自本專案 package.json）+ 契約測試。
+- 套件 `@github/copilot-sdk`。目前 pin **`1.0.11`**，並以
+  `overrides` pin bundled `@github/copilot` **`1.0.80`**；本 repo 刻意不提交
+  npm lockfile，所以 SDK/runtime 必須視為一個可重現 tuple。啟動相容檢查仍以
+  package.json 的 SDK 宣告為單一真相來源。
+- 2026-09-01 在同一 commit、同一 runtime `1.0.80` 做乾淨 A/B：
+  `1.0.7-preview.3` 與 `1.0.11` 均通過 typecheck、198 個 SDK-sensitive tests、
+  build/selfcheck（24 models）及真實 shell permission/event trace；完整 model
+  catalog SHA-256 同為
+  `FBED4B8FED622F0CBC10D8557412DE1F105057DC5FA9C954040B22A8AE5D7435`。
+  Raw trace 亦確認 `canOfferSessionApproval:false`、root event 無 `agentId`、
+  `data.deltaContent`/`data.content`/`data.success` 型別不變。
+- 地端 proxy 當時雖有 `@github/copilot@1.0.81-*`，其
+  `@github/copilot-win32-x64` export 缺 SDK 所需的 `"./sdk"`，selfcheck 會
+  fail；`1.0.80` 是 proxy 上最新且可由 SDK bundled resolver 使用的版本。
 - Callback：`onPermissionRequest` / `onUserInputRequest` / `onElicitationRequest` / `onExitPlanModeRequest`。
 - **權限請求有 10 種變體**（已驗證）：`shell, write, read, mcp, url, memory, custom-tool, hook, extension-management, extension-permission-access`。
 - **`resolvedByHook?: boolean` 存在** → 本機 hook 可繞過 client handler 自行決定；須偵測並在啟用 approval hook/隱式 policy 時**啟動即失敗**或用隔離設定。
@@ -79,14 +92,14 @@
 鍵：`turnId/messageId/toolCallId/agentId`。累積 delta；**持久化 `assistant.message` 為權威最終**（不重複貼）；**過濾 agentId** 只呈現主回應；尾端訊息約 750–1000ms 編輯一次 + turn 末 flush；區塊約 1900 字、凍結；佇列有界（丟中間、保最終）；rate limit 交給 discord.js bucket；以**依到達順序 timeline** 呈現文字／工具／系統狀態：工具為一行 dimmed subtext，thinking 以 Discord spoiler 預設收合、可點擊展開；新 session 明確請求 `reasoningSummary:"detailed"`，`/model` 切換也重送該要求；明確 `streaming:true`。
 
 ## 6. SDK Adapter（薄層）
-隔離 client/session 生命週期、正規化事件、callback 結果變體、model/context 切換、resume、remote。pin 最新版（1.0.7-preview.3）+ lockfile + 啟動相容檢查 + 對安裝 CLI 契約測試。不做多 provider 抽象。
+隔離 client/session 生命週期、正規化事件、callback 結果變體、model/context 切換、resume、remote。pin 已驗證 SDK/runtime tuple（目前 `1.0.11` / `1.0.80`）+ 啟動相容檢查 + 對安裝 CLI 契約測試。不做多 provider 抽象。
 
 ## 7. 從 seam-acp 移植
 **重用小原語**：SerialQueue+順序測試、ChoiceBroker 的 timeout/abort/generation 概念、fence/chunk/flush+golden、附件驗證、SQLite WAL、路徑/repo 選擇、health/single-instance+常駐。
 **不移植**：ACP runtime/profiles、ask-user MCP+bearer、手工 model/context 探索、ACP compaction、CLI 權限模式參數、chat 抽象、排程/tunnel/gist、龐大 orchestrator。
 
 ## 8. 分階段（重排：最小垂直切片先）
-- **P0**：scaffold、config schema、**pin 最新 SDK（1.0.7-preview.3）+ 相容檢查（installed vs declared）**、**single-instance guard**、決定 infiniteSessions 政策、決定隔離方式（A 或 B）。驗收：build+空測綠、啟動連 SDK 並 `listModels()`。
+- **P0**：scaffold、config schema、**pin 並實測 SDK/runtime tuple + 相容檢查（installed vs declared）**、**single-instance guard**、決定 infiniteSessions 政策、決定隔離方式（A 或 B）。驗收：build+空測綠、啟動連 SDK 並 `listModels()`。
 - **P1（真正最小垂直切片）**：
   - 單一 owner/guild/父頻道；單一 canonical allowlisted repo；單一私密 thread/session；**手動佈建的受限 worker 環境**（或標 lab-only）。
   - 一 client + 薄 adapter；簡單有界串流 renderer（delta/final 去重 + 分塊）。
@@ -148,7 +161,10 @@ fake SDK adapter + fake Discord transport + 決定性 clock。必測：逾時只
 1. **隔離方式 = B（先 lab-only）**：不做 controller/worker 分離；P1 只在**可拋棄的 VM/測試帳號/測試 repo**跑；README + 啟動時明確警告「僅限拋棄式環境」。之後再升級到 A。
 2. **帳號盜用 = 先靠 Discord MFA**；TOTP/本機 step-up 列為未來強化（非 v1）。
 3. **GitHub repo = private，於 P0 建立**（lettucebo/discord-copilot-sdk）。
-4. **SDK = 使用最新版 `1.0.7-preview.3`（npm `latest`；依使用者要求）** + lockfile + 啟動相容檢查（declared 取自 package.json，單一真相來源）。
+4. **SDK/runtime = `@github/copilot-sdk 1.0.11` + `@github/copilot 1.0.80`**：
+   兩者都由 package.json exact pin/override 決定；不提交 lockfile。升級前須在
+   同一 runtime 做 A/B typecheck、契約測試、selfcheck、raw event/permission
+   trace 與 model catalog 比對，不能只看 semver 或 `.d.ts`。
 5. **P1 受控 repo = 可拋棄測試 repo（待定）**：開始 P1 live 測試前指定或另建一個 throwaway repo；**不對重要 repo**。
 
 ## 11. RubberDuck 紀錄
@@ -688,6 +704,10 @@ Discord thread 顯示 `🔧 skill — failed`。這不是 renderer 誤報；真�
 因此 `enableSkills:false` **不能**當作 v1.0.71 的 skill-tool 安全控制。空來源時只能再加
 `excludedTools:["skill"]`；live probe 已驗證這會從真實 CLI catalog 移除 skill tool，
 且 shell/glob 不受影響。
+
+2026-09-01 在 pinned runtime `1.0.80` 重跑 live skill smoke，重新確認
+`excludedTools:["skill"]` 會從真實 tool catalog 移除 skill tool；尚未單獨證明
+`enableSkills:false` 已足以處理 builtin skill，因此 fail-closed exclusion 繼續保留。
 
 ### 17.2 採納的設計
 
