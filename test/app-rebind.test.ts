@@ -18,7 +18,6 @@ import type { SendFileResult, Transport } from "../src/core/transport.js";
 import type { DevMode } from "../src/core/binding.js";
 import type { SecureOpenBackend } from "../src/core/secure-open.js";
 import { worktreePath } from "../src/core/worktree.js";
-import { worktreeRoot } from "../src/core/paths.js";
 import type { InstanceLock } from "../src/core/single-instance.js";
 import {
   strictInteraction,
@@ -175,6 +174,11 @@ interface Harness {
   transport: FakeTransport;
   actor: FakeActor;
 }
+
+/** This suite's INJECTED worktree root, matching what `appDependencies` hands
+ *  the app. Deliberately not `paths.worktreeRoot()`: an expectation derived from
+ *  the real home would pass only because the app was reading that same home. */
+const worktreeRoot = (): string => path.join(tmp, "worktrees");
 
 function testChannels(): ChannelRegistry {
   return new ChannelRegistry("c1", "g1", path.join(tmp, "channels.json"));

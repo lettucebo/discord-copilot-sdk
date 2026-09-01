@@ -40,7 +40,6 @@ import type { InstanceLock } from "../src/core/single-instance.js";
 import type { CopilotClient } from "@github/copilot-sdk";
 import type { SendFileResult, Transport } from "../src/core/transport.js";
 import { tmpdir } from "node:os";
-import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import {
@@ -65,12 +64,16 @@ const isolatedHome = (() => {
 
 const REPOS_ROOT = join(tmpdir(), "dcs-fixture-repos");
 const REPO = join(REPOS_ROOT, "repo");
-/** Where `bindingOk` requires a worktree-mode workDir to live. */
-const WT_ROOT = `${stateDir()}-worktrees`;
+
 /** Suite-scoped home for every fixture the app would otherwise default to a
  *  home-backed path for. Created once, because `createForTest` now REQUIRES
  *  those dependencies and a registry has to be written somewhere real. */
 const FIXTURES = mkdtempSync(join(tmpdir(), "dcs-reconcile-fixtures-"));
+/** The worktree root this suite INJECTS, and where a worktree-mode fixture
+ *  workDir must live. Deliberately not derived from `stateDir()`: these tests
+ *  used to spell the real state directory's sibling and then assert against the
+ *  app reading that same real path. */
+const WT_ROOT = join(FIXTURES, "worktrees");
 const tmpFile = (): string => join(tmpdir(), `dp-reconcile-${Math.random()}.json`);
 
 /** The dependency object `createForTest` requires, sourced from this suite's
@@ -954,7 +957,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
     // one thread's conversation against another thread's files. The workDir must
     // be one `bindingOk` accepts, i.e. under the real worktree root.
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, `test-${Math.random().toString(36).slice(2)}`);
+    const wt = join(WT_ROOT, `test-${Math.random().toString(36).slice(2)}`);
     mkdirSync(wt, { recursive: true });
     try {
       resumeCalls.length = 0;
@@ -976,7 +979,7 @@ describe("reconcileOnStartup with MANY sessions (concurrency)", () => {
 
   it("passes disabled skill sources into a resumed actor even when its worktree has a skill", async () => {
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, `skill-source-${Math.random().toString(36).slice(2)}`);
+    const wt = join(WT_ROOT, `skill-source-${Math.random().toString(36).slice(2)}`);
     try {
       const skillDir = join(wt, ".github", "skills", "probe");
       mkdirSync(skillDir, { recursive: true });
@@ -1074,7 +1077,7 @@ describe("startup announcement for records whose thread is gone", () => {
 
   it("posts ONE parent-channel line naming the thread id and its worktree", async () => {
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, "dead"); // where bindingOk requires it to be
+    const wt = join(WT_ROOT, "dead"); // where bindingOk requires it to be
     try {
       const store = new SessionStore(f);
       store.reserve(bind({ threadId: "dead", workDir: wt, branch: "copilot/t-dead" }));
@@ -1095,7 +1098,7 @@ describe("startup announcement for records whose thread is gone", () => {
 
   it("announces a terminal stale rebind pointer instead of reporting its worktree as unowned", async () => {
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, "stale-old");
+    const wt = join(WT_ROOT, "stale-old");
     try {
       const store = new SessionStore(f);
       store.reserve(
@@ -1150,7 +1153,7 @@ describe("startup announcement for records whose thread is gone", () => {
         ["seed-record", "c1"],
         ["secondary-record", "c2"],
       ] as const) {
-        store.reserve(bind({ threadId, parentChannelId, workDir: join(`${stateDir()}-worktrees`, threadId) }));
+        store.reserve(bind({ threadId, parentChannelId, workDir: join(WT_ROOT, threadId) }));
         store.commit(threadId);
         store.setState(threadId, "blocked", "thread-gone");
       }
@@ -1282,7 +1285,7 @@ describe("startup announcement for records whose thread is gone", () => {
 
   it("reports unowned stray worktrees to the seed channel", async () => {
     const f = tmpFile();
-    const stray = join(`${stateDir()}-worktrees`, "unowned");
+    const stray = join(WT_ROOT, "unowned");
     try {
       mkdirSync(stray, { recursive: true });
       writeFileSync(join(stray, ".git"), "gitdir: nowhere", "utf8");
@@ -1323,7 +1326,7 @@ describe("a record retired by reclaim stays announceable", () => {
 
   it("keeps the thread-* diagnosis when the worktree is kept", async () => {
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, "kept");
+    const wt = join(WT_ROOT, "kept");
     try {
       const store = new SessionStore(f);
       store.reserve(bind({ threadId: "kept", workDir: wt, branch: "copilot/t-kept" }));
@@ -1352,7 +1355,7 @@ describe("a record retired by reclaim stays announceable", () => {
 
   it("announces a record retired from a live session too (it still holds disk)", async () => {
     const f = tmpFile();
-    const wt = join(`${stateDir()}-worktrees`, "live-end");
+    const wt = join(WT_ROOT, "live-end");
     try {
       const store = new SessionStore(f);
       store.reserve(bind({ threadId: "live-end", workDir: wt, branch: "copilot/t-live-end" }));
@@ -1394,7 +1397,7 @@ describe("startup announcement length budget", () => {
             bind({
               threadId: id,
               parentChannelId,
-              workDir: join(`${stateDir()}-worktrees`, id),
+              workDir: join(WT_ROOT, id),
               branch: `copilot/t-${id}`,
             })
           );

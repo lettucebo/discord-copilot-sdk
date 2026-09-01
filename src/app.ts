@@ -629,6 +629,14 @@ export interface DiscordCopilotAppTestDependencies {
   /** Skills home handed to every actor. Real default: the `~/.copilot/skills`
    *  of whoever runs the suite. */
   actorSkillsHomeDirectory: string;
+  /** Where this app believes per-session worktrees live. A path, or a provider
+   *  for a suite whose root is only known later. Real default:
+   *  `~/.discord-copilot-sdk-worktrees`, which this app both SCANS for strays
+   *  and creates session checkouts under. */
+  worktreeRoot: string | (() => string);
+  /** Teardown's readiness-marker cleanup. Real default: `clearStartupReady()`,
+   *  which resolves — and creates — `~/.discord-copilot-sdk/startup-ready`. */
+  clearStartupReady: () => Promise<void>;
   /** Not home-backed: the platform whose file-delivery rules apply. */
   fileDeliveryPlatform?: NodeJS.Platform;
 }
@@ -690,6 +698,16 @@ export class DiscordCopilotApp {
    *  as a side effect of merely EXISTING, which is exactly what a test that only
    *  builds an app must not do. */
   private readonly approvals: ApprovalPolicy;
+  /** Where this app believes per-session worktrees live. Production resolves the
+   *  real `worktreeRoot()` on every call — it is a pure path helper, and reading
+   *  it once would freeze a value the uninstaller and the validators derive
+   *  independently. A test injects a suite-scoped root, so a stray-worktree scan
+   *  never reads (and a session checkout never lands in) a real home. */
+  private readonly worktreeRootOf: () => string;
+  /** Teardown's readiness-marker cleanup. Production is `clearStartupReady`,
+   *  which resolves — and creates — a directory under the state directory, so a
+   *  test that merely drives `stop()` used to leave one behind. */
+  private readonly clearStartupReadyOnTeardown: () => Promise<void>;
   /** Home-backed collaborators EVERY actor this app creates must be handed.
    *  Undefined in production, where the actor applies its own real defaults;
    *  `createForTest` always sets it, so no creation path can quietly fall back
@@ -842,6 +860,14 @@ export class DiscordCopilotApp {
         channelRegistryPath()
       );
     this.approvals = testDependencies?.approvals ?? new ApprovalPolicy();
+    const injectedWorktreeRoot = testDependencies?.worktreeRoot;
+    this.worktreeRootOf =
+      injectedWorktreeRoot === undefined
+        ? worktreeRoot
+        : typeof injectedWorktreeRoot === "function"
+          ? injectedWorktreeRoot
+          : (): string => injectedWorktreeRoot;
+    this.clearStartupReadyOnTeardown = testDependencies?.clearStartupReady ?? clearStartupReady;
     if (testDependencies) {
       this.actorHomeDependencies = {
         auditLog: testDependencies.actorAuditLog,
@@ -940,7 +966,7 @@ export class DiscordCopilotApp {
     try {
       verdict = await this.bindingCheck(validationBinding, {
         reposRoot: this.reposRoot,
-        worktreeRoot: worktreeRoot(),
+        worktreeRoot: this.worktreeRootOf(),
       });
     } catch (error) {
       await trustedRoot?.close().catch(() => {});
@@ -1177,7 +1203,7 @@ export class DiscordCopilotApp {
   private assertChannelRegistryUsable(): void {
     if (!this.channels.isCorrupt()) return;
     throw new Error(
-      `channel registry at ${channelRegistryPath()} cannot be trusted: ${this.channels.corruptReason()}. ` +
+      `channel registry at ${this.channels.path()} cannot be trusted: ${this.channels.corruptReason()}. ` +
         `Refusing to start rather than silently falling back to ${this.config.DISCORD_PARENT_CHANNEL_ID} alone, ` +
         `which would permanently block every session under another channel. ` +
         `Inspect or delete the file (channels can be re-added with /channel enable) and restart.`
@@ -1954,7 +1980,7 @@ export class DiscordCopilotApp {
       // operator's own checkout.
       const devMode: DevMode = "worktree";
       const branch = worktreeBranch(thread.id);
-      const requestedWorkDir = worktreePath(worktreeRoot(), repoPath, thread.id);
+      const requestedWorkDir = worktreePath(this.worktreeRootOf(), repoPath, thread.id);
       let worktreeCreated = false;
       await pruneWorktrees(repoPath);
       try {
@@ -3740,7 +3766,7 @@ export class DiscordCopilotApp {
     const branch = target.devMode === "worktree" ? worktreeBranch(threadId) : undefined;
     const requestedWorkDir =
       target.devMode === "worktree"
-        ? worktreePath(worktreeRoot(), target.repoPath, threadId)
+        ? worktreePath(this.worktreeRootOf(), target.repoPath, threadId)
         : target.repoPath;
 
     let createdWorktree = false;
@@ -4402,7 +4428,7 @@ export class DiscordCopilotApp {
       // about ANY session, so per-record handling would be guesswork.
       planReconcile({ corrupt: true });
       throw new Error(
-        `session store at ${sessionStorePath()} is corrupt; refusing to start. Inspect/remove it and restart.`
+        `session store at ${this.store.path()} is corrupt; refusing to start. Inspect/remove it and restart.`
       );
     }
     // Reserve every local-mode repo BEFORE the first resume attempt.
@@ -4430,7 +4456,7 @@ export class DiscordCopilotApp {
         // transition.
         if (!this.store.setState(rec.threadId, "blocked", "local-conflict")) {
           throw new FatalReconcileError(
-            `reconcile: could not persist local-conflict for ${rec.threadId} at ${sessionStorePath()}`
+            `reconcile: could not persist local-conflict for ${rec.threadId} at ${this.store.path()}`
           );
         }
       }
@@ -4768,7 +4794,7 @@ export class DiscordCopilotApp {
    * the same one on Linux, and a stray tree would go unreported.
    */
   private strayWorktreeDirs(known: ReadonlySet<string>): string[] {
-    const root = worktreeRoot();
+    const root = this.worktreeRootOf();
     const out: string[] = [];
     let top: Dirent[];
     try {
@@ -4830,7 +4856,7 @@ export class DiscordCopilotApp {
         // A required terminal transition: if it can't be persisted, that's a disk
         // problem — fail startup rather than run with a non-durable state.
         if (!this.store.setState(rec.threadId, "orphaned", "interrupted-create")) {
-          throw new FatalReconcileError(`reconcile: could not persist orphaned state at ${sessionStorePath()}`);
+          throw new FatalReconcileError(`reconcile: could not persist orphaned state at ${this.store.path()}`);
         }
         return;
       case "skip": {
@@ -4846,7 +4872,7 @@ export class DiscordCopilotApp {
         if (retry) return;
         if (!this.store.setState(rec.threadId, "active", action.reason)) {
           throw new FatalReconcileError(
-            `reconcile: could not persist retry reason for ${rec.threadId} at ${sessionStorePath()}`
+            `reconcile: could not persist retry reason for ${rec.threadId} at ${this.store.path()}`
           );
         }
         console.warn(
@@ -4881,7 +4907,7 @@ export class DiscordCopilotApp {
         // the lease either, so `/repo dev local` would report a phantom holder
         // with a deleted thread, permanently.
         if (!this.store.setState(rec.threadId, "blocked", action.reason)) {
-          throw new FatalReconcileError(`reconcile: could not persist blocked state at ${sessionStorePath()}`);
+          throw new FatalReconcileError(`reconcile: could not persist blocked state at ${this.store.path()}`);
         }
         this.releaseLocalLease(rec.threadId);
         await this.transport
@@ -5102,7 +5128,7 @@ export class DiscordCopilotApp {
     // (or the next boot) simply tries again.
     if (!this.store.commit(rec.threadId)) {
       console.error(
-        `reconcile: could not persist the recovered state for ${rec.threadId} at ${sessionStorePath()}; ` +
+        `reconcile: could not persist the recovered state for ${rec.threadId} at ${this.store.path()}; ` +
           `discarding the resumed session and leaving the record for a later retry.`
       );
       await this.discardResumedActor(rec, actor, "the recovered state could not be written to disk", opts);
@@ -5345,7 +5371,7 @@ export class DiscordCopilotApp {
     const workDirOk =
       rec.devMode === "local"
         ? pathRelation(wd, rec.repoPath) === "same"
-        : isStrictlyInside(wd, worktreeRoot());
+        : isStrictlyInside(wd, this.worktreeRootOf());
     return (
       isStrictlyInside(rec.repoPath, this.reposRoot) &&
       workDirOk &&
@@ -6362,7 +6388,7 @@ export class DiscordCopilotApp {
     await stopCopilotClient(this.copilot).catch((err: unknown) => {
       clientStopFailure = err;
     });
-    await clearStartupReady().catch(() => {});
+    await this.clearStartupReadyOnTeardown().catch(() => {});
     if (clientStopFailure !== undefined) throw clientStopFailure;
   }
 }

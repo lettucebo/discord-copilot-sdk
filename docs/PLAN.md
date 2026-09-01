@@ -554,7 +554,7 @@ enforcement，不能以人工等待或「稍後再看」取代。**但不可直�
 
 同次盤點亦發現 app/actor tests 可因可選的 test dependency 而讀寫真實
 `~/.discord-copilot-sdk`、audit path、worktree root 或
-`~/.copilot/skills`。目前 `DiscordCopilotApp.createForTest` 尚不能注入
+`~/.copilot/skills`。當時 `DiscordCopilotApp.createForTest` 尚不能注入
 approval storage、worktree root、actor audit log 或 actor skills home；
 因此**每個會建構 `DiscordCopilotApp` 的 suite** 都必須在第一次建構前，
 同時把 `HOME` 與 `USERPROFILE` 指向 suite-scoped fake home，並在 teardown
@@ -564,16 +564,59 @@ actor 或呼叫 home-derived path helper 的 suite 也遵循同一規則。
 守門測試要能偵測**讀取**而不只寫入，且不可在檢查真實 home 時呼叫
 本身會建立目錄的 `stateDir()`。Home-derived path 必須從
 `src/core/paths.ts` 的 helper 取得；test 不得重新拼寫
-`.discord-copilot-sdk` 或其 worktree sibling 字面量（
-`app-rebind.test.ts` 現有 8 處屬待修技術債）。
+`.discord-copilot-sdk` 或其 worktree sibling 字面量。
 
 這個 per-suite 規則只是修復期間的最低要求，不是最終防線；它已經被漏掉
 過。最終控制應同時包含：(1) `createForTest` /
 `SessionActor.createForTest` 對 home-backed dependencies 採
-compile-enforced 必填注入；(2) 評估加入 Vitest `setupFiles`（目前 repo
+compile-enforced 必填注入；(2) 評估加入 Vitest `setupFiles`（原本 repo
 沒有 Vitest config）或等價的全 run bootstrap，在載入 product module 前
 統一重導並於結束後還原 `HOME` / `USERPROFILE`。若個別 integration suite
 刻意需要真實 home，必須明確 opt out，而不是依賴未隔離的預設。
+
+### 15.7 compile-enforced 必填 test dependency（2026-09-01）
+
+§15.6 的兩項最終控制皆已落地，且**兩者並存**：`vitest.config.ts` 的
+`globalSetup` / `setupFiles` 仍然重導整個 run 的 `HOME`/`USERPROFILE`（
+defense in depth），而下列注入才是不可被靜默移除的那一層。
+
+* `DiscordCopilotApp.createForTest` 的第五個參數改為**必填**的
+  `DiscordCopilotAppTestDependencies`，取代原本可省略的 store / channels
+  positional 參數與 options。它要求 `store`、`channels`、`approvals`、
+  `actorAuditLog`、`actorSkillsHomeDirectory`、`worktreeRoot`（路徑或
+  provider）與 `clearStartupReady`。`fileDeliveryPlatform` 維持選填，因為
+  它不是 home-backed。
+* `approvals` 由 field initializer 改為 constructor 注入。原本
+  `new ApprovalPolicy()` 在**建構的當下**就經 `stateDir()` 建立真實狀態
+  目錄，這正是「只是建了一個 app」也會碰到真實 home 的路徑。
+* app 內所有 `worktreeRoot()` 呼叫改走注入的 provider；`teardownResources`
+  的 `clearStartupReady()` 改走注入的 seam（它會經
+  `startupReadyDirectory()` → `stateDir()` 建立目錄）。production 預設
+  完全不變。
+* 三條 `SessionActor.create` 路徑（`/new`、`/repo` rebind、resume）都
+  spread 同一個 `actorSourceOptions()`；audit sink 與 skills home 與
+  skill-source policy 綁在同一個方法，避免其中一條路徑漏掉注入。
+* `SessionActor.createForTest` 的 `dependencies` 不再有 `= {}` 預設，並新增
+  必填的 `SessionActorCreateForTestDependencies`（`auditLog`、
+  `skillsHomeDirectory`）。這兩個欄位同時從 `SessionActorCreateForTestOpts`
+  移除，使它們只有單一來源——先前若在 `opts` 傳入，會被 spread 順序靜默
+  覆寫。`secureOpen` / `fileDeliveryPlatform` / `postRpcCleanupTimeoutMs`
+  維持選填，因為它們不是 home-backed。
+* 錯誤訊息不再用 `sessionStorePath()` / `channelRegistryPath()` 推測路徑：
+  `SessionStore.path()` 與 `ChannelRegistry.path()` 回報**實際使用**的檔案。
+  舊寫法在組字串時就會經 `stateDir()` 建立真實目錄，且對注入不同 store 的
+  app 而言那個路徑根本是錯的。
+* 守門測試 `test/test-home-injection.test.ts` 把 `HOME`/`USERPROFILE` 指向
+  一個**被投毒**的 sentinel home（可 resume 的 record、repo approval rule、
+  另一個 enabled channel、stray worktree、`~/.copilot/skills` 內的 skill），
+  然後斷言 app 完全看不到這些狀態，且 sentinel 前後 byte 級不變。投毒是
+  read detector：只檢查「有沒有被建立」抓不到「讀取既有 home」。該檔遵守
+  §15.6 的規則——不呼叫會建立目錄的 `stateDir()`，路徑由 `STATE_DIR_NAME`
+  與純函式 `worktreeRoot()` 組出。已用 mutation 驗證：拿掉 worktree provider
+  或 startup-ready seam 的注入，該測試即失敗。
+* Test 端以 `test/support/app-test-dependencies.ts` 由 suite-scoped 目錄
+  組出必填物件，預設一律用 `??` 解析而非 spread overrides，因此明確傳入
+  `undefined` 仍得到 fixture，不會掉回 home-backed 預設。
 
 ## 16. PR #14 提前合併事故紀錄（2026-08-07）
 

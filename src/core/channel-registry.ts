@@ -72,6 +72,14 @@ export class ChannelRegistry {
     return this.corrupt;
   }
 
+  /** The file this registry actually reads and writes. The startup refusal used
+   * to name `channelRegistryPath()`, which resolves the DEFAULT location and, via
+   * `stateDir()`, creates the real state directory as a side effect of composing
+   * an error message. */
+  path(): string {
+    return this.file;
+  }
+
   /** Why the load failed, for the startup error message. */
   corruptReason(): string | undefined {
     return this.corruptDetail;
