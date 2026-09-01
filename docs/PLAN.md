@@ -1113,6 +1113,13 @@ teardown claims、obligations **同時為空**才釋放，且只釋放一次。
 | button 的 ack 期間遇到 shutdown ⇒ 交付**安全預設值**（deny／reject／cancel），不得交付操作者按下的擴權選項 | `test/app-inbound-ownership.test.ts` |
 | thread 訊息在啟動 SDK turn 之前遇到 shutdown ⇒ 不得開始新的 turn | `test/app-inbound-ownership.test.ts` |
 | 唯讀指令不需要 scope，且 coordinator 不得因此持有任何 exclusive；`/end`／rebind 不被包成 exclusive，與並行的 owned 操作不得死結 | `test/app-inbound-ownership.test.ts` |
+| shutdown 對所有 exclusive scope 只用**一個**共用 bound（不是每個 key 一個）：10 個掛住的 scope 只能觸發一次 join 逾時 | `test/lifecycle-ownership.test.ts` |
+| `/new` 的 `commit` 失敗與失去所有權兩條路徑必須**同形**：runtime 轉成 obligation（非塞進 live map 當屏障），無法確認就不得釋放 lock | `test/app-inbound-ownership.test.ts` |
+| 訊息的所有權閘門必須在 `startTitling` **之前**：titler 會自行建立 Copilot session，關機時不得產生無人拆除的 runtime | `test/app-inbound-ownership.test.ts` |
+| `/file`：所有權只在**送出前**判斷；交給 transport 的述詞僅代表 session 現時性，Discord 已接受的附件不得只因關機而被收回 | `test/app-inbound-ownership.test.ts` |
+| phase gate 必須區分「啟動中，請稍候重試」與關機中的誠實回覆 | `test/app-inbound-ownership.test.ts` |
+| `runOwnedMessage` 必須攔截並記錄 handler 的 rejection（否則會是 unhandled rejection，Node 20+ 會終止 process） | `test/app-inbound-ownership.test.ts` |
+| `/queue` 的回滾只能移除**自己新增的那一則**，不得誤刪操作者先前排入的同字串提示 | `test/app-inbound-ownership.test.ts` |
 
 ### 19.7 抽取結果與仍未做的事
 

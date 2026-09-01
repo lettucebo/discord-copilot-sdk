@@ -1564,7 +1564,9 @@ export class DiscordCopilotApp {
             await input
               .reply(
                 ephemeralReply(
-                  "⏳ 啟動中，請稍候重試；啟動完成後若仍看到「頻道尚未啟用」，再執行 `/channel enable`。"
+                  this.phase === "shuttingDown"
+                    ? INBOUND_DECLINED
+                    : "⏳ 啟動中，請稍候重試；啟動完成後若仍看到「頻道尚未啟用」，再執行 `/channel enable`。"
                 )
               )
               .catch(() => {});
@@ -1572,8 +1574,16 @@ export class DiscordCopilotApp {
           return;
         }
         if (interaction.isRepliable()) {
+          // Two different states, two different answers. "啟動中，請稍候重試"
+          // tells an operator to wait for something that is coming back; during
+          // shutdown nothing is coming back, and retrying is exactly the wrong
+          // advice.
           await interaction
-            .reply(ephemeralReply("⏳ 啟動中，請稍候重試。"))
+            .reply(
+              ephemeralReply(
+                this.phase === "shuttingDown" ? INBOUND_DECLINED : "⏳ 啟動中，請稍候重試。"
+              )
+            )
             .catch(() => {});
         }
         return;
@@ -2027,15 +2037,30 @@ export class DiscordCopilotApp {
       // now, so this cannot simply return: an unconfirmable disconnect must
       // become an obligation, exactly as it does everywhere else, or the lock
       // would be released over a checkout an SDK session may still be in.
+      // The runtime EXISTS from here, so no failure below may simply return.
+      // Registered as an OBLIGATION before the attempt — a concurrent `stop()`
+      // must see it — and attempted once: a confirmed disconnect discharges it,
+      // an unconfirmable one keeps holding the actor, the root capability and
+      // the process lock until a later attempt or a restart confirms it.
+      //
+      // This replaced a `sessions.set()` "fence" on the commit-failure path. A
+      // map entry gates nothing: the coordinator cannot see it, so the lock was
+      // released over a checkout a live SDK session might still have been in,
+      // and it made the live map the only record of a session with no durable
+      // row. The obligation carries the actor itself, so there is one place that
+      // knows, and it is the place the release conclusion is drawn from.
+      const retireCreatedRuntime = async (): Promise<boolean> => {
+        const handle = scope.retain(runtimeObligationKey(thread.id), {
+          describe: () => `a half-created session runtime for ${thread.id} over ${workDir}`,
+          attempt: () => confirmStopped(actor.disconnect(), TEARDOWN_TIMEOUT_MS, () => handle),
+        });
+        return handle.attempt();
+      };
+      const RETAINED_RUNTIME_NOTICE =
+        "⚠️ 無法確認剛建立的 runtime 已關閉。記錄與 worktree 都已保留，" +
+        "bot 也會持續持有單一實例鎖直到確認為止——請重啟 bot。";
       if (lost()) {
-        let disconnected = false;
-        try {
-          await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS);
-          disconnected = true;
-        } catch {
-          disconnected = false;
-        }
-        if (disconnected) {
+        if (await retireCreatedRuntime()) {
           // Nothing durable was promoted, the runtime is proved gone, and the
           // reservation stays `creating` — fail-closed, reconciled on the next
           // boot. Keep the worktree with it for the same reason the create
@@ -2043,49 +2068,19 @@ export class DiscordCopilotApp {
           await dropThread();
           await interaction.editReply(INBOUND_DECLINED);
         } else {
-          const handle = scope.retain(runtimeObligationKey(thread.id), {
-            describe: () => `a half-created session runtime for ${thread.id} over ${workDir}`,
-            attempt: () => confirmStopped(actor.disconnect(), TEARDOWN_TIMEOUT_MS, () => handle),
-          });
-          void handle;
-          await interaction.editReply(
-            "⚠️ bot 正在關閉中，而且無法確認剛建立的 runtime 已關閉。記錄與 worktree 都已保留——請重啟 bot。"
-          );
+          await interaction.editReply(`${INBOUND_DECLINED}\n${RETAINED_RUNTIME_NOTICE}`);
         }
         return;
       }
       // Promote creating→active. A failed commit means the record isn't durable,
-      // so we must NOT run as active. Try a bounded disconnect of the just-created
-      // actor; if that fails the runtime may still be live, so RETAIN the actor as
-      // a fence (registered) rather than losing track of a live runtime session.
+      // so we must NOT run as active — the same situation as above, answered the
+      // same way.
       if (!this.store.commit(thread.id)) {
-        let disconnected = false;
-        try {
-          await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS);
-          disconnected = true;
-        } catch {
-          disconnected = false;
-        }
-        if (disconnected) {
+        if (await retireCreatedRuntime()) {
           await abort("⚠️ 無法持久化 session 狀態（commit 失敗），已取消啟動。請檢查磁碟／權限後重試。");
         } else {
-          // Fence: keep the (maybe-live) actor registered so it is still tracked.
-          this.sessions.set(thread.id, {
-            actor,
-            broker,
-            running: false,
-            titled: true,
-            titleEpoch: 0,
-            queue: [],
-            workDir,
-            repoPath,
-            devMode,
-            branch,
-            parentChannelId,
-            hasRunTurn: true,
-          });
           await interaction.editReply(
-            "⚠️ 無法持久化 session 狀態，且無法確認前述 runtime 已關閉。已保留為屏障——請重啟 bot。"
+            `⚠️ 無法持久化 session 狀態（commit 失敗）。${RETAINED_RUNTIME_NOTICE}`
           );
         }
         return;
@@ -5573,15 +5568,19 @@ export class DiscordCopilotApp {
       await interaction.editReply({ content: this.fileRefusalMessage("unavailable") });
       return;
     }
-    // The existing cancellation predicate, widened by one question. It is
-    // consulted after every await here AND handed to `transport.sendFile`, which
-    // re-asks it around the upload itself — so a shutdown mid-send retracts the
-    // attachment through the same path a rebind or `/end` does, rather than
-    // uploading into a thread this process is about to stop owning.
+    // TWO different questions, deliberately not merged.
+    //
+    // `canSend` is SESSION CURRENTNESS, and it is the only one the transport is
+    // given — it re-asks it AFTER Discord has accepted the upload, and answers
+    // "no" by RETRACTING the message. That is right for a rebind or an `/end`
+    // (the file belongs to a session that no longer exists), and wrong for a
+    // shutdown: the operator asked for this file, Discord delivered it, and
+    // deleting it because a SIGTERM arrived destroys a deliberate action.
+    //
+    // Ownership is asked separately, and only BEFORE the send starts.
     const canSend = (): boolean =>
-      scope.lostReason() === undefined &&
-      this.sessions.get(threadId) === session &&
-      session.actor.canDeliverFiles();
+      this.sessions.get(threadId) === session && session.actor.canDeliverFiles();
+    const owned = (): boolean => scope.lostReason() === undefined;
     const requestedPath = interaction.options.getString("path", true);
     let resolved: Awaited<ReturnType<SessionActor["resolveFileForDelivery"]>>;
     try {
@@ -5603,6 +5602,12 @@ export class DiscordCopilotApp {
       return;
     }
     let sent: SendFileResult;
+    // The LAST point at which a shutdown can stop this without destroying
+    // anything: nothing has been uploaded yet.
+    if (!owned()) {
+      await interaction.editReply({ content: INBOUND_DECLINED });
+      return;
+    }
     try {
       sent = await this.transport.sendFile(threadId, resolved.file, undefined, { canSend });
     } catch {
@@ -5752,10 +5757,13 @@ export class DiscordCopilotApp {
       await reply("▶️ 目前沒有在執行，直接開始這一則。");
       // The reply is a round trip, and `drainQueue` starts a real SDK turn.
       // Starting one now would be new agent work in a process that is going
-      // away; the queue is volatile by design, so dropping it is the honest
-      // outcome rather than leaving a turn nobody will see finish.
+      // away; the queue is volatile by design, so dropping THIS prompt is the
+      // honest outcome. Remove the exact entry that was appended, by position —
+      // filtering on equality also deleted every identical prompt the operator
+      // had queued earlier, which is other people's work.
       if (scope.lostReason()) {
-        session.queue = session.queue.filter((q) => q !== text);
+        const appended = session.queue.lastIndexOf(text);
+        if (appended !== -1) session.queue.splice(appended, 1);
         return;
       }
       void this.drainQueue(interaction.channelId).catch(() => {});
@@ -5778,12 +5786,20 @@ export class DiscordCopilotApp {
    * trying to stop.
    */
   private async runOwnedMessage(message: Message): Promise<void> {
-    const outcome = await this.ownership.runExclusive(
-      inboundOperationKey("message", message.id),
-      (scope) => this.onMessage(message, scope)
-    );
-    if (!outcome.ran) {
-      console.warn(`message ${message.id} was not handled — ${outcome.reason}`);
+    try {
+      const outcome = await this.ownership.runExclusive(
+        inboundOperationKey("message", message.id),
+        (scope) => this.onMessage(message, scope)
+      );
+      if (!outcome.ran) {
+        console.warn(`message ${message.id} was not handled — ${outcome.reason}`);
+      }
+    } catch (err) {
+      // `onMessage` awaits transport notices and a whole SDK turn, any of which
+      // can reject. This is the top of a `void`ed event handler, so an escaping
+      // rejection is an unhandled one — which on Node 20+ terminates the
+      // process, taking the bot down over a failed Discord write.
+      console.error(`message ${message.id} failed:`, err);
     }
   }
 
@@ -5825,17 +5841,15 @@ export class DiscordCopilotApp {
       );
       return;
     }
+    // The gate before ANY new work. It sits above `startTitling` on purpose:
+    // titling is fire-and-forget and creates its own Copilot session, so a
+    // shutdown landing here used to spawn a runtime nobody would ever tear down
+    // and rename a thread for a process that was going away. Starting an SDK
+    // turn (which downloads attachments first) is the same bargain a moment
+    // later — the operator sees a prompt accepted and then nothing.
+    if (scope.lostReason()) return;
     // Name the thread after its first real prompt, exactly once.
     this.startTitling(message.channelId, session, text);
-    // The last gate before real agent work. `tryConsumeFreeform` and the notices
-    // above are awaits, and starting an SDK turn (which downloads attachments
-    // first) into a process that is going away leaves a runtime mid-turn for
-    // shutdown to abort — the operator sees a prompt accepted and then nothing.
-    // The last gate before real agent work: starting an SDK turn (which
-    // downloads attachments first) into a process that is going away leaves a
-    // runtime mid-turn for shutdown to abort, and the operator sees a prompt
-    // accepted and then nothing.
-    if (scope.lostReason()) return;
     // Reserve the turn (via the running guard in runTurn) BEFORE any network I/O,
     // so image downloads serialize with message arrival and two quick image
     // messages can't reorder. The download happens inside runTurn.

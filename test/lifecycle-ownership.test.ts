@@ -443,8 +443,7 @@ describe("lifecycle ownership — the release conclusion", () => {
   });
 });
 
-describe("an attempt that discharges its own handle", () => {
-  /** The real shape this comes from: a detached rebind incarnation whose
+describe("an attempt that discharges its own handle", () => {  /** The real shape this comes from: a detached rebind incarnation whose
    *  RUNTIME is confirmed stopped — which is what ends its claim on the process
    *  lock — while its worktree was kept because it was dirty. The app's
    *  teardown identity-discharges the handle on `confirmed`, and its bounded
@@ -512,5 +511,67 @@ describe("an attempt that discharges its own handle", () => {
 
     expect(messages.some((m) => /could not be discharged; lock retained/.test(m))).toBe(true);
     expect(releases()).toBe(0);
+  });
+});
+
+
+describe("shutdown joins every open scope ONCE, not one bound each", () => {
+  it("returns after a single join timeout however many scopes are hanging", async () => {
+    // Inbound operations made this real: the exclusive set used to hold at most
+    // startup plus a retry, and is now one entry per in-flight command, button
+    // and message. Joining them one at a time multiplied the bound by the number
+    // of open operations, so a busy bot took N x 5s to answer a SIGTERM — long
+    // past the point an init system SIGKILLs it, which loses the deferred
+    // release the bound exists to protect.
+    let bounds = 0;
+    const { ownership, releases } = build({
+      joinTimeoutMs: 100,
+      timers: {
+        set(fn, ms) {
+          bounds++;
+          const t = setTimeout(fn, ms);
+          (t as { unref?: () => void }).unref?.();
+          return t;
+        },
+        clear(handle) {
+          clearTimeout(handle as NodeJS.Timeout);
+        },
+      },
+    });
+
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const running = Array.from({ length: 10 }, (_, i) =>
+      ownership.runExclusive(`op-${i}`, async () => {
+        await held;
+      })
+    );
+    await Promise.resolve();
+
+    const started = Date.now();
+    await ownership.shutdown();
+    const elapsed = Date.now() - started;
+
+    // One bound for the whole set, not ten.
+    expect(elapsed).toBeLessThan(50 * 5);
+    // …and the lock is NOT released: ten operations are still in flight.
+    expect(releases()).toBe(0);
+
+    release();
+    await Promise.all(running);
+    await vi.waitFor(() => expect(releases()).toBe(1));
+  });
+
+  it("still releases immediately when every scope has already settled", async () => {
+    const { ownership, releases } = build({ joinTimeoutMs: 50 });
+    await Promise.all(
+      Array.from({ length: 5 }, (_, i) => ownership.runExclusive(`op-${i}`, async () => {}))
+    );
+
+    await ownership.shutdown();
+
+    expect(releases()).toBe(1);
   });
 });

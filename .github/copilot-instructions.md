@@ -128,7 +128,10 @@ commands that run concurrently today and would be declined by an `/end` teardown
 `/end` and rebind are deliberately NOT wrapped — they are teardowns, already claim their thread
 through `runTeardown`, and an exclusive scope around them would deadlock their own
 `joinExclusive`. Read-only commands (`/sessions`, `/diff`, `/todos`, `/usage`, autocomplete) take
-no scope, because there is nothing for the lock to wait for.
+no scope, because there is nothing for the lock to wait for. Ownership is asked **before** an
+irreversible external effect, never after one: `/file` checks it before the upload starts and
+hands the transport only a session-currentness predicate, because the transport answers "no"
+after Discord has accepted an attachment by *retracting* it.
 
 **Fail-closed is the house rule.** For a newly presented approval card: unsupported permissionkinds deny; timeouts and aborts resolve to deny/cancel; `ask_user` throws rather than fabricating
 an answer; a summary that is too long or contains bidi/control characters is auto-denied rather

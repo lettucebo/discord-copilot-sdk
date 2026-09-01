@@ -385,6 +385,22 @@ class Ownership implements LifecycleOwnership {
     return !still || still.size === 0;
   }
 
+  /** Every scope published RIGHT NOW, joined under one shared bound. The
+   *  release conclusion is still drawn from live state afterwards, so a scope
+   *  that outlives the bound (or one published during it) keeps gating — this
+   *  only decides how long shutdown waits before answering its caller. */
+  private async joinAllExclusive(): Promise<void> {
+    const settlements: Array<Promise<void>> = [];
+    for (const set of this.exclusive.values()) {
+      for (const entry of set) settlements.push(entry.settled);
+    }
+    if (settlements.length === 0) return;
+    await this.bounded(
+      Promise.all(settlements).then(() => undefined),
+      this.joinTimeoutMs
+    ).catch(() => undefined);
+  }
+
   // ----------------------------------------------------------- obligations --
 
   private retain(key: string, obligation: CleanupObligation): ObligationHandle {
@@ -454,7 +470,15 @@ class Ownership implements LifecycleOwnership {
     this.state = "shutting-down";
     // Join first, so anything a still-running scope retains is visible to the
     // sweep below rather than appearing after it.
-    for (const threadId of [...this.exclusive.keys()]) await this.joinExclusive(threadId);
+    //
+    // ONE aggregate bound for the whole set, not one per key. Joining key by key
+    // multiplied the bound by the number of open operations, which was harmless
+    // while the set held at most startup plus a retry — and became a real
+    // problem the moment every inbound command, button and message published its
+    // own scope: a busy bot answered a SIGTERM in N x 5s, long past the point an
+    // init system SIGKILLs it, which is exactly how the deferred release the
+    // bound exists to protect gets lost.
+    await this.joinAllExclusive();
     // Sweep BEFORE the armed teardown: an obligation is a promise made to the
     // outside world, and the resources the armed teardown drops may be what a
     // pending obligation needs.
