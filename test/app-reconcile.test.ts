@@ -44,6 +44,10 @@ import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import {
+  createLifecycleOwnership,
+  type LifecycleOwnership,
+} from "../src/core/lifecycle-ownership.js";
+import {
   strictInteraction,
   asCommandInteraction,
   type StrictInteraction,
@@ -180,7 +184,14 @@ function fakeCopilot(
 
 /** `start()` uses this same constructor without createForTest's test-only
  * dependency injection. Keep this harness narrow: it proves the production
- * construction path cannot silently acquire the fake trusted-root backend. */
+ * construction path cannot silently acquire the fake trusted-root backend.
+ *
+ * The third argument is the LIFECYCLE COORDINATOR, not the raw lock. Declaring
+ * it as a lock here made every per-record `runExclusive` throw
+ * `this.ownership.runExclusive is not a function`; reconciliation catches that
+ * per record and carries on, so the assertions below passed for exactly the
+ * wrong reason — the resume never ran at all. The real factory is used, because
+ * "production-equivalent" is the entire point of this harness. */
 function productionStyleApp(
   copilot: CopilotClient,
   transport: Transport,
@@ -190,7 +201,7 @@ function productionStyleApp(
     new (
       config: Parameters<typeof DiscordCopilotApp.createForTest>[0],
       client: CopilotClient,
-      lock: { path: string; release(): Promise<void> },
+      ownership: LifecycleOwnership,
       transportOverride: Transport,
       storeOverride: SessionStore,
       channelsOverride: ChannelRegistry
@@ -199,7 +210,7 @@ function productionStyleApp(
   const app = new AppConstructor(
     cfg,
     copilot,
-    { path: "(production-style-test)", release: async () => {} },
+    createLifecycleOwnership({ path: "(production-style-test)", release: async () => {} }),
     transport,
     store,
     new ChannelRegistry("c1", "g1", join(isolatedHome, "production-style-channels.json"))
@@ -374,6 +385,14 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
   it("production-style construction does not inject the test-only trusted root", async () => {
     const f = tmpFile();
     const missingWorkDir = join(REPOS_ROOT, `production-workdir-${Math.random().toString(36).slice(2)}`);
+    const warnings: string[] = [];
+    const errors: string[] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation((...a: unknown[]) => {
+      warnings.push(a.map(String).join(" "));
+    });
+    const error = vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      errors.push(a.map(String).join(" "));
+    });
     try {
       expect(existsSync(missingWorkDir)).toBe(false);
       const store = new SessionStore(f);
@@ -383,9 +402,24 @@ describe("reconcileOnStartup (app-level wiring, P2)", () => {
 
       await reconcile(app, async () => "valid");
 
+      // The record is left alone and nothing is registered — but ONLY if the
+      // resume actually ran and refused. It used to be that `ownership` was a
+      // raw lock, every `runExclusive` threw `is not a function`, reconciliation
+      // swallowed that per record, and these two assertions held because nothing
+      // had happened at all.
+      const noise = [...warnings, ...errors].join("\n");
+      expect(noise).not.toMatch(/runExclusive is not a function/);
+      expect(noise).not.toMatch(/is not a function/);
+      // The refusal that this harness exists to prove: production construction
+      // has no fake `SecureOpenBackend`, so capturing a trusted root for the
+      // recorded workdir fails and the resume is refused — reached only because
+      // the coordinator is real and the per-record scope was actually admitted.
+      expect(noise).toMatch(/reconcile: transient trusted-root capture failure for t1/);
       expect(sessionsOf(app).has("t1")).toBe(false);
       expect(store.get("t1")?.state).toBe("active");
     } finally {
+      warn.mockRestore();
+      error.mockRestore();
       rmSync(f, { force: true });
     }
   });
