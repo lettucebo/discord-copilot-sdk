@@ -207,10 +207,37 @@ function sessionsOf(app: DiscordCopilotApp): Map<string, unknown> {
 function localLeasesOf(app: DiscordCopilotApp): Map<string, string> {
   return (app as unknown as { localLeases: Map<string, string> }).localLeases;
 }
-/** Retry-discarded runtimes retained as barriers because teardown was
- *  unconfirmed; the strong reference is what holds the Windows root. */
-function unconfirmedResumesOf(app: DiscordCopilotApp): Map<string, unknown> {
-  return (app as unknown as { unconfirmedResumes: Map<string, unknown> }).unconfirmedResumes;
+/** The coordinator's read-only view of the sets the release conclusion is drawn
+ *  from. A retry-discarded runtime that could not be confirmed stopped is an
+ *  OBLIGATION here now, keyed `runtime:<threadId>`; the obligation object holds
+ *  the actor, which is what keeps the Windows root alive. */
+type Inspector = {
+  exclusiveThreads(): string[];
+  teardownClaims(): string[];
+  obligationKeys(): string[];
+  obligation(key: string): unknown;
+  released(): boolean;
+};
+function inspectOwnership(app: DiscordCopilotApp): Inspector {
+  const inspector = (app as unknown as { ownershipInspector?: Inspector }).ownershipInspector;
+  if (!inspector) throw new Error("this app was not built with the test ownership seam");
+  return inspector;
+}
+function hasRuntimeBarrier(app: DiscordCopilotApp, threadId: string): boolean {
+  return inspectOwnership(app).obligationKeys().includes(`runtime:${threadId}`);
+}
+function obligationHandle(app: DiscordCopilotApp, threadId: string): unknown {
+  return inspectOwnership(app).obligation(`runtime:${threadId}`);
+}
+/** Bounds the coordinator applies, as a test seam. Rebuilds it, so call before
+ *  the app has anything in flight. */
+function useOwnershipBounds(
+  app: DiscordCopilotApp,
+  options: { joinTimeoutMs?: number; obligationTimeoutMs?: number }
+): void {
+  (
+    app as unknown as { useOwnershipForTest(l?: InstanceLock, o?: Record<string, unknown>): void }
+  ).useOwnershipForTest(undefined, options);
 }
 /** Give the app a lock the test can watch. The lock now lives inside the
  *  lifecycle coordinator — the only thing allowed to release it — so a test
@@ -2369,7 +2396,7 @@ describe("access retry vs an explicit teardown that started FIRST", () => {
       // is exactly what this barrier exists to prevent — and `/end` must refuse
       // to reclaim the checkout behind it rather than delete it underneath.
       expect(sessionsOf(app).has("t-hung")).toBe(false);
-      expect(unconfirmedResumesOf(app).has("t-hung")).toBe(true);
+      expect(hasRuntimeBarrier(app, "t-hung")).toBe(true);
       expect(store.get("t-hung")?.state).toBe("active"); // NOT reaped
       expect(interaction.replies.join("\n")).toContain("無法確認");
       expect(interaction.replies.join("\n")).toContain("重啟");
@@ -2431,7 +2458,7 @@ describe("access retry — settlement, durability and teardown retries", () => {
    *  reachable without a five-second test. Safety never depended on the value:
    *  an unsettled attempt refuses, it does not proceed. */
   function shrinkJoin(app: DiscordCopilotApp, ms = 10): void {
-    (app as unknown as { accessResumeJoinTimeoutMs: number }).accessResumeJoinTimeoutMs = ms;
+    useOwnershipBounds(app, { joinTimeoutMs: ms });
   }
 
   it("refuses to reclaim when the join expires before the attempt has settled", async () => {
@@ -2656,11 +2683,11 @@ describe("access retry — settlement, durability and teardown retries", () => {
       gated.release();
       await ending;
       await tick;
-      expect(unconfirmedResumesOf(app).has("t-bar1")).toBe(true);
+      expect(hasRuntimeBarrier(app, "t-bar1")).toBe(true);
 
       failDisconnect = false; // the runtime finally answers
       await app.stop();
-      expect(unconfirmedResumesOf(app).has("t-bar1")).toBe(false);
+      expect(hasRuntimeBarrier(app, "t-bar1")).toBe(false);
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });
@@ -2701,12 +2728,12 @@ describe("access retry — settlement, durability and teardown retries", () => {
       gated.release();
       await ending;
       await tick;
-      expect(unconfirmedResumesOf(app).has("t-bar2")).toBe(true);
+      expect(hasRuntimeBarrier(app, "t-bar2")).toBe(true);
 
       await app.stop();
       // Still unconfirmed ⇒ still a barrier. It is not a leak: it is the only
       // thing standing between a maybe-live runtime and its working tree.
-      expect(unconfirmedResumesOf(app).has("t-bar2")).toBe(true);
+      expect(hasRuntimeBarrier(app, "t-bar2")).toBe(true);
       expect(store.get("t-bar2")?.state).toBe("active"); // record kept with it
     } finally {
       rmSync(f, { force: true });
@@ -2859,8 +2886,8 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
 
       expect(copilot.resumes).toEqual(["sess-again"]);
       expect(interaction.replies.join("\n")).toContain("無法確認");
-      expect(unconfirmedResumesOf(app).has("t-again")).toBe(true);
-      const retained = unconfirmedResumesOf(app).get("t-again");
+      expect(hasRuntimeBarrier(app, "t-again")).toBe(true);
+      const retained = obligationHandle(app, "t-again");
       expect(retained).toBeDefined();
       expect(store.get("t-again")?.state).toBe("active"); // /end refused, record kept
       expect(store.get("t-again")?.reason).toBe("thread-no-access"); // still a candidate
@@ -2872,7 +2899,7 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
 
       expect(copilot.resumes).toEqual(["sess-again"]); // no second resume
       expect(sessionsOf(app).size).toBe(0);
-      expect(unconfirmedResumesOf(app).get("t-again")).toBe(retained); // same strong ref
+      expect(obligationHandle(app, "t-again")).toBe(retained); // same retained identity
       expect(store.get("t-again")?.state).toBe("active");
       expect(store.get("t-again")?.reason).toBe("thread-no-access");
 
@@ -2888,7 +2915,7 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
       await fireRetry(app, jobs);
       expect(copilot.resumes).toEqual(["sess-again"]);
       expect(sessionsOf(app).size).toBe(0);
-      expect(unconfirmedResumesOf(app).get("t-again")).toBe(retained);
+      expect(obligationHandle(app, "t-again")).toBe(retained);
       expect(store.get("t-again")?.state).toBe("active"); // never terminalized
       expect(store.get("t-again")?.reason).toBe("thread-no-access");
     } finally {
@@ -2915,25 +2942,45 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
       shrinkTeardown(app);
       const rec = store.get("t-keepfirst");
       expect(rec).toBeDefined();
-      const first = { disconnect: async (): Promise<void> => new Promise<void>(() => {}) };
-      const second = { disconnect: async (): Promise<void> => {} };
-      const discard = (actor: unknown): Promise<void> =>
+      let firstDisconnects = 0;
+      let secondDisconnects = 0;
+      const first = {
+        disconnect: async (): Promise<void> => {
+          firstDisconnects++;
+          return new Promise<void>(() => {});
+        },
+      };
+      const second = {
+        disconnect: async (): Promise<void> => {
+          secondDisconnects++;
+        },
+      };
+      // The obligation must run under a scope, which is where a real discard
+      // lives; the coordinator's first-wins rule is what is under test.
+      const discard = (actor: unknown): Promise<unknown> =>
         (
           app as unknown as {
-            discardResumedActor(r: unknown, a: unknown, why: string): Promise<void>;
+            ownership: {
+              runExclusive(id: string, body: (s: unknown) => Promise<void>): Promise<unknown>;
+            };
           }
-        ).discardResumedActor(rec, actor, "test");
+        ).ownership.runExclusive("t-keepfirst", async (scope) =>
+          (
+            app as unknown as {
+              discardResumedActor(r: unknown, a: unknown, why: string, o: unknown): Promise<void>;
+            }
+          ).discardResumedActor(rec, actor, "test", { scope })
+        );
 
       await discard(first);
-      expect(
-        (unconfirmedResumesOf(app).get("t-keepfirst") as { actor: unknown } | undefined)?.actor
-      ).toBe(first);
+      const retained = obligationHandle(app, "t-keepfirst");
+      expect(retained).toBeDefined();
+      expect(firstDisconnects).toBe(1);
 
       // A newer actor's clean exit does not make an older, unproven one safe.
       await discard(second);
-      expect(
-        (unconfirmedResumesOf(app).get("t-keepfirst") as { actor: unknown } | undefined)?.actor
-      ).toBe(first);
+      expect(obligationHandle(app, "t-keepfirst")).toBe(retained); // same registration
+      expect(secondDisconnects).toBe(0); // never registered, never attempted
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });
@@ -2955,7 +3002,7 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
         store,
         new ChannelRegistry("c1", "g1", registryFile)
       );
-      const claims = (app as unknown as { endClaims: Map<string, number> }).endClaims;
+      const claims = { get: (id: string) => (inspectOwnership(app).teardownClaims().includes(id) ? 1 : 0), has: (id: string) => inspectOwnership(app).teardownClaims().includes(id) };
       const seen: Array<number | undefined> = [];
       const interaction = {
         channelId: "t-claim",
@@ -3043,7 +3090,7 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
       hold = new Promise<void>((r) => {
         release = r;
       });
-      (app as unknown as { accessResumeJoinTimeoutMs: number }).accessResumeJoinTimeoutMs = 10;
+      useOwnershipBounds(app, { joinTimeoutMs: 10 });
       const fetchesBefore = fetchCalls.length;
       const tick = beginRetry(app, jobs);
       await vi.waitFor(() => expect(fetchCalls.length).toBeGreaterThan(fetchesBefore));
@@ -3114,7 +3161,7 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
       await reconcileReal(app);
       const jobs = installFakeScheduler(app);
       readyAndStartRetry(app);
-      (app as unknown as { accessResumeJoinTimeoutMs: number }).accessResumeJoinTimeoutMs = 10;
+      useOwnershipBounds(app, { joinTimeoutMs: 10 });
       access = true;
 
       // `git worktree add` is already running. An epoch cannot recall it, and it
@@ -3188,7 +3235,7 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
       await reconcileReal(app);
       const jobs = installFakeScheduler(app);
       readyAndStartRetry(app);
-      (app as unknown as { accessResumeJoinTimeoutMs: number }).accessResumeJoinTimeoutMs = 10;
+      useOwnershipBounds(app, { joinTimeoutMs: 10 });
       access = true;
 
       const fetchesBefore = fetchCalls.length;

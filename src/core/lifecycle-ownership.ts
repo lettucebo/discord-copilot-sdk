@@ -186,6 +186,8 @@ export interface OwnershipInspector {
   exclusiveThreads(): string[];
   teardownClaims(): string[];
   obligationKeys(): string[];
+  /** The retained handle for a key, for identity assertions. */
+  obligation(key: string): ObligationHandle | undefined;
   released(): boolean;
 }
 
@@ -456,6 +458,7 @@ class Ownership implements LifecycleOwnership {
       exclusiveThreads: () => [...this.exclusive.keys()],
       teardownClaims: () => [...this.teardownClaims.keys()],
       obligationKeys: () => [...this.obligations.keys()],
+      obligation: (key) => this.obligations.get(key)?.handle,
       released: () => this.released,
     };
   }
