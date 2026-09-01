@@ -233,7 +233,7 @@ function obligationHandle(app: DiscordCopilotApp, threadId: string): unknown {
  *  the app has anything in flight. */
 function useOwnershipBounds(
   app: DiscordCopilotApp,
-  options: { joinTimeoutMs?: number; obligationTimeoutMs?: number }
+  options: { joinTimeoutMs?: number; obligationTimeoutMs?: number; teardownTimeoutMs?: number }
 ): void {
   (
     app as unknown as { useOwnershipForTest(l?: InstanceLock, o?: Record<string, unknown>): void }
@@ -3708,6 +3708,115 @@ describe("a rebind is a teardown claim on its thread", () => {
       expect(inspectOwnership(app).teardownClaims()).toEqual([]);
       const admitted = await ownershipOf(app).runExclusive("t-boom", async () => undefined);
       expect(admitted.ran).toBe(true);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});
+
+describe("nothing this process started may be dropped unnoticed at shutdown", () => {
+  /** Every runtime the app still indexes must have a matching ownership
+   *  obligation. This is the invariant the two blockers broke in different
+   *  places: the app kept its own reference while the coordinator learned
+   *  nothing, so the lock was released over a runtime that might still be live. */
+  function assertEveryRetainedRuntimeIsOwed(app: DiscordCopilotApp): void {
+    const keys = inspectOwnership(app).obligationKeys();
+    const stale = (
+      app as unknown as {
+        staleRebindActors: Map<unknown, { binding: SessionBinding & { generation: number } }>;
+      }
+    ).staleRebindActors;
+    for (const entry of stale.values()) {
+      const key = `stale-rebind:${entry.binding.threadId}:${entry.binding.sessionId}:${entry.binding.generation}`;
+      expect(keys, `retained stale incarnation ${entry.binding.sessionId} is not owed`).toContain(key);
+    }
+  }
+
+  function liveSessionApp(
+    store: SessionStore,
+    registryFile: string,
+    disconnect: () => Promise<void>
+  ): { app: DiscordCopilotApp; releases: () => number } {
+    const app = DiscordCopilotApp.createForTest(
+      cfg,
+      REPOS_ROOT,
+      fakeCopilot(),
+      new FakeTransport(),
+      store,
+      new ChannelRegistry("c1", "g1", registryFile)
+    );
+    let released = 0;
+    useObservableLock(app, {
+      path: "(test)",
+      release: async () => {
+        released++;
+      },
+    });
+    // A perfectly ordinary live session — the case that had no barrier at all.
+    sessionsOf(app).set("t-live", {
+      actor: { disconnect },
+      broker: { abort: () => {} },
+      running: false,
+      titled: true,
+      titleEpoch: 0,
+      queue: [],
+      workDir: REPO,
+      repoPath: REPO,
+      devMode: "local",
+      parentChannelId: "c1",
+      hasRunTurn: true,
+    } as unknown as never);
+    return { app, releases: () => released };
+  }
+
+  it("holds the lock when an ordinary live session's disconnect THROWS", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      let confirmable = false;
+      const { app, releases } = liveSessionApp(new SessionStore(f), registryFile, async () => {
+        if (!confirmable) throw new Error("runtime refused to close");
+      });
+
+      await app.stop();
+
+      expect(releases()).toBe(0);
+      expect(hasRuntimeBarrier(app, "t-live")).toBe(true);
+      assertEveryRetainedRuntimeIsOwed(app);
+
+      // …and letting go is exactly as hard as proving it stopped.
+      confirmable = true;
+      await (
+        inspectOwnership(app).obligation("runtime:t-live") as { attempt(): Promise<boolean> }
+      ).attempt();
+      await vi.waitFor(() => expect(releases()).toBe(1));
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("holds the lock when an ordinary live session's disconnect HANGS", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      let finish: () => void = () => {};
+      const { app, releases } = liveSessionApp(
+        new SessionStore(f),
+        registryFile,
+        () =>
+          new Promise<void>((resolve) => {
+            finish = resolve;
+          })
+      );
+      useOwnershipBounds(app, { obligationTimeoutMs: 20, teardownTimeoutMs: 2_000 });
+
+      await app.stop();
+
+      expect(releases()).toBe(0); // a hang proves no more than a throw
+      expect(hasRuntimeBarrier(app, "t-live")).toBe(true);
+      void finish;
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });

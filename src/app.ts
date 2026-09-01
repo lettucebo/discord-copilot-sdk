@@ -1933,7 +1933,7 @@ export class DiscordCopilotApp {
       closed = false; // runtime may still be live — keep the record, say so
     }
     if (!closed) {
-      if (pendingOld) this.retainStaleRebindActor(pendingOld, undefined, undefined, scope);
+      if (pendingOld) this.retainStaleRebindActor(pendingOld, "rebind-teardown-unconfirmed", undefined, scope);
       // A replacement can have been swapped in before this `/end`; it does not
       // excuse the old incarnation from cleanup merely because ending the
       // replacement timed out too.
@@ -3105,9 +3105,14 @@ export class DiscordCopilotApp {
    * result as a durability gate. */
   private retainStaleRebindActor(
     entry: StaleRebindActor,
-    reason = "rebind-teardown-unconfirmed",
-    fallbackPrimary?: FallbackPrimaryReconciliationPlan,
-    scope?: TeardownScope
+    reason: string,
+    fallbackPrimary: FallbackPrimaryReconciliationPlan | undefined,
+    // REQUIRED, not optional. Every real call site sits inside a teardown claim,
+    // and an omission meant the app kept its index entry while the coordinator
+    // learned nothing — the retained actor would then not gate the lock at all.
+    // Making the compiler ask the question is the only thing that keeps that
+    // true as call sites are added.
+    scope: TeardownScope
   ): boolean {
     const persisted = this.store.retainStaleRebind(entry.binding, reason);
     if (!persisted) {
@@ -3128,7 +3133,7 @@ export class DiscordCopilotApp {
     // all live in the closure, so this is not a second barrier map beside
     // `staleRebindActors`. That map is the app's index for its own lifecycle
     // work (retry, `/end`, fallback reconciliation); this is the ownership fact.
-    scope?.retain(staleRebindObligationKey(entry.binding), {
+    scope.retain(staleRebindObligationKey(entry.binding), {
       describe: () =>
         `a detached rebind incarnation ${entry.binding.sessionId} over ${entry.binding.workDir}`,
       attempt: async () => {
@@ -3373,7 +3378,8 @@ export class DiscordCopilotApp {
               "rebind-teardown-unconfirmed",
               // `/end` already claimed the old session. If persistence fails,
               // retry may remove only this exact target reservation.
-              fallback
+              fallback,
+              scope
             );
             fallbackPrimaryRetained = stale.fallbackPrimary !== undefined;
           } else {
@@ -3600,7 +3606,8 @@ export class DiscordCopilotApp {
             // The old actor is still current here. If this terminal row cannot
             // persist, a later confirmed retry may restore only this snapshot
             // under the target reservation's exact CAS.
-            fallback
+            fallback,
+            scope
           );
         } else {
           console.warn("rebind: commit-failed replacement lost its durable binding before teardown");
@@ -5664,9 +5671,31 @@ export class DiscordCopilotApp {
       // that is about to be disconnected.
       session.currentAbort?.abort();
       session.broker.abort();
-      // Bound the disconnect: a retained fence's disconnect can be permanently
-      // hung, and shutdown must not block forever on it.
-      await withTimeout(session.actor.disconnect(), TEARDOWN_TIMEOUT_MS).catch(() => {});
+      // Registered BEFORE the attempt, and carrying the actor. An ordinary live
+      // session whose disconnect throws or hangs used to be swallowed here: the
+      // loop moved on, `sessions.clear()` dropped the last reference to a
+      // possibly-live runtime (and, on Windows, its root capability), the armed
+      // teardown reported success and the lock was released — handing a
+      // successor instance the very checkout that runtime might still be in.
+      // Now it gates the release exactly like every other unconfirmed runtime,
+      // and only a CONFIRMED disconnect discharges it.
+      const handle = scope.retain(runtimeObligationKey(threadId), {
+        describe: () => `a live session runtime for ${threadId} over ${session.workDir}`,
+        attempt: async () => {
+          try {
+            await withTimeout(session.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+      });
+      if (!(await handle.attempt())) {
+        console.warn(
+          `shutdown: could not confirm the runtime for ${threadId} stopped; holding the ` +
+            `single-instance lock over ${session.workDir} until it is confirmed or this process exits.`
+        );
+      }
       this.transport.dispose(threadId);
     }
     this.sessions.clear();
