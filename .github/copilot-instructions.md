@@ -132,8 +132,11 @@ no scope, because there is nothing for the lock to wait for. Ownership is asked 
 irreversible external effect, never after one: `/file` checks it before the upload starts and
 hands the transport only a session-currentness predicate, because the transport answers "no"
 after Discord has accepted an attachment by *retracting* it. `startBot`'s readiness publication is
-owned the same way and is retractable (`retractReady`), because the marker is an externally
-visible claim that this PID is serving.
+owned the same way and is retractable (`retractStartupReady`), because the marker is an externally
+visible claim that this PID is serving — and a retraction removes BOTH files, since the launcher
+polls the token marker, not the status one. `stop()` also empties every session queue in its
+synchronous phase-gate step, and `drainQueue` refuses on its own, because a finishing turn drains
+the queue from a `void`ed continuation no scope covers.
 
 **A lost rebind asks WHY it was lost, once.** `/end` is a winner that deliberately gives the old
 conversation up, so its target reservation is removed. A shutdown gave up nothing, so the

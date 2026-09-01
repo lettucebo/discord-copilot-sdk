@@ -942,3 +942,149 @@ describe("the phase gate says which phase it is in", () => {
     expect(interaction.answers.join("\n")).not.toContain("啟動中");
   });
 });
+
+describe("/new with a prompt starts no background work into a dying process", () => {
+  it("neither titles nor runs the first turn when shutdown lands on the final reply", async () => {
+    // The session itself is registered and durable by now, so stopping here
+    // leaves nothing half-done: it is a session that has not run its first turn,
+    // exactly as if the prompt had arrived one instant later. What must NOT
+    // happen is the two BACKGROUND operations — the titler creates its own
+    // Copilot session, and `runTurn` starts an SDK turn shutdown then aborts.
+    const reposRoot = join(FIXTURES, "repos");
+    const repoPath = await makeRepo();
+    const registry = new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels.json"));
+    expect(registry.enable(SEED, OWNER)).toBe(true);
+    const store = new SessionStore(join(FIXTURES, "sessions.json"));
+    const { app } = appWith(reposRoot, store, registry);
+    const branch = worktreeBranch(NEW_THREAD_ID);
+    const expectedWorktree = worktreePath(worktreeRoot(), repoPath, NEW_THREAD_ID);
+    cleanupRepo = repoPath;
+    cleanupWorktree = expectedWorktree;
+    cleanupBranch = branch;
+    patchChannelFetch(app, async () => ({
+      type: ChannelType.GuildText,
+      threads: { create: async () => ({ id: NEW_THREAD_ID, delete: async () => {} }) },
+    }));
+    patchBindingCheck(app, async () => ({ ok: true }));
+    const titles: string[] = [];
+    const turns: string[] = [];
+    (app as unknown as { startTitling(t: string, s: unknown, x: string): void }).startTitling = (
+      _t,
+      _s,
+      x
+    ) => {
+      titles.push(x);
+    };
+    (app as unknown as { runTurn(t: string, x: string): Promise<void> }).runTurn = async (_t, x) => {
+      turns.push(x);
+    };
+    const interaction = strictInteraction({
+      user: { id: OWNER },
+      guildId: GUILD,
+      channelId: SEED,
+      channel: { isThread: () => false },
+      options: {
+        getSubcommand: () => "new",
+        // The prompt is what arms the background work.
+        getString: (name?: string) => (name === "prompt" ? "do the thing" : null),
+        getBoolean: () => null,
+      },
+    });
+    // The SIGTERM lands on the FINAL editReply — the last await before the two
+    // background calls.
+    let stopping: Promise<void> | undefined;
+    const realEdit = interaction.editReply.bind(interaction);
+    (interaction as { editReply: (o: unknown) => Promise<void> }).editReply = async (o) => {
+      await realEdit(o as string);
+      if (String(o).includes("Started a session")) stopping = app.stop().catch(() => {});
+    };
+
+    await tryOwnedScope(app, (scope) => cmdNew(app, asCommandInteraction(interaction), scope));
+    await stopping;
+
+    expect(titles).toEqual([]);
+    expect(turns).toEqual([]);
+    // The session it DID create is durable and complete, not half-built.
+    expect(store.get(NEW_THREAD_ID)?.state).toBe("active");
+  });
+});
+
+describe("the queue does not restart work while the bot is stopping", () => {
+  it("is emptied synchronously by stop(), so a finishing turn drains nothing", async () => {
+    // `stop()`'s bounded join waits for an in-flight turn, and the FIRST thing
+    // that turn does when it finishes is `drainQueue`. A queue left populated
+    // therefore started the NEXT prompt during shutdown.
+    const reposRoot = join(FIXTURES, "repos");
+    mkdirSync(reposRoot, { recursive: true });
+    const registry = new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels.json"));
+    const store = new SessionStore(join(FIXTURES, "sessions.json"));
+    const { app } = appWith(reposRoot, store, registry);
+    const threadId = "t-drain";
+    const session = {
+      actor: {} as never,
+      broker: new PendingInteractionBroker(),
+      running: false,
+      titled: true,
+      titleEpoch: 0,
+      queue: ["next one", "and another"],
+      workDir: reposRoot,
+      repoPath: reposRoot,
+      devMode: "local" as const,
+      parentChannelId: SEED,
+      hasRunTurn: true,
+    };
+    (app as unknown as { sessions: Map<string, unknown> }).sessions.set(threadId, session);
+    const turns: string[] = [];
+    (app as unknown as { runTurn(t: string, x: string): Promise<void> }).runTurn = async (_t, x) => {
+      turns.push(x);
+    };
+
+    const stopping = app.stop().catch(() => {});
+    // Synchronously, before the first await inside stop().
+    expect(session.queue).toEqual([]);
+
+    // …and the drain a finishing turn performs starts nothing.
+    await (app as unknown as { drainQueue(t: string): Promise<void> }).drainQueue(threadId);
+    await stopping;
+
+    expect(turns).toEqual([]);
+  });
+
+  it("refuses a direct drain while shutting down, even with a populated queue", async () => {
+    // Independent of the clearing above: `drainQueue` is reached from a `void`ed
+    // continuation that no scope covers, so it has to answer for itself.
+    const reposRoot = join(FIXTURES, "repos");
+    mkdirSync(reposRoot, { recursive: true });
+    const registry = new ChannelRegistry(SEED, GUILD, join(FIXTURES, "channels.json"));
+    const store = new SessionStore(join(FIXTURES, "sessions.json"));
+    const { app } = appWith(reposRoot, store, registry);
+    const threadId = "t-drain-2";
+    const session = {
+      actor: {} as never,
+      broker: new PendingInteractionBroker(),
+      running: false,
+      titled: true,
+      titleEpoch: 0,
+      queue: [] as string[],
+      workDir: reposRoot,
+      repoPath: reposRoot,
+      devMode: "local" as const,
+      parentChannelId: SEED,
+      hasRunTurn: true,
+    };
+    (app as unknown as { sessions: Map<string, unknown> }).sessions.set(threadId, session);
+    const turns: string[] = [];
+    (app as unknown as { runTurn(t: string, x: string): Promise<void> }).runTurn = async (_t, x) => {
+      turns.push(x);
+    };
+    (app as unknown as { shuttingDown: boolean }).shuttingDown = true;
+    (app as unknown as { phase: string }).phase = "shuttingDown";
+    // Re-populated after the phase gate closed — the drain must still refuse.
+    session.queue.push("do not start me");
+
+    await (app as unknown as { drainQueue(t: string): Promise<void> }).drainQueue(threadId);
+
+    expect(turns).toEqual([]);
+    expect(session.queue).toEqual(["do not start me"]); // untouched, not consumed
+  });
+});

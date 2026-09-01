@@ -2110,6 +2110,16 @@ export class DiscordCopilotApp {
       );
 
       if (promptOption) {
+        // The reply above is a Discord round trip, and both calls below start
+        // BACKGROUND work: `startTitling` creates its own Copilot session, and
+        // `runTurn` starts an SDK turn. A signal landing in that gap used to
+        // spawn both into a process that was going away — a titler runtime
+        // nobody would tear down, and a turn shutdown would abort a moment
+        // later. The session itself is already registered and durable, so
+        // stopping here leaves nothing half-done: it is simply a session that
+        // has not run its first turn, exactly as if the prompt had been sent one
+        // instant later.
+        if (lost()) return;
         // Title this the same way a first thread message is titled — the thread
         // was created with the local heuristic so it is never nameless, and the
         // model's shorter name replaces it a few seconds later.
@@ -6121,6 +6131,11 @@ export class DiscordCopilotApp {
   /** Start the next `/queue`d prompt, if any. `/stop` empties the queue, so a
    *  stopped turn never resurrects work the operator asked to abandon. */
   private async drainQueue(threadId: string): Promise<void> {
+    // Independently of `stop()` clearing the queues: this is the one place a
+    // finished turn starts the NEXT one, and it is reached from a `void`ed
+    // continuation that no scope covers. A drain admitted during teardown starts
+    // agent work the coordinator is already waiting to put down.
+    if (this.shuttingDown || this.phase !== "ready") return;
     const session = this.sessions.get(threadId);
     if (!session || session.running || session.queue.length === 0) return;
     const next = session.queue.shift()!;
@@ -6189,6 +6204,13 @@ export class DiscordCopilotApp {
     // learns it has lost the thread the instant a caller asks for shutdown.
     this.shuttingDown = true;
     this.phase = "shuttingDown";
+    // …and every queued prompt is dropped in the same synchronous step. The
+    // coordinator's bounded join waits for an in-flight turn to finish, and the
+    // FIRST thing that turn does when it completes is `drainQueue`. A queue left
+    // populated therefore started the NEXT prompt during shutdown — new agent
+    // work in a process that is going away, and a turn shutdown then aborts.
+    // The queue is volatile by design, so dropping it loses nothing durable.
+    for (const session of this.sessions.values()) session.queue = [];
     // The armed callback is `teardownResources`, never this method: shutdown
     // CALLS the armed teardown, so arming `stop()` would deadlock its own
     // single-flight.
