@@ -1,5 +1,24 @@
 import { describe, it, expect } from "vitest";
+import fs from "node:fs";
+import { createRequire } from "node:module";
 import { sanitizeRuntimeEnv, stopCopilotClient } from "../src/copilot/sdk.js";
+
+describe("Copilot SDK/runtime tuple", () => {
+  it("pins the bundled runtime exactly because installs have no committed lockfile", () => {
+    const pkg = JSON.parse(
+      fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")
+    ) as { dependencies?: Record<string, string>; overrides?: Record<string, string> };
+
+    expect(pkg.dependencies?.["@github/copilot-sdk"]).toBe("1.0.11");
+    expect(pkg.overrides?.["@github/copilot"]).toBe("1.0.80");
+
+    const requireFromSdk = createRequire(createRequire(import.meta.url).resolve("@github/copilot-sdk"));
+    const installedRuntime = JSON.parse(
+      fs.readFileSync(requireFromSdk.resolve("@github/copilot/package.json"), "utf8")
+    ) as { version?: string };
+    expect(installedRuntime.version).toBe(pkg.overrides?.["@github/copilot"]);
+  });
+});
 
 describe("sanitizeRuntimeEnv (secrets must not reach the agent's process env)", () => {
   it("strips the bot token and every DISCORD_* setting", () => {

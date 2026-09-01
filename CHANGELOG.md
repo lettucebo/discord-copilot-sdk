@@ -25,6 +25,10 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Upgraded `@github/copilot-sdk` from `1.0.7-preview.3` to stable `1.0.11` and
+  pinned its bundled `@github/copilot` runtime to the clean-A/B-tested `1.0.80`
+  tuple, preventing unlocked installs from silently changing the runtime under
+  an otherwise unchanged SDK dependency.
 - **Losing Discord channel access (`50001 Missing Access`, including Channel Obfuscation) is
   now retryable, not a terminal block**: an affected session resumes automatically once access
   is restored — the running bot rescans its `thread-no-access` records on a bounded periodic

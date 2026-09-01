@@ -36,8 +36,9 @@ permission kind, and `onElicitationRequest`, are registered but deliberately fai
 - **`package-lock.json` is deliberately not committed** (the reason is in `.gitignore`). Use
   `npm install`; CI does `npm install --no-audit --no-fund`. A lockfile in your working tree is
   local-only — never commit it.
-- `scripts/smoke-live.mjs` hits the real Copilot runtime and hardcodes a repo path; it is a
-  manual acceptance tool, never part of CI.
+- `scripts/smoke-live.mjs` hits the real Copilot runtime against a disposable temporary repo and
+  approves only its exact allowlisted read-only command; it is a manual acceptance tool, never
+  part of CI.
 - `.github/skills/` ships task skills for this repo (`copilot-sdk`, `codeql`, `gh-cli`,
   `git-commit`, `github-issues`, `security-review`, spec/plan authoring, …). Check there before
   reinventing a workflow.
@@ -170,9 +171,11 @@ read by the agent the bot spawns.
 CLI-native repo roots (`.github/skills`, `.agents/skills`, `.claude/skills`) and the user root
 (`~/.copilot/skills`) according to `ENABLE_REPO_SKILLS` / `ENABLE_USER_SKILLS`; it must **not**
 set `enableConfigDiscovery:true` to do so. If no enabled root has a `SKILL.md`, it sends
-`excludedTools:["skill"]`, because CLI 1.0.71 still registers the builtin skill tool even when
-`enableSkills:false`, producing a guaranteed `Skill not found` failure. Repo skill descriptions
-are model context: never describe this as a trust boundary. A repo skill's `allowed-tools`
+`excludedTools:["skill"]`: CLI 1.0.71 registered the builtin tool even with `enableSkills:false`,
+and a runtime 1.0.80 live smoke reconfirmed that this explicit exclusion removes it from the
+catalog. Retain the fail-closed guard until `enableSkills:false` alone is separately proven
+sufficient. Repo skill descriptions are model context: never describe this as a trust boundary.
+A repo skill's `allowed-tools`
 frontmatter was probed against the SDK runtime and does not bypass `onPermissionRequest`, but
 YOLO removes that remaining card gate; preserve the explicit YOLO warning.
 

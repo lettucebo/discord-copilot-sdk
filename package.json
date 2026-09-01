@@ -20,7 +20,7 @@
     "release": "node scripts/release.mjs"
   },
   "dependencies": {
-    "@github/copilot-sdk": "1.0.7-preview.3",
+    "@github/copilot-sdk": "1.0.11",
     "discord.js": "^14.16.3",
     "koffi": "3.1.4",
     "zod": "^3.24.1"
@@ -30,5 +30,8 @@
     "tsx": "^4.19.2",
     "typescript": "~5.7.2",
     "vitest": "^4.1.7"
+  },
+  "overrides": {
+    "@github/copilot": "1.0.80"
   }
 }

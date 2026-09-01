@@ -535,11 +535,12 @@ export class SessionActor {
       // loading repo MCP config. A skill's text may steer the model, but shell
       // permissions still route through Discord; only YOLO removes that gate.
       //
-      // CLI 1.0.71 still registers the skill tool when enableSkills:false if it
-      // finds a builtin skill. With no usable source, excludedTools is therefore
-      // necessary: an empty skill list otherwise invites a guaranteed
-      // "Skill not found" tool failure. SDK documents excludedTools as default-
-      // agent scoped; builtin subagents were probed to inherit this exclusion.
+      // CLI 1.0.71 registered the skill tool when enableSkills:false if it found
+      // a builtin skill. Runtime 1.0.80 was re-probed to confirm that this
+      // excludedTools guard removes it from the catalog; until enableSkills:false
+      // alone is separately proven sufficient, an empty skill list must not
+      // invite a guaranteed "Skill not found" tool failure. Builtin subagents
+      // were probed to inherit this default-agent-scoped exclusion.
       ...(hasSkills
         ? { enableSkills: true, skillDirectories }
         : { enableSkills: false, excludedTools: ["skill"] }),
