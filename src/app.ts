@@ -3812,7 +3812,15 @@ export class DiscordCopilotApp {
       return "⚠️ 舊 session 的改綁清理擁有權遺失，為安全起見未完成改綁。請重啟 bot。";
     }
     this.pendingRebindOlds.delete(session);
-    this.staleRebindActors.set(detachedOld.actor, detachedOld);
+    // Registered as an OWNED obligation, exactly as every other detached
+    // incarnation is. The successful-rebind path is the commonest way one of
+    // these is created, and it was the one route that only added the app's
+    // index entry: a `disconnect` nobody could confirm here left a runtime
+    // holding the old worktree while the process lock was free to be released.
+    // The obligation is entered BEFORE the teardown attempt below, so a
+    // concurrent `stop()` sees it, and `disconnectStaleRebindActor` discharges
+    // it by identity once the runtime is confirmed.
+    this.retainStaleRebindActor(detachedOld, "rebind-cleanup-pending", undefined, scope);
     const oldTeardown = await this.disconnectStaleRebindActor(detachedOld);
     if (!oldTeardown.confirmed) this.scheduleStaleRebindRetry(detachedOld);
     // Cleanup happened (or its durable unconfirmed record was installed)

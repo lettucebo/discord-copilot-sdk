@@ -257,10 +257,11 @@ durably recorded the recovery, and a discarded session is entered as a coordinat
 its disconnect is attempted, is never overwritten by a later one, and is removed only when that
 exact actor's disconnect is confirmed. A thread carrying such a barrier stays a retry candidate but
 the tick must clear the barrier first, so a runtime that was never proved stopped can never have a
-second one resumed on top of it. Every retry attempt also carries a cancellation token (an epoch
-bumped by `stop()`) that is re-checked after each await and before **every** durable transition and
-external side effect, because `stop()`'s join is bounded: an attempt may outlive it, and by then the
-single-instance lock is released and a replacement process may own the same store.
+second one resumed on top of it. Owned work asks its scope (`lostReason()`) after each await and
+before **every** durable transition and external side effect, because a bounded join means an
+attempt can outlive the shutdown it raced. Startup is owned too — construction, reconciliation and
+each startup resume run inside scopes — so no phase of this process mutates state without something
+holding the lock on its behalf.
 
 **`src/core/lifecycle-ownership.ts` is the only thing that decides when this process lets go of its
 single-instance lock** (`--selfcheck`, which never builds an app, is the one carve-out). It exists

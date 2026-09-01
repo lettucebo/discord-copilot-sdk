@@ -27,6 +27,8 @@ const { sdk } = vi.hoisted(() => ({
     clientsCreated: 0,
     clientStartError: undefined as string | undefined,
     clientStops: 0,
+    clientStartBlocks: undefined as Promise<void> | undefined,
+
   },
 }));
 vi.mock("../src/copilot/sdk.js", () => ({
