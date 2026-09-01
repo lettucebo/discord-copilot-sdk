@@ -954,122 +954,67 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   `accessRetryScheduler` 佇列手動觸發，不使用真實等待，也不用 `vi.useFakeTimers()`（那會連同一個 app
   持有的 SDK / git timeout 一起凍住）。
 
-### 19.3 競態防護
+### 19.3 競態防護 —— 由 `LifecycleOwnership` 統一裁決（2026-09-01 重構後）
+
+前六輪 review 在同一組不變式上抓出十幾個問題，每一個的形狀都一樣：**「這個 process 現在可以放手了嗎」
+這件事被分散在四、五個地方各自回答**，而任兩個答案之間永遠隔著一個 await。最後的設計把它收斂成一個
+deep module：`src/core/lifecycle-ownership.ts`。
+
+**對外只有四個操作**（任何「需要第五個」的需求，都是某個呼叫端又想自己推理所有權——正是要移除的東西）：
+
+- `arm(teardown)`：可重複武裝、**最後一次生效**。production 武裝兩次：Copilot client 一存在就武裝
+  **窄**的清理（在 `copilot.start()` **之前**，因為從 client 存在那一刻起它就是要收拾的東西），app 建好、
+  **且 signal handler 安裝之前**再武裝**寬**的 `teardownResources`。shutdown 已開始才 arm 會回 `false`，
+  該清理本身變成一筆 obligation，呼叫端必須中止建構。
+- `runExclusive(threadId, body)`：**同步**發布 scope（在 body 的第一個 await 之前）。只有 shutdown 與
+  該 thread 的 teardown claim 會拒絕；**barrier 刻意不拒絕**——清掉 barrier 正是 body 自己的第一步。
+- `runTeardown(threadId, body)`：計數式（可重入）claim，同步發布；`joinExclusive` 有界，
+  **回 `false` 就是要拒絕**，不是「當作跑完了」。
+- `shutdown()`：single-flight，**非 `async`**（呼叫端必須拿到同一個 promise，第二個 signal 是 join 而不是
+  等一個新包裝物件）。它回傳的 promise 有界，但**釋放與否不由它決定**。
+
+**釋放是每次 transition 重新推導出來的結論**，不是倒數、也不是對快照做判斷：只有 exclusive scopes、
+teardown claims、obligations **同時為空**才釋放，且只釋放一次。
+
+**Obligation 自帶 payload**（actor、retained root、cleanup plan 都在 closure 裡），所以不存在第二份會
+跟它走歪的 barrier map；同一個 key **先到先贏**，因為既有的那筆是「更早、而且沒人證明它停了」的東西，
+它的強引用就是唯一的柵欄。`ObligationHandle` 的 `attempt`/`discharge` 都是**身分安全**的。
+
+在這個基礎上，各個競態的答案變成：
 
 - **不重疊 tick**：`accessRetryTickPromise` 存在時 `runAccessRetryTick()` 直接返回；tick 結束才
   `scheduleAccessRetry()`（先 `clear` 再 `set`），所以任何時刻最多一個 armed timer、最多一個 in-flight tick。
-- **`resumeOwnershipLost()`（新的共用 fence，用於三個點）**：
-  1. `resumeRecord()` **最開頭**，也就是任何 side effect 之前。retry 是在 classify 的 await 之後才走到這裡，
-     `/end`／shutdown 可能已經在那個視窗裡贏走這筆 record；若不擋，接下來的
-     `addWorktree()` 會從還存在的 branch **重建**一個沒有任何 record 指向的 worktree——正好是 `/end` 剛清掉的
-     那種殘留。fence 是同步的，而 `addWorktree` 是下一個 await，兩者之間插不進任何東西。
-  2. `addWorktree()` **成功之後**：重建本身就是一個 await，`/end`／shutdown 可以落在那段時間裡，第 1 點蓋不到。
-     此時**回收我們自己造成的 side effect**（`removeWorktreeIfClean`）。回收失敗不算致命：worktree 只在 git
-     證明乾淨時才會被刪，留下來的目錄會被 startup 的 stray-worktree 掃描報出來。
-  3. `SessionActor.create()` 之後、`sessions.set()` 之前——`shuttingDown`、已有 live session、record 已被移除、
-     record 已非 `active`、record 的 `sessionId`/`generation` 已改變，任一成立就**丟棄**剛 resume 出來的
-     session（bounded `disconnect()`）而不註冊。fence 與 `sessions.set()` 之間沒有 await，因此是一個
-     不可被插入的原子步驟。startup 路徑同樣受惠：它以前也沒有這些保護。
-- **`/end` 一定贏（雙向 handshake，不只事後 fence）**：`/end thread:<id>` 的 record 移除發生在好幾個
-  await 之後，光靠事後 fence 只能擋「retry 先開始」的那一半；「`/end` 先開始」的那一半會讓 retry 在
-  `/end` 的 await 空隙裡 resume 並 `sessions.set`，最後留下一個**沒有 record、而且 local lease 已被釋放**
-  的 live session。因此：
-  - `endStaleRecord()` 在**自己的第一個 await 之前**同步把 threadId 放進 `endClaims`，`finally` 移除
-    （`/end` 失敗時 record 仍是 `active`，必須重新回到迴圈）。
-  - `accessRetryTick` 跳過 `endClaims` 中的 candidate；`resumeOwnershipLost()` 也檢查它（在讀 store 之前，
-    因為 record 這時還在）。
-  - `accessResumeSettled` 在**每個 candidate 的第一個 await 之前**發布一個「這次嘗試（含丟棄與 barrier
-    註冊）全部結束」的 promise。`/end` 有界 `joinAccessResume()` 等的是**這個**，不是 tick promise：
-    舊版外層 bound 與內層 discard 的 `disconnect()` bound 同為 `TEARDOWN_TIMEOUT_MS`，外層可能先到期、
-    `/end` 於是看到空的 barrier map 而放手去回收。現在**逾時本身不再影響安全性**——沒有 settle 的嘗試
-    會讓 `/end`**拒絕**（誠實回覆「還沒結束，請稍後再試」），而不是繼續。bound 只決定操作者等多久被
-    告知，因此是可注入的測試 seam，不是靠 2× 之類的魔術數字。
-  - `discardResumedActor()` 在**嘗試 disconnect 之前**就把 actor 放進 `unconfirmedResumes`，只有
-    **確認成功**才移除。從 actor 存在的那一刻起就可能有 runtime 抓著那個 checkout，正在進行中的丟棄
-    必須是看得見的，而不是「還沒失敗所以 map 是空的」。
-  - **barrier 絕不被覆寫，而且會擋住下一次 resume**。舊版漏掉這一環：`/end` 因無法確認而拒絕、record
-    被保留成 `active`/`thread-no-access` 之後，**下一次 tick 仍然把它當候選**，於是對同一個 sessionId／
-    worktree 再 resume 出第二個 runtime，而它的丟棄會 `set()` 覆寫掉第一個的強引用——正好把 barrier
-    存在的理由（保住第一個 root capability）親手拆掉。現在：
-    (a) `unconfirmedResumes.set()` 只在沒有既有 entry 時寫入，confirmed 移除也只移除**同一個 actor** 的；
-    (b) tick 在 resume 之前先 `retryUnconfirmedResume()`，**只有確認清除才繼續**，否則跳過這個 candidate；
-    (c) `resumeOwnershipLost()` 也硬性檢查 barrier（tick 的檢查到這裡已經隔了好幾個 await）。
-    `isAccessRetryCandidate()` **刻意不**把有 barrier 的 record 排除：那會讓候選集合變空、迴圈轉入閒置，
-    barrier 就再也沒人重試了。
-  - **hung 與 reject 是兩種結局**：`SessionActor.disconnect()` 對同一次 teardown 是 single-flight，
-    所以一個**永遠不 settle** 的 disconnect 在這個 process 內永遠無法被確認——barrier 會一直留著、
-    record 一直是 `active`（不會被終態化），只有重啟能真正收乾淨，`/end` 也是這樣告訴操作者的。
-    會 reject 的 disconnect 則可以被之後的重試（`/end` 或 `stop()`）確認並清除 barrier。
-- **`endClaims` 同時覆蓋兩種 `/end`**：改為計數式（可重入）的 `Map<threadId, number>`，由 `cmdEnd()`
-  在授權檢查之後、任何 await 之前對 `explicit || channelId` 認領整個指令；`endStaleRecord()` 內層再認領
-  一次由計數處理。in-thread 的 `/end` 會先 `sessions.delete()` 再 await git，那個視窗裡討論串已經不是
-  live、record 卻還在，計數式認領讓 retry loop 不會把它當成邀請。
-- **成功的 resume 以 `commit()` 的回傳值為準**：`store.commit()` 是 persist-first，回 false 代表磁碟上
-  （與記憶體中）的 record 仍寫著 `thread-no-access`。此時**不註冊 session、不貼成功通知**，而是把剛
-  resume 出來的 actor 走 `discardResumedActor()`（無法確認就留成 barrier），record 與 local lease 原封
-  不動留給下一次 wake-up／重啟。否則就會出現「活著的 session 背後是一筆否認它存在的 record」，正是
-  `/end` handshake 要防的同一類危險。`commit()` → `sessions.set()` 之間沒有 await，仍是原子步驟。
-- **shutdown 一定贏**：`stop()` 先設 `shuttingDown` / `phase`，再 `clearAccessRetryTimer()`，
-  **接著 bump `accessRetryEpoch` 取消所有在飛的 attempt**，最後才有界地 `await accessRetryTickPromise`。
-  只清 timer 只擋得住下一次 tick；已經在飛的那一次仍可能正在寫 store。而且**那個 join 是有界的**——
-  attempt 可以活得比它久：`stop()` 逾時後仍會繼續 `copilot.stop()` 並**釋放 single-instance lock**，
-  此時一個延遲回來的 classify 若回報 `gone`，舊版就會在「本 process 已交出狀態所有權（下一個 instance
-  可能已經接手同一個 store）」之後，寫入 blocked、釋放 repo lease、還往 Discord 貼訊息。
-- **每個 retry attempt 都帶一個取消 token（epoch）**，在**每一個 await 之後、任何持久轉換或外部副作用
-  之前**檢查，並且在**啟動**昂貴外部工作之前也檢查（root capture、`SessionActor.create`、以及整個
-  attempt 的入口）：`reconcileRecord` 在 classify await 之後檢查一次（涵蓋 `block`／`skip`／`orphan`
-  全部分支），`resumeRecord` 則在重建 worktree 失敗、trusted-root 擷取（前後）、binding 拒絕、
-  `SessionActor.create`（前後），以及註冊前的 fence 各檢查一次。settlement promise 與 epoch 都在
-  **barrier retry 之前**就發布／捕捉，因為那個 retry 本身就是這次 attempt 的第一個 await。
-  startup 不傳 token（`opts.cancelled` 為 undefined），語意完全不變。
-- **token 擋不住「已經發出去」的外部工作，所以 lock 才是最後一道**：epoch 可以讓本 app 不再寫任何東西，
-  但它無法收回一個已經送出的 REST 呼叫、一個正在跑的 `git worktree add`、或一個已經交給 runtime 的
-  `SessionActor.create`。那些工作會照自己的節奏完成，作用在**同一個 state 目錄與同一批 checkout** 上。
-  因此：**`stop()` 若在有界等待內沒能 join 到 tick，就不在正常結束處釋放 single-instance lock**，改成
-  掛在該 tick 的 settle 上延後釋放；若它永遠不 settle，PID lock 就一直留到 process 結束——
-  `acquireSingleInstanceLock` 會把「holder pid 已不存在」的 lock 視為 stale 並回收，`releaseIfOwner`
-  也拒絕刪掉已被後繼者接管的 lock（見 `src/core/single-instance.ts`）。所以「繼續持有」既誠實
-  （這個 pid 真的還在做事），也能自我痊癒。epoch 則退居為 defense-in-depth，負責擋住 app 層的遲到寫入。
-- **lock 的所有權轉移在 bootstrap 被形式化**：`startBot()` 的 catch 原本是
-  `if (app) await app.stop(); if (lock) await lock.release();`——兩句都會跑。正常失敗路徑因此**釋放兩次**
-  （production 靠 `releaseIfOwner` 幸運變成 no-op），更嚴重的是它會**在 app 背後**把上面那個「刻意保留」
-  的決定推翻掉。現在改為 `if (app) stop else if (!transferred && lock) release`，而且
-  **`transferred` 是在 `await runtime.start(...)` 之前就設定的**：所有權轉移發生在**呼叫**的當下，
-  不是成功回傳的當下。`DiscordCopilotApp.start()` 自己的 catch 已經負責兩種結局（有 app 就 `app.stop()`，
-  沒有就自己 release），所以 `runtime.start` 一旦 reject，bootstrap 再碰 lock 就是第二次釋放。
-  這個契約寫進 `BotRuntime.start` 的 doc comment。`--selfcheck` 自己持有一組不經過 app 的 lock，不受影響。
-  **配套的必要修正**：`DiscordCopilotApp.start()` 原本把 `resolveReposRoot()` 與 SDK 版本檢查放在自己的
-  `try` **之外**。所有權既然在「呼叫的當下」就轉移，這兩個 throw 就會從 `start()` 的 catch 上方逃出去——
-  bootstrap 不會再碰 lock，`start()` 的 catch 也看不到它，於是 lock **完全沒有人釋放**。兩者已移進 try，
-  讓 `app ? stop : (copilot?.stop, lock.release)` 這個 catch 涵蓋 `start()` 的每一種結局。
-  這條契約用**真實的 `DiscordCopilotApp.start`**（不是 fake `BotRuntime`）測：壞掉的 `REPOS_ROOT`、
-  與 trust store 重疊的 `REPOS_ROOT`、SDK 版本不符、以及 runtime 啟動失敗，各自斷言 `release` 恰好一次、
-  且前三者根本沒有建立過 Copilot client（因此也沒碰過 Discord）。
-- **`stop()` 是 single-flight**：`stopPromise` 存起來並回傳**同一個** promise（`stop()` 刻意不是 `async`，
-  否則每次呼叫都是新的包裝物件）。第二個 SIGTERM、bot startup 失敗路徑與 signal 撞在一起、或測試重複呼叫，
-  都會 **join** 第一次拆解，而不是從一個只做到一半的 shutdown 提早返回——而 `stop()` 正是「做到一半」
-  等於「SDK child 還活著、lock 還沒放」的地方。
-- **signal handler 不再 `process.exit`**：`stop()` 的等待是有界的，強制結束會把剛剛安排好的東西全部截斷
-  （還在本 pid 底下跑的 `git worktree add` 或 SDK child 會被孤兒化，延後釋放 lock 的 `.then` 也永遠不會跑）。
-  改為 `onTerminationSignal()`：single-flight `stop()` → 設 `process.exitCode` → 讓 event loop 自然排空，
-  process 會在沒有東西撐著它時退出，而那正是延後釋放所等待的同一個條件。錯誤路徑也誠實化：舊寫法只把
-  forced exit 掛在 fulfilment 上，`stop()` reject 會同時造成 unhandled rejection **且** process 永遠不退出；
-  現在會 `console.error` 並設 `exitCode = 1`。兩個 signal 仍各自 `once`，所以第二次 Ctrl-C 沒有 listener、
-  走 Node 預設立即終止——那是操作者明確的強制退出，刻意保留。
-- **capture 成功但沒交給 actor 的路徑必須關掉 capability**：`captureValidatedRoot()` 成功之後，
-  `SessionActor.create()` 會接管（連它自己失敗時也負責 close），但「create 之前被取消」那條 return
-  以前只是直接離開，把 Windows root handle 留到 process 結束、壓在一個沒人在用的 worktree 上。現在該路徑
-  會 `await captured.trustedRoot?.close()`。
-- **無法確認關閉的被丟棄 runtime 會被保留成 barrier**：`discardResumedActor()` 若 `disconnect()` 失敗，
-  該 actor 會被**強引用**留在 `unconfirmedResumes`（Windows 上這個引用就是 root capability 的生命線，
-  掉了就等於允許把可能還活著的 runtime 的工作目錄改名/刪掉）。刻意**不**走 stale-rebind companion row：
-  那會在同一個 worktree 上產生第二個持久宣告，而主 record 通常還在、還指著同一個 session，兩個宣告會
-  互相把對方的 checkout 刪掉。改為沿用 `/end` 既有的慣用法——`/end` 會再試一次有界 disconnect，仍無法
-  確認就**拒絕回收**並誠實回覆（記錄與 worktree 都保留，請重啟），`stop()` 也會再試一次。
-- **lease / generation 不變式不變**：retry 不會另外取 lease（startup pre-scan 取的 local lease 在
-  `thread-no-access` 期間本來就一直持有），terminal 轉換仍由既有的 `block` 分支釋放 lease；resume 一律
-  以 record 上的 `sessionId` / `generation` / `workDir` 回到同一個 worktree 與同一個 conversation。
-
+  timer 與退避政策**仍留在 app**，coordinator 不管排程。
+- **`resumeOwnershipLost()`（共用 fence，用於三個點）**：
+  1. `resumeRecord()` **最開頭**，任何 side effect 之前。若不擋，`addWorktree()` 會從還在的 branch
+     **重建**一個沒有任何 record 指向的 worktree——正好是 `/end` 剛清掉的那種殘留。
+  2. `addWorktree()` **成功之後**：重建本身是 await，第 1 點蓋不到；此時**回收自己造成的 side effect**。
+  3. `SessionActor.create()` 之後、`sessions.set()` 之前。三處都只問 scope 一個問題
+     （`lostReason()` + barrier `retained`），不再自己查三張表。
+- **`/end` 一定贏**：`cmdEnd` 對兩種形式都用 `runTeardown` 認領整個指令（計數式，所以 stale 路徑可再認領
+  一次）。claim 在指令自己的第一個 await 之前就同步成立，於是 retry 的 `runExclusive` 被拒絕；已經在飛的
+  attempt 則在 fence 撞上 `lostReason()`。`/end` 用 `scope.joinExclusive()` 有界等待，**沒 settle 就拒絕回收**。
+- **rebind 也是一次 teardown**：`applyRebind` 同樣跑在 `runTeardown(threadId)` 內。它會停掉舊 runtime、
+  可能留下沒人證明停止的 detached incarnation、並決定一個 worktree 的去留——這正是 teardown 的定義。
+  因此 rebind 進行中，該 thread 的 access retry 會被拒絕；巢狀的 `/end` 是計數 claim，安全。
+- **shutdown 一定贏**：`app.stop()` **同步**關上 phase gate（`shuttingDown` + `phase`）之後才叫
+  `shutdown()`；`stop()` 自己不再有 single-flight（coordinator 就是），而且**武裝的一定是
+  `teardownResources`、絕不是 `stop()`**，否則會 re-enter 正在呼叫它的 single-flight。
+  post-construction 的啟動失敗一律走 `app.stop()`，只有 app 還不存在時才直接叫 coordinator。
+- **武裝的 teardown 有界，而且先上閘**：`copilot.stop()` 是可能卡住的 RPC，而 shutdown 的契約是有界的。
+  閘門在 teardown **執行前**就掛上，只有它**真正完成**才 discharge。於是：卡住 ⇒ `shutdown()` 誠實地以
+  timeout reject、**lock 續持**；晚一點才回來 ⇒ discharge 觸發重新評估、**那時才釋放**；
+  回來但是失敗 ⇒ 閘門留著，因為失敗不是完成。**不重試**：把死到一半的 teardown 再跑一次只會傷得更重。
+- **token 擋不住「已經發出去」的外部工作，所以 lock 才是最後一道**：epoch 可以讓 app 不再寫任何東西，
+  但收不回已送出的 REST 呼叫、正在跑的 `git worktree add`、或已交給 runtime 的 `SessionActor.create`。
+  因此 `stop()` 若沒 join 到 in-flight scope，就**不釋放** lock：交給該 scope settle 後的重新評估；
+  永遠不 settle 就留到 process 結束，後繼者依 `acquireSingleInstanceLock` 把「holder pid 已不在」的 lock
+  視為 stale 回收（`releaseIfOwner` 也拒絕刪掉已被接管的 lock）。
+- **lock 的所有權轉移在 bootstrap 被形式化**：coordinator 在拿到 lock 的當下就建立，並**原封傳進**
+  `runtime.start`。bootstrap 沒有 `transferred` 旗標、沒有 `lock.release()`；它唯一的責任是把失敗導向
+  `app.stop()`（app 已存在）或 `ownership.shutdown()`（還不存在）。`DiscordCopilotApp.start` 的
+  **每一個 throw site 都在自己的 `try` 內**，包括 `resolveReposRoot` 與 SDK 版本檢查。
+  `--selfcheck` 自己持有一組不經過 app 的 lock，是唯一的例外。
 ### 19.4 否決的方案
 
 - **只靠 Discord 事件（`ChannelUpdate` / `GuildMemberUpdate` / `ThreadUpdate`）**：權限恢復不保證對
@@ -1141,7 +1086,11 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | `stop()` 的有界 join 逾時後，延遲回來的 classify（即使是 `gone` 這種終態）**不得**有任何持久寫入、lease 變更或 Discord 副作用——store 檔案 byte-for-byte 不變；而且 lock **不得**在那之前被釋放，要等該 attempt settle 才釋放 | `test/app-reconcile.test.ts` |
 | 同上，但卡在 `addWorktree`（已發出的 git 工作）：lock 保留到重建結束才釋放 | `test/app-reconcile.test.ts` |
 | attempt **永遠不 settle** 時，lock 在整個 process 生命期內都不得釋放（靠後繼者回收 stale PID lock） | `test/app-reconcile.test.ts` |
-| `startBot()` 失敗時：app 已建立 ⇒ 只呼叫 `app.stop()`（release 恰好一次，由 app 自己發出）；app 刻意保留 lock 時 bootstrap **不得**代它釋放；`runtime.start` **reject** 時（不論它自己 release 了或刻意保留）bootstrap 都不得再碰 lock；app 未建立（轉移之前失敗）⇒ 仍要釋放早期 lock | `test/bootstrap.test.ts` |
+| `startBot()` 失敗時：app 已建立 ⇒ 走 `app.stop()`（先關 phase gate 再 teardown，release 恰好一次）；armed teardown 有未決 obligation 時**不得**釋放；app 未建立 ⇒ 由 coordinator 釋放早期 lock | `test/bootstrap.test.ts` |
+| coordinator 本身：pre-shutdown settle 不釋放／健康 shutdown 只釋放一次且 sweep 在 armed teardown 之前／join 逾時延後釋放／sweep 之後才 retain 的 obligation 仍擋住／obligation 失敗與 hang／first-wins 身分／teardown claim 拒絕 admission 但 barrier 不拒絕／計數式重入 claim／late arm 變 obligation／last-arm-wins／armed teardown 有界（永不返回、晚返回、返回但失敗）／timer 必須 unref | `test/lifecycle-ownership.test.ts` |
+| `app.stop()` 一被呼叫就**同步**關上 phase gate：teardown 進行中不得接受任何指令，coordinator 也不得再 admit owned work | `test/app-reconcile.test.ts` |
+| rebind 進行中，該 thread 的 access retry 必須被拒絕（其他 thread 不受影響）；巢狀 `/end` 是計數 claim；teardown body reject 不得洩漏 claim | `test/app-reconcile.test.ts` |
+| 無法確認停止的 detached rebind incarnation 必須擋住 lock 釋放，直到它被 discharge | `test/app-reconcile.test.ts` |
 | **真實** `DiscordCopilotApp.start()` 的每一種失敗都必須釋放 lock 恰好一次：`REPOS_ROOT` 不存在、`REPOS_ROOT` 涵蓋 trust store、SDK 版本不符（三者皆不得建立 Copilot client）、以及 runtime 啟動失敗（要 stop client 再 release） | `test/app-start-ownership.test.ts` |
 | `stop()` 必須 single-flight：三個並行呼叫只跑一次拆解，且拿到**同一個** promise | `test/app-reconcile.test.ts` |
 | termination signal：single-flight `stop()` + 設 `process.exitCode`，**不得**呼叫 `process.exit`（source 契約）；`stop()` 失敗要 `console.error` 且 `exitCode = 1` | `test/app-reconcile.test.ts` |
@@ -1149,24 +1098,22 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | shutdown 穿插 in-flight retry：不註冊 session、不再 arm timer、record 原封不動留給下次開機 | `test/app-reconcile.test.ts` |
 | armed timer 必須 `unref`，`clearAccessRetryTimer()` 必須真的清掉 | `test/app-reconcile.test.ts` |
 
-### 19.7 後續工作（尚未做）
+### 19.7 抽取結果與仍未做的事
 
-這個功能在 `app.ts` 裡長出四組彼此高度相關、而且只服務它自己的狀態：
+**已做（2026-09-01）**：所有權判斷已抽成 deep module `src/core/lifecycle-ownership.ts`（見 §19.3）。
+隨之從 `app.ts` **刪除**的分散狀態：`accessRetryEpoch` 與每次 attempt 的 `cancelled` closure、
+`endClaims` + `claimEnd()`、`accessResumeSettled` + `joinAccessResume()` + `accessResumeJoinTimeoutMs`、
+`unconfirmedResumes` + `retryUnconfirmedResume()`、`stopPromise` + `stopOnce()`，以及 app 上的 `lock`
+欄位與**每一處** `lock.release()`。bootstrap 也拿掉了 `transferred` 旗標與它自己的 release。
+留在 app 的是**政策**而非所有權：timer／退避（`accessRetryScheduler`、`accessRetryTimer`、
+`accessRetryTickPromise`、`accessRetryBackoff`、`accessRetryIdle`）、`reconcileClassify`、
+`resumeTeardownTimeoutMs`，以及 `staleRebindActors`（app 自己做 retry／`/end`／fallback 對帳的索引，
+所有權事實則記在 obligation 裡）。
 
-- **排程**：`accessRetryScheduler`、`accessRetryTimer`、`accessRetryTickPromise`、`accessRetryBackoff`、
-  `accessRetryIdle`、`accessRetryEpoch`
-- **單次 attempt 的生命週期**：`accessResumeSettled`、`accessResumeJoinTimeoutMs`、
-  `resumeTeardownTimeoutMs`、`reconcileClassify`
-- **與明確拆除的 handshake**：`endClaims`（含 `claimEnd()`）
-- **無法確認關閉的 runtime barrier**：`unconfirmedResumes`（含 `retryUnconfirmedResume()`）
-
-加上 `startAccessRetryLoop` / `scheduleAccessRetry` / `runAccessRetryTick` / `accessRetryTick` /
-`isAccessRetryCandidate` / `joinAccessResume` / `discardResumedActor` / `resumeOwnershipLost`
-這一組方法，它已經是一個可以獨立命名的物件——`AccessRetryCoordinator`。
-
-**刻意不在這一輪做**：抽取會把剛剛用測試釘死的競態時序整批搬家，風險與收益不成比例。列為後續：
-連同它的測試一起搬，維持每個競態測試的顯式交錯寫法。（此處刻意不記行數：那是會隨每次改動就過期的
-數字，`git diff --stat main...HEAD -- src/app.ts` 隨時可以得到當下的真值。）
+**仍未做**：`app.ts` 依然很大，retry loop 的排程與 `reconcileRecord`／`resumeRecord` 仍在同一個檔案。
+若要再切，下一刀應該是把「access-retry 排程 + 候選判定」與「reconcile/resume 狀態機」分開，而**不是**
+再切所有權——那一刀已經切完了。（此處刻意不記行數：那是會隨每次改動就過期的數字，
+`git diff --stat main...HEAD -- src/app.ts` 隨時可以得到當下的真值。）
 
 測試側則**刻意不合併** fixture 樣板。每個案例在 copilot（fake／gated／resume 失敗／commit spy）、
 transport、record 形狀（local／worktree）、fetch 行為上至少差一項；把它們塞進一個多旋鈕的 helper 只會

@@ -363,6 +363,12 @@ interface ReconcileAttemptOpts {
  *  the coordinator's first-wins rule IS the "never overwrite a barrier" rule. */
 const runtimeObligationKey = (threadId: string): string => `runtime:${threadId}`;
 
+/** Where a detached rebind incarnation is recorded. Keyed by its DURABLE
+ *  identity, not by thread: one thread can legitimately have two of them, and
+ *  first-wins must not drop the older unproven one. */
+const staleRebindObligationKey = (b: SessionRecord): string =>
+  `stale-rebind:${b.threadId}:${b.sessionId}:${b.generation}`;
+
 /** Format an executable list for a compact reply. */
 function fmtList(items: string[]): string {
   return items.length ? items.map((e) => `\`${e}\``).join(", ") : "(none)";
@@ -1867,14 +1873,15 @@ export class DiscordCopilotApp {
     // which the thread stops being live while its record still exists, and the
     // retry loop must not treat that as an invitation. The claim is counted by
     // the coordinator, so the stale path below may claim again.
-    return this.ownership.runTeardown(explicit || interaction.channelId, () =>
-      this.cmdEndClaimed(interaction, explicit)
+    return this.ownership.runTeardown(explicit || interaction.channelId, (scope) =>
+      this.cmdEndClaimed(interaction, explicit, scope)
     );
   }
 
   private async cmdEndClaimed(
     interaction: ChatInputCommandInteraction,
-    explicit: string | undefined
+    explicit: string | undefined,
+    scope: TeardownScope
   ): Promise<void> {
     // A record whose thread was DELETED is the commonest leftover, and it is
     // exactly the one you cannot type `/end` inside. `thread:` makes it
@@ -1926,7 +1933,7 @@ export class DiscordCopilotApp {
       closed = false; // runtime may still be live — keep the record, say so
     }
     if (!closed) {
-      if (pendingOld) this.retainStaleRebindActor(pendingOld);
+      if (pendingOld) this.retainStaleRebindActor(pendingOld, undefined, undefined, scope);
       // A replacement can have been swapped in before this `/end`; it does not
       // excuse the old incarnation from cleanup merely because ending the
       // replacement timed out too.
@@ -3004,7 +3011,16 @@ export class DiscordCopilotApp {
     }
     this.rebinding.add(threadId);
     try {
-      return await this.applyRebindInner(threadId, target);
+      // A rebind IS a teardown-and-replace of one thread's session: it stops the
+      // old runtime, may leave a detached incarnation nobody proved stopped, and
+      // decides the fate of a worktree. Running it as a lifecycle teardown claim
+      // is what lets it record that incarnation as an ownership obligation, and
+      // what makes the access-retry loop decline this thread for the duration —
+      // a retry resuming into a thread mid-rebind is the same hazard `/end`
+      // already guards. The claim is counted, so a nested `/end` is safe.
+      return await this.ownership.runTeardown(threadId, (scope) =>
+        this.applyRebindInner(threadId, target, scope)
+      );
     } finally {
       this.rebinding.delete(threadId);
     }
@@ -3090,7 +3106,8 @@ export class DiscordCopilotApp {
   private retainStaleRebindActor(
     entry: StaleRebindActor,
     reason = "rebind-teardown-unconfirmed",
-    fallbackPrimary?: FallbackPrimaryReconciliationPlan
+    fallbackPrimary?: FallbackPrimaryReconciliationPlan,
+    scope?: TeardownScope
   ): boolean {
     const persisted = this.store.retainStaleRebind(entry.binding, reason);
     if (!persisted) {
@@ -3101,6 +3118,30 @@ export class DiscordCopilotApp {
       if (fallbackPrimary) entry.fallbackPrimary = fallbackPrimary;
     }
     this.staleRebindActors.set(entry.actor, entry);
+    // The same fact the retry loop's barrier records, about a different kind of
+    // runtime: this process created it, cannot prove it stopped, and it may
+    // still be holding a checkout. Recorded as an OBLIGATION so it gates the
+    // LOCK too — shutdown used to retry these actors and then release whether or
+    // not any of them had confirmed.
+    //
+    // The obligation carries the entry itself: actor, binding and cleanup plan
+    // all live in the closure, so this is not a second barrier map beside
+    // `staleRebindActors`. That map is the app's index for its own lifecycle
+    // work (retry, `/end`, fallback reconciliation); this is the ownership fact.
+    scope?.retain(staleRebindObligationKey(entry.binding), {
+      describe: () =>
+        `a detached rebind incarnation ${entry.binding.sessionId} over ${entry.binding.workDir}`,
+      attempt: async () => {
+        const outcome = await withTimeout(
+          this.disconnectStaleRebindActor(entry),
+          TEARDOWN_TIMEOUT_MS
+        ).catch(() => undefined);
+        // Only a confirmed teardown WHOSE CLEANUP also completed discharges it.
+        // An unconfirmed runtime, or a worktree git would not let us remove, is
+        // still a reason this process may not let go.
+        return outcome?.confirmed === true && outcome.cleaned;
+      },
+    });
     this.scheduleStaleRebindRetry(entry);
     return persisted;
   }
@@ -3227,7 +3268,8 @@ export class DiscordCopilotApp {
 
   private async applyRebindInner(
     threadId: string,
-    target: { repoPath: string; devMode: DevMode }
+    target: { repoPath: string; devMode: DevMode },
+    scope: TeardownScope
   ): Promise<string> {
     const session = this.sessions.get(threadId);
     if (!session) return "⚠️ 這個討論串已經沒有進行中的 session，未改綁。";

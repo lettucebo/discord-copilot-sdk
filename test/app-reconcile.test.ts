@@ -3555,3 +3555,162 @@ describe("the phase gate closes before the teardown, not after it", () => {
     expect(startCatch).toMatch(/else await ownership\.shutdown\(\)/);
   });
 });
+
+describe("a rebind is a teardown claim on its thread", () => {
+  /** Drive the claim the way `applyRebind` does, without building a real rebind
+   *  transaction: the claim, not the git work, is what is under test here. */
+  function ownershipOf(app: DiscordCopilotApp): {
+    runTeardown(id: string, body: (s: unknown) => Promise<unknown>): Promise<unknown>;
+    runExclusive(id: string, body: (s: unknown) => Promise<unknown>): Promise<{ ran: boolean }>;
+    shutdown(): Promise<void>;
+  } {
+    return (app as unknown as { ownership: ReturnType<typeof ownershipOf> }).ownership;
+  }
+
+  function appWith(f: string, registryFile: string, store: SessionStore): DiscordCopilotApp {
+    return DiscordCopilotApp.createForTest(
+      cfg,
+      REPOS_ROOT,
+      fakeCopilot(),
+      new FakeTransport(),
+      store,
+      new ChannelRegistry("c1", "g1", registryFile)
+    );
+  }
+
+  it("declines a concurrent access retry for the thread it is rebinding", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-rb", sessionId: "sess-rb" }));
+      store.commit("t-rb");
+      const app = appWith(f, registryFile, store);
+      let access = false;
+      setChannelFetch(app, async () => {
+        if (!access) throw { code: 50001 };
+        return visibleThread;
+      });
+      await reconcileReal(app);
+      const jobs = installFakeScheduler(app);
+      readyAndStartRetry(app);
+      access = true;
+
+      let admitted: { ran: boolean } | undefined;
+      let other: { ran: boolean } | undefined;
+      await ownershipOf(app).runTeardown("t-rb", async () => {
+        // A rebind is mid-transaction. A retry resuming into this thread now is
+        // the same hazard `/end` already guards against.
+        admitted = await ownershipOf(app).runExclusive("t-rb", async () => undefined);
+        other = await ownershipOf(app).runExclusive("t-other", async () => undefined);
+      });
+
+      expect(admitted?.ran).toBe(false);
+      expect(other?.ran).toBe(true); // and only that thread
+      // Released with the transaction, so the loop works again.
+      await fireRetry(app, jobs);
+      expect(sessionsOf(app).has("t-rb")).toBe(true);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("keeps the lock until a detached incarnation is discharged, across shutdown", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const app = appWith(f, registryFile, store);
+      let released = 0;
+      useObservableLock(app, {
+        path: "(test)",
+        release: async () => {
+          released++;
+        },
+      });
+      let confirmable = false;
+      await ownershipOf(app).runTeardown("t-stale", async (scope) => {
+        (scope as { retain(k: string, o: unknown): unknown }).retain(
+          "stale-rebind:t-stale:s1:1",
+          {
+            describe: () => "a detached rebind incarnation s1",
+            attempt: async () => confirmable,
+          }
+        );
+      });
+      expect(inspectOwnership(app).obligationKeys()).toEqual(["stale-rebind:t-stale:s1:1"]);
+
+      await app.stop();
+      // The runtime was never proved stopped, so the checkout it may still hold
+      // must not be handed to a successor instance.
+      expect(released).toBe(0);
+      expect(inspectOwnership(app).obligationKeys()).toEqual(["stale-rebind:t-stale:s1:1"]);
+
+      confirmable = true;
+      await (
+        inspectOwnership(app).obligation("stale-rebind:t-stale:s1:1") as
+          | { attempt(): Promise<boolean> }
+          | undefined
+      )?.attempt();
+      await vi.waitFor(() => expect(released).toBe(1));
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("releases overlapping rebind and /end claims independently", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const app = appWith(f, registryFile, store);
+      const seen: string[][] = [];
+
+      await ownershipOf(app).runTeardown("t-ov", async () => {
+        seen.push(inspectOwnership(app).teardownClaims());
+        // A nested `/end` inside a rebind is a counted claim, not a second one.
+        await ownershipOf(app).runTeardown("t-ov", async () => {
+          seen.push(inspectOwnership(app).teardownClaims());
+        });
+        // The inner claim released; the outer one still stands.
+        seen.push(inspectOwnership(app).teardownClaims());
+        const admitted = await ownershipOf(app).runExclusive("t-ov", async () => undefined);
+        expect(admitted.ran).toBe(false);
+      });
+
+      expect(seen).toEqual([["t-ov"], ["t-ov"], ["t-ov"]]);
+      expect(inspectOwnership(app).teardownClaims()).toEqual([]);
+      const after = await ownershipOf(app).runExclusive("t-ov", async () => undefined);
+      expect(after.ran).toBe(true);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("does not leak a claim when the teardown body rejects", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const app = appWith(f, registryFile, store);
+
+      await expect(
+        ownershipOf(app).runTeardown("t-boom", async () => {
+          throw new Error("rebind exploded mid-transaction");
+        })
+      ).rejects.toThrow(/rebind exploded/);
+
+      // A leaked claim would silently take this thread out of the retry loop for
+      // the life of the process.
+      expect(inspectOwnership(app).teardownClaims()).toEqual([]);
+      const admitted = await ownershipOf(app).runExclusive("t-boom", async () => undefined);
+      expect(admitted.ran).toBe(true);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});

@@ -260,18 +260,35 @@ the tick must clear the barrier first, so a runtime that was never proved stoppe
 second one resumed on top of it. Every retry attempt also carries a cancellation token (an epoch
 bumped by `stop()`) that is re-checked after each await and before **every** durable transition and
 external side effect, because `stop()`'s join is bounded: an attempt may outlive it, and by then the
-single-instance lock is released and a replacement process may own the same store. Startup passes no
-token and its semantics are unchanged. A cancellation token cannot recall external work that was
-already issued, so `stop()` additionally does **not** release the single-instance lock when its
-bounded join did not quiesce: the release is deferred until that attempt settles, and if it never
-does, the PID lock stays until the process exits and the successor reclaims it as stale
-(`src/core/single-instance.ts`). Holding it is what makes an already-issued REST/git/runtime call
-cross-process safe, so nothing may release it behind the app's back: `startBot`'s failure path
-releases the lock only when it has not yet been transferred, and the transfer happens when
-`runtime.start` is **invoked** (a rejection means the runtime already dealt with it), and every
-throw site in `DiscordCopilotApp.start` — including `resolveReposRoot` and the SDK-version check —
-must live inside its own `try`, or the lock ends up released by nobody. `stop()` is
-single-flight and returns the identical promise, and a termination signal sets `process.exitCode`
-rather than forcing an exit — a forced exit orphans a git/SDK child still running under this pid and
-abandons the deferred lock release that waits for it. Any successful `captureValidatedRoot` that
-does not hand its capability to a `SessionActor` must close it.
+single-instance lock is released and a replacement process may own the same store.
+
+**`src/core/lifecycle-ownership.ts` is the only thing that decides when this process lets go of its
+single-instance lock** (`--selfcheck`, which never builds an app, is the one carve-out). It exists
+because "may I release?" needs four unrelated-looking facts at once — is an owned attempt still
+inside unrecallable REST/git/SDK work, is an explicit teardown mid-flight, is a runtime outstanding
+that nobody proved stopped, has the app's resource teardown completed — and every time those were
+answered in separate places the release escaped through the gap. Its external interface is
+deliberately **four** operations (`arm`, `runExclusive`, `runTeardown`, `shutdown`); anything that
+wants a fifth is a caller trying to reason about ownership itself, which is the mistake this
+replaces. Release is a conclusion re-drawn from live state at every transition — only when the
+exclusive scopes, the teardown claims and the obligations are *simultaneously* empty — never a
+countdown over a snapshot. Obligations carry their payload (the actor, the retained root) so there
+is no second map to drift, and first registration for a key wins, because an existing entry is an
+older thing nobody proved gone.
+
+The rules that follow from it: bootstrap creates the coordinator the instant the lock exists and
+passes that same instance into `runtime.start`; a post-construction failure goes through
+`app.stop()`, which closes the phase gate **synchronously** before shutdown begins, and only a
+pre-construction failure calls `shutdown()` directly. Every throw site in `DiscordCopilotApp.start`
+— including `resolveReposRoot` and the SDK-version check — lives inside its own `try`. The armed
+teardown is `teardownResources`, never `stop()` (shutdown *calls* it, so arming `stop()` deadlocks
+its own single-flight), it is bounded, and it is gated before it runs and discharged only when it
+genuinely completes: wedged or failed, the lock stays held. Work that owns a thread runs inside
+`runExclusive`; `/end` **and `applyRebind`** run inside `runTeardown`, because a rebind is a
+teardown-and-replace of one thread — so an access retry for that thread is declined for the
+duration, and a nested `/end` is a counted claim. A termination signal sets `process.exitCode`
+rather than forcing an exit: a forced exit orphans a git/SDK child still running under this pid and
+abandons a deferred release that was waiting for it. If nothing can discharge an obligation, the PID
+lock simply stays until the process exits and the successor reclaims it as stale
+(`src/core/single-instance.ts`). Any successful `captureValidatedRoot` that does not hand its
+capability to a `SessionActor` must close it.
