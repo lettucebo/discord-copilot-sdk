@@ -1030,6 +1030,12 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
   `acquireSingleInstanceLock` 會把「holder pid 已不存在」的 lock 視為 stale 並回收，`releaseIfOwner`
   也拒絕刪掉已被後繼者接管的 lock（見 `src/core/single-instance.ts`）。所以「繼續持有」既誠實
   （這個 pid 真的還在做事），也能自我痊癒。epoch 則退居為 defense-in-depth，負責擋住 app 層的遲到寫入。
+- **lock 的所有權轉移在 bootstrap 被形式化**：`startBot()` 的 catch 原本是
+  `if (app) await app.stop(); if (lock) await lock.release();`——兩句都會跑。正常失敗路徑因此**釋放兩次**
+  （production 靠 `releaseIfOwner` 幸運變成 no-op），更嚴重的是它會**在 app 背後**把上面那個「刻意保留」
+  的決定推翻掉。現在改為 `if (app) stop else if (lock) release`：`runtime.start()` 回傳之前 lock 是
+  bootstrap 的，失敗必須釋放（否則後繼者會繼承一個沒有 process 持有的 lock）；回傳之後 lock 屬於 app，
+  只有 `app.stop()` 有權決定要不要交出去。`--selfcheck` 自己持有一組不經過 app 的 lock，不受影響。
 - **無法確認關閉的被丟棄 runtime 會被保留成 barrier**：`discardResumedActor()` 若 `disconnect()` 失敗，
   該 actor 會被**強引用**留在 `unconfirmedResumes`（Windows 上這個引用就是 root capability 的生命線，
   掉了就等於允許把可能還活著的 runtime 的工作目錄改名/刪掉）。刻意**不**走 stale-rebind companion row：
@@ -1111,6 +1117,7 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | `stop()` 的有界 join 逾時後，延遲回來的 classify（即使是 `gone` 這種終態）**不得**有任何持久寫入、lease 變更或 Discord 副作用——store 檔案 byte-for-byte 不變；而且 lock **不得**在那之前被釋放，要等該 attempt settle 才釋放 | `test/app-reconcile.test.ts` |
 | 同上，但卡在 `addWorktree`（已發出的 git 工作）：lock 保留到重建結束才釋放 | `test/app-reconcile.test.ts` |
 | attempt **永遠不 settle** 時，lock 在整個 process 生命期內都不得釋放（靠後繼者回收 stale PID lock） | `test/app-reconcile.test.ts` |
+| `startBot()` 失敗時：app 已建立 ⇒ 只呼叫 `app.stop()`（release 恰好一次，由 app 自己發出）；app 刻意保留 lock 時 bootstrap **不得**代它釋放；app 未建立 ⇒ 仍要釋放早期 lock | `test/bootstrap.test.ts` |
 
 ### 19.7 後續工作（尚未做）
 

@@ -266,4 +266,6 @@ already issued, so `stop()` additionally does **not** release the single-instanc
 bounded join did not quiesce: the release is deferred until that attempt settles, and if it never
 does, the PID lock stays until the process exits and the successor reclaims it as stale
 (`src/core/single-instance.ts`). Holding it is what makes an already-issued REST/git/runtime call
-cross-process safe.
+cross-process safe, so nothing may release it behind the app's back: `startBot`'s failure path
+releases the lock only when no app was created, because from the moment `runtime.start` returns the
+lock belongs to the app.
