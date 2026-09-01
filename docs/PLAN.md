@@ -1118,17 +1118,29 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | 同上，但卡在 `addWorktree`（已發出的 git 工作）：lock 保留到重建結束才釋放 | `test/app-reconcile.test.ts` |
 | attempt **永遠不 settle** 時，lock 在整個 process 生命期內都不得釋放（靠後繼者回收 stale PID lock） | `test/app-reconcile.test.ts` |
 | `startBot()` 失敗時：app 已建立 ⇒ 只呼叫 `app.stop()`（release 恰好一次，由 app 自己發出）；app 刻意保留 lock 時 bootstrap **不得**代它釋放；app 未建立 ⇒ 仍要釋放早期 lock | `test/bootstrap.test.ts` |
+| shutdown 穿插 in-flight retry：不註冊 session、不再 arm timer、record 原封不動留給下次開機 | `test/app-reconcile.test.ts` |
+| armed timer 必須 `unref`，`clearAccessRetryTimer()` 必須真的清掉 | `test/app-reconcile.test.ts` |
 
 ### 19.7 後續工作（尚未做）
 
-`app.ts` 因這個功能增加約 330 行（loop、fence、handshake、barrier）。這些狀態彼此高度相關
-（`accessRetry*`、`accessResume*`、`endClaims`、`unconfirmedResumes`），已經是一個可以獨立命名的
-物件——`AccessRetryCoordinator`。**刻意不在這一輪做**：抽取會把剛剛用測試釘死的競態時序整批搬家，
-風險與收益不成比例。列為後續：連同它的測試一起搬，維持每個競態測試的顯式交錯寫法。
+這個功能在 `app.ts` 裡長出四組彼此高度相關、而且只服務它自己的狀態：
+
+- **排程**：`accessRetryScheduler`、`accessRetryTimer`、`accessRetryTickPromise`、`accessRetryBackoff`、
+  `accessRetryIdle`、`accessRetryEpoch`
+- **單次 attempt 的生命週期**：`accessResumeSettled`、`accessResumeJoinTimeoutMs`、
+  `resumeTeardownTimeoutMs`、`reconcileClassify`
+- **與明確拆除的 handshake**：`endClaims`（含 `claimEnd()`）
+- **無法確認關閉的 runtime barrier**：`unconfirmedResumes`（含 `retryUnconfirmedResume()`）
+
+加上 `startAccessRetryLoop` / `scheduleAccessRetry` / `runAccessRetryTick` / `accessRetryTick` /
+`isAccessRetryCandidate` / `joinAccessResume` / `discardResumedActor` / `resumeOwnershipLost`
+這一組方法，它已經是一個可以獨立命名的物件——`AccessRetryCoordinator`。
+
+**刻意不在這一輪做**：抽取會把剛剛用測試釘死的競態時序整批搬家，風險與收益不成比例。列為後續：
+連同它的測試一起搬，維持每個競態測試的顯式交錯寫法。（此處刻意不記行數：那是會隨每次改動就過期的
+數字，`git diff --stat main...HEAD -- src/app.ts` 隨時可以得到當下的真值。）
 
 測試側則**刻意不合併** fixture 樣板。每個案例在 copilot（fake／gated／resume 失敗／commit spy）、
 transport、record 形狀（local／worktree）、fetch 行為上至少差一項；把它們塞進一個多旋鈕的 helper 只會
 把「這個測試到底哪裡不一樣」藏起來，而這正是競態測試唯一重要的資訊。本檔案既有的 41 個測試也都用
 同樣的顯式寫法。
-| shutdown 穿插 in-flight retry：不註冊 session、不再 arm timer、record 原封不動留給下次開機 | `test/app-reconcile.test.ts` |
-| armed timer 必須 `unref`，`clearAccessRetryTimer()` 必須真的清掉 | `test/app-reconcile.test.ts` |
