@@ -3204,3 +3204,233 @@ describe("a retry attempt that outlives shutdown must touch nothing", () => {
     }
   });
 });
+
+describe("shutdown ownership: single-flight, no forced exit, no leaked capability", () => {
+  it("runs stop() exactly once no matter how many callers ask", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let releases = 0;
+      let releasing: (() => void) | undefined;
+      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+        path: "(test)",
+        async release(): Promise<void> {
+          releases++;
+          // Hold the FIRST stop open, so the second caller genuinely overlaps it.
+          await new Promise<void>((r) => {
+            releasing = r;
+          });
+        },
+      };
+
+      const first = app.stop();
+      const second = app.stop();
+      const third = app.stop();
+      await vi.waitFor(() => expect(releasing).toBeDefined());
+      releasing?.();
+      await Promise.all([first, second, third]);
+
+      // A second SIGINT/SIGTERM (or a bootstrap catch racing a signal) must JOIN
+      // the teardown, not return early from a half-finished one.
+      expect(releases).toBe(1);
+      expect(second).toBe(first);
+      expect(third).toBe(first);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("a termination signal stops once and sets an exit code instead of forcing exit", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    const previousExitCode = process.exitCode;
+    try {
+      const store = new SessionStore(f);
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let releases = 0;
+      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+        path: "(test)",
+        async release(): Promise<void> {
+          releases++;
+        },
+      };
+      process.exitCode = undefined;
+
+      const onSignal = (app as unknown as {
+        onTerminationSignal(sig: string): Promise<void>;
+      }).onTerminationSignal.bind(app);
+      await Promise.all([onSignal("SIGINT"), onSignal("SIGTERM")]);
+
+      expect(releases).toBe(1);
+      expect(process.exitCode).toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("reports a failed shutdown honestly instead of claiming success", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    const previousExitCode = process.exitCode;
+    const errors: unknown[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      errors.push(a);
+    });
+    try {
+      const store = new SessionStore(f);
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      (app as unknown as { lock: { path: string; release(): Promise<void> } }).lock = {
+        path: "(test)",
+        release: async () => {
+          throw new Error("lock file vanished");
+        },
+      };
+      // `lock.release()` is already `.catch()`ed inside stop(); force the failure
+      // through a path that is not, so the signal handler's error branch is real.
+      (app as unknown as { clearAccessRetryTimer(): void }).clearAccessRetryTimer = () => {
+        throw new Error("teardown exploded");
+      };
+      process.exitCode = undefined;
+
+      await (app as unknown as { onTerminationSignal(sig: string): Promise<void> }).onTerminationSignal(
+        "SIGTERM"
+      );
+
+      expect(process.exitCode).toBe(1); // not a quiet exit 0
+      expect(JSON.stringify(errors)).toContain("teardown exploded");
+    } finally {
+      spy.mockRestore();
+      process.exitCode = previousExitCode;
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("does not force process.exit from the signal path", () => {
+    // A forced exit truncates the very things shutdown just went to the trouble
+    // of arranging: a git/runtime child still running under this pid, and the
+    // deferred lock release that waits for it. Asserted at the source because a
+    // real `process.exit` cannot be observed from inside the process it kills.
+    const src = readFileSync(join(process.cwd(), "src", "app.ts"), "utf8");
+    const signalSection = src.slice(
+      src.indexOf("private installSignalHandlers"),
+      src.indexOf("private async stopOnce(")
+    );
+    expect(signalSection.length).toBeGreaterThan(0);
+    expect(signalSection).not.toMatch(/process\.exit\s*\(/);
+    expect(signalSection).toContain("process.exitCode");
+  });
+
+  it("closes a captured root that cancellation stops from reaching an actor", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-root", sessionId: "sess-root" }));
+      store.commit("t-root");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let closes = 0;
+      const trustedRoot = {
+        validationPath: REPO,
+        finalPath: REPO,
+        close: async (): Promise<void> => {
+          closes++;
+        },
+      };
+      (app as unknown as {
+        captureValidatedRoot(b: unknown): Promise<unknown>;
+      }).captureValidatedRoot = async () => {
+        // The capability is open from here on; nothing but a transfer to an
+        // actor, or a close, may end this method.
+        (app as unknown as { shuttingDown: boolean }).shuttingDown = true;
+        return { ok: true, trustedRoot, binding: bind({ threadId: "t-root" }), approvalKey: REPO };
+      };
+
+      const rec = store.get("t-root");
+      await (app as unknown as { resumeRecord(r: unknown, o?: unknown): Promise<void> }).resumeRecord(rec);
+
+      expect(closes).toBe(1); // released, not leaked
+      expect(sessionsOf(app).has("t-root")).toBe(false);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("closes a captured root when the resume itself fails", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-root2", sessionId: "sess-root2" }));
+      store.commit("t-root2");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot({ resumeError: "getaddrinfo ENOTFOUND api.githubcopilot.com" }),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let closes = 0;
+      const trustedRoot = {
+        validationPath: REPO,
+        finalPath: REPO,
+        close: async (): Promise<void> => {
+          closes++;
+        },
+      };
+      (app as unknown as {
+        captureValidatedRoot(b: unknown): Promise<unknown>;
+      }).captureValidatedRoot = async () => ({
+        ok: true,
+        trustedRoot,
+        binding: bind({ threadId: "t-root2" }),
+        approvalKey: REPO,
+      });
+
+      const rec = store.get("t-root2");
+      await (app as unknown as { resumeRecord(r: unknown, o?: unknown): Promise<void> }).resumeRecord(rec);
+
+      expect(closes).toBe(1); // no actor took it over, so it must be closed
+      expect(sessionsOf(app).has("t-root2")).toBe(false);
+      expect(store.get("t-root2")?.state).toBe("active"); // transient ⇒ retried later
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});

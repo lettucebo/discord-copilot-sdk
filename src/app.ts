@@ -647,6 +647,9 @@ export class DiscordCopilotApp {
    *  thing keeping the root capability alive, and that capability is what stops
    *  a maybe-live runtime from being handed a deleted working tree. */
   private readonly unconfirmedResumes = new Map<string, { actor: SessionActor; binding: SessionRecord }>();
+  /** The one teardown, so every later caller joins it instead of returning from
+   *  a shutdown that is still half done. */
+  private stopPromise?: Promise<void>;
   /** Only createForTest sets this. Production must capture a native trusted
    * root, while app state-machine fixtures receive an opaque fail-closed root. */
   private actorCreateDependencies?: SessionActorCreateDependencies;
@@ -4445,6 +4448,13 @@ export class DiscordCopilotApp {
     const beforeCreate = this.resumeOwnershipLost(rec, opts);
     if (beforeCreate) {
       console.warn(`resume: not creating a session for ${rec.threadId} — ${beforeCreate}`);
+      // The capability is open and nothing is going to take it over. Every other
+      // way out of this method after a successful capture either hands it to an
+      // actor (which owns it from then on, including closing it when
+      // `SessionActor.create` itself fails) or closes it; this path is the one
+      // that used to just return, leaving a Windows root handle held for the
+      // life of the process against a worktree nobody is using.
+      await captured.trustedRoot?.close().catch(() => {});
       return;
     }
     try {
@@ -5546,14 +5556,60 @@ export class DiscordCopilotApp {
   // ---- shutdown ----------------------------------------------------------
 
   private installSignalHandlers(): void {
-    const handler = (): void => void this.stop().then(() => process.exit(0));
-    process.once("SIGINT", handler);
-    process.once("SIGTERM", handler);
+    const handler = (signal: string): void => void this.onTerminationSignal(signal);
+    // `once` per signal, deliberately: a SECOND Ctrl-C has no listener left and
+    // Node's default terminates immediately. That is the operator's explicit
+    // force-quit, and it stays available. A different signal (SIGTERM after
+    // SIGINT) still lands here and joins the same single-flight teardown.
+    process.once("SIGINT", () => handler("SIGINT"));
+    process.once("SIGTERM", () => handler("SIGTERM"));
   }
 
-  /** Reverse-order teardown; the single-instance lock is released LAST. */
-  async stop(): Promise<void> {
-    if (this.shuttingDown) return;
+  /**
+   * What a termination signal does.
+   *
+   * Deliberately does NOT call `process.exit`. Forcing an exit truncates exactly
+   * what shutdown just arranged: `stop()`'s wait is bounded, so a `git worktree
+   * add` or an SDK child may still be running under this pid, and the lock
+   * release may have been deferred until that work settles. Killing the process
+   * orphans the child and abandons the deferred release. Setting `exitCode` and
+   * letting the event loop drain means the process exits once nothing is holding
+   * it open — which is the same condition the deferred release waits for.
+   *
+   * A failed teardown is reported and exits non-zero. The previous handler
+   * chained a forced exit onto `stop()`'s fulfilment only, so a rejection became
+   * an unhandled rejection AND the process never exited — the two worst answers.
+   */
+  private async onTerminationSignal(signal: string): Promise<void> {
+    try {
+      await this.stop();
+      process.exitCode = 0;
+    } catch (err) {
+      console.error(
+        `shutdown: ${signal} teardown failed (${err instanceof Error ? err.message : String(err)}); ` +
+          `exiting non-zero. Some state may not have been cleaned up.`
+      );
+      process.exitCode = 1;
+    }
+  }
+
+  /**
+   * Reverse-order teardown; the single-instance lock is released LAST.
+   *
+   * Single-flight: a second signal, a bootstrap failure path racing a signal, or
+   * a test calling it twice all JOIN the first teardown. Returning early instead
+   * would let a caller believe cleanup had finished while it was still half done
+   * — and `stop()` is precisely where "half done" means a live SDK child and an
+   * unreleased lock.
+   */
+  stop(): Promise<void> {
+    // Not `async`: callers must get the IDENTICAL promise, so a second signal
+    // joins the first teardown rather than awaiting a fresh wrapper around it.
+    this.stopPromise ??= this.stopOnce();
+    return this.stopPromise;
+  }
+
+  private async stopOnce(): Promise<void> {
     this.shuttingDown = true;
     this.phase = "shuttingDown"; // reject any late input while tearing down
     // Disarm before the teardown loop. `shuttingDown` also stops a tick that is

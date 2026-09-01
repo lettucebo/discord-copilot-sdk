@@ -267,5 +267,9 @@ bounded join did not quiesce: the release is deferred until that attempt settles
 does, the PID lock stays until the process exits and the successor reclaims it as stale
 (`src/core/single-instance.ts`). Holding it is what makes an already-issued REST/git/runtime call
 cross-process safe, so nothing may release it behind the app's back: `startBot`'s failure path
-releases the lock only when no app was created, because from the moment `runtime.start` returns the
-lock belongs to the app.
+releases the lock only when it has not yet been transferred, and the transfer happens when
+`runtime.start` is **invoked** (a rejection means the runtime already dealt with it). `stop()` is
+single-flight and returns the identical promise, and a termination signal sets `process.exitCode`
+rather than forcing an exit — a forced exit orphans a git/SDK child still running under this pid and
+abandons the deferred lock release that waits for it. Any successful `captureValidatedRoot` that
+does not hand its capability to a `SessionActor` must close it.

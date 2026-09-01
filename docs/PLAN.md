@@ -1033,9 +1033,26 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 - **lock 的所有權轉移在 bootstrap 被形式化**：`startBot()` 的 catch 原本是
   `if (app) await app.stop(); if (lock) await lock.release();`——兩句都會跑。正常失敗路徑因此**釋放兩次**
   （production 靠 `releaseIfOwner` 幸運變成 no-op），更嚴重的是它會**在 app 背後**把上面那個「刻意保留」
-  的決定推翻掉。現在改為 `if (app) stop else if (lock) release`：`runtime.start()` 回傳之前 lock 是
-  bootstrap 的，失敗必須釋放（否則後繼者會繼承一個沒有 process 持有的 lock）；回傳之後 lock 屬於 app，
-  只有 `app.stop()` 有權決定要不要交出去。`--selfcheck` 自己持有一組不經過 app 的 lock，不受影響。
+  的決定推翻掉。現在改為 `if (app) stop else if (!transferred && lock) release`，而且
+  **`transferred` 是在 `await runtime.start(...)` 之前就設定的**：所有權轉移發生在**呼叫**的當下，
+  不是成功回傳的當下。`DiscordCopilotApp.start()` 自己的 catch 已經負責兩種結局（有 app 就 `app.stop()`，
+  沒有就自己 release），所以 `runtime.start` 一旦 reject，bootstrap 再碰 lock 就是第二次釋放。
+  這個契約寫進 `BotRuntime.start` 的 doc comment。`--selfcheck` 自己持有一組不經過 app 的 lock，不受影響。
+- **`stop()` 是 single-flight**：`stopPromise` 存起來並回傳**同一個** promise（`stop()` 刻意不是 `async`，
+  否則每次呼叫都是新的包裝物件）。第二個 SIGTERM、bot startup 失敗路徑與 signal 撞在一起、或測試重複呼叫，
+  都會 **join** 第一次拆解，而不是從一個只做到一半的 shutdown 提早返回——而 `stop()` 正是「做到一半」
+  等於「SDK child 還活著、lock 還沒放」的地方。
+- **signal handler 不再 `process.exit`**：`stop()` 的等待是有界的，強制結束會把剛剛安排好的東西全部截斷
+  （還在本 pid 底下跑的 `git worktree add` 或 SDK child 會被孤兒化，延後釋放 lock 的 `.then` 也永遠不會跑）。
+  改為 `onTerminationSignal()`：single-flight `stop()` → 設 `process.exitCode` → 讓 event loop 自然排空，
+  process 會在沒有東西撐著它時退出，而那正是延後釋放所等待的同一個條件。錯誤路徑也誠實化：舊寫法只把
+  forced exit 掛在 fulfilment 上，`stop()` reject 會同時造成 unhandled rejection **且** process 永遠不退出；
+  現在會 `console.error` 並設 `exitCode = 1`。兩個 signal 仍各自 `once`，所以第二次 Ctrl-C 沒有 listener、
+  走 Node 預設立即終止——那是操作者明確的強制退出，刻意保留。
+- **capture 成功但沒交給 actor 的路徑必須關掉 capability**：`captureValidatedRoot()` 成功之後，
+  `SessionActor.create()` 會接管（連它自己失敗時也負責 close），但「create 之前被取消」那條 return
+  以前只是直接離開，把 Windows root handle 留到 process 結束、壓在一個沒人在用的 worktree 上。現在該路徑
+  會 `await captured.trustedRoot?.close()`。
 - **無法確認關閉的被丟棄 runtime 會被保留成 barrier**：`discardResumedActor()` 若 `disconnect()` 失敗，
   該 actor 會被**強引用**留在 `unconfirmedResumes`（Windows 上這個引用就是 root capability 的生命線，
   掉了就等於允許把可能還活著的 runtime 的工作目錄改名/刪掉）。刻意**不**走 stale-rebind companion row：
@@ -1117,7 +1134,10 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 | `stop()` 的有界 join 逾時後，延遲回來的 classify（即使是 `gone` 這種終態）**不得**有任何持久寫入、lease 變更或 Discord 副作用——store 檔案 byte-for-byte 不變；而且 lock **不得**在那之前被釋放，要等該 attempt settle 才釋放 | `test/app-reconcile.test.ts` |
 | 同上，但卡在 `addWorktree`（已發出的 git 工作）：lock 保留到重建結束才釋放 | `test/app-reconcile.test.ts` |
 | attempt **永遠不 settle** 時，lock 在整個 process 生命期內都不得釋放（靠後繼者回收 stale PID lock） | `test/app-reconcile.test.ts` |
-| `startBot()` 失敗時：app 已建立 ⇒ 只呼叫 `app.stop()`（release 恰好一次，由 app 自己發出）；app 刻意保留 lock 時 bootstrap **不得**代它釋放；app 未建立 ⇒ 仍要釋放早期 lock | `test/bootstrap.test.ts` |
+| `startBot()` 失敗時：app 已建立 ⇒ 只呼叫 `app.stop()`（release 恰好一次，由 app 自己發出）；app 刻意保留 lock 時 bootstrap **不得**代它釋放；`runtime.start` **reject** 時（不論它自己 release 了或刻意保留）bootstrap 都不得再碰 lock；app 未建立（轉移之前失敗）⇒ 仍要釋放早期 lock | `test/bootstrap.test.ts` |
+| `stop()` 必須 single-flight：三個並行呼叫只跑一次拆解，且拿到**同一個** promise | `test/app-reconcile.test.ts` |
+| termination signal：single-flight `stop()` + 設 `process.exitCode`，**不得**呼叫 `process.exit`（source 契約）；`stop()` 失敗要 `console.error` 且 `exitCode = 1` | `test/app-reconcile.test.ts` |
+| capture 成功但（取消或 resume 失敗）沒交給 actor 時，`trustedRoot.close()` 必須被呼叫恰好一次 | `test/app-reconcile.test.ts` |
 | shutdown 穿插 in-flight retry：不註冊 session、不再 arm timer、record 原封不動留給下次開機 | `test/app-reconcile.test.ts` |
 | armed timer 必須 `unref`，`clearAccessRetryTimer()` 必須真的清掉 | `test/app-reconcile.test.ts` |
 

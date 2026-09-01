@@ -103,15 +103,24 @@ describe("startBot", () => {
     expect(release).not.toHaveBeenCalled();
   });
 
-  it("still releases the early lock when the app was never created", async () => {
+  it("does not release when runtime.start rejects after doing its own cleanup", async () => {
+    // Ownership transfers when `runtime.start` is INVOKED, not when it returns:
+    // `DiscordCopilotApp.start` takes the lock, and its own failure path either
+    // stops the app it built (which decides the lock's fate) or releases the
+    // lock itself. Bootstrap releasing again on a rejection is a second release
+    // of a lock it no longer owns.
     const release = vi.fn(async () => {});
+    const held = lock(release);
 
     await expect(
       startBot({
-        acquireLock: async () => lock(release),
+        acquireLock: async () => held,
         loadRuntime: async () => ({
           loadConfig: () => config(),
           start: async () => {
+            // What the real `start()` does when it got far enough to build an
+            // app: stop it, and let the app decide about the lock.
+            await held.release();
             throw new Error("gateway login failed");
           },
         }),
@@ -120,6 +129,25 @@ describe("startBot", () => {
     ).rejects.toThrow(/gateway login failed/);
 
     expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("does not release when runtime.start rejects while deliberately holding the lock", async () => {
+    const release = vi.fn(async () => {});
+
+    await expect(
+      startBot({
+        acquireLock: async () => lock(release),
+        loadRuntime: async () => ({
+          loadConfig: () => config(),
+          start: async () => {
+            throw new Error("stopped, but an in-flight attempt still holds the lock");
+          },
+        }),
+        publishReady: async () => {},
+      })
+    ).rejects.toThrow(/still holds the lock/);
+
+    expect(release).not.toHaveBeenCalled();
   });
 
   it("releases the early lock when runtime loading fails", async () => {
