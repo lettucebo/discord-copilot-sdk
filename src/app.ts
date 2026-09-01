@@ -293,6 +293,10 @@ function rebindButtons(nonce: string): ActionRowBuilder<ButtonBuilder> {
  *  could not be persisted), as opposed to one bad record we can skip past. */
 class FatalReconcileError extends Error {}
 
+/** Startup was told to stop before it finished. Distinct so the failure reads as
+ *  a deliberate abandonment rather than a crash. */
+class StartupAbandonedError extends Error {}
+
 /** Most sessions that may be live at once. Each holds a runtime session, a
  *  worktree and a Discord thread; an unbounded number of them on an unattended
  *  lab machine is a resource leak, not a feature. */
@@ -1086,11 +1090,14 @@ export class DiscordCopilotApp {
    *  await in `onReady` is followed by this: a signal can complete a shutdown
    *  in any of those gaps, and nothing below one may then mutate the store,
    *  announce success, or open the phase gate. */
-  private startupLost(where: string): boolean {
+  private startupLost(where: string): void {
     const lost = this.startupScope?.lostReason();
-    if (!lost) return false;
-    console.warn(`startup: abandoning ${where} — ${lost}`);
-    return true;
+    if (!lost) return;
+    // THROWS rather than returning quietly. A quiet return let `onReady` resolve
+    // normally, `login()` resolve, `start()` succeed and `publishReady()` write
+    // a readiness marker for a process that had been torn down mid-startup. The
+    // failure has to propagate so `startBot` takes its failure path.
+    throw new StartupAbandonedError(`startup: abandoning ${where} — ${lost}`);
   }
 
   private async onReady(clientId: string): Promise<void> {    await this.loadModels();
@@ -1099,16 +1106,16 @@ export class DiscordCopilotApp {
     // Reconcile persisted sessions BEFORE accepting input (phase gate), so a
     // /new can't race startup resume and double-register a thread.
     this.phase = "reconciling";
-    if (this.startupLost("before reconciliation")) return;
+    this.startupLost("before reconciliation");
     await this.reconcileOnStartup();
-    if (this.startupLost("after reconciliation")) return;
+    this.startupLost("after reconciliation");
     // Clear scratch left by a clone that died mid-flight. Safe here: nothing is
     // provisioning yet, and only directories carrying our own marker are swept.
     await sweepStaleStaging(this.reposRoot);
     // The gate is opened LAST, and only if this process is still the one that
     // was asked to start. Declaring readiness after a shutdown would admit
     // commands into an app whose resources are already being torn down.
-    if (this.startupLost("before opening the phase gate")) return;
+    this.startupLost("before opening the phase gate");
     this.phase = "ready";
     // ADR-0002's other half: a `thread-no-access` record must also come back
     // WITHOUT a restart, once the permission is restored. Armed only now, so a
@@ -2285,10 +2292,9 @@ export class DiscordCopilotApp {
     if (hasFallbackOwnership()) {
       await this.retryStaleRebindActorsForThread(threadId);
       if (hasFallbackOwnership()) {
-        await interaction.reply({
+        await interaction.editReply({
           content:
             "⚠️ replacement 的安全屏障仍未能安全對帳；其 actor 擁有權與記錄均已保留，請稍後重試或重啟 bot。",
-          ...EPHEMERAL,
         });
         return;
       }
@@ -2304,18 +2310,17 @@ export class DiscordCopilotApp {
       await this.retryStaleRebindActorsForThread(threadId);
       const stillLive = [...this.staleRebindActors.values()].some((entry) => entry.threadId === threadId);
       if (stillLive) {
-        await interaction.reply({
+        await interaction.editReply({
           content: "⚠️ 舊 runtime 仍未確認停止；其 worktree 記錄已保留，請稍後重試或重啟 bot。",
-          ...EPHEMERAL,
         });
         return;
       }
       const remaining = this.store.staleRebindsForThread(threadId);
       if (!remaining.length) {
-        await interaction.reply({ content: "✅ 舊 incarnation 已確認清理。", ...EPHEMERAL });
+        await interaction.editReply({ content: "✅ 舊 incarnation 已確認清理。" });
         return;
       }
-      await interaction.deferReply({ ...EPHEMERAL });
+      // Already deferred at the top of this method.
       const outcomes: Array<{ ok: boolean; tail: string }> = [];
       for (const binding of remaining) outcomes.push(await this.reclaimStaleRebind(binding, true));
       await interaction.editReply(
@@ -2326,7 +2331,7 @@ export class DiscordCopilotApp {
       return;
     }
     if (!rec) {
-      await interaction.reply({ content: "這個討論串沒有進行中的 session。", ...EPHEMERAL });
+      await interaction.editReply({ content: "這個討論串沒有進行中的 session。" });
       return;
     }
     const disposition = classifyRecordDisposition(rec.state, this.sessions.has(threadId), this.creating);
@@ -2334,31 +2339,28 @@ export class DiscordCopilotApp {
       // Defensive: the callers check this synchronously first, but falling
       // through to the destructive path if that ever changes would tear down a
       // running session's worktree.
-      await interaction.reply({
+      await interaction.editReply({
         content: "這個討論串仍有進行中的 session，請直接用 `/end`（不加參數）。",
-        ...EPHEMERAL,
       });
       return;
     }
     if (disposition === "in-flight") {
-      await interaction.reply({
+      await interaction.editReply({
         content: "⏳ 這個討論串的 `/new` 還在建立中，現在清除會把它的 worktree 抽掉。請等它完成後再試。",
-        ...EPHEMERAL,
       });
       return;
     }
     if (disposition === "retry-pending" && rec.reason !== "thread-no-access") {
       // reconcile kept this record ON PURPOSE after a transient failure. Its
       // sessionId is the only pointer to the Copilot conversation.
-      await interaction.reply({
+      await interaction.editReply({
         content:
           "ℹ️ 這個記錄仍是 `active`：復原時只是暫時失敗，**重新啟動 bot 會再試一次**。\n" +
           "現在清除會永久丟掉這段對話紀錄，所以不做。若確定不要了，重啟後它會變成 `orphaned`／`blocked`，屆時再 `/end`。",
-        ...EPHEMERAL,
       });
       return;
     }
-    await interaction.deferReply({ ...EPHEMERAL });
+      // Already deferred at the top of this method.
     const outcome = await this.reclaim(threadId, rec.repoPath, rec.workDir, rec.branch);
     // Re-read: reclaim may have retired the record, so the captured `rec.state`
     // would be stale in the failure message.
@@ -3216,7 +3218,11 @@ export class DiscordCopilotApp {
     // all live in the closure, so this is not a second barrier map beside
     // `staleRebindActors`. That map is the app's index for its own lifecycle
     // work (retry, `/end`, fallback reconciliation); this is the ownership fact.
-    scope.retain(staleRebindObligationKey(entry.binding), {
+    // Kept ON THE ENTRY, so every other path that confirms this runtime stopped
+    // can identity-discharge it. A handle thrown away here would mean the
+    // ordinary teardown paths cleared the app's index while the coordinator went
+    // on holding the lock for a runtime that had in fact been proved gone.
+    entry.obligation = scope.retain(staleRebindObligationKey(entry.binding), {
       describe: () =>
         `a detached rebind incarnation ${entry.binding.sessionId} over ${entry.binding.workDir}`,
       attempt: async () => {
@@ -5815,7 +5821,17 @@ export class DiscordCopilotApp {
       // successor instance the very checkout that runtime might still be in.
       // Now it gates the release exactly like every other unconfirmed runtime,
       // and only a CONFIRMED disconnect discharges it.
-      const handle = scope.retain(runtimeObligationKey(threadId), {
+      // First-wins is right about which runtime owns the key and wrong as an
+      // answer for the loser: if an older unconfirmed runtime already holds it,
+      // `retain` would hand back ITS handle, and attempting that one leaves THIS
+      // live actor dropped by `sessions.clear()` below with nobody holding it.
+      // The loser gets its own key, so it is disconnected and, failing that,
+      // retained and gating like any other.
+      const primaryTaken = scope.obligation(runtimeObligationKey(threadId))?.retained === true;
+      const key = primaryTaken
+        ? `${runtimeObligationKey(threadId)}#superseded-${++this.supersededResumeSeq}`
+        : runtimeObligationKey(threadId);
+      const handle = scope.retain(key, {
         describe: () => `a live session runtime for ${threadId} over ${session.workDir}`,
         attempt: async () => {
           try {

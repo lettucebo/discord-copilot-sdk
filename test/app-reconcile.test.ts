@@ -3022,7 +3022,11 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
         async reply(): Promise<void> {
           seen.push(claims.get("t-claim")); // claimed while the command runs
         },
-        async deferReply(): Promise<void> {},
+        async deferReply(): Promise<void> {
+          // `/end`'s stale path defers before its bounded waits now, so the
+          // claim is observed here rather than at the first reply.
+          seen.push(claims.get("t-claim"));
+        },
         async editReply(): Promise<void> {},
       };
       await (
@@ -4027,9 +4031,13 @@ describe("startup is owned work, and its resumes are owned per thread", () => {
         (app as unknown as { startupScope: unknown }).startupScope = scope;
         await held;
         sawLost = scope.lostReason();
-        // What onReady does with that answer.
-        if (!(app as unknown as { startupLost(w: string): boolean }).startupLost("test")) {
+        // What onReady does with that answer: it THROWS, so `start()` fails and
+        // `publishReady()` is never reached.
+        try {
+          (app as unknown as { startupLost(w: string): void }).startupLost("test");
           (app as unknown as { phase: string }).phase = "ready";
+        } catch (err) {
+          sawLost = err instanceof Error ? err.message : String(err);
         }
       });
 
@@ -4253,6 +4261,108 @@ describe("a rebind that loses ownership mid-transaction installs nothing", () =>
       // Never enters the transaction: no worktree, no SDK session, no store write.
       expect(result).toContain("關閉中");
       expect(store.get("t-rbx")).toBeUndefined();
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});
+
+/**
+ * An interaction that throws the way discord.js does.
+ *
+ * The previous fakes accepted `reply()` after `deferReply()`, so a command that
+ * deferred and then replied looked green in tests and threw
+ * `InteractionAlreadyReplied` in production — which aborted `/end` before it
+ * reclaimed anything. Every new interaction test should use this.
+ */
+function strictInteraction(over: Record<string, unknown> = {}): {
+  answers: string[];
+  deferred: boolean;
+  replied: boolean;
+} & Record<string, unknown> {
+  const answers: string[] = [];
+  const self = {
+    answers,
+    deferred: false,
+    replied: false,
+    async deferReply(): Promise<void> {
+      if (self.deferred || self.replied) throw new Error("InteractionAlreadyReplied");
+      self.deferred = true;
+    },
+    async reply(o: { content: string }): Promise<void> {
+      if (self.deferred || self.replied) throw new Error("InteractionAlreadyReplied");
+      self.replied = true;
+      answers.push(o.content);
+    },
+    async editReply(o: string | { content: string }): Promise<void> {
+      if (!self.deferred && !self.replied) throw new Error("InteractionNotReplied");
+      answers.push(typeof o === "string" ? o : o.content);
+    },
+    ...over,
+  };
+  return self as never;
+}
+
+describe("/end answers exactly once, through the real reclaim path", () => {
+  it("defers, then edits — never replies after deferring", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      // A genuinely terminal record, so the REAL reclaim path runs to the end.
+      store.reserve(bind({ threadId: "t-strict", sessionId: "sess-strict" }));
+      store.commit("t-strict");
+      store.setState("t-strict", "blocked", "thread-gone");
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      const interaction = strictInteraction();
+
+      await (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(interaction, "t-strict");
+
+      // The command answered, and the reclaim it exists for actually happened —
+      // both of which a reply-after-defer would have prevented.
+      expect(interaction.deferred).toBe(true);
+      expect(interaction.answers).toHaveLength(1);
+      expect(interaction.answers[0]).toContain("已清除");
+      expect(store.get("t-strict")).toBeUndefined();
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("answers a refusal by editing too, and leaves the record alone", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-strict2", sessionId: "sess-strict2" }));
+      store.commit("t-strict2"); // active, no reason ⇒ retry-pending ⇒ refused
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      const interaction = strictInteraction();
+
+      await (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(interaction, "t-strict2");
+
+      expect(interaction.answers).toHaveLength(1);
+      expect(store.get("t-strict2")?.state).toBe("active"); // untouched
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });
