@@ -43,6 +43,11 @@ import { tmpdir } from "node:os";
 import { stateDir } from "../src/core/paths.js";
 import { join } from "node:path";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  strictInteraction,
+  asCommandInteraction,
+  type StrictInteraction,
+} from "./support/strict-interaction.js";
 
 const isolatedHome = (() => {
   const value = process.env["DISCORD_COPILOT_SDK_VITEST_HOME"];
@@ -3562,13 +3567,25 @@ describe("the phase gate closes before the teardown, not after it", () => {
     // `app.stop()`, which closes the gate, rather than straight to the
     // coordinator, which would tear the app down underneath a bot that still
     // believed it was ready.
+    //
+    // A source contract, deliberately kept alongside the REAL one in
+    // `app-start-ownership.test.ts` ("abandons a startup that was stopped after
+    // the app was built"): that test proves the behaviour, this one pins the
+    // shape the behaviour depends on — that the failure path consults the
+    // PARTIALLY constructed app, not just the fully built one. `built` is
+    // assigned only on complete success, so a check of `built` alone silently
+    // routes every mid-construction failure to the coordinator instead.
     const src = readFileSync(join(process.cwd(), "src", "app.ts"), "utf8");
     const startBody = src.slice(
       src.indexOf("static async start("),
       src.indexOf("private assertChannelRegistryUsable")
     );
-    expect(startBody).toMatch(/if \(built\) await built\.stop\(\)/);
+    expect(startBody).toMatch(/const app = built \?\? partial\.app;/);
+    expect(startBody).toMatch(/if \(app\) await app\.stop\(\)/);
     expect(startBody).toMatch(/else await ownership\.shutdown\(\)/);
+    // The app is published to that failure path the instant it exists, before
+    // anything that can throw between construction and login.
+    expect(startBody).toMatch(/partial\.app = app;/);
     // …and the whole of startup is owned work, so a signal cannot complete a
     // shutdown and release the lock while construction is still running.
     expect(startBody).toContain("runExclusive(PROCESS_STARTUP_KEY");
@@ -4269,40 +4286,9 @@ describe("a rebind that loses ownership mid-transaction installs nothing", () =>
 });
 
 /**
- * An interaction that throws the way discord.js does.
- *
- * The previous fakes accepted `reply()` after `deferReply()`, so a command that
- * deferred and then replied looked green in tests and threw
- * `InteractionAlreadyReplied` in production — which aborted `/end` before it
- * reclaimed anything. Every new interaction test should use this.
+ * `/end`'s answer contract, against the interaction fake that throws the way
+ * discord.js does (`test/support/strict-interaction.ts`).
  */
-function strictInteraction(over: Record<string, unknown> = {}): {
-  answers: string[];
-  deferred: boolean;
-  replied: boolean;
-} & Record<string, unknown> {
-  const answers: string[] = [];
-  const self = {
-    answers,
-    deferred: false,
-    replied: false,
-    async deferReply(): Promise<void> {
-      if (self.deferred || self.replied) throw new Error("InteractionAlreadyReplied");
-      self.deferred = true;
-    },
-    async reply(o: { content: string }): Promise<void> {
-      if (self.deferred || self.replied) throw new Error("InteractionAlreadyReplied");
-      self.replied = true;
-      answers.push(o.content);
-    },
-    async editReply(o: string | { content: string }): Promise<void> {
-      if (!self.deferred && !self.replied) throw new Error("InteractionNotReplied");
-      answers.push(typeof o === "string" ? o : o.content);
-    },
-    ...over,
-  };
-  return self as never;
-}
 
 describe("/end answers exactly once, through the real reclaim path", () => {
   it("defers, then edits — never replies after deferring", async () => {
@@ -4363,6 +4349,122 @@ describe("/end answers exactly once, through the real reclaim path", () => {
 
       expect(interaction.answers).toHaveLength(1);
       expect(store.get("t-strict2")?.state).toBe("active"); // untouched
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  /** Every remaining branch that answers AFTER the deferral. Each one is a
+   *  separate `editReply`, and each is a place a `reply` would throw
+   *  `InteractionAlreadyReplied` and abort the command. Driven as a table so a
+   *  branch added later without a test is conspicuous rather than silent. */
+  const postDeferBranches: Array<{
+    name: string;
+    arrange(store: SessionStore, app: DiscordCopilotApp, threadId: string): void;
+    expected: RegExp;
+  }> = [
+    {
+      name: "no record at all",
+      arrange: () => {},
+      expected: /沒有進行中的 session/,
+    },
+    {
+      name: "the thread is still live",
+      arrange: (store, app, threadId) => {
+        store.reserve(bind({ threadId, sessionId: `s-${threadId}` }));
+        store.commit(threadId);
+        sessionsOf(app).set(threadId, {});
+      },
+      expected: /請直接用/,
+    },
+    {
+      name: "a /new is still in flight",
+      arrange: (store, app, threadId) => {
+        store.reserve(bind({ threadId, sessionId: `s-${threadId}` }));
+        (app as unknown as { creating: boolean }).creating = true;
+      },
+      expected: /還在建立中/,
+    },
+    {
+      name: "reconcile kept it for a restart retry",
+      arrange: (store, _app, threadId) => {
+        store.reserve(bind({ threadId, sessionId: `s-${threadId}` }));
+        store.commit(threadId);
+        store.setState(threadId, "active", "transient-thread-fetch");
+      },
+      expected: /重新啟動 bot 會再試一次/,
+    },
+    {
+      name: "a terminal record is reclaimed",
+      arrange: (store, _app, threadId) => {
+        store.reserve(bind({ threadId, sessionId: `s-${threadId}` }));
+        store.commit(threadId);
+        store.setState(threadId, "orphaned", "thread-gone");
+      },
+      expected: /已清除/,
+    },
+  ];
+
+  for (const branch of postDeferBranches) {
+    it(`edits (never replies) when ${branch.name}`, async () => {
+      const f = tmpFile();
+      const registryFile = `${f}.channels.json`;
+      const threadId = `t-tbl-${postDeferBranches.indexOf(branch)}`;
+      try {
+        const store = new SessionStore(f);
+        const app = DiscordCopilotApp.createForTest(
+          cfg,
+          REPOS_ROOT,
+          fakeCopilot(),
+          new FakeTransport(),
+          store,
+          new ChannelRegistry("c1", "g1", registryFile)
+        );
+        branch.arrange(store, app, threadId);
+        const interaction = strictInteraction({ channelId: threadId });
+
+        await (
+          app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+        ).endStaleRecord(interaction, threadId);
+
+        // Deferred, answered exactly once, and answered by editing: a `reply`
+        // here would have thrown before the branch's own work completed.
+        expect(interaction.deferred).toBe(true);
+        expect(interaction.replied).toBe(false);
+        expect(interaction.answers).toHaveLength(1);
+        expect(interaction.answers[0]).toMatch(branch.expected);
+      } finally {
+        rmSync(f, { force: true });
+        rmSync(registryFile, { force: true });
+      }
+    });
+  }
+
+  it("replies (it never deferred) when the bot is already shutting down", async () => {
+    // The ONE branch that must still use `reply`: the teardown claim is declined
+    // before `endStaleRecordClaimed` runs, so nothing has acknowledged yet.
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        new SessionStore(f),
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      await app.stop();
+      const interaction: StrictInteraction = strictInteraction({ channelId: "t-shut" });
+
+      await (
+        app as unknown as { endStaleRecord(i: unknown, threadId: string): Promise<void> }
+      ).endStaleRecord(interaction, "t-shut");
+
+      expect(interaction.deferred).toBe(false);
+      expect(interaction.replied).toBe(true);
+      expect(interaction.answers[0]).toMatch(/關閉中/);
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });

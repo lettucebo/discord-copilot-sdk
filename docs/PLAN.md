@@ -1101,6 +1101,9 @@ teardown claims、obligations **同時為空**才釋放，且只釋放一次。
 | capture 成功但（取消或 resume 失敗）沒交給 actor 時，`trustedRoot.close()` 必須被呼叫恰好一次 | `test/app-reconcile.test.ts` |
 | shutdown 穿插 in-flight retry：不註冊 session、不再 arm timer、record 原封不動留給下次開機 | `test/app-reconcile.test.ts` |
 | armed timer 必須 `unref`，`clearAccessRetryTimer()` 必須真的清掉 | `test/app-reconcile.test.ts` |
+| 建構完成後、login 之前收到 `app.stop()`：`start()` 必須以 `StartupAbandonedError` 失敗、永遠不回傳 app，`startBot()` 因此不會 publish readiness（走真實 `start()` 的 `beforeLogin` 測試接縫） | `test/app-start-ownership.test.ts` |
+| **一般成功改綁**退役的舊 actor：disconnect 無法確認時必須成為 obligation，`app.stop()` 不得釋放 lock；真實 retry 路徑確認後才 discharge 並釋放恰好一次 | `test/app-rebind.test.ts` |
+| `/end` 在 defer **之後**的每一個分支都必須用 `editReply` 回答（表格驅動）；唯一仍用 `reply` 的是 claim 被拒的關閉中分支 | `test/app-reconcile.test.ts` |
 
 ### 19.7 抽取結果與仍未做的事
 

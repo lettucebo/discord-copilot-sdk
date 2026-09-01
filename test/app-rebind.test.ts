@@ -19,6 +19,8 @@ import type { DevMode } from "../src/core/binding.js";
 import type { SecureOpenBackend } from "../src/core/secure-open.js";
 import { worktreePath } from "../src/core/worktree.js";
 import { worktreeRoot } from "../src/core/paths.js";
+import type { InstanceLock } from "../src/core/single-instance.js";
+import { strictInteraction, asCommandInteraction } from "./support/strict-interaction.js";
 
 const run = promisify(execFile);
 
@@ -258,16 +260,19 @@ const blocker = (
   ).rebindBlocker("t1", session, target);
 
 function endInteraction(): ChatInputCommandInteraction {
-  return {
-    user: { id: "u1" },
-    guildId: "g1",
-    channelId: "t1",
-    channel: { isThread: () => true, parentId: "c1" },
-    options: { getString: () => null },
-    reply: async () => {},
-    deferReply: async () => {},
-    editReply: async () => {},
-  } as unknown as ChatInputCommandInteraction;
+  // The STRICT shared fake: it throws `InteractionAlreadyReplied` exactly where
+  // discord.js does, so `/end`'s answer path cannot pass here while failing in
+  // production. The permissive local fake this replaced was the reason a
+  // reply-after-defer went unnoticed.
+  return asCommandInteraction(
+    strictInteraction({
+      user: { id: "u1" },
+      guildId: "g1",
+      channelId: "t1",
+      channel: { isThread: () => true, parentId: "c1" },
+      options: { getString: () => null },
+    })
+  );
 }
 
 const endThread = (app: DiscordCopilotApp): Promise<void> =>
@@ -276,6 +281,44 @@ const endThread = (app: DiscordCopilotApp): Promise<void> =>
       cmdEnd(i: ChatInputCommandInteraction): Promise<void>;
     }
   ).cmdEnd(endInteraction());
+
+/** The coordinator's read-only view of the sets its release conclusion is drawn
+ *  from. A detached rebind incarnation this process could not prove stopped is
+ *  an OBLIGATION here, keyed by its DURABLE identity. */
+type Inspector = {
+  exclusiveThreads(): string[];
+  teardownClaims(): string[];
+  obligationKeys(): string[];
+  obligation(key: string): unknown;
+  released(): boolean;
+};
+function inspectOwnership(app: DiscordCopilotApp): Inspector {
+  const inspector = (app as unknown as { ownershipInspector?: Inspector }).ownershipInspector;
+  if (!inspector) throw new Error("this app was not built with the test ownership seam");
+  return inspector;
+}
+/** Give the app a lock the test can watch. The lock lives INSIDE the lifecycle
+ *  coordinator — the only thing allowed to release it — so the only honest way
+ *  to count releases is to hand that coordinator an observable lock. */
+function useObservableLock(app: DiscordCopilotApp, lock: InstanceLock): void {
+  (app as unknown as { useOwnershipForTest(l: InstanceLock): void }).useOwnershipForTest(lock);
+}
+const staleRebindKey = (b: { threadId: string; sessionId: string; generation: number }): string =>
+  `stale-rebind:${b.threadId}:${b.sessionId}:${b.generation}`;
+/** The invariant the two indexes must agree on: anything the app still holds a
+ *  strong reference to must also be something the coordinator is owed. An entry
+ *  in one and not the other is exactly how a live runtime kept a checkout while
+ *  the process lock was free to go. */
+function assertEveryRetainedRuntimeIsOwed(app: DiscordCopilotApp): void {
+  const keys = inspectOwnership(app).obligationKeys();
+  for (const entry of staleRebindActors(app).values()) {
+    const binding = (entry as { binding: { threadId: string; sessionId: string; generation: number } })
+      .binding;
+    expect(keys, `retained stale incarnation ${binding.sessionId} is not owed`).toContain(
+      staleRebindKey(binding)
+    );
+  }
+}
 
 /** A REAL git repo: the rebind path runs `git worktree add`, `git status` and
  *  `git symbolic-ref` for real, and a `.git` directory alone makes all of them
@@ -1751,5 +1794,58 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
     const { app } = harness();
     sessions(app).delete("t1");
     expect(await applyRebind(app, { repoPath: repoB, devMode: "local" })).toMatch(/沒有進行中的 session/);
+  });
+});
+
+
+describe("applyRebind — the process lock", { timeout: 60_000 }, () => {
+  it("holds the lock for an unconfirmed retired incarnation, and lets go once a real retry confirms it", async () => {
+    // The end-to-end shape of the defect: a NORMAL, successful rebind retires
+    // the old actor, its disconnect cannot be confirmed, and the process still
+    // owns a runtime that may be holding the old checkout. Before the stale
+    // incarnation became a coordinator obligation this route only added the
+    // app's own index entry, so `stop()` released the single-instance lock and
+    // a successor could start against a repo this process had not let go of.
+    const { app, actor } = harness({ devMode: "local", repo: repoA });
+    let releases = 0;
+    useObservableLock(app, {
+      path: "(observable)",
+      release: async () => {
+        releases++;
+      },
+    });
+    // The old runtime does not answer. Its cleanup is therefore unprovable.
+    actor.disconnectFails = true;
+
+    const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+    expect(out).toMatch(/已改綁/);
+
+    // The app kept the actor, and the coordinator was told about it.
+    expect(staleRebindActors(app).size).toBe(1);
+    assertEveryRetainedRuntimeIsOwed(app);
+    const entry = [...staleRebindActors(app).values()][0] as {
+      binding: { threadId: string; sessionId: string; generation: number };
+    };
+    const key = staleRebindKey(entry.binding);
+    expect(inspectOwnership(app).obligationKeys()).toContain(key);
+
+    // A full shutdown may NOT release the lock: the sweep re-attempts the
+    // disconnect, it still fails, and the obligation stays.
+    await app.stop();
+    expect(releases).toBe(0);
+    expect(inspectOwnership(app).obligationKeys()).toContain(key);
+    assertEveryRetainedRuntimeIsOwed(app);
+
+    // The runtime finally answers, through the REAL retry path — not by poking
+    // the coordinator. Confirmation discharges the obligation by identity, the
+    // coordinator re-draws its conclusion, and the lock goes exactly once.
+    actor.disconnectFails = false;
+    await retryStaleRebinds(app);
+    expect(staleRebindActors(app).size).toBe(0);
+    expect(inspectOwnership(app).obligationKeys()).not.toContain(key);
+    assertEveryRetainedRuntimeIsOwed(app);
+    await vi.waitFor(() => expect(releases).toBe(1));
+
+    await sessions(app).get("t1")?.actor.disconnect().catch(() => {});
   });
 });

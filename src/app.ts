@@ -295,7 +295,15 @@ class FatalReconcileError extends Error {}
 
 /** Startup was told to stop before it finished. Distinct so the failure reads as
  *  a deliberate abandonment rather than a crash. */
-class StartupAbandonedError extends Error {}
+export class StartupAbandonedError extends Error {}
+
+/** Test-only seams on the real `start()` path. Production passes none, so the
+ *  production flow is exactly the flow under test minus these hooks. */
+export interface StartDependencies {
+  /** Runs after the app is constructed and published, before the gateway login
+   *  installs signal handlers. Lets a test stand at that exact point. */
+  beforeLogin?(app: DiscordCopilotApp): Promise<void>;
+}
 
 /** Most sessions that may be live at once. Each holds a runtime session, a
  *  worktree and a Discord thread; an unbounded number of them on an unattended
@@ -935,7 +943,11 @@ export class DiscordCopilotApp {
 
   /** Fully start after bootstrap has already acquired the instance lock and
    *  wrapped it in the one thing allowed to release it. */
-  static async start(config: Config, ownership: LifecycleOwnership): Promise<DiscordCopilotApp> {
+  static async start(
+    config: Config,
+    ownership: LifecycleOwnership,
+    deps: StartDependencies = {}
+  ): Promise<DiscordCopilotApp> {
     // The ENTIRE startup runs as owned work, published before its first await.
     // Everything inside constructs runtimes, mutates the store for every
     // persisted record and finally opens the phase gate; a signal arriving in
@@ -944,9 +956,14 @@ export class DiscordCopilotApp {
     // rather than depending on each step remembering to ask.
     let built: DiscordCopilotApp | undefined;
     let failure: unknown;
+    // The PARTIALLY constructed app, published the moment it exists. `built` is
+    // assigned only on full success, so a failure path that tested it could
+    // never see an app — and would call the coordinator directly, tearing the
+    // app down with its phase gate still open.
+    const partial: { app?: DiscordCopilotApp } = {};
     const outcome = await ownership.runExclusive(PROCESS_STARTUP_KEY, async (scope) => {
       try {
-        built = await DiscordCopilotApp.startInScope(config, ownership, scope);
+        built = await DiscordCopilotApp.startInScope(config, ownership, scope, partial, deps);
       } catch (err) {
         failure = err;
       }
@@ -954,7 +971,11 @@ export class DiscordCopilotApp {
     // Both teardown paths run OUTSIDE the scope: `shutdown()` joins exclusive
     // scopes, so calling it from within this one would stall on itself.
     if (failure !== undefined) {
-      if (built) await built.stop().catch(() => {});
+      const app = built ?? partial.app;
+      // Once the app exists, `stop()` is the door: it closes the phase gate
+      // SYNCHRONOUSLY before the teardown runs. Only a failure from before
+      // construction has nothing to gate.
+      if (app) await app.stop().catch(() => {});
       else await ownership.shutdown().catch(() => {});
       throw failure;
     }
@@ -966,7 +987,9 @@ export class DiscordCopilotApp {
   private static async startInScope(
     config: Config,
     ownership: LifecycleOwnership,
-    scope: OwnedScope
+    scope: OwnedScope,
+    partial: { app?: DiscordCopilotApp },
+    deps: StartDependencies
   ): Promise<DiscordCopilotApp> {
     // INSIDE the try, both of them: a throw that escaped it used to leave the
     // lock held by nobody. These two are the earliest things that can fail — a
@@ -1000,6 +1023,10 @@ export class DiscordCopilotApp {
     if (lostAfterStart) throw new Error(`refusing to start: ${lostAfterStart}`);
     await preflightModel(copilot, config.DEFAULT_MODEL);
     const app = new DiscordCopilotApp(config, copilot, ownership);
+    // Published the INSTANT it exists. From here a failure must be answered by
+    // `app.stop()`, which closes the phase gate synchronously — not by the
+    // coordinator alone, which would tear the app down with that gate open.
+    partial.app = app;
     app.reposRoot = reposRoot;
     app.startupScope = scope;
     // Before the gateway, not after: a registry we cannot trust must not reach
@@ -1010,6 +1037,15 @@ export class DiscordCopilotApp {
     // everything this app owns, not just the client.
     if (!ownership.arm((teardown) => app.teardownResources(teardown))) {
       throw new Error("shutdown began before the app could be armed for teardown");
+    }
+    // The last checkpoint before the gateway. `login()` installs the signal
+    // handlers and opens the connection, so a shutdown that began while the app
+    // was being built must stop HERE — bringing a gateway up for a process that
+    // is already tearing down is how a bot ends up online with no resources.
+    await deps.beforeLogin?.(app);
+    const lostBeforeLogin = scope.lostReason();
+    if (lostBeforeLogin) {
+      throw new StartupAbandonedError(`startup: abandoning before login — ${lostBeforeLogin}`);
     }
     await app.login();
     return app;

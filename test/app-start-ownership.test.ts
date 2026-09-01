@@ -48,7 +48,7 @@ vi.mock("../src/copilot/sdk.js", () => ({
   sdkSelfCheck: async () => ({ modelCount: 0 }),
 }));
 
-const { DiscordCopilotApp } = await import("../src/app.js");
+const { DiscordCopilotApp, StartupAbandonedError } = await import("../src/app.js");
 const { parseConfig } = await import("../src/config.js");
 import type { InstanceLock } from "../src/core/single-instance.js";
 import { createLifecycleOwnership } from "../src/core/lifecycle-ownership.js";
@@ -188,5 +188,61 @@ describe("start()'s repos root fixture", () => {
   it("is a usable root, so the failures above are the ones under test", () => {
     mkdirSync(join(reposRoot, "placeholder"), { recursive: true });
     expect(() => config()).not.toThrow();
+  });
+});
+
+describe("startup torn down between construction and login", () => {
+  it("rejects with StartupAbandonedError, never returns an app, releases once", async () => {
+    // The exact schedule: the app EXISTS (so a failure must go through its own
+    // `stop()`, closing the phase gate) but the gateway is not up yet. A quiet
+    // return here used to let `start()` resolve and `startBot` publish
+    // readiness for a process that had been torn down.
+    const held = lock();
+    const { createLifecycleOwnership } = await import("../src/core/lifecycle-ownership.js");
+    const ownership = createLifecycleOwnership(held.lock, { joinTimeoutMs: 20 });
+
+    let seenPhase: string | undefined;
+    const starting = DiscordCopilotApp.start(config(), ownership, {
+      beforeLogin: async (app) => {
+        // A SIGTERM arrives here.
+        await app.stop();
+        seenPhase = (app as unknown as { phase: string }).phase;
+      },
+    });
+
+    await expect(starting).rejects.toThrow(StartupAbandonedError);
+    expect(seenPhase).toBe("shuttingDown"); // the gate closed synchronously
+    expect(sdk.clientsCreated).toBe(1);
+    expect(sdk.clientStops).toBe(1); // the client it built was put down
+    await vi.waitFor(() => expect(held.releases()).toBe(1)); // exactly once
+  });
+
+  // `startBot` builds its own coordinator with production bounds, so the join of
+  // the still-open startup scope really does take the default 5s here.
+  it("never publishes readiness for a startup that was torn down", { timeout: 20_000 }, async () => {
+    let published = 0;
+    const { startBot } = await import("../src/core/bootstrap.js");
+    const release = vi.fn(async () => {});
+
+    await expect(
+      startBot({
+        acquireLock: async () => ({ path: "(test)", release }),
+        loadRuntime: async () => ({
+          loadConfig: () => config(),
+          start: (c, ownership) =>
+            DiscordCopilotApp.start(c, ownership, {
+              beforeLogin: async (app) => {
+                await app.stop();
+              },
+            }),
+        }),
+        publishReady: async () => {
+          published++;
+        },
+      })
+    ).rejects.toThrow(StartupAbandonedError);
+
+    expect(published).toBe(0); // the readiness marker is never written
+    expect(release).toHaveBeenCalledOnce();
   });
 });
