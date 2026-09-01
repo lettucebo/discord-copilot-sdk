@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { sanitizeRuntimeEnv } from "../src/copilot/sdk.js";
+import { sanitizeRuntimeEnv, stopCopilotClient } from "../src/copilot/sdk.js";
 
 describe("sanitizeRuntimeEnv (secrets must not reach the agent's process env)", () => {
   it("strips the bot token and every DISCORD_* setting", () => {
@@ -35,5 +35,38 @@ describe("sanitizeRuntimeEnv (secrets must not reach the agent's process env)", 
   it("keeps a variable that merely CONTAINS the prefix rather than starting with it", () => {
     const out = sanitizeRuntimeEnv({ MY_DISCORD_TOKEN: "keep" });
     expect(out["MY_DISCORD_TOKEN"]).toBe("keep");
+  });
+});
+
+describe("stopCopilotClient (a reported cleanup failure IS a failure)", () => {
+  it("resolves when the client reports no errors", async () => {
+    await expect(stopCopilotClient({ stop: async () => [] })).resolves.toBeUndefined();
+  });
+
+  it("rejects when the client FULFILS with errors", async () => {
+    // `CopilotClient.stop(): Promise<Error[]>` reports a cleanup that did not
+    // work by fulfilling, not by rejecting. Awaiting it for the side effect
+    // therefore read every one of those failures as a clean stop.
+    const reported = [new Error("child did not exit"), new Error("socket still open")];
+    await expect(stopCopilotClient({ stop: async () => reported })).rejects.toThrow(
+      /reported 2 cleanup error/
+    );
+  });
+
+  it("carries the reported errors, so a log says what actually failed", async () => {
+    const reported = [new Error("child did not exit")];
+    const err = await stopCopilotClient({ stop: async () => reported }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AggregateError);
+    expect((err as AggregateError).errors).toEqual(reported);
+  });
+
+  it("still propagates an outright rejection", async () => {
+    await expect(
+      stopCopilotClient({
+        stop: async () => {
+          throw new Error("rpc closed");
+        },
+      })
+    ).rejects.toThrow(/rpc closed/);
   });
 });

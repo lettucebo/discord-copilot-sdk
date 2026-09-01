@@ -153,7 +153,11 @@ frontmatter was probed against the SDK runtime and does not bypass `onPermission
 YOLO removes that remaining card gate; preserve the explicit YOLO warning.
 
 `createCopilotClient` strips `DISCORD_*` / `DISCOPILOT_*` from the agent's env, and
-`useLoggedInUser: true` is hardcoded.
+`useLoggedInUser: true` is hardcoded. **`CopilotClient.stop()` is `Promise<Error[]>`** — it reports
+a cleanup that did not work by *fulfilling* with a non-empty array, not by rejecting. Every caller
+goes through `stopCopilotClient()` in `copilot/sdk.ts`; awaiting `stop()` for its side effect made
+a dirty stop look like a clean one, and an armed teardown that "succeeds" is exactly what lets the
+lifecycle coordinator release the single-instance lock.
 
 **Agent-derived output must never ping anyone.** Every send path in `discord-transport.ts` passes
 `allowedMentions: { parse: [] }`; a new send path that forgets it is a real regression.

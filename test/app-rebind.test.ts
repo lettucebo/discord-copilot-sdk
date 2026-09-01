@@ -133,7 +133,9 @@ function fakeCopilot(opts: { createFails?: boolean } = {}): CopilotClient {
       if (opts.createFails) throw new Error("runtime refused");
       return { on() {}, async send() {}, async disconnect() {} };
     },
-    async stop() {},
+    async stop(): Promise<Error[]> {
+      return [];
+    },
   } as unknown as CopilotClient;
 }
 

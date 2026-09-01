@@ -27,26 +27,36 @@ const { sdk } = vi.hoisted(() => ({
     clientsCreated: 0,
     clientStartError: undefined as string | undefined,
     clientStops: 0,
+    clientStopErrors: [] as Error[],
     clientStartBlocks: undefined as Promise<void> | undefined,
 
   },
 }));
-vi.mock("../src/copilot/sdk.js", () => ({
-  checkSdkCompat: () => sdk.compat,
-  createCopilotClient: () => {
-    sdk.clientsCreated++;
-    return {
-      start: async () => {
-        if (sdk.clientStartError) throw new Error(sdk.clientStartError);
-      },
-      stop: async () => {
-        sdk.clientStops++;
-      },
-      listModels: async () => [],
-    };
-  },
-  sdkSelfCheck: async () => ({ modelCount: 0 }),
-}));
+vi.mock("../src/copilot/sdk.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/copilot/sdk.js")>();
+  return {
+    checkSdkCompat: () => sdk.compat,
+    createCopilotClient: () => {
+      sdk.clientsCreated++;
+      return {
+        start: async () => {
+          if (sdk.clientStartError) throw new Error(sdk.clientStartError);
+        },
+        // The real contract: `stop()` FULFILS with the errors it hit, so a
+        // clean stop is an empty array.
+        stop: async (): Promise<Error[]> => {
+          sdk.clientStops++;
+          return sdk.clientStopErrors;
+        },
+        listModels: async () => [],
+      };
+    },
+    sdkSelfCheck: async () => ({ modelCount: 0 }),
+    // Deliberately NOT stubbed: mocking the reported-error check away would make
+    // these ownership tests green against a helper that does not exist.
+    stopCopilotClient: actual.stopCopilotClient,
+  };
+});
 
 const { DiscordCopilotApp, StartupAbandonedError } = await import("../src/app.js");
 const { parseConfig } = await import("../src/config.js");
@@ -90,6 +100,7 @@ afterEach(() => {
   sdk.clientsCreated = 0;
   sdk.clientStartError = undefined;
   sdk.clientStops = 0;
+  sdk.clientStopErrors = [];
 });
 
 afterAll(() => {
@@ -244,5 +255,30 @@ describe("startup torn down between construction and login", () => {
 
     expect(published).toBe(0); // the readiness marker is never written
     expect(release).toHaveBeenCalledOnce();
+  });
+});
+
+describe("an armed teardown the SDK REPORTS as failed", () => {
+  it("keeps the lock when copilot.stop() fulfils with cleanup errors", async () => {
+    // End to end through the REAL `start()` and the REAL armed teardown. The
+    // client reports a dirty stop by FULFILLING with errors; awaiting it for the
+    // side effect read that as success, so the coordinator concluded everything
+    // was down and released the single-instance lock while a copilot-cli child
+    // was still running.
+    const held = lock();
+    const ownership = createLifecycleOwnership(held.lock, { joinTimeoutMs: 20 });
+    sdk.clientStopErrors = [new Error("copilot-cli child did not exit")];
+
+    const starting = DiscordCopilotApp.start(config(), ownership, {
+      beforeLogin: async (app) => {
+        await app.stop().catch(() => {});
+      },
+    });
+
+    await expect(starting).rejects.toThrow();
+    expect(sdk.clientStops).toBe(1);
+    // The teardown could not be proved, so the lock is still this process's.
+    await new Promise((r) => setTimeout(r, 40));
+    expect(held.releases()).toBe(0);
   });
 });

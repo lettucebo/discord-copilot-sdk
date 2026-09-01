@@ -109,7 +109,7 @@ const cfg = {
 const fakeCopilot = {
   // `stop()` is exercised by the shutdown test; the fake must offer it or the
   // assertion fails on the fixture rather than on the behaviour under test.
-  stop: async () => {},
+  stop: async (): Promise<Error[]> => [],
 } as unknown as CopilotClient;
 
 function imageMessage(url: string): unknown {

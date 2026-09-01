@@ -110,6 +110,27 @@ export interface SelfCheckResult {
   sample?: { id: string; contextWindow?: number; efforts?: string[] };
 }
 
+/**
+ * Stop a Copilot client, treating a REPORTED failure as a failure.
+ *
+ * `CopilotClient.stop()` is `Promise<Error[]>`: it reports a cleanup that did
+ * not work by FULFILLING with a non-empty array, not by rejecting. Awaiting it
+ * for its side effect therefore read every one of those failures as a clean
+ * stop — and in the bot that is what an armed teardown reports to the lifecycle
+ * coordinator, which then released the single-instance lock over repos a
+ * copilot-cli child might still have been working in. One place reads the
+ * result, so no caller can drift back.
+ */
+export async function stopCopilotClient(client: Pick<CopilotClient, "stop">): Promise<void> {
+  const errors = await client.stop();
+  if (errors.length > 0) {
+    throw new AggregateError(
+      errors,
+      `the Copilot client reported ${errors.length} cleanup error(s) while stopping`
+    );
+  }
+}
+
 /** Connect to the local Copilot runtime and enumerate models. Proves the SDK
  *  wiring + local auth work end to end. Treats zero models as a failure. */
 export async function sdkSelfCheck(): Promise<SelfCheckResult> {
@@ -137,6 +158,12 @@ export async function sdkSelfCheck(): Promise<SelfCheckResult> {
       ...(sample ? { sample } : {}),
     };
   } finally {
-    await client.stop();
+    // Audited alongside the two armed teardowns: this one REPORTS rather than
+    // fails. `--selfcheck` owns no lock and holds no repo, and throwing from
+    // this `finally` would replace the diagnostic the operator ran it for, so a
+    // dirty stop is surfaced and the result stands.
+    await stopCopilotClient(client).catch((err: unknown) => {
+      console.error("selfcheck: the Copilot client did not stop cleanly", err);
+    });
   }
 }

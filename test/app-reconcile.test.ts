@@ -166,7 +166,9 @@ function fakeCopilot(
   return {
     createSession: async () => fakeSession,
     // A no-op `stop`, so a test may drive the real `app.stop()` teardown.
-    async stop(): Promise<void> {},
+    async stop(): Promise<Error[]> {
+      return []; // the real client REPORTS cleanup errors; none here
+    },
     resumeSession: async (id: string, cfg: Record<string, unknown>) => {
       resumeCalls.push({ id, cfg });
       const e = typeof opts.resumeError === "function" ? opts.resumeError(id) : opts.resumeError;
@@ -1447,7 +1449,9 @@ function gatedCopilot(opts: { disconnectError?: string; disconnectFails?: () => 
   return {
     client: {
       createSession: async () => session,
-      async stop(): Promise<void> {},
+      async stop(): Promise<Error[]> {
+      return []; // the real client REPORTS cleanup errors; none here
+    },
       resumeSession: async (id: string) => {
         calls.push(id);
         await gate;
@@ -2812,7 +2816,9 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
     return {
       client: {
         createSession: async () => makeSession(),
-        async stop(): Promise<void> {},
+        async stop(): Promise<Error[]> {
+      return []; // the real client REPORTS cleanup errors; none here
+    },
         resumeSession: async (id: string) => {
           resumes.push(id);
           if (resumeGate) {
@@ -3526,8 +3532,9 @@ describe("the phase gate closes before the teardown, not after it", () => {
       const copilot = {
         createSession: async () => fakeSession,
         resumeSession: async () => fakeSession,
-        stop: async () => {
+        stop: async (): Promise<Error[]> => {
           await held;
+          return [];
         },
       } as unknown as CopilotClient;
       const app = DiscordCopilotApp.createForTest(
@@ -4094,7 +4101,9 @@ describe("startup is owned work, and its resumes are owned per thread", () => {
       };
       const copilot = {
         createSession: async () => session,
-        async stop(): Promise<void> {},
+        async stop(): Promise<Error[]> {
+      return []; // the real client REPORTS cleanup errors; none here
+    },
         resumeSession: async (id: string) => {
           resumes.push(id);
           return session;
@@ -4465,6 +4474,222 @@ describe("/end answers exactly once, through the real reclaim path", () => {
       expect(interaction.deferred).toBe(false);
       expect(interaction.replied).toBe(true);
       expect(interaction.answers[0]).toMatch(/關閉中/);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+});
+
+describe("teardown failures the SDK REPORTS rather than throws", () => {
+  it("holds the lock when copilot.stop() fulfils with cleanup errors", async () => {
+    // `CopilotClient.stop()` is `Promise<Error[]>`: it reports a cleanup that
+    // did not work by FULFILLING with a non-empty array, not by rejecting.
+    // Awaiting it for its side effect therefore read every failure as a success
+    // — the armed teardown "proved" it had put the runtime down, and the
+    // coordinator released the single-instance lock over repos a copilot-cli
+    // child might still have been working in.
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const copilot = {
+        createSession: async () => fakeSession,
+        stop: async (): Promise<Error[]> => [new Error("copilot-cli child did not exit")],
+      } as unknown as CopilotClient;
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        copilot,
+        new FakeTransport(),
+        new SessionStore(f),
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let releases = 0;
+      useObservableLock(app, {
+        path: "(test)",
+        release: async () => {
+          releases++;
+        },
+      });
+
+      await expect(app.stop()).rejects.toThrow();
+      expect(releases).toBe(0);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("still releases when copilot.stop() fulfils with an EMPTY array", async () => {
+    // The success shape of the same contract: an empty array is a clean stop.
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const copilot = {
+        createSession: async () => fakeSession,
+        stop: async (): Promise<Error[]> => [],
+      } as unknown as CopilotClient;
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        copilot,
+        new FakeTransport(),
+        new SessionStore(f),
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let releases = 0;
+      useObservableLock(app, {
+        path: "(test)",
+        release: async () => {
+          releases++;
+        },
+      });
+
+      await app.stop();
+      expect(releases).toBe(1);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("uses the same reported-error check for BOTH armed teardowns", () => {
+    // The narrow arm runs only in the window between the client existing and
+    // the app existing, which no app-level fixture can stand in (the real one
+    // is driven end to end in `app-start-ownership.test.ts`). A source contract
+    // for the pair, so neither can drift back to awaiting `stop()` for its side
+    // effect.
+    const src = readFileSync(join(process.cwd(), "src", "app.ts"), "utf8");
+    expect(src).toMatch(/ownership\.arm\(\(\) => stopCopilotClient\(copilot\)\)/);
+    expect(src).toMatch(/await stopCopilotClient\(this\.copilot\)/);
+  });
+});
+
+describe("a runtime that confirms LATE still discharges what it was owed", () => {
+  it("discharges the obligation when a disconnect settles after its bound expired", async () => {
+    // `withTimeout` rejecting says "not yet", not "never": the underlying
+    // `disconnect()` is single-flight and keeps running. Nothing watched it
+    // afterwards, so a runtime that stopped one millisecond past the bound went
+    // on holding the process lock for the whole life of the process.
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-late", sessionId: "sess-late" }));
+      store.commit("t-late");
+      let settle: (() => void) | undefined;
+      const session = {
+        ...fakeSession,
+        disconnect: () =>
+          new Promise<void>((resolve) => {
+            settle = resolve;
+          }),
+      };
+      const copilot = {
+        createSession: async () => session,
+        stop: async (): Promise<Error[]> => [],
+        resumeSession: async () => session,
+      } as unknown as CopilotClient;
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        copilot,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let releases = 0;
+      useObservableLock(app, {
+        path: "(test)",
+        release: async () => {
+          releases++;
+        },
+      });
+      useOwnershipBounds(app, { obligationTimeoutMs: 20 });
+      (app as unknown as { resumeTeardownTimeoutMs: number }).resumeTeardownTimeoutMs = 20;
+      setChannelFetch(app, async () => visibleThread);
+
+      // The resume works at the runtime and then cannot be written down, so the
+      // actor is discarded — and its disconnect does not answer in time.
+      const commit = vi.spyOn(store, "commit").mockReturnValue(false);
+      try {
+        await reconcileReal(app);
+      } finally {
+        commit.mockRestore();
+      }
+      expect(hasRuntimeBarrier(app, "t-late")).toBe(true);
+
+      // A full shutdown cannot confirm it either, so the lock stays held.
+      await app.stop();
+      expect(releases).toBe(0);
+      expect(hasRuntimeBarrier(app, "t-late")).toBe(true);
+
+      // …and then the runtime finally stops, long after every bound.
+      settle?.();
+
+      await vi.waitFor(() => expect(hasRuntimeBarrier(app, "t-late")).toBe(false));
+      await vi.waitFor(() => expect(releases).toBe(1));
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
+  it("does NOT discharge when the late answer is a failure", async () => {
+    // The other half of the contract: a disconnect that eventually REJECTS has
+    // proved nothing, so the lock stays held until this process exits.
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const store = new SessionStore(f);
+      store.reserve(bind({ threadId: "t-latefail", sessionId: "sess-latefail" }));
+      store.commit("t-latefail");
+      let fail: ((e: Error) => void) | undefined;
+      const session = {
+        ...fakeSession,
+        disconnect: () =>
+          new Promise<void>((_resolve, reject) => {
+            fail = reject;
+          }),
+      };
+      const copilot = {
+        createSession: async () => session,
+        stop: async (): Promise<Error[]> => [],
+        resumeSession: async () => session,
+      } as unknown as CopilotClient;
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        copilot,
+        new FakeTransport(),
+        store,
+        new ChannelRegistry("c1", "g1", registryFile)
+      );
+      let releases = 0;
+      useObservableLock(app, {
+        path: "(test)",
+        release: async () => {
+          releases++;
+        },
+      });
+      useOwnershipBounds(app, { obligationTimeoutMs: 20 });
+      (app as unknown as { resumeTeardownTimeoutMs: number }).resumeTeardownTimeoutMs = 20;
+      setChannelFetch(app, async () => visibleThread);
+
+      const commit = vi.spyOn(store, "commit").mockReturnValue(false);
+      try {
+        await reconcileReal(app);
+      } finally {
+        commit.mockRestore();
+      }
+      await app.stop();
+      expect(releases).toBe(0);
+
+      fail?.(new Error("runtime never answered"));
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(hasRuntimeBarrier(app, "t-latefail")).toBe(true);
+      expect(releases).toBe(0);
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });

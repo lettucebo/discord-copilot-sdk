@@ -63,7 +63,7 @@ import path, { join } from "node:path";
 
 import { sendUnlessAborted } from "./core/turn-gate.js";
 import { shouldResetEffort, validateEffort, EFFORT_LEVELS } from "./core/effort.js";
-import { createCopilotClient, checkSdkCompat } from "./copilot/sdk.js";
+import { createCopilotClient, checkSdkCompat, stopCopilotClient } from "./copilot/sdk.js";
 import { PendingInteractionBroker, type PendingView } from "./core/broker.js";
 import {
   SessionActor,
@@ -417,8 +417,36 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-/** Ack the Discord button interaction BEFORE settling the decision. On ack
- *  success the user's decision is delivered; on ack failure the SAFE default
+/**
+ * Await a bounded teardown WITHOUT abandoning the unbounded truth.
+ *
+ * The bound expiring says "not yet", never "never": the underlying disconnect
+ * is single-flight and keeps running. Nothing watched it afterwards, so a
+ * runtime that stopped one millisecond past the bound went on gating the
+ * process lock for the whole life of the process — an obligation that nobody
+ * left could ever discharge. A late SUCCESS discharges by identity; a late
+ * failure has proved nothing and deliberately discharges nothing.
+ */
+function confirmStopped(
+  settling: Promise<unknown>,
+  timeoutMs: number,
+  handle: () => ObligationHandle | undefined
+): Promise<boolean> {
+  return withTimeout(settling, timeoutMs).then(
+    () => true,
+    () => {
+      settling.then(
+        () => handle()?.discharge(),
+        () => {
+          /* still unproven: this runtime goes on gating the lock */
+        }
+      );
+      return false;
+    }
+  );
+}
+
+/** Ack the Discord button interaction BEFORE settling the decision. On ack *  success the user's decision is delivered; on ack failure the SAFE default
  *  (deny) is delivered instead, so an Allow never runs while Discord shows an
  *  error. Pure + exported for unit tests. */
 export async function resolveButtonAck(
@@ -1014,8 +1042,10 @@ export class DiscordCopilotApp {
     // from here, so from here it is something shutdown must put down. Failure is
     // NOT swallowed — an unclosed client is exactly the kind of thing that must
     // gate the lock rather than be logged.
-    if (!ownership.arm(async () => void (await copilot.stop()))) {
-      await copilot.stop().catch(() => {});
+    if (!ownership.arm(() => stopCopilotClient(copilot))) {
+      await stopCopilotClient(copilot).catch((err: unknown) => {
+        console.error("startup: the Copilot client could not be stopped cleanly", err);
+      });
       throw new Error("shutdown began before the Copilot client could be armed for teardown");
     }
     await copilot.start();
@@ -4890,8 +4920,11 @@ export class DiscordCopilotApp {
     console.warn(`resume: discarding the resumed session for ${rec.threadId} — ${why}`);
     const scope = opts.scope;
     if (!scope) {
-      // Startup has no scope: it runs before anything else can be in flight, and
-      // a failure here is retried by the next boot.
+      // NOT startup — startup owns a scope per record now, and every production
+      // caller passes one. This is the defensive tail for a caller that does
+      // not, and it can only ever be best effort: with no scope there is
+      // nothing to hand an obligation to, so an unconfirmed runtime here is
+      // reported and left to the next boot rather than silently believed.
       await withTimeout(actor.disconnect(), this.resumeTeardownTimeoutMs).catch(() => {
         console.warn(`resume: could not confirm the discarded runtime for ${rec.threadId} stopped.`);
       });
@@ -4913,14 +4946,7 @@ export class DiscordCopilotApp {
     }
     const handle = scope.retain(ownKey, {
       describe: () => `a resumed runtime for ${rec.threadId} over ${rec.workDir}`,
-      attempt: async () => {
-        try {
-          await withTimeout(actor.disconnect(), this.resumeTeardownTimeoutMs);
-          return true;
-        } catch {
-          return false;
-        }
-      },
+      attempt: () => confirmStopped(actor.disconnect(), this.resumeTeardownTimeoutMs, () => handle),
     });
     if (!(await handle.attempt())) {
       console.warn(
@@ -5877,14 +5903,7 @@ export class DiscordCopilotApp {
         : runtimeObligationKey(threadId);
       const handle = scope.retain(key, {
         describe: () => `a live session runtime for ${threadId} over ${session.workDir}`,
-        attempt: async () => {
-          try {
-            await withTimeout(session.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
-            return true;
-          } catch {
-            return false;
-          }
-        },
+        attempt: () => confirmStopped(session.actor.disconnect(), TEARDOWN_TIMEOUT_MS, () => handle),
       });
       if (!(await handle.attempt())) {
         console.warn(
@@ -5907,8 +5926,18 @@ export class DiscordCopilotApp {
     } catch {
       /* best effort */
     }
-    await this.copilot.stop().catch(() => {});
+    // A REPORTED cleanup failure is a failure. `CopilotClient.stop()` fulfils
+    // with the errors it hit, so awaiting it for the side effect let a dirty
+    // stop claim success — and the armed teardown's success is exactly what the
+    // coordinator's release conclusion is drawn from. The readiness marker is
+    // still cleared first: that part did work, and leaving it behind would tell
+    // the next start a dead process was ready.
+    let clientStopFailure: unknown;
+    await stopCopilotClient(this.copilot).catch((err: unknown) => {
+      clientStopFailure = err;
+    });
     await clearStartupReady().catch(() => {});
+    if (clientStopFailure !== undefined) throw clientStopFailure;
   }
 }
 
