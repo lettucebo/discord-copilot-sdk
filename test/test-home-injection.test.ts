@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import ts from "typescript";
 import type { CopilotClient } from "@github/copilot-sdk";
 import { DiscordCopilotApp } from "../src/app.js";
 import { ApprovalPolicy } from "../src/core/approval-policy.js";
@@ -101,17 +102,25 @@ function config(reposRoot: string): Config {
   } as unknown as Config;
 }
 
-const fakeCopilot = (): CopilotClient =>
+interface CapturedSessionConfig {
+  readonly skillDirectories?: string[];
+  readonly excludedTools?: string[];
+}
+
+const fakeCopilot = (configs: CapturedSessionConfig[] = []): CopilotClient =>
   ({
-    createSession: async () => ({
-      sessionId: "sentinel-session",
-      on(): void {},
-      async send(): Promise<void> {},
-      async abort(): Promise<boolean> {
-        return true;
-      },
-      async disconnect(): Promise<void> {},
-    }),
+    createSession: async (sessionConfig: CapturedSessionConfig) => {
+      configs.push(sessionConfig);
+      return {
+        sessionId: "sentinel-session",
+        on(): void {},
+        async send(): Promise<void> {},
+        async abort(): Promise<boolean> {
+          return true;
+        },
+        async disconnect(): Promise<void> {},
+      };
+    },
     async stop(): Promise<Error[]> {
       return [];
     },
@@ -323,36 +332,46 @@ describe("createForTest uses what it was injected, and nothing from a real home"
     // `SessionActor.create` call in the orchestrator must spread the ONE method
     // that carries the injected sink and skills home.
     const source = fs.readFileSync(new URL("../src/app.ts", import.meta.url), "utf8");
-    const needle = "SessionActor.create(this.copilot, {";
+    const sourceFile = ts.createSourceFile("app.ts", source, ts.ScriptTarget.Latest, true);
     const spreads: boolean[] = [];
-    for (let at = source.indexOf(needle); at !== -1; at = source.indexOf(needle, at + 1)) {
-      const open = source.indexOf("{", at + needle.length - 1);
-      let depth = 0;
-      let end = open;
-      for (; end < source.length; end++) {
-        const ch = source[end];
-        if (ch === "{") depth++;
-        else if (ch === "}") {
-          depth--;
-          if (depth === 0) break;
-        }
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.expression.getText(sourceFile) === "SessionActor" &&
+        node.expression.name.text === "create"
+      ) {
+        spreads.push(
+          node.arguments.some(
+            (argument) =>
+              ts.isObjectLiteralExpression(argument) &&
+              argument.properties.some(
+                (property) =>
+                  ts.isSpreadAssignment(property) &&
+                  property.expression.getText(sourceFile) === "this.actorSourceOptions()"
+              )
+          )
+        );
       }
-      spreads.push(source.slice(open, end).includes("...this.actorSourceOptions()"));
-    }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
 
     expect(spreads.length).toBeGreaterThanOrEqual(3); // /new, /repo rebind, resume
     expect(spreads.every(Boolean)).toBe(true);
   });
 
-  it("keeps an actor's audit sink and skills home out of the sentinel home", async () => {    sentinel = poisonedHome();
+  it("keeps an actor's audit sink and skills home out of the sentinel home", async () => {
+    sentinel = poisonedHome();
     const before = snapshot(sentinel.home);
 
     const auditLog = new RecordingAuditLog();
+    const sessionConfigs: CapturedSessionConfig[] = [];
     const workingDirectory = path.join(sentinel.injected, "work");
     fs.mkdirSync(workingDirectory, { recursive: true });
 
     const actor = await SessionActor.createForTest(
-      fakeCopilot(),
+      fakeCopilot(sessionConfigs),
       {
         sessionKey: "guard",
         workingDirectory,
@@ -372,8 +391,23 @@ describe("createForTest uses what it was injected, and nothing from a real home"
       }
     );
 
-    expect(actor.hasRepoSkills()).toBe(false);
-    await actor.disconnect();
+    try {
+      expect(actor.hasRepoSkills()).toBe(false);
+      expect(sessionConfigs).toEqual([
+        expect.objectContaining({
+          excludedTools: ["skill"],
+        }),
+      ]);
+      expect(sessionConfigs[0]?.skillDirectories).toBeUndefined();
+      expect(
+        (actor as unknown as { postAudit(text: string): boolean }).postAudit("test audit")
+      ).toBe(true);
+      expect(auditLog.entries).toEqual([
+        expect.objectContaining({ sessionKey: "guard", text: "test audit" }),
+      ]);
+    } finally {
+      await actor.disconnect();
+    }
 
     expect(fs.existsSync(path.join(sentinel.stateDir, "default.audit.jsonl"))).toBe(false);
     expect(snapshot(sentinel.home)).toEqual(before);
