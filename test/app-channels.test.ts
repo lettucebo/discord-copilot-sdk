@@ -279,6 +279,20 @@ afterEach(() => {
 });
 
 describe("/channel", () => {
+  it("rechecks the owner gate inside the extracted handler", async () => {
+    const { app, registry } = harness();
+    const interaction = slash({
+      userId: "99999",
+      channelId: SECONDARY,
+      subcommand: "enable",
+    });
+
+    await cmdChannel(app, asInteraction(interaction));
+
+    expect(textOf(interaction.replies[0])).toBe("Not authorized.");
+    expect(registry.enabledSet()).toEqual(new Set([SEED]));
+  });
+
   it("denies a non-owner through the real dispatch without mutating the registry", async () => {
     const { app, registry } = harness();
     const interaction = strictInteraction({

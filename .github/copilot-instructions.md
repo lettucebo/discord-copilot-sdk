@@ -64,14 +64,28 @@ flowchart LR
 - **`src/index.ts`** — entry: loads `.env`, reports pre-rename leftovers, takes the
   single-instance lock, starts `DiscordCopilotApp`. Also serves `--version` / `--selfcheck`.
 - **`src/app.ts`** (the orchestrator, several thousand lines — by far the largest file in the
-  repo) — owns **inbound** Discord: slash-command *handling*,
+  repo) — owns **inbound** Discord: slash-command *dispatch and authorization routing*,
   button interactions, thread messages, the thread⇄session map, startup reconciliation, worktree
   lifecycle, thread titling, `/queue` and steering. It no longer defines or registers the commands
-  themselves — `onReady` calls `registerCommands` from `platforms/discord/commands.ts`. It imports
+  themselves — `onReady` calls `registerCommands` from `platforms/discord/commands.ts` — and it no
+  longer implements `/channel`: `cmdChannel` is a dependency-wiring delegate to
+  `platforms/discord/channel-command.ts` (`inspectChannelTarget` stays as a one-line delegate
+  because the ownership suite fault-injects a shutdown at that seam). It imports
   discord.js directly; the
   `Transport` seam is for **outbound** UI, not a full abstraction of Discord. Correctness-critical
   logic is factored into exported pure helpers (`resolveButtonAck`, `decisionBindsToChannel`,
   `isOurEndedThread`, `applyYoloToggle`) so it is unit-testable without Discord.
+- **`src/platforms/discord/channel-command.ts`** — sole owner of the `/channel` cluster:
+  `parseChannelRef`, the private-channel visibility guidance, `list` / `enable` / `disable`, the
+  channel-holder scan, and the enable-target inspection (`inspectChannelTarget`, including
+  `REQUIRED_CHANNEL_PERMISSIONS`). It takes an explicit `ChannelCommandContext` — an
+  `AuthContext` + `AuthPolicy` pair that it evaluates with `isOwner` as the ready-path primary
+  gate, the `ChannelRegistry`, a readonly live-session view, a `records()` callback (never a
+  pre-handler snapshot), the Discord client, the configured guild id, `fileDeliveryAvailable()`,
+  the declined message, and the injected target inspector — so the command can touch nothing else.
+  Enable stays
+  ack-before-allow, disable stays persist-first, and both re-read `scope.lostReason()` immediately
+  before the durable write.
 - **`src/platforms/discord/commands.ts`** — sole owner of the slash-command *surface*: the complete
   guild-command payload (`buildCommandRegistrationPayload`, `restrictCommandDefaults`, which hides
   every command from non-admins by default) and the guild-scoped REST v10 registration
@@ -103,7 +117,8 @@ flowchart LR
   record can't let a generation be reused. A resume error is `transient` unless it definitively
   says the session is gone — never lose conversation history on an ambiguous failure.
 - **`src/core/channel-registry.ts` + `platforms/discord/auth.ts` +
-  `platforms/discord/channel-fetch.ts`** — the Discord access model has two independent gates.
+  `platforms/discord/channel-fetch.ts` + `platforms/discord/channel-command.ts`** — the Discord
+  access model has two independent gates.
   `ChannelRegistry` is the durable set where the bot may act; Discord private-channel membership
   controls what the bot can see. Registry v1 migrates to v2 by importing
   `DISCORD_PARENT_CHANNEL_ID` once as an ordinary removable entry. Channel fetches distinguish
