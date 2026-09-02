@@ -1848,6 +1848,103 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
   });
 });
 
+/**
+ * The stop paths of the transaction's middle phases.
+ *
+ * Every one of these ends the rebind between the file-delivery fence and the
+ * map swap, and each has its OWN rollback set — the target checkout, the local
+ * lease, the old incarnation's durable companion row and the fence itself. The
+ * successful and `/end` routes above pin the phases either side of them; these
+ * pin the phases in between, so a rollback cannot be quietly re-homed to the
+ * wrong phase without a failing assertion.
+ */
+describe("applyRebind — the rollback each phase owes", { timeout: 60_000 }, () => {
+  it("undoes the fence, and nothing else, when the target worktree cannot be created", async () => {
+    const { app, store, actor } = harness();
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    // `git worktree add` refuses a path that already exists, which is the
+    // cheapest REAL failure of this phase — no module has to be replaced.
+    fs.mkdirSync(path.dirname(targetWorktree), { recursive: true });
+    fs.writeFileSync(targetWorktree, "in the way");
+    try {
+      const out = await applyRebind(app, { repoPath: repoB, devMode: "worktree" });
+
+      expect(out).toMatch(/無法建立目標 worktree/);
+      expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
+      expect(store.get("t1")).toMatchObject({ sessionId: "s1", repoPath: repoA });
+      expect(staleRebinds(store)).toEqual([]);
+      expect(leases(app).get(leaseKeyOf(repoA))).toBe("t1");
+      expect(actor.resumeFileDeliveryCalls).toEqual([1]);
+    } finally {
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
+  it("puts the old lease back when the target's local lease is taken during the binding proof", async () => {
+    const { app, store, actor } = harness();
+    // The pre-click blocker already refuses a held target; what matters here is
+    // the window AFTER it, which is exactly where this steals the lease.
+    (app as unknown as { bindingCheck: unknown }).bindingCheck = async () => {
+      leases(app).set(leaseKeyOf(repoB), "t-other");
+      return { ok: true };
+    };
+
+    const out = await applyRebind(app, { repoPath: repoB, devMode: "local" });
+
+    expect(out).toMatch(/取走 local 佔用/);
+    expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
+    expect(store.get("t1")).toMatchObject({ sessionId: "s1", repoPath: repoA });
+    expect(leases(app).get(leaseKeyOf(repoA))).toBe("t1");
+    expect(leases(app).get(leaseKeyOf(repoB))).toBe("t-other");
+    expect(actor.resumeFileDeliveryCalls).toEqual([1]);
+  });
+
+  it("withdraws the target worktree AND the old companion row when the reservation cannot be written", async () => {
+    const { app, store, actor } = harness();
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    // The old incarnation's terminal row is written BEFORE `reserve()` replaces
+    // the mutable thread slot, so a failed reservation has to take it back.
+    const reserveSpy = vi.spyOn(store, "reserve").mockReturnValue(false);
+    try {
+      const out = await applyRebind(app, { repoPath: repoB, devMode: "worktree" });
+
+      expect(out).toMatch(/寫入磁碟失敗/);
+      expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
+      expect(store.get("t1")).toMatchObject({ sessionId: "s1", repoPath: repoA });
+      expect(staleRebinds(store)).toEqual([]);
+      expect(leases(app).get(leaseKeyOf(repoA))).toBe("t1");
+      expect(actor.resumeFileDeliveryCalls).toEqual([1]);
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+    } finally {
+      reserveSpy.mockRestore();
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses rather than overwrite a thread whose durable record vanished mid-transaction", async () => {
+    const { app, store, actor } = harness();
+    const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
+    // A live actor with no persist-first record is already unsafe: the rebind
+    // must not replace the only durable pointer its rollback could describe.
+    (app as unknown as { bindingCheck: unknown }).bindingCheck = async () => {
+      store.remove("t1");
+      return { ok: true };
+    };
+    try {
+      const out = await applyRebind(app, { repoPath: repoB, devMode: "worktree" });
+
+      expect(out).toMatch(/耐久記錄/);
+      expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
+      expect(staleRebinds(store)).toEqual([]);
+      expect(leases(app).get(leaseKeyOf(repoA))).toBe("t1");
+      expect(actor.resumeFileDeliveryCalls).toEqual([1]);
+      expect(fs.existsSync(targetWorktree)).toBe(false);
+    } finally {
+      fs.rmSync(path.dirname(targetWorktree), { recursive: true, force: true });
+    }
+  });
+});
+
 
 describe("applyRebind — the process lock", { timeout: 60_000 }, () => {
   it("holds the lock for an unconfirmed retired incarnation, and lets go once a real retry confirms it", async () => {
