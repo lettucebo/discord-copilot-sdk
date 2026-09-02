@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { REST, Routes } from "discord.js";
 import {
   encodePermissionId,
   decodePermissionId,
@@ -13,10 +14,13 @@ import {
   decisionBindsToChannel,
   applyYoloToggle,
   approvalScopeKeys,
-  buildCommandRegistrationPayload,
-  restrictCommandDefaults,
   yoloOnWarning,
 } from "../src/app.js";
+import {
+  buildCommandRegistrationPayload,
+  registerCommands,
+  restrictCommandDefaults,
+} from "../src/platforms/discord/commands.js";
 
 describe("custom-id", () => {
   it("round-trips each action + nonce", () => {
@@ -810,6 +814,31 @@ describe("custom-id", () => {
         required: true,
         choices: undefined,
       });
+    });
+
+    it("registers the characterized payload at the guild-scoped route", async () => {
+      const put = vi.spyOn(REST.prototype, "put").mockResolvedValue(undefined);
+      const setToken = vi.spyOn(REST.prototype, "setToken");
+      const modelIds = ["model-a", "model-b"];
+
+      try {
+        await registerCommands({
+          botToken: "test-token",
+          clientId: "client-id",
+          guildId: "guild-id",
+          modelIds,
+        });
+
+        expect(setToken).toHaveBeenCalledWith("test-token");
+        expect(put).toHaveBeenCalledOnce();
+        expect(put).toHaveBeenCalledWith(
+          Routes.applicationGuildCommands("client-id", "guild-id"),
+          { body: buildCommandRegistrationPayload(modelIds) }
+        );
+      } finally {
+        put.mockRestore();
+        setToken.mockRestore();
+      }
     });
   });
 
