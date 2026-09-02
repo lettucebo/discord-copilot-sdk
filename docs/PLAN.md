@@ -359,7 +359,7 @@ resume 的錯誤。
    Integrations 有個別覆寫，否則沒有人能呼叫指令——即使頻道可見。這與私密頻道模型互補：
    前者限制「誰看得到」，後者限制「看得到的人裡誰能用」。已知支援情境：`isAuthorized` 從不
    要求 allow-listed user 是 Administrator，所以需要啟動期護欄警告（見
-   [`DISCORD-SETUP.md`](DISCORD-SETUP.md#4c-command-permission-defaults-default_member_permissions0) §4c）；程式端護欄已實作為 `restrictCommandDefaults()`（`src/app.ts`），
+   [`DISCORD-SETUP.md`](DISCORD-SETUP.md#4c-command-permission-defaults-default_member_permissions0) §4c）；程式端護欄已實作為 `restrictCommandDefaults()`（`src/platforms/discord/commands.ts`），
    由 `test/discord-routing.test.ts` 涵蓋（見 §13.3）。
 
 **已接受的殘留風險（文件層級）：**

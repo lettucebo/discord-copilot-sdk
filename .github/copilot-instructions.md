@@ -64,12 +64,19 @@ flowchart LR
 - **`src/index.ts`** — entry: loads `.env`, reports pre-rename leftovers, takes the
   single-instance lock, starts `DiscordCopilotApp`. Also serves `--version` / `--selfcheck`.
 - **`src/app.ts`** (the orchestrator, several thousand lines — by far the largest file in the
-  repo) — owns **inbound** Discord: slash commands,
+  repo) — owns **inbound** Discord: slash-command *handling*,
   button interactions, thread messages, the thread⇄session map, startup reconciliation, worktree
-  lifecycle, thread titling, `/queue` and steering. It imports discord.js directly; the
+  lifecycle, thread titling, `/queue` and steering. It no longer defines or registers the commands
+  themselves — `onReady` calls `registerCommands` from `platforms/discord/commands.ts`. It imports
+  discord.js directly; the
   `Transport` seam is for **outbound** UI, not a full abstraction of Discord. Correctness-critical
   logic is factored into exported pure helpers (`resolveButtonAck`, `decisionBindsToChannel`,
   `isOurEndedThread`, `applyYoloToggle`) so it is unit-testable without Discord.
+- **`src/platforms/discord/commands.ts`** — sole owner of the slash-command *surface*: the complete
+  guild-command payload (`buildCommandRegistrationPayload`, `restrictCommandDefaults`, which hides
+  every command from non-admins by default) and the guild-scoped REST v10 registration
+  (`registerCommands`, `Routes.applicationGuildCommands`). The payload is pure and golden-tested in
+  `test/discord-routing.test.ts`, so a command-definition change shows up as a snapshot diff.
 - **`src/core/transport.ts` / `platforms/discord/discord-transport.ts`** — renders assistant
   output + prompts, and owns the decision/choice/plan sinks that feed decisions back. Renders are
   debounced ~1s, serialized per session with a write chain, and epoch-fenced per turn.
