@@ -59,6 +59,9 @@ flowchart LR
   A --> RE["ReconciliationEngine — core/reconciliation-engine.ts"]
   RE --> A
   RE --> ST["SessionStore + reconcile"]
+  A --> RB["RebindCoordinator — core/rebind-coordinator.ts"]
+  RB --> A
+  RB --> ST
   A --> ST
   A --> W["git worktrees"]
   S <--> P["ApprovalPolicy"]
@@ -72,8 +75,10 @@ flowchart LR
   lifecycle, thread titling, `/queue` and steering. For startup/access reconciliation it is the
   **phase/host adapter**, not the orchestrator: it sets the phase, calls
   `reconciliation.reconcileStartup()`, opens the gate, calls `reconciliation.arm()` exactly once,
-  and `disarm()`s on teardown, while the engine owns the pass and all of its retry state. It no
-  longer defines or registers the commands
+  and `disarm()`s on teardown, while the engine owns the pass and all of its retry state. It is
+  the host adapter for repo-rebind in the same sense: it owns the `/repo` confirmation card
+  (`beginRebind`, `publishRebindConfirm`, `rebindCards`) and calls `RebindCoordinator` for the
+  transaction itself. It no longer defines or registers the commands
   themselves — `onReady` calls `registerCommands` from `platforms/discord/commands.ts` — and it no
   longer implements `/channel`: `cmdChannel` is a dependency-wiring delegate to
   `platforms/discord/channel-command.ts` (`inspectChannelTarget` stays as a one-line delegate
@@ -82,6 +87,23 @@ flowchart LR
   `Transport` seam is for **outbound** UI, not a full abstraction of Discord. Correctness-critical
   logic is factored into exported pure helpers (`resolveButtonAck`, `decisionBindsToChannel`,
   `isOurEndedThread`, `applyYoloToggle`) so it is unit-testable without Discord.
+- **`src/core/rebind-coordinator.ts`** — owns the repo-rebind transaction and the state that
+  exists only because one can fail halfway: the per-thread admission set, `staleRebindActors`
+  (the detached incarnations this process could not prove stopped, each strongly holding its
+  actor/root until a confirmed disconnect), and `pendingRebindOlds` (the pre-swap durable
+  companion `/end` must finish). It owns the nine phases over one `RebindTransaction` context,
+  their shared `abandonRebind` rollback, the fallback-primary plans, the retain/retry/discharge
+  machinery and `reclaimStaleRebind`. Its external surface is a handful of domain operations —
+  `blockers`, `apply`, `claimEnd` (returning a `RebindEndClaim` `/end` settles — `settlePendingOld`
+  answers `undefined` when the thread had no pre-swap companion, so "no companion" cannot be
+  spelled as a settled-and-clean outcome nobody proved), `settleDetached`,
+  `reclaimAbandonedRecords`, `hasUnreconciledFallback`, `hasDetachedIncarnations`,
+  `sweepDetachedOnShutdown`, and the read-only `detachedIncarnations()` the ownership suites
+  assert on. Everything it needs from the host lives in ONE `RebindHostPorts` grouped as
+  process / inventory / world, late-bound for the same reason the reconciliation ports are.
+  `SessionActor.create` deliberately stays app-side behind `createReplacementActor`, so a rebind
+  cannot load different skill/audit/quota options than `/new` or resume. It must never import
+  `app.ts`; `LifecycleOwnership` remains the only lock-release authority.
 - **`src/core/reconciliation-engine.ts`** — owns startup reconciliation, the ADR-0002
   access-restoration retry loop and every piece of state behind them: the retry cadence
   (`ACCESS_RETRY_DELAYS_MS`), the single armed timer, the in-flight tick, backoff/idle, the
@@ -153,7 +175,12 @@ flowchart LR
   `copilot/t-<threadId>`, rooted at `~/.discord-copilot-sdk-worktrees` — a *sibling* of the state
   dir, never a child, so no agent's cwd has the trust store as an ancestor. A worktree is removed
   only when git proves it clean; when one is retained, its record is retained with it (the record
-  is the only pointer to that Copilot conversation).
+  is the only pointer to that Copilot conversation). `worktreeOutcomeText` lives here beside the
+  outcomes it names (as `describeBindingProblem` does in `binding.ts`), because `/end`'s reclaim
+  and the rebind coordinator's stale-incarnation reclaim must tell one story about one worktree.
+- **`src/core/session.ts`** — the `Session` shape (one live Discord thread ⇄ Copilot session).
+  It is not in `app.ts` because the rebind coordinator both reads and installs one; `app.ts`
+  re-exports it, so tests keep importing it from there.
 - **`scripts/`** — the bilingual installer/uninstaller. `setup.mjs`, `uninstall.mjs` and
   `scripts/lib/*.mjs` are plain ESM using **Node built-ins only** (they run before `npm install`),
   with logic factored into `scripts/lib/` so it can be unit-tested. `smoke-*.mjs` are manual tools
@@ -189,7 +216,8 @@ the queue from a `void`ed continuation no scope covers.
 conversation up, so its target reservation is removed. A shutdown gave up nothing, so the
 displaced primary is restored under the same CAS the pre-swap rollbacks use. The two are only
 distinguishable *before* teardown runs — it clears the live map and marks every session ended —
-so `applyRebindInner` latches the reason at the first observation instead of re-asking later.
+so `RebindCoordinator`'s first phase latches the reason at the first observation instead of
+re-asking later.
 
 **Fail-closed is the house rule.** For a newly presented approval card: unsupported permissionkinds deny; timeouts and aborts resolve to deny/cancel; `ask_user` throws rather than fabricating
 an answer; a summary that is too long or contains bidi/control characters is auto-denied rather
@@ -386,8 +414,8 @@ pre-construction failure calls `shutdown()` directly. Every throw site in `Disco
 teardown is `teardownResources`, never `stop()` (shutdown *calls* it, so arming `stop()` deadlocks
 its own single-flight), it is bounded, and it is gated before it runs and discharged only when it
 genuinely completes: wedged or failed, the lock stays held. Work that owns a thread runs inside
-`runExclusive`; `/end` **and `applyRebind`** run inside `runTeardown`, because a rebind is a
-teardown-and-replace of one thread — so an access retry for that thread is declined for the
+`runExclusive`; `/end` **and `RebindCoordinator.apply`** run inside `runTeardown`, because a rebind
+is a teardown-and-replace of one thread — so an access retry for that thread is declined for the
 duration, and a nested `/end` is a counted claim. A termination signal sets `process.exitCode`
 rather than forcing an exit: a forced exit orphans a git/SDK child still running under this pid and
 abandons a deferred release that was waiting for it. If nothing can discharge an obligation, the PID

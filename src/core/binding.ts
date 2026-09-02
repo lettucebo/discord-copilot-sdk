@@ -1,6 +1,7 @@
 import path from "node:path";
 import { canonicalPathOr, isGitWorkTreeRoot, isStrictlyInside, pathRelation } from "./repo.js";
 import { repoRootStrict, topLevelStrict } from "./worktree.js";
+import type { TrustedRoot } from "./secure-open.js";
 
 /**
  * How a session's working directory relates to its repo.
@@ -49,6 +50,16 @@ export type BindingProblem =
   | "worktree-owner-unknown";
 
 export type BindingVerdict = { ok: true } | { ok: false; problem: BindingProblem; detail: string };
+
+/** What the host's shared capture-and-prove helper answers.
+ *
+ *  Owned here, beside the verdict it carries, because BOTH long-running
+ *  coordinators consume it (reconciliation resumes a record, the rebind
+ *  coordinator points a replacement at a new target) while the helper itself
+ *  stays with the host that owns the secure-open backend and the approval key. */
+export type ValidatedRootCapture =
+  | { ok: true; trustedRoot?: TrustedRoot; binding: Binding; approvalKey: string }
+  | { ok: false; verdict: Exclude<BindingVerdict, { ok: true }> };
 
 /**
  * Prove — not assume — that a working directory belongs to the repo it claims.

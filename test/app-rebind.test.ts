@@ -5,6 +5,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { DiscordCopilotApp, type Session } from "../src/app.js";
+import type { RebindCoordinator, StaleRebindActor } from "../src/core/rebind-coordinator.js";
 import { SessionStore } from "../src/core/session-store.js";
 import { PendingInteractionBroker } from "../src/core/broker.js";
 import { addWorktree } from "../src/core/worktree.js";
@@ -247,8 +248,16 @@ const sessions = (app: DiscordCopilotApp): Map<string, Session> =>
   (app as unknown as { sessions: Map<string, Session> }).sessions;
 const leases = (app: DiscordCopilotApp): Map<string, string> =>
   (app as unknown as { localLeases: Map<string, string> }).localLeases;
-const staleRebindActors = (app: DiscordCopilotApp): Map<SessionActor, unknown> =>
-  (app as unknown as { staleRebindActors: Map<SessionActor, unknown> }).staleRebindActors;
+/** The rebind coordinator itself. The transaction, its preconditions and the
+ *  detached incarnations it still owns all live there now; the app keeps the
+ *  confirmation card, the sessions map, the leases and the capture/actor
+ *  helpers `/new` and resume share. Reached through the app on purpose — these
+ *  suites assert on the WIRING, so a coordinator built by hand here would pass
+ *  while the app talked to a different one. */
+const rebind = (app: DiscordCopilotApp): RebindCoordinator =>
+  (app as unknown as { rebind: RebindCoordinator }).rebind;
+const staleRebindActors = (app: DiscordCopilotApp): ReadonlyMap<SessionActor, StaleRebindActor> =>
+  rebind(app).detachedIncarnations();
 const staleRebinds = (store: SessionStore): ReturnType<SessionStore["all"]> =>
   (
     store as unknown as {
@@ -256,11 +265,7 @@ const staleRebinds = (store: SessionStore): ReturnType<SessionStore["all"]> =>
     }
   ).staleRebinds();
 const retryStaleRebinds = (app: DiscordCopilotApp): Promise<void> =>
-  (
-    app as unknown as {
-      retryStaleRebindActorsForThread(threadId: string): Promise<void>;
-    }
-  ).retryStaleRebindActorsForThread("t1");
+  rebind(app).settleDetached("t1");
 /** Mirrors `DiscordCopilotApp.leaseKey`: the SAME canonicaliser, case-folded on
  *  Windows ONLY. Using `path.resolve().toLowerCase()` here made the assertions
  *  pass locally and fail on CI twice — once for the case rule on Linux, once
@@ -268,11 +273,7 @@ const retryStaleRebinds = (app: DiscordCopilotApp): Promise<void> =>
 const leaseKeyOf = (p: string): string =>
   process.platform === "win32" ? canonicalPathOr(p).toLowerCase() : canonicalPathOr(p);
 const applyRebind = (app: DiscordCopilotApp, target: { repoPath: string; devMode: DevMode }): Promise<string> =>
-  (
-    app as unknown as {
-      applyRebind(t: string, x: { repoPath: string; devMode: DevMode }): Promise<string>;
-    }
-  ).applyRebind("t1", target);
+  rebind(app).apply("t1", target);
 const beginRebind = (
   app: DiscordCopilotApp,
   interaction: StrictInteraction & StrictInteractionFields,
@@ -292,12 +293,7 @@ const blocker = (
   app: DiscordCopilotApp,
   session: Session,
   target: { repoPath: string; devMode: DevMode }
-): Promise<string | undefined> =>
-  (
-    app as unknown as {
-      rebindBlocker(t: string, s: Session, x: { repoPath: string; devMode: DevMode }): Promise<string | undefined>;
-    }
-  ).rebindBlocker("t1", session, target);
+): Promise<string | undefined> => rebind(app).blockers("t1", session, target);
 
 function endInteraction(): ChatInputCommandInteraction {
   // The STRICT shared fake: it throws `InteractionAlreadyReplied` exactly where
@@ -357,17 +353,15 @@ function useObservableOwnership(
 }
 const staleRebindKey = (b: { threadId: string; sessionId: string; generation: number }): string =>
   `stale-rebind:${b.threadId}:${b.sessionId}:${b.generation}`;
-/** The invariant the two indexes must agree on: anything the app still holds a
- *  strong reference to must also be something the coordinator is owed. An entry
- *  in one and not the other is exactly how a live runtime kept a checkout while
- *  the process lock was free to go. */
+/** The invariant the two indexes must agree on: anything the rebind coordinator
+ *  still holds a strong reference to must also be something the lifecycle
+ *  coordinator is owed. An entry in one and not the other is exactly how a live
+ *  runtime kept a checkout while the process lock was free to go. */
 function assertEveryRetainedRuntimeIsOwed(app: DiscordCopilotApp): void {
   const keys = inspectOwnership(app).obligationKeys();
   for (const entry of staleRebindActors(app).values()) {
-    const binding = (entry as { binding: { threadId: string; sessionId: string; generation: number } })
-      .binding;
-    expect(keys, `retained stale incarnation ${binding.sessionId} is not owed`).toContain(
-      staleRebindKey(binding)
+    expect(keys, `retained stale incarnation ${entry.binding.sessionId} is not owed`).toContain(
+      staleRebindKey(entry.binding)
     );
   }
 }
@@ -404,7 +398,7 @@ afterEach(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-describe("rebindBlocker — the preconditions that protect work", { timeout: 60_000 }, () => {
+describe("RebindCoordinator.blockers — the preconditions that protect work", { timeout: 60_000 }, () => {
   it("refuses while a turn is running", async () => {
     const { app } = harness();
     const s = sessions(app).get("t1")!;
@@ -491,7 +485,7 @@ describe("/end local lease durability", { timeout: 60_000 }, () => {
   });
 });
 
-describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
+describe("RebindCoordinator.apply — the transaction", { timeout: 60_000 }, () => {
   it("moves the lease when going local → local on a DIFFERENT repo", async () => {
     // The first version only released the lease when the TARGET was not local,
     // so this left the thread holding the repo it had just left — blocking every
@@ -589,11 +583,8 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       expect(sessions(app).get("t1")?.actor).toBe(actor as unknown as Session["actor"]);
       expect(store.get("t1")?.sessionId).toBe("s1");
       await vi.waitFor(() => expect(replacementDisconnect).toHaveBeenCalledTimes(2));
-      await vi.waitFor(() =>
-        expect(
-          (app as unknown as { staleRebindActors: Map<SessionActor, unknown> }).staleRebindActors.size
-        ).toBe(0)
-      );
+      await vi.waitFor(() => expect(staleRebindActors(app).size).toBe(0));
+
       expect(fs.existsSync(targetWorktree)).toBe(false);
     } finally {
       commitSpy.mockRestore();
@@ -1243,11 +1234,8 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
       await expect(rebinding).resolves.toMatch(/已結束/);
 
       await vi.waitFor(() => expect(replacementDisconnect).toHaveBeenCalledTimes(2));
-      await vi.waitFor(() =>
-        expect(
-          (app as unknown as { staleRebindActors: Map<SessionActor, unknown> }).staleRebindActors.size
-        ).toBe(0)
-      );
+      await vi.waitFor(() => expect(staleRebindActors(app).size).toBe(0));
+
       expect(sessions(app).get("t1")).toBeUndefined();
       expect(store.get("t1")).toBeUndefined();
       expect(leases(app).get(leaseKeyOf(repoA))).toBeUndefined();
@@ -1858,7 +1846,7 @@ describe("applyRebind — the transaction", { timeout: 60_000 }, () => {
  * pin the phases in between, so a rollback cannot be quietly re-homed to the
  * wrong phase without a failing assertion.
  */
-describe("applyRebind — the rollback each phase owes", { timeout: 60_000 }, () => {
+describe("RebindCoordinator.apply — the rollback each phase owes", { timeout: 60_000 }, () => {
   it("undoes the fence, and nothing else, when the target worktree cannot be created", async () => {
     const { app, store, actor } = harness();
     const targetWorktree = worktreePath(worktreeRoot(), repoB, "t1");
@@ -1946,7 +1934,7 @@ describe("applyRebind — the rollback each phase owes", { timeout: 60_000 }, ()
 });
 
 
-describe("applyRebind — the process lock", { timeout: 60_000 }, () => {
+describe("RebindCoordinator.apply — the process lock", { timeout: 60_000 }, () => {
   it("holds the lock for an unconfirmed retired incarnation, and lets go once a real retry confirms it", async () => {
     // The end-to-end shape of the defect: a NORMAL, successful rebind retires
     // the old actor, its disconnect cannot be confirmed, and the process still
@@ -1971,9 +1959,7 @@ describe("applyRebind — the process lock", { timeout: 60_000 }, () => {
     // The app kept the actor, and the coordinator was told about it.
     expect(staleRebindActors(app).size).toBe(1);
     assertEveryRetainedRuntimeIsOwed(app);
-    const entry = [...staleRebindActors(app).values()][0] as {
-      binding: { threadId: string; sessionId: string; generation: number };
-    };
+    const entry = [...staleRebindActors(app).values()][0]!;
     const key = staleRebindKey(entry.binding);
     expect(inspectOwnership(app).obligationKeys()).toContain(key);
 
