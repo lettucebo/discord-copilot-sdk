@@ -210,6 +210,108 @@ interface StaleRebindTeardown {
   tail: string;
 }
 
+/** The fixed target of one rebind, exactly as the confirmation card approved
+ *  it. Carried as ONE value so no phase can re-derive a different repo or dev
+ *  mode than the operator confirmed. */
+interface RebindTarget {
+  repoPath: string;
+  devMode: DevMode;
+}
+
+/** A rebind phase either hands the transaction its next value or ends the whole
+ *  transaction with the exact message the operator is shown. A stop is never an
+ *  exception: every one of them is a sentence some rollback already earned. */
+type RebindStep<T> = { ok: true; value: T } | { ok: false; message: string };
+
+/** A phase that produces nothing for the next one: `undefined` continues, a
+ *  string ends the transaction with that message. */
+type RebindStop = string | undefined;
+
+/**
+ * The one state value a rebind transaction carries between its phases.
+ *
+ * It holds three different kinds of thing, and the difference is the whole
+ * reason this is a single value rather than a bag of parameters:
+ *
+ *  - the FIXED inputs (`threadId`, `target`, `scope`, the exact old `session`
+ *    object and its snapshot). Decided once, before the first await, and never
+ *    re-derived — re-reading the live map mid-transaction is precisely how a
+ *    phase ends up acting on a session it no longer owns.
+ *  - the FENCES (`ownsOldSession`, `endedByCommand`, `restoreOldFileDelivery`).
+ *    Closures built in the first phase, so the `lostToOperator` latch and the
+ *    file-delivery fence are the SAME ones for every later phase and for the
+ *    shared rollback. Two copies of that latch would answer differently.
+ *  - the ROLLBACK OBLIGATIONS, which are mutable. Each phase records what it
+ *    actually created; that is what lets `abandonRebind` stay one method that
+ *    disposes exactly what exists, instead of one rollback per phase boundary.
+ */
+interface RebindTransaction {
+  readonly threadId: string;
+  readonly target: RebindTarget;
+  readonly scope: TeardownScope;
+  /** The exact session object being replaced. Identity, never thread id: the
+   *  map entry can be swapped underneath this transaction. */
+  readonly session: Session;
+  /** Immutable snapshot of the old session, for the lease restore and for the
+   *  retained-worktree notice that is read AFTER the map swap. */
+  readonly old: Session;
+  readonly branch: string | undefined;
+  /** Where the target checkout is asked for. The PROVEN display path comes back
+   *  from the capture phase and is what gets persisted and handed to the SDK. */
+  readonly requestedWorkDir: string;
+  /** May this transaction still install what it is building? */
+  readonly ownsOldSession: () => boolean;
+  /** Lost to an explicit `/end` rather than to a shutdown. */
+  readonly endedByCommand: () => boolean;
+  /** Lift the pre-transaction file-delivery fence, but only while this
+   *  transaction still owns the old session. */
+  readonly restoreOldFileDelivery: () => void;
+  createdWorktree: boolean;
+  /** A live OS capability on Windows. Whoever holds it must close it or hand it
+   *  to `SessionActor.create`; dropping the reference keeps the root fenced for
+   *  the rest of the process's life. */
+  trustedRoot?: TrustedRoot;
+  targetLeaseHeld: boolean;
+  reservedIdentity?: { sessionId: string; generation: number };
+  /** The primary record this transaction moved aside, kept for the rollback
+   *  that has to put it back. Set only once `reserve()` has actually replaced
+   *  the thread slot, so `abandonRebind` cannot "restore" something that was
+   *  never displaced. */
+  restorablePrevious?: SessionRecord;
+  /** The replacement runtime while THIS transaction still owns it. Cleared at
+   *  the map swap, where ownership passes to the live-session map. */
+  replacementActor?: SessionActor;
+  replacementBinding?: SessionRecord;
+  oldStale?: StaleRebindActor;
+}
+
+/** What the capture phase proved. `workDir` is the display path git accepted,
+ *  not the one that was requested, and it is what gets persisted. */
+interface RebindTargetCapture {
+  workDir: string;
+  approvalKey: string;
+}
+
+/** The durable identity reserved for the replacement, and the record it
+ *  displaced. Returned as one value because every later phase's rollback needs
+ *  the exact triple to CAS against. */
+interface RebindReservation {
+  sessionId: string;
+  generation: number;
+  /** The primary record `reserve()` displaced — the only snapshot a rollback
+   *  may restore. */
+  previous: SessionRecord;
+  /** Carried forward from `previous`: a rebind replaces the SDK conversation,
+   *  not the Discord thread that owns the outbound file quota. */
+  fileDeliveryBytes: number;
+}
+
+/** The replacement runtime, built but not yet owning the thread. */
+interface RebindReplacement {
+  actor: SessionActor;
+  broker: PendingInteractionBroker;
+}
+
 /** The subset of an SDK session the throwaway titler uses. */
 interface TitlerSession {
   sessionId?: string;
@@ -297,6 +399,12 @@ const QUEUE_MAX = 10;
  *  around for five minutes is more likely to be clicked by accident than
  *  answered deliberately. */
 const REBIND_CONFIRM_TIMEOUT_MS = 120_000;
+
+/** What every phase of a rebind transaction says when it discovers the thread
+ *  was ended (by `/end` or by a shutdown) while it was awaiting. Shared so the
+ *  phases cannot drift into telling the operator two different stories about
+ *  the same outcome. */
+const REBIND_ENDED = "⚠️ 這個討論串已結束，改綁已取消。";
 
 /** What a rebind confirmation settles to. */
 type RebindDecision = RebindAction;
@@ -2988,7 +3096,7 @@ export class DiscordCopilotApp {
    */
   private async applyRebind(
     threadId: string,
-    target: { repoPath: string; devMode: DevMode }
+    target: RebindTarget
   ): Promise<string> {
     // One rebind per thread at a time. Everything below is a long chain of
     // awaits (git subprocesses, then an SDK create), and two runs would each
@@ -3273,14 +3381,58 @@ export class DiscordCopilotApp {
     }
   }
 
+  /**
+   * The rebind transaction, as an ordered list of phases over ONE context.
+   *
+   * Each phase owns a checkpoint of the numbered order documented on
+   * `applyRebind`: it re-asks `tx.ownsOldSession()` after its own awaits, and
+   * it records on the transaction whatever it created, so the shared rollback
+   * (`abandonRebind`) can dispose exactly what exists at that moment. A phase
+   * that stops the transaction returns the sentence the operator is shown; it
+   * never throws its own control flow.
+   *
+   * The last step is deliberately NOT awaited here: `commitRebindTransaction`
+   * hands over to the retirement of the old incarnation with no await between
+   * the map swap and the ownership registration of the detached predecessor.
+   */
   private async applyRebindInner(
     threadId: string,
-    target: { repoPath: string; devMode: DevMode },
+    target: RebindTarget,
     scope: TeardownScope
   ): Promise<string> {
+    const started = await this.beginRebindTransaction(threadId, target, scope);
+    if (!started.ok) return started.message;
+    const tx = started.value;
+    const worktree = await this.openRebindTargetWorktree(tx);
+    if (worktree !== undefined) return worktree;
+    const captured = await this.captureRebindTarget(tx);
+    if (!captured.ok) return captured.message;
+    const reserved = await this.reserveRebindTarget(tx, captured.value);
+    if (!reserved.ok) return reserved.message;
+    const replacement = await this.createRebindReplacement(tx, captured.value, reserved.value);
+    if (!replacement.ok) return replacement.message;
+    return this.commitRebindTransaction(tx, captured.value, reserved.value, replacement.value);
+  }
+
+  /**
+   * Phase 1 — re-check everything, fence the old session, and build the context
+   * every later phase mutates.
+   *
+   * The pre-click checks are stale by now, so `rebindBlocker` is asked again.
+   * The file-delivery fence is taken SYNCHRONOUSLY, before that call and before
+   * any git or SDK await: a stale actor must not reserve or send against the
+   * replacement record while this transaction is in flight. That is why the
+   * fence lives in this phase and not in the one that reserves the target —
+   * moving it there would move it past an await.
+   */
+  private async beginRebindTransaction(
+    threadId: string,
+    target: RebindTarget,
+    scope: TeardownScope
+  ): Promise<RebindStep<RebindTransaction>> {
     const session = this.sessions.get(threadId);
-    if (!session) return "⚠️ 這個討論串已經沒有進行中的 session，未改綁。";
-    if (this.endedSessions.has(session)) return "⚠️ 這個討論串已結束，改綁未執行。";
+    if (!session) return { ok: false, message: "⚠️ 這個討論串已經沒有進行中的 session，未改綁。" };
+    if (this.endedSessions.has(session)) return { ok: false, message: "⚠️ 這個討論串已結束，改綁未執行。" };
     /**
      * May this transaction still install what it is building?
      *
@@ -3328,7 +3480,6 @@ export class DiscordCopilotApp {
     const endedByCommand = (): boolean =>
       lostToOperator ??
       (this.endedSessions.has(session) || this.sessions.get(threadId) !== session);
-    const endedRebind = "⚠️ 這個討論串已結束，改綁已取消。";
     // Fence old attachments synchronously, before rebindBlocker or any git/SDK
     // await. A stale actor must not reserve or send against the replacement
     // record while this transaction is in flight.
@@ -3339,196 +3490,88 @@ export class DiscordCopilotApp {
       }
     };
     const stale = await this.rebindBlocker(threadId, session, target);
-    if (!ownsOldSession()) return endedRebind;
+    if (!ownsOldSession()) return { ok: false, message: REBIND_ENDED };
     if (stale) {
       restoreOldFileDelivery();
-      return `${stale}\n（在你確認的這段時間內狀態改變了，因此未改綁。）`;
+      return {
+        ok: false,
+        message: `${stale}\n（在你確認的這段時間內狀態改變了，因此未改綁。）`,
+      };
     }
 
-    const old = { ...session };
-    const branch = target.devMode === "worktree" ? worktreeBranch(threadId) : undefined;
-    const requestedWorkDir =
-      target.devMode === "worktree"
-        ? worktreePath(this.worktreeRootOf(), target.repoPath, threadId)
-        : target.repoPath;
+    return {
+      ok: true,
+      value: {
+        threadId,
+        target,
+        scope,
+        session,
+        old: { ...session },
+        branch: target.devMode === "worktree" ? worktreeBranch(threadId) : undefined,
+        requestedWorkDir:
+          target.devMode === "worktree"
+            ? worktreePath(this.worktreeRootOf(), target.repoPath, threadId)
+            : target.repoPath,
+        ownsOldSession,
+        endedByCommand,
+        restoreOldFileDelivery,
+        createdWorktree: false,
+        targetLeaseHeld: false,
+      },
+    };
+  }
 
-    let createdWorktree = false;
-    let trustedRoot: TrustedRoot | undefined;
-    let reservedIdentity: { sessionId: string; generation: number } | undefined;
-    let replacementActor: SessionActor | undefined;
-    let replacementBinding: SessionRecord | undefined;
-    let oldStale: StaleRebindActor | undefined;
-    /** The primary record this transaction moved aside, kept for the rollback
-     *  that has to put it back. Set only once `reserve()` has actually replaced
-     *  the thread slot, so `abandonEndedRebind` cannot "restore" something that
-     *  was never displaced. */
-    let restorablePrevious: SessionRecord | undefined;
-    let targetLeaseHeld = false;
+  /** Phase 2 — build the TARGET worktree. The old one is not touched yet, so
+   *  every stop here only has to undo what this phase itself created. */
+  private async openRebindTargetWorktree(tx: RebindTransaction): Promise<RebindStop> {
+    const { branch, requestedWorkDir, target } = tx;
     if (target.devMode === "worktree" && branch) {
       try {
         await pruneWorktrees(target.repoPath);
-        if (!ownsOldSession()) return endedRebind;
+        if (!tx.ownsOldSession()) return REBIND_ENDED;
         await addWorktree(target.repoPath, requestedWorkDir, branch);
-        createdWorktree = true;
-        if (!ownsOldSession()) {
+        tx.createdWorktree = true;
+        if (!tx.ownsOldSession()) {
           await removeWorktreeIfClean(target.repoPath, requestedWorkDir, branch).catch(() => "failed" as const);
-          return endedRebind;
+          return REBIND_ENDED;
         }
       } catch (err) {
-        if (!ownsOldSession()) return endedRebind;
-        restoreOldFileDelivery();
+        if (!tx.ownsOldSession()) return REBIND_ENDED;
+        tx.restoreOldFileDelivery();
         return `⚠️ 無法建立目標 worktree（${err instanceof Error ? err.message : String(err)}）。未改綁，原本的設定不變。`;
       }
     }
-    const undoWorktree = async (): Promise<void> => {
-      if (createdWorktree) {
-        await removeWorktreeIfClean(target.repoPath, requestedWorkDir, branch).catch(() => "failed" as const);
-      }
-    };
-    const releaseTargetLease = (): void => {
-      if (!targetLeaseHeld) return;
-      const key = this.leaseKey(target.repoPath);
-      if (this.localLeases.get(key) === threadId) this.localLeases.delete(key);
-      targetLeaseHeld = false;
-    };
-    /** Dispose resources prepared after this transaction lost the old session.
-     *
-     * TWO different losers reach here, and they want opposite things.
-     *
-     * `/end` is the winner and deliberately gave the old conversation up: its
-     * target reservation is REMOVED and the old primary stays gone.
-     *
-     * A shutdown gave up nothing. The old record was moved aside (a stale
-     * companion row) and its thread slot overwritten with the target
-     * reservation, so removing the target alone leaves the thread with NO
-     * resumable primary — the conversation survives only as a terminal
-     * stale-rebind pointer, and the next boot cannot bring it back. The
-     * pre-swap rollbacks above already restore `previous` under the exact CAS;
-     * this does the same, so a signal in the middle of a rebind costs the
-     * operator the rebind and nothing else. */
-    const abandonEndedRebind = async (): Promise<string> => {
-      // The first commit-failure disconnect may have raced `/end` before its
-      // fallback tracker was registered. Flip an existing plan synchronously;
-      // a plan created below is removal-only as well.
-      //
-      // Only for `/end`. A shutdown must NOT turn a restore into a removal: the
-      // owner never gave up the old record, and the next boot is expected to
-      // resume it. Overwriting `/end`'s outcome, or a shutdown's, with the
-      // other's is exactly what this distinction prevents.
-      if (endedByCommand()) this.markFallbackPrimaryEnded(threadId);
-      // Decided ONCE, before any await: `endedByCommand()` reads the live map,
-      // which shutdown's teardown clears, so asking again later would silently
-      // turn "the process is stopping" into "the operator ended it".
-      const givenUpByOperator = endedByCommand();
-      const trackedReplacement =
-        replacementActor === undefined ? undefined : this.staleRebindActors.get(replacementActor);
-      if (trackedReplacement?.fallbackPrimary) {
-        // The fallback owns BOTH the primary reservation and the terminal
-        // tracker. Its cleanup must run through one CAS transaction: removing
-        // the primary here would strand the tracker if its later reconciliation
-        // loses the target or cannot persist.
-        const teardown = await this.disconnectStaleRebindActor(trackedReplacement);
-        releaseTargetLease();
-        return `${endedRebind}${teardown.tail}`;
-      }
+    return undefined;
+  }
 
-      let replacementClosed = true;
-      let replacementDurablyRetained = true;
-      let fallbackPrimaryRetained = false;
-      if (replacementActor) {
-        try {
-          await withTimeout(replacementActor.disconnect(), TEARDOWN_TIMEOUT_MS);
-        } catch {
-          replacementClosed = false;
-          // Retain the actor and root fence until a retry can CONFIRM teardown;
-          // do not let a timed-out `/end` turn it into an invisible writer.
-          if (replacementBinding) {
-            const fallback = this.fallbackPrimaryPlan(
-              replacementBinding,
-              // A shutdown keeps the RESTORE plan: when a later retry finally
-              // confirms this replacement stopped, the old primary comes back
-              // under the target's exact CAS. `/end` gets the removal-only
-              // plan, because it gave the old conversation up on purpose.
-              givenUpByOperator ? undefined : restorablePrevious,
-              givenUpByOperator ? undefined : ownsOldSession,
-              givenUpByOperator
-                ? undefined
-                : () => {
-                    if (oldStale && this.pendingRebindOlds.get(session) === oldStale) {
-                      this.pendingRebindOlds.delete(session);
-                    }
-                  },
-              givenUpByOperator ? undefined : restoreOldFileDelivery
-            );
-            if (givenUpByOperator) this.setFallbackPrimaryRemoval(fallback);
-            const stale = this.staleRebindActor(replacementActor, replacementBinding, true);
-            replacementDurablyRetained = this.retainStaleRebindActor(
-              stale,
-              "rebind-teardown-unconfirmed",
-              // `/end` already claimed the old session. If persistence fails,
-              // retry may remove only this exact target reservation.
-              fallback,
-              scope
-            );
-            fallbackPrimaryRetained = stale.fallbackPrimary !== undefined;
-          } else {
-            // This should be unreachable: a replacement actor is created only
-            // after reserve has produced its immutable binding. Do not close a
-            // root we cannot durably describe.
-            console.warn("rebind: replacement actor lost its durable binding before teardown");
-            replacementDurablyRetained = false;
-          }
-        }
-      } else {
-        await trustedRoot?.close().catch(() => {});
-      }
-      // If the terminal stale row could not be written, the target reservation
-      // is the only crash-surviving pointer to this possibly-live replacement.
-      // Never remove it until teardown is durably represented elsewhere.
-      if (!fallbackPrimaryRetained) {
-        if (reservedIdentity && (replacementClosed || replacementDurablyRetained)) {
-          if (givenUpByOperator || !restorablePrevious) {
-            this.store.removeIfCurrent(threadId, reservedIdentity.sessionId, reservedIdentity.generation);
-          } else {
-            // Shutdown: put the old primary BACK. Removing the target alone
-            // left the thread with no resumable record at all, so the next boot
-            // saw only a terminal stale pointer and the conversation was lost —
-            // for a rebind the operator never even completed. The same CAS the
-            // create-failure path uses, so a newer reservation cannot be
-            // clobbered.
-            const restored = restorablePrevious;
-            const rollback = this.store.restoreIfCurrent(
-              restored,
-              reservedIdentity.sessionId,
-              reservedIdentity.generation
-            );
-            if (rollback.ok) {
-              this.pendingRebindOlds.delete(session);
-              this.store.removeStaleRebind(restored.threadId, restored.sessionId, restored.generation);
-            } else {
-              console.warn(
-                `rebind: could not restore the primary record for ${threadId} after a shutdown; ` +
-                  "leaving the target reservation and the stale companion for reconcile."
-              );
-            }
-          }
-        } else if (reservedIdentity) {
-          console.warn(
-            `rebind: retaining target reservation ${reservedIdentity.sessionId} as fallback after stale ownership write failure`
-          );
-        }
-      }
-      releaseTargetLease();
-      if (replacementClosed) await undoWorktree();
-      if (!replacementClosed && !replacementDurablyRetained) {
-        return (
-          `${endedRebind}\n` +
-          "⚠️ 無法持久化新 runtime 的終止記錄；目標 session 記錄已保留為安全屏障，未完成清理。請重啟 bot 或稍後重試。"
-        );
-      }
-      return endedRebind;
-    };
+  /** Undo the target checkout, and only if this transaction is the thing that
+   *  created it. Safe to call unconditionally for exactly that reason. */
+  private async undoRebindWorktree(tx: RebindTransaction): Promise<void> {
+    if (tx.createdWorktree) {
+      await removeWorktreeIfClean(tx.target.repoPath, tx.requestedWorkDir, tx.branch).catch(
+        () => "failed" as const
+      );
+    }
+  }
 
+  /** Drop the target's local lease, and only while this transaction still holds
+   *  it: after the map swap it belongs to the replacement, not to a rollback. */
+  private releaseRebindTargetLease(tx: RebindTransaction): void {
+    if (!tx.targetLeaseHeld) return;
+    const key = this.leaseKey(tx.target.repoPath);
+    if (this.localLeases.get(key) === tx.threadId) this.localLeases.delete(key);
+    tx.targetLeaseHeld = false;
+  }
+
+  /** Phase 3 — prove the new binding with git before an agent is pointed at it.
+   *
+   *  Ends by taking ownership of the captured root: from here every stop must
+   *  close it, which is why the lease and the reservation live in the next
+   *  phase rather than here. */
+  private async captureRebindTarget(
+    tx: RebindTransaction
+  ): Promise<RebindStep<RebindTargetCapture>> {
+    const { branch, requestedWorkDir, target } = tx;
     let captured;
     try {
       captured = await this.captureValidatedRoot({
@@ -3538,47 +3581,74 @@ export class DiscordCopilotApp {
         branch,
       });
     } catch (err) {
-      if (!ownsOldSession()) return abandonEndedRebind();
-      restoreOldFileDelivery();
-      await undoWorktree();
-      return `⚠️ 無法安全開啟目標工作目錄（${err instanceof Error ? err.message : String(err)}）。未改綁。`;
+      if (!tx.ownsOldSession()) return { ok: false, message: await this.abandonRebind(tx) };
+      tx.restoreOldFileDelivery();
+      await this.undoRebindWorktree(tx);
+      return {
+        ok: false,
+        message: `⚠️ 無法安全開啟目標工作目錄（${err instanceof Error ? err.message : String(err)}）。未改綁。`,
+      };
     }
-    if (!ownsOldSession()) {
-      if (captured.ok) trustedRoot = captured.trustedRoot;
-      return abandonEndedRebind();
+    if (!tx.ownsOldSession()) {
+      if (captured.ok) tx.trustedRoot = captured.trustedRoot;
+      return { ok: false, message: await this.abandonRebind(tx) };
     }
     if (!captured.ok) {
-      restoreOldFileDelivery();
-      await undoWorktree();
-      return `⚠️ 目標綁定無法通過驗證（${describeBindingProblem(captured.verdict.problem)}：${captured.verdict.detail}）。未改綁。`;
+      tx.restoreOldFileDelivery();
+      await this.undoRebindWorktree(tx);
+      return {
+        ok: false,
+        message: `⚠️ 目標綁定無法通過驗證（${describeBindingProblem(captured.verdict.problem)}：${captured.verdict.detail}）。未改綁。`,
+      };
     }
-    trustedRoot = captured.trustedRoot;
-    const workDir = captured.binding.workDir;
-    const approvalKey = captured.approvalKey;
+    tx.trustedRoot = captured.trustedRoot;
+    return {
+      ok: true,
+      value: { workDir: captured.binding.workDir, approvalKey: captured.approvalKey },
+    };
+  }
 
+  /**
+   * Phase 4 — move the local lease, persist the old incarnation, and reserve
+   * the replacement record durably.
+   *
+   * The lease belongs with the reservation and not with the capture: it has to
+   * be taken before the new session exists, and from the first line of this
+   * phase every stop unwinds the same three things — the captured root, the
+   * lease and the target checkout. Splitting them would duplicate that unwind
+   * across a phase boundary.
+   */
+  private async reserveRebindTarget(
+    tx: RebindTransaction,
+    capture: RebindTargetCapture
+  ): Promise<RebindStep<RebindReservation>> {
+    const { old, session, target, threadId } = tx;
     // Take the lease BEFORE the new session exists, so a concurrent
     // `/repo dev local` in another thread cannot slip in between check and create.
     // Release the OLD one first: a local→local move to a DIFFERENT repo would
     // otherwise leave this thread holding the repo it just left, blocking every
     // other thread from it for ever.
     if (target.devMode === "local") {
-      if (!ownsOldSession()) return abandonEndedRebind();
+      if (!tx.ownsOldSession()) return { ok: false, message: await this.abandonRebind(tx) };
       this.releaseLocalLease(threadId);
       const lease = this.acquireLocalLease(target.repoPath, threadId);
       if (!lease.ok) {
-        await trustedRoot?.close().catch(() => {});
-        trustedRoot = undefined;
-        if (!ownsOldSession()) return abandonEndedRebind();
-        restoreOldFileDelivery();
+        await tx.trustedRoot?.close().catch(() => {});
+        tx.trustedRoot = undefined;
+        if (!tx.ownsOldSession()) return { ok: false, message: await this.abandonRebind(tx) };
+        tx.restoreOldFileDelivery();
         this.restoreLeaseFor(threadId, old);
-        await undoWorktree();
-        return `🔒 \`${path.basename(target.repoPath)}\` 剛剛被 <#${lease.holder}> 取走 local 佔用，未改綁。`;
+        await this.undoRebindWorktree(tx);
+        return {
+          ok: false,
+          message: `🔒 \`${path.basename(target.repoPath)}\` 剛剛被 <#${lease.holder}> 取走 local 佔用，未改綁。`,
+        };
       }
-      targetLeaseHeld = true;
-      if (!ownsOldSession()) return abandonEndedRebind();
+      tx.targetLeaseHeld = true;
+      if (!tx.ownsOldSession()) return { ok: false, message: await this.abandonRebind(tx) };
     }
 
-    if (!ownsOldSession()) return abandonEndedRebind();
+    if (!tx.ownsOldSession()) return { ok: false, message: await this.abandonRebind(tx) };
     const sessionId = randomUUID();
     const generation = this.store.nextGeneration();
     const previous = this.store.get(threadId);
@@ -3586,30 +3656,36 @@ export class DiscordCopilotApp {
       // A live actor without its persist-first record is already an unsafe
       // state. Do not overwrite the only possible durable pointer with a
       // replacement whose rollback could not describe the old root.
-      await trustedRoot?.close().catch(() => {});
-      trustedRoot = undefined;
-      restoreOldFileDelivery();
+      await tx.trustedRoot?.close().catch(() => {});
+      tx.trustedRoot = undefined;
+      tx.restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
-      await undoWorktree();
-      return "⚠️ 找不到目前 session 的耐久記錄，為避免遺失舊 runtime／worktree 擁有權，未改綁。";
+      await this.undoRebindWorktree(tx);
+      return {
+        ok: false,
+        message: "⚠️ 找不到目前 session 的耐久記錄，為避免遺失舊 runtime／worktree 擁有權，未改綁。",
+      };
     }
     // A rebind replaces the SDK conversation but not the Discord thread that
     // owns this outbound capability, so retain its conservative quota.
     const fileDeliveryBytes = previous.fileDeliveryBytes;
-    if (!ownsOldSession()) return abandonEndedRebind();
+    if (!tx.ownsOldSession()) return { ok: false, message: await this.abandonRebind(tx) };
     // Persist the old incarnation BEFORE `reserve()` replaces the mutable
     // thread slot. If `/end` wins during target create, this is the durable
     // pointer it terminalizes; it is never a resumable second session.
-    oldStale = this.staleRebindActor(old.actor, previous, true);
+    tx.oldStale = this.staleRebindActor(old.actor, previous, true);
     if (!this.store.retainStaleRebind(previous, "rebind-cleanup-pending")) {
-      await trustedRoot?.close().catch(() => {});
-      trustedRoot = undefined;
-      restoreOldFileDelivery();
+      await tx.trustedRoot?.close().catch(() => {});
+      tx.trustedRoot = undefined;
+      tx.restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
-      await undoWorktree();
-      return "⚠️ 無法持久化舊 session 的改綁清理記錄，未改綁。請檢查磁碟／權限後重試。";
+      await this.undoRebindWorktree(tx);
+      return {
+        ok: false,
+        message: "⚠️ 無法持久化舊 session 的改綁清理記錄，未改綁。請檢查磁碟／權限後重試。",
+      };
     }
-    this.pendingRebindOlds.set(session, oldStale);
+    this.pendingRebindOlds.set(session, tx.oldStale);
     const reserved = this.store.reserve({
       threadId,
       sessionId,
@@ -3622,35 +3698,52 @@ export class DiscordCopilotApp {
       // session started in any other enabled channel then failed `bindingOk` on
       // the next restart and was marked `blocked` — terminal.
       parentChannelId: session.parentChannelId,
-      workDir,
+      workDir: capture.workDir,
       devMode: target.devMode,
       fileDeliveryBytes,
-      branch,
+      branch: tx.branch,
     });
     if (!reserved) {
-      await trustedRoot?.close().catch(() => {});
-      trustedRoot = undefined;
-      if (!ownsOldSession()) return abandonEndedRebind();
+      await tx.trustedRoot?.close().catch(() => {});
+      tx.trustedRoot = undefined;
+      if (!tx.ownsOldSession()) return { ok: false, message: await this.abandonRebind(tx) };
       this.pendingRebindOlds.delete(session);
       this.store.removeStaleRebind(previous.threadId, previous.sessionId, previous.generation);
-      restoreOldFileDelivery();
+      tx.restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
-      await undoWorktree();
-      return "⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未改綁。請檢查磁碟／權限後重試。";
+      await this.undoRebindWorktree(tx);
+      return {
+        ok: false,
+        message: "⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未改綁。請檢查磁碟／權限後重試。",
+      };
     }
-    reservedIdentity = { sessionId, generation };
-    restorablePrevious = previous;
-    replacementBinding = this.store.get(threadId);
+    tx.reservedIdentity = { sessionId, generation };
+    tx.restorablePrevious = previous;
+    tx.replacementBinding = this.store.get(threadId);
+    return { ok: true, value: { sessionId, generation, previous, fileDeliveryBytes } };
+  }
 
+  /** Phase 5 — create the replacement SDK session against the reservation.
+   *
+   *  The OLD session is still live and registered throughout, so a failure here
+   *  restores only the row this attempt reserved and leaves the conversation
+   *  exactly where it was. */
+  private async createRebindReplacement(
+    tx: RebindTransaction,
+    capture: RebindTargetCapture,
+    reservation: RebindReservation
+  ): Promise<RebindStep<RebindReplacement>> {
+    const { old, session, threadId } = tx;
+    const { fileDeliveryBytes, generation, previous, sessionId } = reservation;
     const broker = new PendingInteractionBroker();
     let actor: SessionActor;
     try {
-      if (!ownsOldSession()) return abandonEndedRebind();
+      if (!tx.ownsOldSession()) return { ok: false, message: await this.abandonRebind(tx) };
       actor = await SessionActor.create(this.copilot, {
         sessionKey: threadId,
-        ...(trustedRoot ? { trustedRoot } : {}),
-        workingDirectory: workDir,
-        approvalKey,
+        ...(tx.trustedRoot ? { trustedRoot: tx.trustedRoot } : {}),
+        workingDirectory: capture.workDir,
+        approvalKey: capture.approvalKey,
         model: this.config.DEFAULT_MODEL,
         contextTier: this.config.DEFAULT_CONTEXT_TIER,
         broker,
@@ -3661,12 +3754,12 @@ export class DiscordCopilotApp {
         ...this.fileDeliveryQuotaOptions(threadId, fileDeliveryBytes, sessionId, generation),
         ...this.actorSourceOptions(),
       });
-      replacementActor = actor;
-      trustedRoot = undefined; // ownership transferred to the returned actor
+      tx.replacementActor = actor;
+      tx.trustedRoot = undefined; // ownership transferred to the returned actor
     } catch (err) {
       // `SessionActor.create` owns and closes the captured root on every throw.
-      trustedRoot = undefined;
-      if (!ownsOldSession()) return abandonEndedRebind();
+      tx.trustedRoot = undefined;
+      if (!tx.ownsOldSession()) return { ok: false, message: await this.abandonRebind(tx) };
       // The OLD session is still live and registered — nothing has been swapped
       // yet — restore only the row this attempt reserved. Preserving a larger
       // total keeps a late replacement reservation monotonic, at the cost of
@@ -3676,115 +3769,170 @@ export class DiscordCopilotApp {
         this.pendingRebindOlds.delete(session);
         this.store.removeStaleRebind(previous.threadId, previous.sessionId, previous.generation);
       }
-      if (rollback.ok && !rollback.quotaAdvanced) restoreOldFileDelivery();
+      if (rollback.ok && !rollback.quotaAdvanced) tx.restoreOldFileDelivery();
       this.restoreLeaseFor(threadId, old);
-      await undoWorktree();
-      return (
-        `⚠️ 建立新的 Copilot session 失敗（${err instanceof Error ? err.message : String(err)}）。未改綁，原本的對話仍在。` +
-        (rollback.ok && !rollback.quotaAdvanced
-          ? ""
-          : "\n⚠️ 為避免覆寫較新的檔案配額，原 session 的檔案傳送保持停用。")
-      );
+      await this.undoRebindWorktree(tx);
+      return {
+        ok: false,
+        message:
+          `⚠️ 建立新的 Copilot session 失敗（${err instanceof Error ? err.message : String(err)}）。未改綁，原本的對話仍在。` +
+          (rollback.ok && !rollback.quotaAdvanced
+            ? ""
+            : "\n⚠️ 為避免覆寫較新的檔案配額，原 session 的檔案傳送保持停用。"),
+      };
     }
-    if (!ownsOldSession()) return abandonEndedRebind();
+    return { ok: true, value: { actor, broker } };
+  }
+
+  /**
+   * Phase 6 — commit the reservation and swap the in-memory session.
+   *
+   * Commit and swap are ONE phase because there is no await between them: an
+   * ownership check separates them in the source, and inserting a suspension
+   * point there would create a window in which `/end` could take the thread
+   * after the record went `active` but before anything owned the replacement.
+   *
+   * For the same reason the retirement of the old incarnation is entered
+   * SYNCHRONOUSLY at the end of this method rather than awaited by the caller:
+   * between `sessions.set()` and `retainStaleRebindActor()` the detached
+   * predecessor is owned by nothing, and `/end` reads the map to decide what it
+   * owns.
+   */
+  private async commitRebindTransaction(
+    tx: RebindTransaction,
+    capture: RebindTargetCapture,
+    reservation: RebindReservation,
+    replacement: RebindReplacement
+  ): Promise<string> {
+    const { session, target, threadId } = tx;
+    if (!tx.ownsOldSession()) return this.abandonRebind(tx);
     if (!this.store.commit(threadId)) {
-      let replacementClosed = true;
-      let replacementDurablyRetained = true;
-      try {
-        await withTimeout(actor.disconnect(), TEARDOWN_TIMEOUT_MS);
-      } catch {
-        replacementClosed = false;
-        // A failed commit means this actor never enters `sessions`; retain it
-        // until a confirmed retry releases its root, and only then remove its
-        // target worktree. Otherwise a live SDK process could become invisible
-        // while its working directory is deleted underneath it.
-        if (replacementBinding) {
-          const fallback = this.fallbackPrimaryPlan(
-            replacementBinding,
-            previous,
-            ownsOldSession,
-            () => {
-              if (oldStale && this.pendingRebindOlds.get(session) === oldStale) {
-                this.pendingRebindOlds.delete(session);
-              }
-            },
-            restoreOldFileDelivery
-          );
-          // `/end` can claim the old actor while the initial teardown await is
-          // pending. Install the removal plan BEFORE retain schedules a retry,
-          // so that retry never sees a stale restore callback.
-          if (!ownsOldSession()) this.setFallbackPrimaryRemoval(fallback);
-          replacementDurablyRetained = this.retainStaleRebindActor(
-            this.staleRebindActor(actor, replacementBinding, true),
-            "rebind-teardown-unconfirmed",
-            // The old actor is still current here. If this terminal row cannot
-            // persist, a later confirmed retry may restore only this snapshot
-            // under the target reservation's exact CAS.
-            fallback,
-            scope
-          );
-        } else {
-          console.warn("rebind: commit-failed replacement lost its durable binding before teardown");
-          replacementDurablyRetained = false;
-        }
-      }
-      if (!ownsOldSession()) return abandonEndedRebind();
-      // A failed terminal-row write leaves the target reservation as the only
-      // durable pointer to the replacement. Restoring `previous` would erase
-      // it, so hold that primary barrier until a confirmed retry can clean it.
-      const holdTargetReservation = !replacementClosed && !replacementDurablyRetained;
-      let rollback = { ok: false, quotaAdvanced: false };
-      if (!holdTargetReservation) {
-        rollback = this.store.restoreIfCurrent(previous, sessionId, generation);
-        if (rollback.ok) {
-          this.pendingRebindOlds.delete(session);
-          this.store.removeStaleRebind(previous.threadId, previous.sessionId, previous.generation);
-        }
-      } else {
-        console.warn(
-          `rebind: retaining target reservation ${sessionId} as fallback after stale ownership write failure`
-        );
-      }
-      if (rollback.ok && !rollback.quotaAdvanced) restoreOldFileDelivery();
-      this.restoreLeaseFor(threadId, old);
-      if (replacementClosed) await undoWorktree();
-      return (
-        "⚠️ 無法持久化 session 狀態（commit 失敗），未改綁。請檢查磁碟／權限後重試。" +
-        (rollback.ok && !rollback.quotaAdvanced
-          ? ""
-          : "\n⚠️ 為避免覆寫較新的檔案配額，原 session 的檔案傳送保持停用。") +
-        (replacementClosed
-          ? ""
-          : holdTargetReservation
-            ? "\n⚠️ 無法持久化新 runtime 的終止記錄；目標 session 記錄已保留為安全屏障，未完成清理。請重啟 bot 或稍後重試。"
-            : "\n⚠️ 無法確認新 runtime 已停止；目標 worktree 暫時保留，會在確認停止後再清理。")
-      );
+      return this.rollbackFailedRebindCommit(tx, reservation, replacement);
     }
 
     // Swap. From here the new session owns the thread.
-    if (!ownsOldSession()) return abandonEndedRebind();
-    const replacement: Session = {
-      actor,
-      broker,
+    if (!tx.ownsOldSession()) return this.abandonRebind(tx);
+    const next: Session = {
+      actor: replacement.actor,
+      broker: replacement.broker,
       running: false,
       titled: session.titled,
       titleEpoch: session.titleEpoch,
       queue: [],
-      workDir,
+      workDir: capture.workDir,
       repoPath: target.repoPath,
       devMode: target.devMode,
-      branch,
+      branch: tx.branch,
       parentChannelId: session.parentChannelId,
       hasRunTurn: false,
     };
-    this.sessions.set(threadId, replacement);
-    replacementActor = undefined; // now owned by the live-session map
-    targetLeaseHeld = false; // now owned by the replacement, not this rollback
+    this.sessions.set(threadId, next);
+    tx.replacementActor = undefined; // now owned by the live-session map
+    tx.targetLeaseHeld = false; // now owned by the replacement, not this rollback
     if (target.devMode !== "local") this.releaseLocalLease(threadId);
     // Session-scoped approvals are grants for THIS conversation in THIS repo;
     // carrying them into a different repo would widen a grant the operator never
     // made there.
     this.approvals.clearSession(threadId);
+    return this.retireRebindPredecessor(tx, capture, next);
+  }
+
+  /** The commit failed, so this replacement never enters `sessions`. Retain it
+   *  until a confirmed retry releases its root, and only then remove its target
+   *  worktree: otherwise a live SDK process could become invisible while its
+   *  working directory is deleted underneath it. */
+  private async rollbackFailedRebindCommit(
+    tx: RebindTransaction,
+    reservation: RebindReservation,
+    replacement: RebindReplacement
+  ): Promise<string> {
+    const { old, session, threadId } = tx;
+    const { generation, previous, sessionId } = reservation;
+    let replacementClosed = true;
+    let replacementDurablyRetained = true;
+    try {
+      await withTimeout(replacement.actor.disconnect(), TEARDOWN_TIMEOUT_MS);
+    } catch {
+      replacementClosed = false;
+      // A failed commit means this actor never enters `sessions`; retain it
+      // until a confirmed retry releases its root, and only then remove its
+      // target worktree. Otherwise a live SDK process could become invisible
+      // while its working directory is deleted underneath it.
+      if (tx.replacementBinding) {
+        const fallback = this.fallbackPrimaryPlan(
+          tx.replacementBinding,
+          previous,
+          tx.ownsOldSession,
+          () => {
+            if (tx.oldStale && this.pendingRebindOlds.get(session) === tx.oldStale) {
+              this.pendingRebindOlds.delete(session);
+            }
+          },
+          tx.restoreOldFileDelivery
+        );
+        // `/end` can claim the old actor while the initial teardown await is
+        // pending. Install the removal plan BEFORE retain schedules a retry,
+        // so that retry never sees a stale restore callback.
+        if (!tx.ownsOldSession()) this.setFallbackPrimaryRemoval(fallback);
+        replacementDurablyRetained = this.retainStaleRebindActor(
+          this.staleRebindActor(replacement.actor, tx.replacementBinding, true),
+          "rebind-teardown-unconfirmed",
+          // The old actor is still current here. If this terminal row cannot
+          // persist, a later confirmed retry may restore only this snapshot
+          // under the target reservation's exact CAS.
+          fallback,
+          tx.scope
+        );
+      } else {
+        console.warn("rebind: commit-failed replacement lost its durable binding before teardown");
+        replacementDurablyRetained = false;
+      }
+    }
+    if (!tx.ownsOldSession()) return this.abandonRebind(tx);
+    // A failed terminal-row write leaves the target reservation as the only
+    // durable pointer to the replacement. Restoring `previous` would erase
+    // it, so hold that primary barrier until a confirmed retry can clean it.
+    const holdTargetReservation = !replacementClosed && !replacementDurablyRetained;
+    let rollback = { ok: false, quotaAdvanced: false };
+    if (!holdTargetReservation) {
+      rollback = this.store.restoreIfCurrent(previous, sessionId, generation);
+      if (rollback.ok) {
+        this.pendingRebindOlds.delete(session);
+        this.store.removeStaleRebind(previous.threadId, previous.sessionId, previous.generation);
+      }
+    } else {
+      console.warn(
+        `rebind: retaining target reservation ${sessionId} as fallback after stale ownership write failure`
+      );
+    }
+    if (rollback.ok && !rollback.quotaAdvanced) tx.restoreOldFileDelivery();
+    this.restoreLeaseFor(threadId, old);
+    if (replacementClosed) await this.undoRebindWorktree(tx);
+    return (
+      "⚠️ 無法持久化 session 狀態（commit 失敗），未改綁。請檢查磁碟／權限後重試。" +
+      (rollback.ok && !rollback.quotaAdvanced
+        ? ""
+        : "\n⚠️ 為避免覆寫較新的檔案配額，原 session 的檔案傳送保持停用。") +
+      (replacementClosed
+        ? ""
+        : holdTargetReservation
+          ? "\n⚠️ 無法持久化新 runtime 的終止記錄；目標 session 記錄已保留為安全屏障，未完成清理。請重啟 bot 或稍後重試。"
+          : "\n⚠️ 無法確認新 runtime 已停止；目標 worktree 暫時保留，會在確認停止後再清理。")
+    );
+  }
+
+  /** Phase 7 — retire the old incarnation and answer the operator.
+   *
+   *  Entered with no await after the map swap: the old actor is no longer in
+   *  `sessions`, so ownership must transfer to the stale tracker BEFORE its
+   *  first disconnect await. `/end` can then join this exact operation rather
+   *  than delete the replacement and leave the old root/worktree unowned. */
+  private async retireRebindPredecessor(
+    tx: RebindTransaction,
+    capture: RebindTargetCapture,
+    replacement: Session
+  ): Promise<string> {
+    const { branch, old, session, target, threadId } = tx;
     const ownsReplacement = (): boolean =>
       this.sessions.get(threadId) === replacement && !this.endedSessions.has(replacement);
 
@@ -3792,7 +3940,7 @@ export class DiscordCopilotApp {
     // stale tracker BEFORE its first disconnect await. `/end` can now join this
     // exact operation rather than delete the replacement and leave the old
     // root/worktree unowned.
-    const detachedOld = oldStale;
+    const detachedOld = tx.oldStale;
     if (!detachedOld) {
       // This can only happen after a broken in-memory mutation; fail closed by
       // leaving the replacement active rather than pretending its predecessor
@@ -3808,13 +3956,13 @@ export class DiscordCopilotApp {
     // The obligation is entered BEFORE the teardown attempt below, so a
     // concurrent `stop()` sees it, and `disconnectStaleRebindActor` discharges
     // it by identity once the runtime is confirmed.
-    this.retainStaleRebindActor(detachedOld, "rebind-cleanup-pending", undefined, scope);
+    this.retainStaleRebindActor(detachedOld, "rebind-cleanup-pending", undefined, tx.scope);
     const oldTeardown = await this.disconnectStaleRebindActor(detachedOld);
     if (!oldTeardown.confirmed) this.scheduleStaleRebindRetry(detachedOld);
     // Cleanup happened (or its durable unconfirmed record was installed)
     // BEFORE this fence. Thus a winning `/end` cannot skip old cleanup merely
     // because it removed the replacement from the map while we were awaiting.
-    if (!ownsReplacement()) return endedRebind;
+    if (!ownsReplacement()) return REBIND_ENDED;
     let tail = oldTeardown.tail;
     if (
       !oldTeardown.confirmed &&
@@ -3827,12 +3975,161 @@ export class DiscordCopilotApp {
     return (
       `✅ 已改綁到 \`${path.basename(target.repoPath)}\` · \`${target.devMode}\`` +
       (branch ? `（分支 \`${branch}\`）` : "（直接在 repo 本體上開發）") +
-      `\n📂 工作目錄：\`${workDir}\`\n🧠 這是一段全新的對話，先前的歷史不再沿用。` +
+      `\n📂 工作目錄：\`${capture.workDir}\`\n🧠 這是一段全新的對話，先前的歷史不再沿用。` +
       (target.devMode === "local"
         ? "\n⚠️ local 模式：agent 會直接改這個 repo 的工作區，`/end` 沒有東西可以清除。"
         : "") +
       tail
     );
+  }
+
+  /**
+   * Dispose resources prepared after this transaction lost the old session.
+   *
+   * The one rollback shared by every phase, which is why the transaction
+   * carries its obligations rather than each phase owning them: this method
+   * disposes exactly what has been created so far, whichever phase noticed.
+   *
+   * TWO different losers reach here, and they want opposite things.
+   *
+   * `/end` is the winner and deliberately gave the old conversation up: its
+   * target reservation is REMOVED and the old primary stays gone.
+   *
+   * A shutdown gave up nothing. The old record was moved aside (a stale
+   * companion row) and its thread slot overwritten with the target
+   * reservation, so removing the target alone leaves the thread with NO
+   * resumable primary — the conversation survives only as a terminal
+   * stale-rebind pointer, and the next boot cannot bring it back. The
+   * pre-swap rollbacks above already restore `previous` under the exact CAS;
+   * this does the same, so a signal in the middle of a rebind costs the
+   * operator the rebind and nothing else.
+   */
+  private async abandonRebind(tx: RebindTransaction): Promise<string> {
+    const { session, threadId } = tx;
+    // The first commit-failure disconnect may have raced `/end` before its
+    // fallback tracker was registered. Flip an existing plan synchronously;
+    // a plan created below is removal-only as well.
+    //
+    // Only for `/end`. A shutdown must NOT turn a restore into a removal: the
+    // owner never gave up the old record, and the next boot is expected to
+    // resume it. Overwriting `/end`'s outcome, or a shutdown's, with the
+    // other's is exactly what this distinction prevents.
+    if (tx.endedByCommand()) this.markFallbackPrimaryEnded(threadId);
+    // Decided ONCE, before any await: `endedByCommand()` reads the live map,
+    // which shutdown's teardown clears, so asking again later would silently
+    // turn "the process is stopping" into "the operator ended it".
+    const givenUpByOperator = tx.endedByCommand();
+    const trackedReplacement =
+      tx.replacementActor === undefined ? undefined : this.staleRebindActors.get(tx.replacementActor);
+    if (trackedReplacement?.fallbackPrimary) {
+      // The fallback owns BOTH the primary reservation and the terminal
+      // tracker. Its cleanup must run through one CAS transaction: removing
+      // the primary here would strand the tracker if its later reconciliation
+      // loses the target or cannot persist.
+      const teardown = await this.disconnectStaleRebindActor(trackedReplacement);
+      this.releaseRebindTargetLease(tx);
+      return `${REBIND_ENDED}${teardown.tail}`;
+    }
+
+    let replacementClosed = true;
+    let replacementDurablyRetained = true;
+    let fallbackPrimaryRetained = false;
+    if (tx.replacementActor) {
+      try {
+        await withTimeout(tx.replacementActor.disconnect(), TEARDOWN_TIMEOUT_MS);
+      } catch {
+        replacementClosed = false;
+        // Retain the actor and root fence until a retry can CONFIRM teardown;
+        // do not let a timed-out `/end` turn it into an invisible writer.
+        if (tx.replacementBinding) {
+          const fallback = this.fallbackPrimaryPlan(
+            tx.replacementBinding,
+            // A shutdown keeps the RESTORE plan: when a later retry finally
+            // confirms this replacement stopped, the old primary comes back
+            // under the target's exact CAS. `/end` gets the removal-only
+            // plan, because it gave the old conversation up on purpose.
+            givenUpByOperator ? undefined : tx.restorablePrevious,
+            givenUpByOperator ? undefined : tx.ownsOldSession,
+            givenUpByOperator
+              ? undefined
+              : () => {
+                  if (tx.oldStale && this.pendingRebindOlds.get(session) === tx.oldStale) {
+                    this.pendingRebindOlds.delete(session);
+                  }
+                },
+            givenUpByOperator ? undefined : tx.restoreOldFileDelivery
+          );
+          if (givenUpByOperator) this.setFallbackPrimaryRemoval(fallback);
+          const stale = this.staleRebindActor(tx.replacementActor, tx.replacementBinding, true);
+          replacementDurablyRetained = this.retainStaleRebindActor(
+            stale,
+            "rebind-teardown-unconfirmed",
+            // `/end` already claimed the old session. If persistence fails,
+            // retry may remove only this exact target reservation.
+            fallback,
+            tx.scope
+          );
+          fallbackPrimaryRetained = stale.fallbackPrimary !== undefined;
+        } else {
+          // This should be unreachable: a replacement actor is created only
+          // after reserve has produced its immutable binding. Do not close a
+          // root we cannot durably describe.
+          console.warn("rebind: replacement actor lost its durable binding before teardown");
+          replacementDurablyRetained = false;
+        }
+      }
+    } else {
+      await tx.trustedRoot?.close().catch(() => {});
+    }
+    // If the terminal stale row could not be written, the target reservation
+    // is the only crash-surviving pointer to this possibly-live replacement.
+    // Never remove it until teardown is durably represented elsewhere.
+    if (!fallbackPrimaryRetained) {
+      if (tx.reservedIdentity && (replacementClosed || replacementDurablyRetained)) {
+        if (givenUpByOperator || !tx.restorablePrevious) {
+          this.store.removeIfCurrent(
+            threadId,
+            tx.reservedIdentity.sessionId,
+            tx.reservedIdentity.generation
+          );
+        } else {
+          // Shutdown: put the old primary BACK. Removing the target alone
+          // left the thread with no resumable record at all, so the next boot
+          // saw only a terminal stale pointer and the conversation was lost —
+          // for a rebind the operator never even completed. The same CAS the
+          // create-failure path uses, so a newer reservation cannot be
+          // clobbered.
+          const restored = tx.restorablePrevious;
+          const rollback = this.store.restoreIfCurrent(
+            restored,
+            tx.reservedIdentity.sessionId,
+            tx.reservedIdentity.generation
+          );
+          if (rollback.ok) {
+            this.pendingRebindOlds.delete(session);
+            this.store.removeStaleRebind(restored.threadId, restored.sessionId, restored.generation);
+          } else {
+            console.warn(
+              `rebind: could not restore the primary record for ${threadId} after a shutdown; ` +
+                "leaving the target reservation and the stale companion for reconcile."
+            );
+          }
+        }
+      } else if (tx.reservedIdentity) {
+        console.warn(
+          `rebind: retaining target reservation ${tx.reservedIdentity.sessionId} as fallback after stale ownership write failure`
+        );
+      }
+    }
+    this.releaseRebindTargetLease(tx);
+    if (replacementClosed) await this.undoRebindWorktree(tx);
+    if (!replacementClosed && !replacementDurablyRetained) {
+      return (
+        `${REBIND_ENDED}\n` +
+        "⚠️ 無法持久化新 runtime 的終止記錄；目標 session 記錄已保留為安全屏障，未完成清理。請重啟 bot 或稍後重試。"
+      );
+    }
+    return REBIND_ENDED;
   }
 
   /** Put the local lease back where it was after a failed rebind. */
