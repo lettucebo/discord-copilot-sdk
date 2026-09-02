@@ -3672,7 +3672,7 @@ describe("the phase gate closes before the teardown, not after it", () => {
 });
 
 describe("a rebind is a teardown claim on its thread", () => {
-  /** Drive the claim the way `applyRebind` does, without building a real rebind
+  /** Drive the claim the way `RebindCoordinator.apply` does, without building a real rebind
    *  transaction: the claim, not the git work, is what is under test here. */
   function ownershipOf(app: DiscordCopilotApp): {
     runTeardown(id: string, body: (s: unknown) => Promise<unknown>): Promise<unknown>;
@@ -3838,9 +3838,14 @@ describe("nothing this process started may be dropped unnoticed at shutdown", ()
     const keys = inspectOwnership(app).obligationKeys();
     const stale = (
       app as unknown as {
-        staleRebindActors: Map<unknown, { binding: SessionBinding & { generation: number } }>;
+        rebind: {
+          detachedIncarnations(): ReadonlyMap<
+            unknown,
+            { binding: SessionBinding & { generation: number } }
+          >;
+        };
       }
-    ).staleRebindActors;
+    ).rebind.detachedIncarnations();
     for (const entry of stale.values()) {
       const key = `stale-rebind:${entry.binding.threadId}:${entry.binding.sessionId}:${entry.binding.generation}`;
       expect(keys, `retained stale incarnation ${entry.binding.sessionId} is not owed`).toContain(key);
@@ -4216,8 +4221,9 @@ describe("startup is owned work, and its resumes are owned per thread", () => {
 
 describe("a rebind that loses ownership mid-transaction installs nothing", () => {
   /** Drive the predicate the transaction is built on, at each phase. Every await
-   *  in `applyRebindInner` is already followed by a check of it with that
-   *  phase's own rollback; these prove the check now sees a shutdown too. */
+   *  in `RebindCoordinator`'s phase list is already followed by a check of it
+   *  with that phase's own rollback; these prove the check now sees a shutdown
+   *  too. */
   function ownsProbe(app: DiscordCopilotApp, threadId: string): {
     run(body: (owns: () => boolean) => Promise<void>): Promise<unknown>;
   } {
@@ -4344,9 +4350,11 @@ describe("a rebind that loses ownership mid-transaction installs nothing", () =>
 
       const result = await (
         app as unknown as {
-          applyRebind(id: string, t: { repoPath: string; devMode: string }): Promise<string>;
+          rebind: {
+            apply(id: string, t: { repoPath: string; devMode: string }): Promise<string>;
+          };
         }
-      ).applyRebind("t-rbx", { repoPath: REPO, devMode: "local" });
+      ).rebind.apply("t-rbx", { repoPath: REPO, devMode: "local" });
 
       // Never enters the transaction: no worktree, no SDK session, no store write.
       expect(result).toContain("關閉中");

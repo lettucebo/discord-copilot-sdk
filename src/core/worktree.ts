@@ -239,11 +239,35 @@ export async function inspectWorktree(dir: string, expectBranch?: string): Promi
  *    different branch than the record's: what we promise to keep is not what is
  *    actually checked out, so we refuse and let a human look.
  */
+export type WorktreeRemoval = "removed" | "already-absent" | "kept-dirty" | "kept-detached" | "failed";
+
+/** One honest sentence per worktree-cleanup outcome.
+ *
+ *  Lives beside the operation whose outcomes it names, exactly as
+ *  `describeBindingProblem` lives beside the binding verdict: `/end`'s reclaim
+ *  and the rebind coordinator's stale-incarnation reclaim both report the same
+ *  five outcomes, and two copies of these sentences would drift into telling
+ *  the operator two different stories about one worktree. */
+export function worktreeOutcomeText(r: WorktreeRemoval, dir: string, branch: string): string {
+  switch (r) {
+    case "removed":
+      return `\n🌿 worktree 已清除（分支 \`${branch}\` 保留）。`;
+    case "already-absent":
+      return `\n🌿 worktree \`${dir}\` 已經不存在了（分支 \`${branch}\` 保留）。`;
+    case "kept-dirty":
+      return `\n🌿 worktree **保留**：\`${dir}\` 還有未提交／未追蹤／被忽略的內容（分支 \`${branch}\`）。確認後可自行 \`git worktree remove\`，再用 \`/end thread:<id>\` 重試清除記錄。`;
+    case "kept-detached":
+      return `\n🌿 worktree **保留**：\`${dir}\` 的 HEAD 不是 \`${branch}\`（detached 或換了分支），裡面可能有沒有任何分支指向的 commit。請自行確認後再移除。`;
+    default:
+      return `\n⚠️ 無法移除 worktree \`${dir}\`，請自行檢查。`;
+  }
+}
+
 export async function removeWorktreeIfClean(
   repo: string,
   dir: string,
   expectBranch?: string
-): Promise<"removed" | "already-absent" | "kept-dirty" | "kept-detached" | "failed"> {
+): Promise<WorktreeRemoval> {
   // "The directory is gone" is not a failure, and conflating the two strands
   // records for ever: a caller that keeps the record whenever cleanup != removed
   // can never let go of one whose tree is already absent, because every retry

@@ -886,7 +886,8 @@ explicit skill roots。它不在 CI（需要本機 Copilot 登入），但每次
 - **rebind 舊 incarnation 的雙重所有權帳本**：在可變的主 thread record 被 replacement 覆寫前，先將舊
   immutable `(threadId, sessionId, generation)` binding 寫入 v5 `staleRebinds`，以既有 `blocked`
   terminal state 記錄 `rebind-cleanup-pending`／`rebind-teardown-unconfirmed`。map swap 後，該 actor、
-  captured binding、worktree/branch、owner thread 與 cleanup plan 一起留在 `staleRebindActors`；它的
+  captured binding、worktree/branch、owner thread 與 cleanup plan 一起留在 `staleRebindActors`
+  （2026-09-03 起由 `core/rebind-coordinator.ts` 擁有，見 §19.7）；它的
   trusted root 只有在 disconnect **確認**後才可釋放。`/end`、正常 rebind 收尾與 shutdown join 同一個
   bounded disconnect promise：`/end` 即使已清 replacement，也會處理舊 incarnation；確認後只在 rebind
   preflight 曾證明可清、且 `removeWorktreeIfClean` 再次證明安全時移除 worktree。若仍未確認，terminal
@@ -1059,7 +1060,7 @@ teardown claims、obligations **同時為空**才釋放，且只釋放一次。
 - **`/end` 一定贏**：`cmdEnd` 對兩種形式都用 `runTeardown` 認領整個指令（計數式，所以 stale 路徑可再認領
   一次）。claim 在指令自己的第一個 await 之前就同步成立，於是 retry 的 `runExclusive` 被拒絕；已經在飛的
   attempt 則在 fence 撞上 `lostReason()`。`/end` 用 `scope.joinExclusive()` 有界等待，**沒 settle 就拒絕回收**。
-- **rebind 也是一次 teardown**：`applyRebind` 同樣跑在 `runTeardown(threadId)` 內。它會停掉舊 runtime、
+- **rebind 也是一次 teardown**：`RebindCoordinator.apply()` 同樣跑在 `runTeardown(threadId)` 內。它會停掉舊 runtime、
   可能留下沒人證明停止的 detached incarnation、並決定一個 worktree 的去留——這正是 teardown 的定義。
   因此 rebind 進行中，該 thread 的 access retry 會被拒絕；巢狀的 `/end` 是計數 claim，安全。
 - **shutdown 一定贏**：`app.stop()` **同步**關上 phase gate（`shuttingDown` + `phase`）之後才叫
@@ -1232,8 +1233,28 @@ engine 需要的東西全部走**一個** `ReconciliationPorts`（依角色分�
 engine 必須用**同一個**答案回答「這個 runtime 真的停了嗎」，兩份會漂移；兩者都借用該模組唯一那個
 已 `unref` 的 timer site（`lifecycle-ownership.test.ts` 的 source 契約要求全檔只有一處 `setTimeout(`）。
 
-**仍未做**：`app.ts` 依然很大（inbound 指令、rebind、worktree 生命週期、titling 都還在裡面）。
-下一刀不應該再切所有權，也不應該再切 reconciliation——這兩刀都切完了。（此處刻意不記行數：那是會隨
+**已做（2026-09-03，issue #34 Phase 2）**：repo-rebind 也照同一刀切開，搬進 deep module
+`src/core/rebind-coordinator.ts`。它擁有整個交易與**只因為 rebind 會半途失敗才存在**的狀態：
+per-thread 的 `rebinding` admission set、`staleRebindActors`（本 process 無法證明已停止的 detached
+incarnation，連同它的 actor／trusted root 一起強引用著）、`pendingRebindOlds`（swap 前那份 durable
+companion，`/end` 必須把它收尾）。九個 phase、共用的 `abandonRebind` rollback、fallback-primary 計畫、
+retain／retry／discharge 機制與 `reclaimStaleRebind` 全在裡面。對外只有少數幾個 domain 操作：
+`blockers()`／`apply()`／`claimEnd()`（回傳 `/end` 用來收尾的 `RebindEndClaim`）／`settleDetached()`／
+`reclaimAbandonedRecords()`／`hasUnreconciledFallback()`／`hasDetachedIncarnations()`／
+`sweepDetachedOnShutdown()`，以及所有權測試唯一誠實的觀測點 `detachedIncarnations()`（唯讀）。
+所需的一切走**一個** `RebindHostPorts`（同樣分成 `process`／`inventory`／`world`、同樣晚繫結）。
+
+刻意**留在 `app.ts`** 的：`/repo` 確認卡（`beginRebind`／`publishRebindConfirm`／`rebindCards`，那是
+inbound Discord UI）、`sessions`／`endedSessions`／`localLeases`／`store`／`captureValidatedRoot`
+（`/new`、resume 也共用），以及 `SessionActor.create`——第三個 create site 必須跟 `/new`、resume 展開
+同一份 `actorSourceOptions()`／`fileDeliveryQuotaOptions()`，所以它以 `createReplacementActor` port
+的形式留在 app 端。`worktreeOutcomeText` 則下沉到 `core/worktree.ts`（與 `binding.ts` 的
+`describeBindingProblem` 同一個道理）：`/end` 的 reclaim 與 rebind 的 stale reclaim 必須對同一棵
+worktree 講同一句話。`Session` 型別移到 `core/session.ts` 並由 `app.ts` re-export，這樣 coordinator
+不必為了描述自己的輸入而 import 整個 orchestrator。
+
+**仍未做**：`app.ts` 依然不小（inbound 指令、`/new`、worktree 生命週期、titling 都還在裡面）。
+下一刀不應該再切所有權、reconciliation 或 rebind——這三刀都切完了。（此處刻意不記行數：那是會隨
 每次改動就過期的數字，`git diff --stat main...HEAD -- src/app.ts` 隨時可以得到當下的真值。）
 
 測試側則**刻意不合併** fixture 樣板。每個案例在 copilot（fake／gated／resume 失敗／commit spy）、

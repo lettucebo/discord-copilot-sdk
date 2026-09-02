@@ -4,7 +4,7 @@ import {
   describeBindingProblem,
   validateBinding,
   type Binding,
-  type BindingVerdict,
+  type ValidatedRootCapture,
 } from "./binding.js";
 import {
   confirmStopped,
@@ -95,12 +95,10 @@ export interface ReconcileAttemptOpts {
  *  it EXACTLY: they retain and discharge the same barrier for one thread. */
 export const runtimeObligationKey = (threadId: string): string => `runtime:${threadId}`;
 
-/** What the app's shared capture-and-prove helper answers. Owned here because
- *  the engine consumes it; the app also uses the same shape for `/new` and
- *  rebind, which is precisely why it stays an app-side helper. */
-export type ValidatedRootCapture =
-  | { ok: true; trustedRoot?: TrustedRoot; binding: Binding; approvalKey: string }
-  | { ok: false; verdict: Exclude<BindingVerdict, { ok: true }> };
+/** What the app's shared capture-and-prove helper answers. Defined in
+ *  `binding.ts` now that the rebind coordinator consumes the same shape; the
+ *  helper itself stays app-side because `/new`, resume and rebind share it. */
+export type { ValidatedRootCapture } from "./binding.js";
 
 /** One resumed runtime, before the app registers it as a live session. The
  *  broker is created by the same app-side step that creates the actor, so a
