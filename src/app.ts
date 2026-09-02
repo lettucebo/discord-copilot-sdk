@@ -209,6 +209,64 @@ interface TitlerSession {
   disconnect?: () => Promise<unknown>;
 }
 
+/** Every new session is isolated. `local` is reachable only through an explicit
+ *  `/repo dev local` in the thread — a config key that made it the default for
+ *  every new thread would be the same hazard with a longer fuse, since it
+ *  silently opts every future session into editing the operator's own checkout. */
+const NEW_SESSION_DEV_MODE: DevMode = "worktree";
+
+/** The fixed inputs of `/new`'s owned transaction, decided by `cmdNew`'s guards
+ *  before the first phase runs. Carried as ONE value so no phase can re-derive a
+ *  different parent or repo than the guards approved. */
+interface NewSessionRequest {
+  interaction: ChatInputCommandInteraction;
+  /** The inbound claim every phase re-asks before it creates anything. */
+  scope: OwnedScope;
+  parentChannelId: string;
+  repoPath: string;
+  /** `/new prompt:` — names the thread up front and runs the first turn at the
+   *  end, so it crosses the whole transaction. */
+  promptOption: string | null;
+}
+
+/** The Discord thread `/new` has already created, together with the best-effort
+ *  rollback that undoes it. The two travel as one value because from the moment
+ *  the thread exists, no later phase may abandon it silently. */
+interface NewSessionThread {
+  id: string;
+  drop: () => Promise<void>;
+}
+
+/** The caller-assigned durable identity, allocated BEFORE the worktree and the
+ *  runtime so a crash between reservation and creation leaves an identifiable id
+ *  on disk rather than a live runtime session nobody knows about. */
+interface NewSessionIdentity {
+  sessionId: string;
+  generation: number;
+  fileDeliveryBytes: number;
+}
+
+/** This session's own checkout, plus the ONLY rollback later phases may use:
+ *  `abort` undoes the worktree AND the thread and then answers the operator.
+ *  Nothing below may drop the worktree on its own — a checkout the operator was
+ *  told does not exist is unreachable, since `/end` only works on a LIVE
+ *  session. */
+interface NewSessionWorktree {
+  branch: string;
+  workDir: string;
+  abort: (msg: string) => Promise<void>;
+}
+
+/** What survives capture → binding proof → final gates → durable reservation.
+ *  `workDir` is the proven display path that gets persisted and handed to the
+ *  SDK; `trustedRoot` is a live OS capability on Windows whose ownership now
+ *  belongs to the caller — it must reach `SessionActor.create()` or be closed. */
+interface NewSessionReservation {
+  trustedRoot?: TrustedRoot;
+  workDir: string;
+  approvalKey: string;
+}
+
 function ephemeralReply(content: string): {
   content: string;
   flags: MessageFlags.Ephemeral;
@@ -1634,340 +1692,438 @@ export class DiscordCopilotApp {
     }
     this.creating = true;
     try {
-      // Everything below crosses several awaits, and `/channel disable` can
-      // land in any of those gaps: it checks for live sessions, sees none (this
-      // one has no record yet), and revokes. Recheck the TARGET channel before
-      // creating the thread and before reserving the record, or this session
-      // could be created under a channel the operator had already revoked and
-      // become terminally `blocked` on the next restart.
-      //
-      // This deliberately does NOT use the registry's GLOBAL epoch. An enable
-      // or disable for a completely unrelated channel must not abort a valid
-      // `/new` here, then falsely tell the operator THIS channel was disabled.
-      // The authorization question is only whether THIS parent is enabled now.
-      const stillEnabled = (): boolean => this.channels.has(parentChannelId);
-      // The same question about the PROCESS rather than the channel, asked at
-      // the same points. `/new` builds a Discord thread, a git worktree, a root
-      // capability, an SDK session and a durable record, and a signal can land
-      // in any of those gaps: without this it would finish building all of it
-      // into a process that is going away, leaving a thread, a checkout and a
-      // `creating` row nobody is left to reconcile.
-      const lost = (): string | undefined => scope.lostReason();
-      const parentResult = await fetchChannelSafe(this.discord, parentChannelId);
-      if (lost()) {
-        await interaction.editReply(INBOUND_DECLINED);
-        return;
-      }
-      if (parentResult.kind !== "ok") {
-        const reason =
-          parentResult.kind === "gone"
-            ? "頻道不存在"
-            : parentResult.kind === "no-access"
-              ? "bot 沒有 View Channel 權限"
-              : parentResult.error instanceof Error
-                ? parentResult.error.message
-                : String(parentResult.error);
-        await interaction.editReply(`⚠️ 無法讀取頻道 <#${parentChannelId}>：${reason}`);
-        return;
-      }
-      const parent = parentResult.channel as { type?: number };
-      if (!parent || parent.type !== ChannelType.GuildText) {
-        await interaction.editReply("Parent channel is not a text channel.");
-        return;
-      }
-      if (!stillEnabled()) {
-        await interaction.editReply(
-          `⚠️ <#${parentChannelId}> 在這期間被停用了，沒有建立 session。`
-        );
-        return;
-      }
-
-      // Name the thread from its first prompt when /new already carries one;
-      // otherwise a timestamp holds the slot until the first message arrives.
-      // No ordinal prefix: Discord orders a channel's threads by creation
-      // (verified live 2026-07-28), so a number would only eat sidebar width.
-      const promptOption = interaction.options.getString("prompt");
-      const stamp = new Date().toISOString().slice(5, 16).replace("T", " ");
-      const threadName = (promptOption ? deriveThreadTitle(promptOption) : "") || `copilot ${stamp}`;
-
-      let thread;
-      try {
-        thread = await (parent as TextChannel).threads.create({
-          name: threadName.slice(0, THREAD_NAME_MAX),
-          autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
-        });
-      } catch (err) {
-        // Almost always a missing Create Public Threads / Send Messages in
-        // Threads permission in a newly enabled channel. Say so here rather than
-        // leaving the deferred reply spinning forever.
-        await interaction.editReply(
-          `⚠️ 無法在 <#${parentChannelId}> 建立討論串：${err instanceof Error ? err.message : String(err)}\n` +
-            "常見原因是 bot 在該頻道缺少 `Create Public Threads` 或 `Send Messages in Threads`。"
-        );
-        return;
-      }
-      // Best-effort cleanup of the just-created thread on any abort path below,
-      // so a failed /new doesn't litter empty threads.
-      const dropThread = async (): Promise<void> => {
-        await (thread as unknown as { delete?: () => Promise<unknown> }).delete?.().catch(() => {});
-      };
-      // The thread exists now, so from here losing ownership must undo it.
-      if (lost()) {
-        await dropThread();
-        await interaction.editReply(INBOUND_DECLINED);
-        return;
-      }
-      // Reserve-before-create (P2): durably record a `creating` row with a
-      // caller-assigned session id BEFORE calling createSession, so a crash
-      // between the two leaves an identifiable id on disk rather than a live
-      // runtime session nobody knows about.
-      const sessionId = randomUUID();
-      const generation = this.store.nextGeneration();
-      const fileDeliveryBytes = 0;
-
-      // Every new session is isolated. `local` is reachable only through an
-      // explicit `/repo dev local` in the thread — a config key that made it the
-      // default for every new thread would be the same hazard with a longer
-      // fuse, since it silently opts every future session into editing the
-      // operator's own checkout.
-      const devMode: DevMode = "worktree";
-      const branch = worktreeBranch(thread.id);
-      const requestedWorkDir = worktreePath(this.worktreeRootOf(), repoPath, thread.id);
-      let worktreeCreated = false;
-      await pruneWorktrees(repoPath);
-      try {
-        await addWorktree(repoPath, requestedWorkDir, branch);
-        worktreeCreated = true;
-      } catch (err) {
-        await dropThread();
-        await interaction.editReply(
-          `⚠️ 無法為這個 session 建立 git worktree（${err instanceof Error ? err.message : String(err)}）。未建立 session。`
-        );
-        return;
-      }
-      // Every abort path from here on must undo the worktree too, or the
-      // operator is told "未建立 session" while a full checkout (and a branch)
-      // is left on disk with no command able to reach it — /end only works on a
-      // LIVE session. Safe to call unconditionally: a worktree that was just
-      // created is clean by construction, so nothing can be lost.
-      const dropWorktree = async (): Promise<void> => {
-        if (!worktreeCreated) return;
-        await removeWorktreeIfClean(repoPath, requestedWorkDir, branch).catch(() => "failed" as const);
-      };
-      const abort = async (msg: string): Promise<void> => {
-        await dropWorktree();
-        await dropThread();
-        await interaction.editReply(msg);
-      };
-      // A checkout on disk is the most expensive thing this command creates and
-      // the one a shutdown most easily orphans: nothing else can reach it, since
-      // `/end` only works on a LIVE session. `abort` is the existing rollback.
-      if (lost()) {
-        await abort(INBOUND_DECLINED);
-        return;
-      }
-
-      // On Windows capture first, then prove the handle-bound validation path.
-      // POSIX starts a normal session without a root capability because the SDK
-      // only accepts a mutable cwd pathname; it therefore exposes no file tool.
-      let captured;
-      try {
-        captured = await this.captureValidatedRoot({
-          repoPath,
-          workDir: requestedWorkDir,
-          devMode,
-          branch,
-        });
-      } catch (err) {
-        await abort(
-          `⚠️ 無法安全開啟工作目錄（${err instanceof Error ? err.message : String(err)}）。未建立 session。`
-        );
-        return;
-      }
-      if (!captured.ok) {
-        await abort(
-          `⚠️ 無法確認工作目錄歸屬（${describeBindingProblem(captured.verdict.problem)}：${captured.verdict.detail}）。未建立 session。`
-        );
-        return;
-      }
-      const trustedRoot = captured.trustedRoot;
-      const workDir = captured.binding.workDir;
-      const approvalKey = captured.approvalKey;
-
-      // LAST authorization check before anything durable exists. The window from
-      // the first check to here spans a thread creation, a `git worktree add`
-      // and a binding proof — easily seconds — and `/channel disable` cannot see
-      // this session until the record below exists. Checking here is what makes
-      // "a disabled channel never gains a session" true rather than likely.
-      if (!stillEnabled()) {
-        await trustedRoot?.close().catch(() => {});
-        await abort(`⚠️ <#${parentChannelId}> 在這期間被停用了，已回復（討論串與 worktree 都已移除）。`);
-        return;
-      }
-      // …and the same question about the process, at the same point and with the
-      // same rollback. The capture is a real OS handle on Windows; dropping the
-      // reference without closing it would keep the root fenced for the rest of
-      // the process's life.
-      if (lost()) {
-        await trustedRoot?.close().catch(() => {});
-        await abort(INBOUND_DECLINED);
-        return;
-      }
-
-      const reserved = this.store.reserve({
-        threadId: thread.id,
-        sessionId,
-        generation,
-        repoPath,
-        guildId: this.config.DISCORD_GUILD_ID,
+      await this.createNewSession({
+        interaction,
+        scope,
         parentChannelId,
-        workDir,
-        devMode,
-        fileDeliveryBytes,
-        branch,
+        repoPath,
+        promptOption: interaction.options.getString("prompt"),
       });
-      if (!reserved) {
-        await trustedRoot?.close().catch(() => {});
-        await abort("⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未建立新的 session。請檢查磁碟／權限後重試。");
-        return;
-      }
-
-      const broker = new PendingInteractionBroker();
-      let actor: SessionActor;
-      try {
-        actor = await SessionActor.create(this.copilot, {
-          sessionKey: thread.id,
-          ...(trustedRoot ? { trustedRoot } : {}),
-          workingDirectory: workDir,
-          approvalKey,
-          model: this.config.DEFAULT_MODEL,
-          contextTier: this.config.DEFAULT_CONTEXT_TIER,
-          broker,
-          transport: this.transport,
-          policy: this.approvals,
-          generation,
-          createSessionId: sessionId,
-          ...this.fileDeliveryQuotaOptions(thread.id, fileDeliveryBytes, sessionId, generation),
-          ...this.actorSourceOptions(),
-        });
-      } catch (err) {
-        // Create failed. The RPC may or may not have created the assigned id, so
-        // best-effort DELETE it to remove any dormant runtime session (it has no
-        // actor and can never receive a turn, so it can't contend for the tree,
-        // but we don't want it lingering). The record stays `creating` (→
-        // orphaned on restart, fail-closed); no live actor exists, so /new can be
-        // retried.
-        await withTimeout(
-          ((this.copilot as unknown as { deleteSession?: (id: string) => Promise<unknown> }).deleteSession?.(
-            sessionId
-          ) ?? Promise.resolve()) as Promise<unknown>,
-          TEARDOWN_TIMEOUT_MS
-        ).catch(() => {});
-        // The record stays `creating` (→ orphaned on restart, fail-closed), so
-        // keep the worktree: an orphaned row is the operator's to inspect, and
-        // deleting the tree would remove the only evidence of what happened.
-        await dropThread();
-        await interaction.editReply(
-          `⚠️ 建立 session 失敗（${err instanceof Error ? err.message : String(err)}）。請重試 /new。`
-        );
-        return;
-      }
-      // Ownership can be lost between the reservation and the runtime, so ask
-      // once more before promoting anything to `active`. The runtime EXISTS by
-      // now, so this cannot simply return: an unconfirmable disconnect must
-      // become an obligation, exactly as it does everywhere else, or the lock
-      // would be released over a checkout an SDK session may still be in.
-      // The runtime EXISTS from here, so no failure below may simply return.
-      // Registered as an OBLIGATION before the attempt — a concurrent `stop()`
-      // must see it — and attempted once: a confirmed disconnect discharges it,
-      // an unconfirmable one keeps holding the actor, the root capability and
-      // the process lock until a later attempt or a restart confirms it.
-      //
-      // This replaced a `sessions.set()` "fence" on the commit-failure path. A
-      // map entry gates nothing: the coordinator cannot see it, so the lock was
-      // released over a checkout a live SDK session might still have been in,
-      // and it made the live map the only record of a session with no durable
-      // row. The obligation carries the actor itself, so there is one place that
-      // knows, and it is the place the release conclusion is drawn from.
-      const retireCreatedRuntime = async (): Promise<boolean> => {
-        const handle = scope.retain(runtimeObligationKey(thread.id), {
-          describe: () => `a half-created session runtime for ${thread.id} over ${workDir}`,
-          attempt: () => confirmStopped(actor.disconnect(), TEARDOWN_TIMEOUT_MS, () => handle),
-        });
-        return handle.attempt();
-      };
-      const RETAINED_RUNTIME_NOTICE =
-        "⚠️ 無法確認剛建立的 runtime 已關閉。記錄與 worktree 都已保留，" +
-        "bot 也會持續持有單一實例鎖直到確認為止——請重啟 bot。";
-      if (lost()) {
-        if (await retireCreatedRuntime()) {
-          // Nothing durable was promoted, the runtime is proved gone, and the
-          // reservation stays `creating` — fail-closed, reconciled on the next
-          // boot. Keep the worktree with it for the same reason the create
-          // failure above does: the row is the operator's only evidence.
-          await dropThread();
-          await interaction.editReply(INBOUND_DECLINED);
-        } else {
-          await interaction.editReply(`${INBOUND_DECLINED}\n${RETAINED_RUNTIME_NOTICE}`);
-        }
-        return;
-      }
-      // Promote creating→active. A failed commit means the record isn't durable,
-      // so we must NOT run as active — the same situation as above, answered the
-      // same way.
-      if (!this.store.commit(thread.id)) {
-        if (await retireCreatedRuntime()) {
-          await abort("⚠️ 無法持久化 session 狀態（commit 失敗），已取消啟動。請檢查磁碟／權限後重試。");
-        } else {
-          await interaction.editReply(
-            `⚠️ 無法持久化 session 狀態（commit 失敗）。${RETAINED_RUNTIME_NOTICE}`
-          );
-        }
-        return;
-      }
-      const session: Session = {
-        actor,
-        broker,
-        running: false,
-        titled: false,
-        titleEpoch: 0,
-        queue: [],
-        workDir,
-        repoPath,
-        devMode,
-        branch,
-        parentChannelId,
-        hasRunTurn: false,
-      };
-      this.sessions.set(thread.id, session);
-      const live = this.sessions.size;
-      await interaction.editReply(
-        `Started a session in <#${thread.id}>. Send prompts there.` +
-          (live > 1 ? `（目前有 ${live} 個 session 同時進行）` : "") +
-          `\n📁 repo：\`${path.basename(repoPath)}\`` +
-          `\n🌿 這個 session 有自己的 git worktree（分支 \`${branch}\`），與其他 session 的檔案互相隔離。` +
-          `\n（想直接在 repo 本體上開發，在該討論串用 \`/repo dev local\`。）`
-      );
-
-      if (promptOption) {
-        // The reply above is a Discord round trip, and both calls below start
-        // BACKGROUND work: `startTitling` creates its own Copilot session, and
-        // `runTurn` starts an SDK turn. A signal landing in that gap used to
-        // spawn both into a process that was going away — a titler runtime
-        // nobody would tear down, and a turn shutdown would abort a moment
-        // later. The session itself is already registered and durable, so
-        // stopping here leaves nothing half-done: it is simply a session that
-        // has not run its first turn, exactly as if the prompt had been sent one
-        // instant later.
-        if (lost()) return;
-        // Title this the same way a first thread message is titled — the thread
-        // was created with the local heuristic so it is never nameless, and the
-        // model's shorter name replaces it a few seconds later.
-        this.startTitling(thread.id, session, promptOption);
-        void this.runTurn(thread.id, promptOption).catch(() => {});
-      }
     } finally {
       this.creating = false;
+    }
+  }
+
+  /** Whether THIS parent channel is still enabled, asked again before the thread
+   *  is created and again before the record is reserved.
+   *
+   *  Everything inside `/new`'s transaction crosses several awaits, and
+   *  `/channel disable` can land in any of those gaps: it checks for live
+   *  sessions, sees none (this one has no record yet), and revokes. Without the
+   *  rechecks this session could be created under a channel the operator had
+   *  already revoked and become terminally `blocked` on the next restart.
+   *
+   *  This deliberately does NOT use the registry's GLOBAL epoch. An enable or
+   *  disable for a completely unrelated channel must not abort a valid `/new`,
+   *  then falsely tell the operator THIS channel was disabled. The authorization
+   *  question is only whether THIS parent is enabled now. */
+  private newSessionParentEnabled(parentChannelId: string): boolean {
+    return this.channels.has(parentChannelId);
+  }
+
+  /**
+   * `/new`'s owned transaction, run with the global `creating` single-flight
+   * held: parent proof → thread → durable identity → worktree → binding proof
+   * and reservation → runtime, promotion and first turn.
+   *
+   * Each phase answers the operator itself and returns `undefined` when the flow
+   * stops, because from the thread onwards stopping means rolling back what that
+   * phase owns. Alongside the channel question `newSessionParentEnabled` asks,
+   * every phase re-asks `scope.lostReason()` — the same question about the
+   * PROCESS. `/new` builds a Discord thread, a git worktree, a root capability,
+   * an SDK session and a durable record, and a signal can land in any of those
+   * gaps: without it `/new` would finish building all of that into a process
+   * that is going away, leaving a thread, a checkout and a `creating` row nobody
+   * is left to reconcile.
+   */
+  private async createNewSession(req: NewSessionRequest): Promise<void> {
+    const parent = await this.resolveNewSessionParent(req);
+    if (!parent) return;
+    const thread = await this.openNewSessionThread(req, parent);
+    if (!thread) return;
+    // Reserve-before-create (P2): durably record a `creating` row with a
+    // caller-assigned session id BEFORE calling createSession, so a crash
+    // between the two leaves an identifiable id on disk rather than a live
+    // runtime session nobody knows about.
+    const identity: NewSessionIdentity = {
+      sessionId: randomUUID(),
+      generation: this.store.nextGeneration(),
+      fileDeliveryBytes: 0,
+    };
+    const worktree = await this.createNewSessionWorktree(req, thread);
+    if (!worktree) return;
+    const reservation = await this.reserveNewSession(req, thread, worktree, identity);
+    if (!reservation) return;
+    await this.startReservedSession(req, thread, worktree, identity, reservation);
+  }
+
+  /** Prove the parent channel exists, is visible, is a text channel and is still
+   *  enabled. Nothing has been created yet, so every stop path here only has to
+   *  answer the deferred reply. */
+  private async resolveNewSessionParent(req: NewSessionRequest): Promise<TextChannel | undefined> {
+    const { interaction, parentChannelId, scope } = req;
+    const parentResult = await fetchChannelSafe(this.discord, parentChannelId);
+    if (scope.lostReason()) {
+      await interaction.editReply(INBOUND_DECLINED);
+      return undefined;
+    }
+    if (parentResult.kind !== "ok") {
+      const reason =
+        parentResult.kind === "gone"
+          ? "頻道不存在"
+          : parentResult.kind === "no-access"
+            ? "bot 沒有 View Channel 權限"
+            : parentResult.error instanceof Error
+              ? parentResult.error.message
+              : String(parentResult.error);
+      await interaction.editReply(`⚠️ 無法讀取頻道 <#${parentChannelId}>：${reason}`);
+      return undefined;
+    }
+    const parent = parentResult.channel as { type?: number };
+    if (!parent || parent.type !== ChannelType.GuildText) {
+      await interaction.editReply("Parent channel is not a text channel.");
+      return undefined;
+    }
+    if (!this.newSessionParentEnabled(parentChannelId)) {
+      await interaction.editReply(
+        `⚠️ <#${parentChannelId}> 在這期間被停用了，沒有建立 session。`
+      );
+      return undefined;
+    }
+    return parent as TextChannel;
+  }
+
+  /** Create the session's thread and hand back the rollback that undoes it. The
+   *  thread is the first thing `/new` leaves behind, so this phase is also where
+   *  losing ownership starts costing something. */
+  private async openNewSessionThread(
+    req: NewSessionRequest,
+    parent: TextChannel
+  ): Promise<NewSessionThread | undefined> {
+    const { interaction, parentChannelId, promptOption, scope } = req;
+    // Name the thread from its first prompt when /new already carries one;
+    // otherwise a timestamp holds the slot until the first message arrives.
+    // No ordinal prefix: Discord orders a channel's threads by creation
+    // (verified live 2026-07-28), so a number would only eat sidebar width.
+    const stamp = new Date().toISOString().slice(5, 16).replace("T", " ");
+    const threadName = (promptOption ? deriveThreadTitle(promptOption) : "") || `copilot ${stamp}`;
+
+    let created;
+    try {
+      created = await parent.threads.create({
+        name: threadName.slice(0, THREAD_NAME_MAX),
+        autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+      });
+    } catch (err) {
+      // Almost always a missing Create Public Threads / Send Messages in
+      // Threads permission in a newly enabled channel. Say so here rather than
+      // leaving the deferred reply spinning forever.
+      await interaction.editReply(
+        `⚠️ 無法在 <#${parentChannelId}> 建立討論串：${err instanceof Error ? err.message : String(err)}\n` +
+          "常見原因是 bot 在該頻道缺少 `Create Public Threads` 或 `Send Messages in Threads`。"
+      );
+      return undefined;
+    }
+    // Best-effort cleanup of the just-created thread on any abort path below,
+    // so a failed /new doesn't litter empty threads.
+    const drop = async (): Promise<void> => {
+      await (created as unknown as { delete?: () => Promise<unknown> }).delete?.().catch(() => {});
+    };
+    // The thread exists now, so from here losing ownership must undo it.
+    if (scope.lostReason()) {
+      await drop();
+      await interaction.editReply(INBOUND_DECLINED);
+      return undefined;
+    }
+    return { id: created.id, drop };
+  }
+
+  /** Give the session its own git worktree, and build the rollback every later
+   *  phase aborts through. */
+  private async createNewSessionWorktree(
+    req: NewSessionRequest,
+    thread: NewSessionThread
+  ): Promise<NewSessionWorktree | undefined> {
+    const { interaction, repoPath, scope } = req;
+    const branch = worktreeBranch(thread.id);
+    const requestedWorkDir = worktreePath(this.worktreeRootOf(), repoPath, thread.id);
+    let worktreeCreated = false;
+    await pruneWorktrees(repoPath);
+    try {
+      await addWorktree(repoPath, requestedWorkDir, branch);
+      worktreeCreated = true;
+    } catch (err) {
+      await thread.drop();
+      await interaction.editReply(
+        `⚠️ 無法為這個 session 建立 git worktree（${err instanceof Error ? err.message : String(err)}）。未建立 session。`
+      );
+      return undefined;
+    }
+    // Every abort path from here on must undo the worktree too, or the
+    // operator is told "未建立 session" while a full checkout (and a branch)
+    // is left on disk with no command able to reach it — /end only works on a
+    // LIVE session. Safe to call unconditionally: a worktree that was just
+    // created is clean by construction, so nothing can be lost.
+    const dropWorktree = async (): Promise<void> => {
+      if (!worktreeCreated) return;
+      await removeWorktreeIfClean(repoPath, requestedWorkDir, branch).catch(() => "failed" as const);
+    };
+    const abort = async (msg: string): Promise<void> => {
+      await dropWorktree();
+      await thread.drop();
+      await interaction.editReply(msg);
+    };
+    // A checkout on disk is the most expensive thing this command creates and
+    // the one a shutdown most easily orphans: nothing else can reach it, since
+    // `/end` only works on a LIVE session. `abort` is the existing rollback.
+    if (scope.lostReason()) {
+      await abort(INBOUND_DECLINED);
+      return undefined;
+    }
+    return { branch, workDir: requestedWorkDir, abort };
+  }
+
+  /** Capture the root, prove the binding, ask both authorization questions one
+   *  last time, and only then write the durable `creating` row.
+   *
+   *  Kept as ONE phase on purpose: the captured capability is a live OS handle
+   *  that this method still owns, so every failure between the capture and a
+   *  successful reservation must close it AND abort. Splitting the gates from
+   *  the reservation would either duplicate that close or move it away from the
+   *  proof it fences. */
+  private async reserveNewSession(
+    req: NewSessionRequest,
+    thread: NewSessionThread,
+    worktree: NewSessionWorktree,
+    identity: NewSessionIdentity
+  ): Promise<NewSessionReservation | undefined> {
+    const { interaction, parentChannelId, repoPath, scope } = req;
+    // On Windows capture first, then prove the handle-bound validation path.
+    // POSIX starts a normal session without a root capability because the SDK
+    // only accepts a mutable cwd pathname; it therefore exposes no file tool.
+    let captured;
+    try {
+      captured = await this.captureValidatedRoot({
+        repoPath,
+        workDir: worktree.workDir,
+        devMode: NEW_SESSION_DEV_MODE,
+        branch: worktree.branch,
+      });
+    } catch (err) {
+      await worktree.abort(
+        `⚠️ 無法安全開啟工作目錄（${err instanceof Error ? err.message : String(err)}）。未建立 session。`
+      );
+      return undefined;
+    }
+    if (!captured.ok) {
+      await worktree.abort(
+        `⚠️ 無法確認工作目錄歸屬（${describeBindingProblem(captured.verdict.problem)}：${captured.verdict.detail}）。未建立 session。`
+      );
+      return undefined;
+    }
+    const trustedRoot = captured.trustedRoot;
+    const workDir = captured.binding.workDir;
+    const approvalKey = captured.approvalKey;
+
+    // LAST authorization check before anything durable exists. The window from
+    // the first check to here spans a thread creation, a `git worktree add`
+    // and a binding proof — easily seconds — and `/channel disable` cannot see
+    // this session until the record below exists. Checking here is what makes
+    // "a disabled channel never gains a session" true rather than likely.
+    if (!this.newSessionParentEnabled(parentChannelId)) {
+      await trustedRoot?.close().catch(() => {});
+      await worktree.abort(
+        `⚠️ <#${parentChannelId}> 在這期間被停用了，已回復（討論串與 worktree 都已移除）。`
+      );
+      return undefined;
+    }
+    // …and the same question about the process, at the same point and with the
+    // same rollback. The capture is a real OS handle on Windows; dropping the
+    // reference without closing it would keep the root fenced for the rest of
+    // the process's life.
+    if (scope.lostReason()) {
+      await trustedRoot?.close().catch(() => {});
+      await worktree.abort(INBOUND_DECLINED);
+      return undefined;
+    }
+
+    const reserved = this.store.reserve({
+      threadId: thread.id,
+      sessionId: identity.sessionId,
+      generation: identity.generation,
+      repoPath,
+      guildId: this.config.DISCORD_GUILD_ID,
+      parentChannelId,
+      workDir,
+      devMode: NEW_SESSION_DEV_MODE,
+      fileDeliveryBytes: identity.fileDeliveryBytes,
+      branch: worktree.branch,
+    });
+    if (!reserved) {
+      await trustedRoot?.close().catch(() => {});
+      await worktree.abort(
+        "⚠️ 無法持久化 session 狀態（寫入磁碟失敗），未建立新的 session。請檢查磁碟／權限後重試。"
+      );
+      return undefined;
+    }
+    return { ...(trustedRoot ? { trustedRoot } : {}), workDir, approvalKey };
+  }
+
+  /** Create the runtime against the reservation, promote creating→active,
+   *  register the live session and start its first turn.
+   *
+   *  The runtime EXISTS from the moment `SessionActor.create()` resolves, so
+   *  unlike every phase above this one cannot simply return: an unconfirmable
+   *  disconnect becomes an OBLIGATION. */
+  private async startReservedSession(
+    req: NewSessionRequest,
+    thread: NewSessionThread,
+    worktree: NewSessionWorktree,
+    identity: NewSessionIdentity,
+    reservation: NewSessionReservation
+  ): Promise<void> {
+    const { interaction, parentChannelId, promptOption, repoPath, scope } = req;
+    const { approvalKey, trustedRoot, workDir } = reservation;
+    const broker = new PendingInteractionBroker();
+    let actor: SessionActor;
+    try {
+      actor = await SessionActor.create(this.copilot, {
+        sessionKey: thread.id,
+        ...(trustedRoot ? { trustedRoot } : {}),
+        workingDirectory: workDir,
+        approvalKey,
+        model: this.config.DEFAULT_MODEL,
+        contextTier: this.config.DEFAULT_CONTEXT_TIER,
+        broker,
+        transport: this.transport,
+        policy: this.approvals,
+        generation: identity.generation,
+        createSessionId: identity.sessionId,
+        ...this.fileDeliveryQuotaOptions(
+          thread.id,
+          identity.fileDeliveryBytes,
+          identity.sessionId,
+          identity.generation
+        ),
+        ...this.actorSourceOptions(),
+      });
+    } catch (err) {
+      // Create failed. The RPC may or may not have created the assigned id, so
+      // best-effort DELETE it to remove any dormant runtime session (it has no
+      // actor and can never receive a turn, so it can't contend for the tree,
+      // but we don't want it lingering). The record stays `creating` (→
+      // orphaned on restart, fail-closed); no live actor exists, so /new can be
+      // retried.
+      await withTimeout(
+        ((this.copilot as unknown as { deleteSession?: (id: string) => Promise<unknown> }).deleteSession?.(
+          identity.sessionId
+        ) ?? Promise.resolve()) as Promise<unknown>,
+        TEARDOWN_TIMEOUT_MS
+      ).catch(() => {});
+      // The record stays `creating` (→ orphaned on restart, fail-closed), so
+      // keep the worktree: an orphaned row is the operator's to inspect, and
+      // deleting the tree would remove the only evidence of what happened.
+      await thread.drop();
+      await interaction.editReply(
+        `⚠️ 建立 session 失敗（${err instanceof Error ? err.message : String(err)}）。請重試 /new。`
+      );
+      return;
+    }
+    // Ownership can be lost between the reservation and the runtime, so ask
+    // once more before promoting anything to `active`. The runtime EXISTS by
+    // now, so this cannot simply return: an unconfirmable disconnect must
+    // become an obligation, exactly as it does everywhere else, or the lock
+    // would be released over a checkout an SDK session may still be in.
+    // The runtime EXISTS from here, so no failure below may simply return.
+    // Registered as an OBLIGATION before the attempt — a concurrent `stop()`
+    // must see it — and attempted once: a confirmed disconnect discharges it,
+    // an unconfirmable one keeps holding the actor, the root capability and
+    // the process lock until a later attempt or a restart confirms it.
+    //
+    // This replaced a `sessions.set()` "fence" on the commit-failure path. A
+    // map entry gates nothing: the coordinator cannot see it, so the lock was
+    // released over a checkout a live SDK session might still have been in,
+    // and it made the live map the only record of a session with no durable
+    // row. The obligation carries the actor itself, so there is one place that
+    // knows, and it is the place the release conclusion is drawn from.
+    const retireCreatedRuntime = async (): Promise<boolean> => {
+      const handle = scope.retain(runtimeObligationKey(thread.id), {
+        describe: () => `a half-created session runtime for ${thread.id} over ${workDir}`,
+        attempt: () => confirmStopped(actor.disconnect(), TEARDOWN_TIMEOUT_MS, () => handle),
+      });
+      return handle.attempt();
+    };
+    const RETAINED_RUNTIME_NOTICE =
+      "⚠️ 無法確認剛建立的 runtime 已關閉。記錄與 worktree 都已保留，" +
+      "bot 也會持續持有單一實例鎖直到確認為止——請重啟 bot。";
+    if (scope.lostReason()) {
+      if (await retireCreatedRuntime()) {
+        // Nothing durable was promoted, the runtime is proved gone, and the
+        // reservation stays `creating` — fail-closed, reconciled on the next
+        // boot. Keep the worktree with it for the same reason the create
+        // failure above does: the row is the operator's only evidence.
+        await thread.drop();
+        await interaction.editReply(INBOUND_DECLINED);
+      } else {
+        await interaction.editReply(`${INBOUND_DECLINED}\n${RETAINED_RUNTIME_NOTICE}`);
+      }
+      return;
+    }
+    // Promote creating→active. A failed commit means the record isn't durable,
+    // so we must NOT run as active — the same situation as above, answered the
+    // same way.
+    if (!this.store.commit(thread.id)) {
+      if (await retireCreatedRuntime()) {
+        await worktree.abort(
+          "⚠️ 無法持久化 session 狀態（commit 失敗），已取消啟動。請檢查磁碟／權限後重試。"
+        );
+      } else {
+        await interaction.editReply(
+          `⚠️ 無法持久化 session 狀態（commit 失敗）。${RETAINED_RUNTIME_NOTICE}`
+        );
+      }
+      return;
+    }
+    const session: Session = {
+      actor,
+      broker,
+      running: false,
+      titled: false,
+      titleEpoch: 0,
+      queue: [],
+      workDir,
+      repoPath,
+      devMode: NEW_SESSION_DEV_MODE,
+      branch: worktree.branch,
+      parentChannelId,
+      hasRunTurn: false,
+    };
+    this.sessions.set(thread.id, session);
+    const live = this.sessions.size;
+    await interaction.editReply(
+      `Started a session in <#${thread.id}>. Send prompts there.` +
+        (live > 1 ? `（目前有 ${live} 個 session 同時進行）` : "") +
+        `\n📁 repo：\`${path.basename(repoPath)}\`` +
+        `\n🌿 這個 session 有自己的 git worktree（分支 \`${worktree.branch}\`），與其他 session 的檔案互相隔離。` +
+        `\n（想直接在 repo 本體上開發，在該討論串用 \`/repo dev local\`。）`
+    );
+
+    if (promptOption) {
+      // The reply above is a Discord round trip, and both calls below start
+      // BACKGROUND work: `startTitling` creates its own Copilot session, and
+      // `runTurn` starts an SDK turn. A signal landing in that gap used to
+      // spawn both into a process that was going away — a titler runtime
+      // nobody would tear down, and a turn shutdown would abort a moment
+      // later. The session itself is already registered and durable, so
+      // stopping here leaves nothing half-done: it is simply a session that
+      // has not run its first turn, exactly as if the prompt had been sent one
+      // instant later.
+      if (scope.lostReason()) return;
+      // Title this the same way a first thread message is titled — the thread
+      // was created with the local heuristic so it is never nameless, and the
+      // model's shorter name replaces it a few seconds later.
+      this.startTitling(thread.id, session, promptOption);
+      void this.runTurn(thread.id, promptOption).catch(() => {});
     }
   }
 
