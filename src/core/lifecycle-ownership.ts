@@ -586,3 +586,55 @@ export function createLifecycleOwnershipForTest(
   const ownership = new Ownership(lock, options);
   return { ownership, inspect: ownership.inspector() };
 }
+
+/** Reject if `p` doesn't settle within `ms` (the pending work keeps running).
+ *
+ *  Shared here because `confirmStopped`, the reconciliation engine and the app
+ *  all need the same non-cancelling bound: timeout answers only "not settled
+ *  yet", never that the underlying operation stopped. It borrows the module's
+ *  ONE timer site so this bound is unref'd like every other: a bound we are
+ *  merely waiting on must never be the reason the process stays alive. */
+export function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = defaultTimers.set(() => reject(new Error("timeout")), ms);
+    p.then(
+      (v) => {
+        defaultTimers.clear(t);
+        resolve(v);
+      },
+      (e) => {
+        defaultTimers.clear(t);
+        reject(e);
+      }
+    );
+  });
+}
+
+/**
+ * Await a bounded teardown WITHOUT abandoning the unbounded truth.
+ *
+ * The bound expiring says "not yet", never "never": the underlying disconnect
+ * is single-flight and keeps running. Nothing watched it afterwards, so a
+ * runtime that stopped one millisecond past the bound went on gating the
+ * process lock for the whole life of the process — an obligation that nobody
+ * left could ever discharge. A late SUCCESS discharges by identity; a late
+ * failure has proved nothing and deliberately discharges nothing.
+ */
+export function confirmStopped(
+  settling: Promise<unknown>,
+  timeoutMs: number,
+  handle: () => ObligationHandle | undefined
+): Promise<boolean> {
+  return withTimeout(settling, timeoutMs).then(
+    () => true,
+    () => {
+      settling.then(
+        () => handle()?.discharge(),
+        () => {
+          /* still unproven: this runtime goes on gating the lock */
+        }
+      );
+      return false;
+    }
+  );
+}

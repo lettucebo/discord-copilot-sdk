@@ -46,6 +46,7 @@ import {
   createLifecycleOwnership,
   type LifecycleOwnership,
 } from "../src/core/lifecycle-ownership.js";
+import type { ReconciliationEngine } from "../src/core/reconciliation-engine.js";
 import {
   strictInteraction,
   asCommandInteraction,
@@ -1440,16 +1441,23 @@ interface FakeRetryJob {
   handle: object;
 }
 
+/** The reconciliation engine this app owns. Startup reconciliation, the armed
+ *  wake-up, backoff/idle and every resume fence live there now; the app is the
+ *  phase/host adapter around it. */
+function engineOf(app: DiscordCopilotApp): ReconciliationEngine {
+  return (app as unknown as { reconciliation: ReconciliationEngine }).reconciliation;
+}
+
 /** Replace the retry loop's timer with a queue a test can fire by hand. Real
  *  waits would make this suite either slow or flaky, and `vi.useFakeTimers()`
  *  would also freeze the SDK/git timeouts the same app owns. */
 function installFakeScheduler(app: DiscordCopilotApp): FakeRetryJob[] {
   const jobs: FakeRetryJob[] = [];
   (
-    app as unknown as {
-      accessRetryScheduler: { set(fn: () => void, ms: number): unknown; clear(h: unknown): void };
+    engineOf(app) as unknown as {
+      scheduler: { set(fn: () => void, ms: number): unknown; clear(h: unknown): void };
     }
-  ).accessRetryScheduler = {
+  ).scheduler = {
     set(fn: () => void, ms: number): unknown {
       const handle = {};
       jobs.push({ fn, ms, handle });
@@ -1466,7 +1474,7 @@ function installFakeScheduler(app: DiscordCopilotApp): FakeRetryJob[] {
 /** What `onReady` does once reconciliation is finished. */
 function readyAndStartRetry(app: DiscordCopilotApp): void {
   (app as unknown as { phase: string }).phase = "ready";
-  (app as unknown as { startAccessRetryLoop(): void }).startAccessRetryLoop();
+  engineOf(app).arm();
 }
 
 /** Fire the next scheduled wake-up and wait for the tick it starts. */
@@ -1475,20 +1483,24 @@ async function fireRetry(app: DiscordCopilotApp, jobs: FakeRetryJob[]): Promise<
 }
 
 /** Fire the next wake-up WITHOUT waiting, so a test can act while the tick is
- *  suspended inside the runtime — which is where every race here lives. */
+ *  suspended inside the runtime — which is where every race here lives.
+ *  `nudge()` joins the tick the wake-up just started rather than opening a
+ *  second one, which is exactly the no-overlap rule under test elsewhere. */
 function beginRetry(app: DiscordCopilotApp, jobs: FakeRetryJob[]): Promise<void> {
   const job = jobs.shift();
   expect(job, "expected a scheduled retry wake-up").toBeDefined();
   job?.fn();
-  return (
-    (app as unknown as { accessRetryTickPromise?: Promise<void> }).accessRetryTickPromise ??
-    Promise.resolve()
-  );
+  return engineOf(app).nudge();
 }
 
 /** A stray timer fire, as a second armed timer or an event poke would produce. */
 function runRetryTick(app: DiscordCopilotApp): void {
-  (app as unknown as { runAccessRetryTick(): void }).runAccessRetryTick();
+  void engineOf(app).nudge();
+}
+
+/** Shrink the engine's per-attempt teardown bound. */
+function setResumeTeardownTimeout(app: DiscordCopilotApp, ms: number): void {
+  (engineOf(app) as unknown as { resumeTeardownTimeoutMs: number }).resumeTeardownTimeoutMs = ms;
 }
 
 /** A copilot whose resume is held open until the test releases it, so `/end`
@@ -1586,6 +1598,32 @@ const visibleThread = {
 };
 
 describe("same-process access-restoration retry (ADR-0002)", () => {
+  it("does not run or arm from a nudge before the retry loop is armed", async () => {
+    const f = tmpFile();
+    const registryFile = `${f}.channels.json`;
+    try {
+      const app = DiscordCopilotApp.createForTest(
+        cfg,
+        REPOS_ROOT,
+        fakeCopilot(),
+        new FakeTransport(),
+        appDependencies({
+          store: new SessionStore(f),
+          channels: new ChannelRegistry("c1", "g1", registryFile),
+        })
+      );
+      const jobs = installFakeScheduler(app);
+      (app as unknown as { phase: string }).phase = "ready";
+
+      await engineOf(app).nudge();
+
+      expect(jobs).toEqual([]);
+    } finally {
+      rmSync(f, { force: true });
+      rmSync(registryFile, { force: true });
+    }
+  });
+
   it("resumes a 50001 no-access record exactly once, once access is restored", async () => {
     const f = tmpFile();
     const registryFile = `${f}.channels.json`;
@@ -1929,11 +1967,12 @@ describe("same-process access-restoration retry (ADR-0002)", () => {
         appDependencies({ store: new SessionStore(f), channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       (app as unknown as { phase: string }).phase = "ready";
-      (app as unknown as { startAccessRetryLoop(): void }).startAccessRetryLoop();
-      const timer = (app as unknown as { accessRetryTimer?: { hasRef?(): boolean } }).accessRetryTimer;
-      expect(timer?.hasRef?.()).toBe(false);
-      (app as unknown as { clearAccessRetryTimer(): void }).clearAccessRetryTimer();
-      expect((app as unknown as { accessRetryTimer?: unknown }).accessRetryTimer).toBeUndefined();
+      const engine = engineOf(app);
+      engine.arm();
+      const armed = engine as unknown as { accessRetryTimer?: { hasRef?(): boolean } };
+      expect(armed.accessRetryTimer?.hasRef?.()).toBe(false);
+      engine.disarm();
+      expect(armed.accessRetryTimer).toBeUndefined();
     } finally {
       rmSync(f, { force: true });
       rmSync(registryFile, { force: true });
@@ -2894,7 +2933,7 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
    *  so `/end` reaches the barrier it is supposed to find rather than expiring
    *  first — that expiry has its own test. */
   function shrinkTeardown(app: DiscordCopilotApp, teardownMs = 10, joinMs = 2_000): void {
-    (app as unknown as { resumeTeardownTimeoutMs: number }).resumeTeardownTimeoutMs = teardownMs;
+    setResumeTeardownTimeout(app, teardownMs);
     (app as unknown as { accessResumeJoinTimeoutMs: number }).accessResumeJoinTimeoutMs = joinMs;
   }
 
@@ -3019,7 +3058,7 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
           }
         ).ownership.runExclusive("t-keepfirst", async (scope) =>
           (
-            app as unknown as {
+            engineOf(app) as unknown as {
               discardResumedActor(r: unknown, a: unknown, why: string, o: unknown): Promise<void>;
             }
           ).discardResumedActor(rec, actor, "test", { scope })
@@ -3100,10 +3139,10 @@ describe("access retry must not resume behind its own unconfirmed barrier", () =
     // defect this whole feature exists to fix — so the wiring is asserted at the
     // source, the way this repo already asserts shipped-script and doc contracts.
     const src = readFileSync(join(process.cwd(), "src", "app.ts"), "utf8");
-    const armed = /this\.phase = "ready";\s*(?:\/\/[^\n]*\n\s*)*this\.startAccessRetryLoop\(\);/;
+    const armed = /this\.phase = "ready";\s*(?:\/\/[^\n]*\n\s*)*this\.reconciliation\.arm\(\);/;
     expect(src).toMatch(armed);
     // And only there: a second arming site would be a second loop.
-    expect(src.match(/this\.startAccessRetryLoop\(\)/g)).toHaveLength(1);
+    expect(src.match(/this\.reconciliation\.arm\(\)/g)).toHaveLength(1);
   });
 });
 
@@ -3427,7 +3466,8 @@ describe("shutdown ownership: single-flight, no forced exit, no leaked capabilit
       });
       // `lock.release()` is already `.catch()`ed inside stop(); force the failure
       // through a path that is not, so the signal handler's error branch is real.
-      (app as unknown as { clearAccessRetryTimer(): void }).clearAccessRetryTimer = () => {
+      // The teardown's first step is disarming the reconciliation engine.
+      (engineOf(app) as unknown as { disarm(): void }).disarm = () => {
         throw new Error("teardown exploded");
       };
       process.exitCode = undefined;
@@ -4143,7 +4183,7 @@ describe("startup is owned work, and its resumes are owned per thread", () => {
         appDependencies({ store, channels: new ChannelRegistry("c1", "g1", registryFile) })
       );
       useOwnershipBounds(app, { obligationTimeoutMs: 20 });
-      (app as unknown as { resumeTeardownTimeoutMs: number }).resumeTeardownTimeoutMs = 20;
+      setResumeTeardownTimeout(app, 20);
       setChannelFetch(app, async () => visibleThread);
 
       // The startup resume succeeds at the runtime and then cannot record it.
@@ -4627,7 +4667,7 @@ describe("a runtime that confirms LATE still discharges what it was owed", () =>
         },
       });
       useOwnershipBounds(app, { obligationTimeoutMs: 20 });
-      (app as unknown as { resumeTeardownTimeoutMs: number }).resumeTeardownTimeoutMs = 20;
+      setResumeTeardownTimeout(app, 20);
       setChannelFetch(app, async () => visibleThread);
 
       // The resume works at the runtime and then cannot be written down, so the
@@ -4693,7 +4733,7 @@ describe("a runtime that confirms LATE still discharges what it was owed", () =>
         },
       });
       useOwnershipBounds(app, { obligationTimeoutMs: 20 });
-      (app as unknown as { resumeTeardownTimeoutMs: number }).resumeTeardownTimeoutMs = 20;
+      setResumeTeardownTimeout(app, 20);
       setChannelFetch(app, async () => visibleThread);
 
       const commit = vi.spyOn(store, "commit").mockReturnValue(false);
