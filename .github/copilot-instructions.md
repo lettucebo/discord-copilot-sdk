@@ -56,7 +56,10 @@ flowchart LR
   S --> R["TurnRenderer — core/turn-render.ts"]
   R --> T
   S <--> C["Copilot runtime — @github/copilot-sdk"]
-  A --> ST["SessionStore + reconcile"]
+  A --> RE["ReconciliationEngine — core/reconciliation-engine.ts"]
+  RE --> A
+  RE --> ST["SessionStore + reconcile"]
+  A --> ST
   A --> W["git worktrees"]
   S <--> P["ApprovalPolicy"]
 ```
@@ -65,8 +68,12 @@ flowchart LR
   single-instance lock, starts `DiscordCopilotApp`. Also serves `--version` / `--selfcheck`.
 - **`src/app.ts`** (the orchestrator, several thousand lines — by far the largest file in the
   repo) — owns **inbound** Discord: slash-command *dispatch and authorization routing*,
-  button interactions, thread messages, the thread⇄session map, startup reconciliation, worktree
-  lifecycle, thread titling, `/queue` and steering. It no longer defines or registers the commands
+  button interactions, thread messages, the thread⇄session map, worktree
+  lifecycle, thread titling, `/queue` and steering. For startup/access reconciliation it is the
+  **phase/host adapter**, not the orchestrator: it sets the phase, calls
+  `reconciliation.reconcileStartup()`, opens the gate, calls `reconciliation.arm()` exactly once,
+  and `disarm()`s on teardown, while the engine owns the pass and all of its retry state. It no
+  longer defines or registers the commands
   themselves — `onReady` calls `registerCommands` from `platforms/discord/commands.ts` — and it no
   longer implements `/channel`: `cmdChannel` is a dependency-wiring delegate to
   `platforms/discord/channel-command.ts` (`inspectChannelTarget` stays as a one-line delegate
@@ -75,6 +82,20 @@ flowchart LR
   `Transport` seam is for **outbound** UI, not a full abstraction of Discord. Correctness-critical
   logic is factored into exported pure helpers (`resolveButtonAck`, `decisionBindsToChannel`,
   `isOurEndedThread`, `applyYoloToggle`) so it is unit-testable without Discord.
+- **`src/core/reconciliation-engine.ts`** — owns startup reconciliation, the ADR-0002
+  access-restoration retry loop and every piece of state behind them: the retry cadence
+  (`ACCESS_RETRY_DELAYS_MS`), the single armed timer, the in-flight tick, backoff/idle, the
+  once-per-thread transient notice, candidate selection, per-record reconciliation, `resumeRecord`
+  and its repeated ownership fences, `runtimeObligationKey` barriers and the superseded-key counter.
+  Its four lifecycle operations are `reconcileStartup` / `arm` / `disarm` / `nudge`; three narrow
+  seams remain for existing app/test integration: `resumeRecord`, `discardResumedActor`, and
+  `supersededRuntimeKey`. `nudge` is inert until `arm`, and `disarm` prevents an in-flight tick from
+  re-arming its timer. Everything it needs from the process lives in ONE `ReconciliationPorts` grouped as
+  process / inventory / world, and every port callback is late-bound so a test that patches
+  `bindingCheck`, `captureValidatedRoot` or `classifyThread` on the app is still the thing the
+  engine calls. Pure plan/classification stays in `core/reconcile.ts`; `LifecycleOwnership`
+  remains the only lock-release authority — the engine only uses `runExclusive` and the
+  retain/obligation behaviour of an `OwnedScope`. It must never import `app.ts`.
 - **`src/platforms/discord/channel-command.ts`** — sole owner of the `/channel` cluster:
   `parseChannelRef`, the private-channel visibility guidance, `list` / `enable` / `disable`, the
   channel-holder scan, and the enable-target inspection (`inspectChannelTarget`, including
@@ -116,6 +137,9 @@ flowchart LR
   the disk write succeeds), corrupt ≠ absent, and `generationHighWater` persisted so a deleted
   record can't let a generation be reused. A resume error is `transient` unless it definitively
   says the session is gone — never lose conversation history on an ambiguous failure.
+  `reconcile.ts` stays **pure** (`planReconcile`, `classifyResumeError`,
+  `classifyRecordDisposition`); the side-effecting pass that consumes it is the reconciliation
+  engine.
 - **`src/core/channel-registry.ts` + `platforms/discord/auth.ts` +
   `platforms/discord/channel-fetch.ts` + `platforms/discord/channel-command.ts`** — the Discord
   access model has two independent gates.
@@ -309,8 +333,8 @@ command-permission overrides are a secondary, manual server-admin layer, not bot
 a visible command from an unauthorized location must still receive the normal safe refusal and
 perform no work. Losing channel visibility (`50001`/Channel Obfuscation) classifies the affected
 session as retryable `thread-no-access`: a single bounded periodic scan armed after startup
-(`startAccessRetryLoop`, 15s backing off to 5 min) re-runs the ordinary reconcile/resume path for
-those records, so it resumes automatically once access is restored — without a restart, because
+(`ReconciliationEngine.arm`, 15s backing off to 5 min) re-runs the ordinary reconcile/resume path
+for those records, so it resumes automatically once access is restored — without a restart, because
 restoring a permission emits no reliable gateway event for a thread the bot could not see — and it
 is explicitly, manually clearable with `/end thread:<id>` after an informed owner decides to give
 up on recovery (ADR-0002) — it must never be treated as a permanent block. Each retry re-fetches the
@@ -323,8 +347,10 @@ hatch, parking it until a restart. `/end` claims a thread synchronously before i
 and the loop skips claimed threads, because `/end` removes the record several awaits later — long
 enough for a resume to register a session it would then orphan; an attempt that has not settled
 makes `/end` refuse rather than proceed, so no timeout value is load-bearing. `resumeRecord`
+(in `core/reconciliation-engine.ts`)
 re-proves it still owns the record before it rebuilds a missing worktree, again after that rebuild,
-and once more immediately before `sessions.set`; it registers a session only after `commit()` has
+and once more immediately before the app's `registerResumedSession`; it registers a session only
+after `commit()` has
 durably recorded the recovery, and a discarded session is entered as a coordinator obligation **before**
 its disconnect is attempted, is never overwritten by a later one, and is removed only when that
 exact actor's disconnect is confirmed. A thread carrying such a barrier stays a retry candidate but
@@ -347,7 +373,10 @@ replaces. Release is a conclusion re-drawn from live state at every transition �
 exclusive scopes, the teardown claims and the obligations are *simultaneously* empty — never a
 countdown over a snapshot. Obligations carry their payload (the actor, the retained root) so there
 is no second map to drift, and first registration for a key wins, because an existing entry is an
-older thing nobody proved gone.
+older thing nobody proved gone. The module also exports the two helpers that answer "did this
+runtime actually stop?" — `withTimeout` and `confirmStopped` — because shutdown and the
+reconciliation engine must answer it identically; both borrow the module's single unref'd timer
+site.
 
 The rules that follow from it: bootstrap creates the coordinator the instant the lock exists and
 passes that same instance into `runtime.start`; a post-construction failure goes through
